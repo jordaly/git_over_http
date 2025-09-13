@@ -211,26 +211,26 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 )
                 self.assertIn("Add hello.txt", log)
 
-    # Not workig for some reason but when usign it in a real environment it works
-    # TODO: fix this test 
-    # def test_forbidden_ip(self):
-    #     # Request should be blocked by allowlist check BEFORE backend
-    #     with ServerRunner(
-    #         allow_ips=set(),  # deny all
-    #         trace_log=None,
-    #         project_root=self.tmp_root,
-    #         backend_path=self.backend,
-    #     ) as srvrun:
+    # TODO: fix this test
+    @unittest.skip("Not workig for some reason but when usign it in a real environment it works")
+    def test_forbidden_ip(self):
+        # Request should be blocked by allowlist check BEFORE backend
+        with ServerRunner(
+            allow_ips=set(),  # deny all
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+        ) as srvrun:
 
-    #         conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
-    #         try:
-    #             conn.request("GET", "/git/repo.git/info/refs?service=git-receive-pack")
-    #             resp = conn.getresponse()
-    #             body = resp.read()
-    #             self.assertEqual(resp.status, 403)
-    #             self.assertIn(b"Forbidden", body)
-    #         finally:
-    #             conn.close()
+            conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
+            try:
+                conn.request("GET", "/git/repo.git/info/refs?service=git-receive-pack")
+                resp = conn.getresponse()
+                body = resp.read()
+                self.assertEqual(resp.status, 403)
+                self.assertIn(b"Forbidden", body)
+            finally:
+                conn.close()
 
     def test_not_found_wrong_prefix(self):
         with ServerRunner(

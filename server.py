@@ -270,11 +270,10 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
-    def __init__(self, *args, allowlist, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Per-instance allowlist; tests (or callers) can override this safely.
-        self.allowlist = allowlist
-        # self.allowlist = ALLOWED_CLIENT_IPS
+        self.allowlist = ALLOWED_CLIENT_IPS
 
 
 def main():

@@ -82,7 +82,7 @@ class ServerRunner:
             p.start()
 
         # Bind on loopback for tests
-        self.httpd = srv.ThreadedHTTPServer((self.bind_host, self.port), srv.GitHTTPHandler, allowlist=self.allow_ips)
+        self.httpd = srv.ThreadedHTTPServer((self.bind_host, self.port), srv.GitHTTPHandler)
         # Per-instance allowlist (handler reads from here)
         self.httpd.allowlist = self.allow_ips
 
@@ -101,8 +101,6 @@ class ServerRunner:
         if self._owns_projroot:
             shutil.rmtree(self.project_root, ignore_errors=True)
 
-
-# ---------- tests using real backend ----------
 
 @unittest.skipUnless(_which_git(), "git not found in PATH")
 @unittest.skipUnless(_which_git_backend(), "git-http-backend not found")

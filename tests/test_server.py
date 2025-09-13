@@ -211,6 +211,8 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 )
                 self.assertIn("Add hello.txt", log)
 
+    # Not workig for some reason but when usign it in a real environment it works
+    # TODO: fix this test 
     # def test_forbidden_ip(self):
     #     # Request should be blocked by allowlist check BEFORE backend
     #     with ServerRunner(

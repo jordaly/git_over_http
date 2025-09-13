@@ -1,19 +1,19 @@
-import io
 import os
 import socket
 import threading
-import time
 import http.client
 import subprocess
 import unittest
+import tempfile
+import shutil
 from contextlib import closing
 from unittest.mock import patch
 
-# Adjust this import if your module name differs
+# Import your server module
 import server as srv
 
 
-# ---------- Helpers ----------
+# ---------- helpers ----------
 
 def _find_free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
@@ -21,132 +21,71 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-class _PipeLikeStdout:
-    """
-    A tiny pipe-like object that a fake backend writes into on a background thread,
-    while the server reads from it. Simulates streamed CGI output.
-    """
-    def __init__(self):
-        r_fd, w_fd = os.pipe()
-        self._r = os.fdopen(r_fd, "rb", buffering=0)
-        self._w = os.fdopen(w_fd, "wb", buffering=0)
-
-    def write(self, data: bytes):
-        self._w.write(data)
-        self._w.flush()
-
-    def close_writer(self):
-        try:
-            self._w.close()
-        except Exception:
-            pass
-
-    def read(self, n: int = -1) -> bytes:
-        return self._r.read(n)
-
-    # Alias read1 for compatibility if the server uses it
-    read1 = read
-
-    def close_reader(self):
-        try:
-            self._r.close()
-        except Exception:
-            pass
+def _which_git_backend():
+    # Typical Debian/Ubuntu path; fall back to PATH lookup
+    candidates = [
+        "/usr/lib/git-core/git-http-backend",
+        shutil.which("git-http-backend"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
 
 
-class FakeProc:
-    """
-    Fake replacement for subprocess.Popen that simulates git-http-backend:
-    - Accepts stdin (server streams POST body).
-    - Streams CGI headers + body gradually via stdout.
-    - Supports wait()/kill()/returncode.
-    """
-    def __init__(self, *args, **kwargs):
-        self.args = args
-        self.kwargs = kwargs
-        self.env = kwargs.get("env", {})
-        self.stdin = io.BytesIO()
-        self.stdout = _PipeLikeStdout()
-        self._stderr_target = kwargs.get("stderr", subprocess.DEVNULL)
-        self._returncode = 0
-        self._done = threading.Event()
-
-        # Create realistic CGI headers + a streamed body
-        # (You can assert PATH_INFO/QUERY_STRING here if you want stricter checks)
-        header = (
-            b"Status: 200 OK\r\n"
-            b"Content-Type: application/x-git-receive-pack-advertisement\r\n"
-            b"\r\n"
-        )
-        body_chunks = [
-            b"# service=git-receive-pack\n",
-            b"0000",
-            b"some-streamed-data-1\n",
-            b"some-streamed-data-2\n",
-        ]
-
-        def _writer():
-            try:
-                self.stdout.write(header)
-                for ch in body_chunks:
-                    time.sleep(0.02)  # stagger chunks to mimic streaming
-                    self.stdout.write(ch)
-                self.stdout.close_writer()
-            finally:
-                self._done.set()
-
-        self._writer_thread = threading.Thread(target=_writer, daemon=True)
-        self._writer_thread.start()
-
-    def wait(self, timeout=None):
-        finished = self._done.wait(timeout=timeout)
-        if not finished:
-            raise TimeoutError("FakeProc: wait timeout")
-        return self._returncode
-
-    def kill(self):
-        self._returncode = -9
-        self._done.set()
-
-    @property
-    def returncode(self):
-        return self._returncode
+def _which_git():
+    return shutil.which("git")
 
 
 class ServerRunner:
     """
-    Context manager to run the HTTP server with patched constants and FakeProc.
-    Each test gets an isolated instance on a free port.
+    Context manager to run the HTTP server with the REAL git-http-backend.
+    - Patches server constants to point to a temporary project root
+    - Sets per-instance allowlist that the handler reads from
     """
-    def __init__(self, allow_ips=None, url_prefix="/git", trace_log=None, project_root="/tmp/git-proj-root"):
+    def __init__(
+        self,
+        allow_ips=None,
+        url_prefix="/git",
+        trace_log=None,
+        project_root=None,
+        backend_path=None,
+        bind_host="127.0.0.1",
+    ):
         self.allow_ips = set(allow_ips or {"127.0.0.1"})
         self.url_prefix = url_prefix
-        self.trace_log = trace_log   # set to None on Linux to avoid opening Windows paths
-        self.project_root = project_root
+        self.trace_log = trace_log
+        self.project_root = project_root or tempfile.mkdtemp(prefix="git-http-projroot-")
+        self.backend_path = backend_path or _which_git_backend()
         self.port = _find_free_port()
+        self.bind_host = bind_host
+
         self.httpd = None
         self.thread = None
         self._patches = []
+        self._owns_projroot = project_root is None  # if we created it, we clean it
 
     def __enter__(self):
         os.makedirs(self.project_root, exist_ok=True)
 
-        # Patch module constants to be Linux-friendly and test specific
+        # Patch module constants
         self._patches.append(patch.object(srv, "TRACE_LOG", self.trace_log))
         self._patches.append(patch.object(srv, "GIT_PROJECT_ROOT", self.project_root))
         self._patches.append(patch.object(srv, "ALLOWED_CLIENT_IPS", self.allow_ips))
         self._patches.append(patch.object(srv, "URL_PREFIX", self.url_prefix))
-        # Backend path won't be used, but set something POSIX-y
-        self._patches.append(patch.object(srv, "GIT_HTTP_BACKEND", "/usr/lib/git-core/git-http-backend"))
+        if self.backend_path:
+            self._patches.append(patch.object(srv, "GIT_HTTP_BACKEND", self.backend_path))
         # Ensure HTTP/1.1
         self._patches.append(patch.object(srv.GitHTTPHandler, "protocol_version", "HTTP/1.1"))
-        # Stub subprocess.Popen with FakeProc
-        self._patches.append(patch.object(subprocess, "Popen", FakeProc))
 
         for p in self._patches:
             p.start()
 
-        self.httpd = srv.ThreadedHTTPServer(("127.0.0.1", self.port), srv.GitHTTPHandler)
+        # Bind on loopback for tests
+        self.httpd = srv.ThreadedHTTPServer((self.bind_host, self.port), srv.GitHTTPHandler, allowlist=self.allow_ips)
+        # Per-instance allowlist (handler reads from here)
+        self.httpd.allowlist = self.allow_ips
+
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         return self
@@ -159,14 +98,58 @@ class ServerRunner:
             self.thread.join(timeout=1)
         for p in reversed(self._patches):
             p.stop()
+        if self._owns_projroot:
+            shutil.rmtree(self.project_root, ignore_errors=True)
 
 
-# ---------- Tests ----------
+# ---------- tests using real backend ----------
 
-class GitHTTPServerTests(unittest.TestCase):
+@unittest.skipUnless(_which_git(), "git not found in PATH")
+@unittest.skipUnless(_which_git_backend(), "git-http-backend not found")
+class GitHTTPServerRealBackendTests(unittest.TestCase):
+
+    def setUp(self):
+        self.git = _which_git()
+        self.backend = _which_git_backend()
+        self.tmp_root = tempfile.mkdtemp(prefix="git-http-root-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_root, ignore_errors=True)
+
+    def _run(self, *args, **kwargs):
+        """Run a command; accept either a command list or varargs."""
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            cmd = list(args[0])
+        else:
+            cmd = list(args)
+        return subprocess.run(cmd, check=True, **kwargs)
+
+    def _git(self, *args, cwd=None, env=None, git_dir=None, work_tree=None):
+        cmd = [self.git]
+        if git_dir:
+            cmd += ["--git-dir", git_dir]
+        if work_tree:
+            cmd += ["--work-tree", work_tree]
+        cmd += list(args)
+        return self._run(cmd, cwd=cwd, env=env)
+
+    def _enable_receive_pack(self, bare_git_dir: str):
+        # Required for pushes over Smart HTTP
+        self._git("config", "http.receivepack", "true", git_dir=bare_git_dir)
 
     def test_info_refs_get_ok(self):
-        with ServerRunner(trace_log=None) as srvrun:
+        # Create a bare repo and enable receive-pack
+        bare = os.path.join(self.tmp_root, "repo.git")
+        self._git("init", "--bare", bare)
+        self._enable_receive_pack(bare)
+
+        with ServerRunner(
+            allow_ips={"127.0.0.1"},
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+        ) as srvrun:
+            # GET info/refs (receive-pack service) directly
             conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
             try:
                 path = "/git/repo.git/info/refs?service=git-receive-pack"
@@ -175,43 +158,68 @@ class GitHTTPServerTests(unittest.TestCase):
                 body = resp.read()
 
                 self.assertEqual(resp.status, 200)
-                self.assertEqual(
-                    resp.getheader("Content-Type"),
-                    "application/x-git-receive-pack-advertisement"
-                )
-                # Body contains streamed markers
-                self.assertIn(b"# service=git-receive-pack", body)
-                self.assertIn(b"some-streamed-data-1", body)
-                self.assertIn(b"some-streamed-data-2", body)
-            finally:
-                conn.close()
-
-    def test_git_receive_pack_post_streams_request_body(self):
-        with ServerRunner(trace_log=None) as srvrun:
-            conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
-            try:
-                path = "/git/repo.git/git-receive-pack"
-                payload = b"0123456789" * 100  # ~1KB
-                headers = {
-                    "Content-Type": "application/x-git-receive-pack-request",
-                    "Content-Length": str(len(payload)),
-                }
-                conn.request("POST", path, body=payload, headers=headers)
-                resp = conn.getresponse()
-                body = resp.read()
-
-                self.assertEqual(resp.status, 200)
-                self.assertEqual(
-                    resp.getheader("Content-Type"),
-                    "application/x-git-receive-pack-advertisement"
-                )
+                ctype = resp.getheader("Content-Type")
+                self.assertEqual(ctype, "application/x-git-receive-pack-advertisement")
+                # Smart HTTP banner presence
                 self.assertIn(b"# service=git-receive-pack", body)
             finally:
                 conn.close()
+
+    def test_end_to_end_clone_commit_push(self):
+        # Create a bare repo and enable receive-pack
+        bare = os.path.join(self.tmp_root, "repo.git")
+        self._git("init", "--bare", bare)
+        self._enable_receive_pack(bare)
+
+        with ServerRunner(
+            allow_ips={"127.0.0.1"},
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+        ) as srvrun:
+
+            repo_url = f"http://127.0.0.1:{srvrun.port}/git/repo.git"
+
+            with tempfile.TemporaryDirectory(prefix="git-http-client-") as clienttmp:
+                clone_dir = os.path.join(clienttmp, "clone")
+
+                # Clone over HTTP (upload-pack is on by default)
+                self._git("clone", repo_url, clone_dir)
+
+                # Configure identity locally
+                env = os.environ.copy()
+
+                def git_local(*args):
+                    return self._git(*args, cwd=clone_dir, env=env)
+
+                git_local("config", "user.name", "Test User")
+                git_local("config", "user.email", "test@example.com")
+
+                # Create file, add, commit
+                with open(os.path.join(clone_dir, "hello.txt"), "w", encoding="utf-8") as f:
+                    f.write("hello over http\n")
+                git_local("add", "hello.txt")
+                git_local("commit", "-m", "Add hello.txt")
+
+                # Push over HTTP (receive-pack requires enabling per repo)
+                git_local("push", "origin", "HEAD:refs/heads/master")
+
+                # Verify commit in bare repo
+                log = subprocess.check_output(
+                    [self.git, "--git-dir", bare, "log", "--oneline", "--branches"],
+                    text=True
+                )
+                self.assertIn("Add hello.txt", log)
 
     # def test_forbidden_ip(self):
-    #     # Empty allowlist => 127.0.0.1 not allowed => 403
-    #     with ServerRunner(allow_ips=set(), trace_log=None) as srvrun:
+    #     # Request should be blocked by allowlist check BEFORE backend
+    #     with ServerRunner(
+    #         allow_ips=set(),  # deny all
+    #         trace_log=None,
+    #         project_root=self.tmp_root,
+    #         backend_path=self.backend,
+    #     ) as srvrun:
+
     #         conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
     #         try:
     #             conn.request("GET", "/git/repo.git/info/refs?service=git-receive-pack")
@@ -223,7 +231,13 @@ class GitHTTPServerTests(unittest.TestCase):
     #             conn.close()
 
     def test_not_found_wrong_prefix(self):
-        with ServerRunner(trace_log=None) as srvrun:
+        with ServerRunner(
+            allow_ips={"127.0.0.1"},
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+        ) as srvrun:
+
             conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
             try:
                 conn.request("GET", "/nope/repo.git/info/refs?service=git-receive-pack")

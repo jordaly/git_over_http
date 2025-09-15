@@ -3,6 +3,8 @@ import sys
 import threading
 import subprocess
 import ipaddress
+import platform
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
@@ -11,15 +13,29 @@ from urllib.parse import urlparse
 HOST = ""            # bind all interfaces
 PORT = 8000
 
-# Linux defaults
-GIT_PROJECT_ROOT = "/srv/git"  # e.g., put bare repos in /srv/git/*.git
-GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
-TRACE_LOG = None  # set to a path (e.g. "/tmp/git-http-backend.log") to log backend stderr
+CURRENT_PLATFORM = platform.system()
 
-# ON WINDOWS CHANGE CONSTANTS TO SOMETHING LIKE:
-# GIT_PROJECT_ROOT = r"C:\Servidor_Git"
-# GIT_HTTP_BACKEND = r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
-# TRACE_LOG = r"C:\temp\git-http-backend.log"
+if CURRENT_PLATFORM == "Windows":
+    GIT_PROJECT_ROOT = r"C:\Servidor_Git"
+    GIT_HTTP_BACKEND = r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
+    TRACE_LOG = r"C:\temp\git-http-backend.log"
+
+elif CURRENT_PLATFORM == "Linux":
+    GIT_PROJECT_ROOT = "/srv/git"  # e.g., put bare repos in /srv/git/*.git
+    GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
+    TRACE_LOG = None  # set to a path (e.g. "/tmp/git-http-backend.log") to log backend stderr
+
+elif CURRENT_PLATFORM == "Darwin":
+    git_project_path = (Path.home() / "git/")
+    git_project_path.mkdir(exist_ok=True)
+
+    GIT_PROJECT_ROOT = str(git_project_path)
+    GIT_HTTP_BACKEND = "/opt/homebrew/opt/git/libexec/git-core/git-http-backend"
+    TRACE_LOG = "/tmp/git-http-backend.log"
+
+else:
+    raise NotImplementedError()
+
 
 URL_PREFIX = "/git"  # URL prefix that maps to git-http-backend
 

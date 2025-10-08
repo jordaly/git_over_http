@@ -4,6 +4,7 @@ import threading
 import subprocess
 import ipaddress
 import platform
+import base64
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -28,7 +29,6 @@ elif CURRENT_PLATFORM == "Linux":
 elif CURRENT_PLATFORM == "Darwin":
     git_project_path = (Path.home() / "git/")
     git_project_path.mkdir(exist_ok=True)
-
     GIT_PROJECT_ROOT = str(git_project_path)
     GIT_HTTP_BACKEND = "/opt/homebrew/opt/git/libexec/git-core/git-http-backend"
     TRACE_LOG = "/tmp/git-http-backend.log"
@@ -36,16 +36,22 @@ elif CURRENT_PLATFORM == "Darwin":
 else:
     raise NotImplementedError()
 
-
 URL_PREFIX = "/git"  # URL prefix that maps to git-http-backend
 
 ALLOWED_CLIENT_IPS = {
     "127.0.0.1",
-    # You may add CIDRs like "192.168.16.0/24" or "::1/128"
+    # Example: "192.168.16.0/24"
+}
+
+# ---- BASIC AUTH CONFIG ----
+REQUIRE_AUTH = True
+REALM = "Git Repositories"
+VALID_USERS = {
+    "jordaly": "clave123",
+    "edwin": "dev123",
 }
 
 # ----------------------------------------
-
 
 def _ip_allowed(ip: str, allow: set[str]) -> bool:
     """Allow exact IPs or CIDRs; handles IPv4/IPv6. Empty allowlist denies all."""
@@ -57,16 +63,14 @@ def _ip_allowed(ip: str, allow: set[str]) -> bool:
         return False
     for item in allow:
         try:
-            # CIDR (e.g., "192.168.1.0/24", "::1/128")
             if addr in ipaddress.ip_network(item, strict=False):
                 return True
         except ValueError:
-            # Single IP string
             try:
                 if ipaddress.ip_address(item) == addr:
                     return True
             except ValueError:
-                if item == ip:  # literal fallback
+                if item == ip:
                     return True
     return False
 
@@ -94,19 +98,49 @@ def _write_request_body_to_stdin(handler: BaseHTTPRequestHandler, proc: subproce
 
 
 class GitHTTPHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"  # important: keep 1.1
+    protocol_version = "HTTP/1.1"
 
     # -------- small helpers --------
     def _client_ip(self) -> str:
         ip = self.client_address[0]
-        # normalize IPv6 loopback to IPv4 for simple allowlists
         if ip == "::1":
             return "127.0.0.1"
         return ip
 
     def _allowlist(self) -> set[str]:
-        # Prefer per-server allowlist if present, else module default
         return getattr(self.server, "allowlist", ALLOWED_CLIENT_IPS)
+
+    # -------- AUTHENTICATION --------
+    def _require_auth(self) -> bool:
+        """Ask for username/password via HTTP Basic Auth (Git-native prompt)."""
+        if not REQUIRE_AUTH:
+            return True
+
+        auth_header = self.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Basic "):
+            return self._request_auth()
+
+        try:
+            decoded = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
+            username, password = decoded.split(":", 1)
+        except Exception:
+            return self._request_auth()
+
+        if VALID_USERS.get(username) == password:
+            return True
+        return self._request_auth()
+
+    def _request_auth(self):
+        """Send the 401 challenge so Git prompts for login."""
+        self.send_response(401, "Unauthorized")
+        self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        try:
+            self.wfile.write(b"Authentication required.\n")
+        except Exception:
+            pass
+        return False
 
     # -------- response helpers --------
     def _forbidden(self, msg=b"403 Forbidden\n"):
@@ -135,24 +169,17 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
     # -------- main handler --------
     def _handle_git(self):
-        # Map /git/... to CGI PATH_INFO for git-http-backend
         if not self.path.startswith(URL_PREFIX + "/"):
             return self._not_found()
 
         parsed = urlparse(self.path)
-        path_info = parsed.path[len(URL_PREFIX):]  # keep leading slash before repo
+        path_info = parsed.path[len(URL_PREFIX):]
         query = parsed.query or ""
 
-        # Build CGI-like env for git-http-backend
         env = os.environ.copy()
         env["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
         env["GIT_HTTP_EXPORT_ALL"] = "1"
 
-        # Helpful while debugging:
-        # env["GIT_TRACE"] = "1"
-        # env["GIT_TRACE_PACKET"] = "1"
-
-        # Standard CGI vars `git-http-backend` expects
         env["REQUEST_METHOD"] = self.command
         env["GIT_COMMITTER_NAME"] = env.get("GIT_COMMITTER_NAME", "git-http")
         env["GIT_COMMITTER_EMAIL"] = env.get("GIT_COMMITTER_EMAIL", "git-http@localhost")
@@ -170,7 +197,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if clen:
             env["CONTENT_LENGTH"] = str(clen)
 
-        # Launch backend
         stderr_target = open(TRACE_LOG, "ab", buffering=0) if TRACE_LOG else subprocess.DEVNULL
         proc = subprocess.Popen(
             [GIT_HTTP_BACKEND],
@@ -181,12 +207,11 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             bufsize=0
         )
 
-        # If there's a request body, stream it into backend stdin in a separate thread
         if clen > 0:
             t = threading.Thread(target=_write_request_body_to_stdin, args=(self, proc, clen), daemon=True)
             t.start()
 
-        # Read backend CGI response headers first
+        # Parse headers
         header_bytes = bytearray()
         while True:
             b = proc.stdout.read(1)
@@ -219,7 +244,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                     k, v = line.split(":", 1)
                     extra_headers.append((k.strip(), v.strip()))
 
-        # Send status & headers to client
         self.send_response(status_code, reason)
         for k, v in extra_headers:
             if k.lower() in ("status", "content-length"):
@@ -229,7 +253,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
         self.end_headers()
 
-        # Stream the rest of stdout to the client
         try:
             CHUNK = 65536
             while True:
@@ -241,7 +264,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
         finally:
-            # Close backend stdout to avoid ResourceWarning
             try:
                 if hasattr(proc.stdout, "close_reader"):
                     proc.stdout.close_reader()
@@ -249,7 +271,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                     proc.stdout.close()
             except Exception:
                 pass
-            # ensure process ends
             try:
                 proc.wait(timeout=5)
             except Exception:
@@ -257,7 +278,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                     proc.kill()
                 except Exception:
                     pass
-
             if TRACE_LOG and hasattr(stderr_target, "flush"):
                 try:
                     stderr_target.flush()
@@ -265,18 +285,24 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-    # Route only /git/* to backend; apply allowlist EARLY
+    # -------- routing --------
     def do_GET(self):
-        if not _ip_allowed(self._client_ip(), self._allowlist()):
+        ip = self._client_ip()
+        if not _ip_allowed(ip, self._allowlist()):
             self._forbidden(b"403 Forbidden: IP not allowed.\n")
+            return
+        if not self._require_auth():
             return
         if self.path.startswith(URL_PREFIX + "/"):
             return self._handle_git()
         return self._not_found()
 
     def do_POST(self):
-        if not _ip_allowed(self._client_ip(), self._allowlist()):
+        ip = self._client_ip()
+        if not _ip_allowed(ip, self._allowlist()):
             self._forbidden(b"403 Forbidden: IP not allowed.\n")
+            return
+        if not self._require_auth():
             return
         if self.path.startswith(URL_PREFIX + "/"):
             return self._handle_git()
@@ -288,12 +314,10 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Per-instance allowlist; tests (or callers) can override this safely.
         self.allowlist = ALLOWED_CLIENT_IPS
 
 
 def main():
-    # If you enable TRACE_LOG with a path, create its directory
     if TRACE_LOG:
         os.makedirs(os.path.dirname(TRACE_LOG), exist_ok=True)
     if not os.path.exists(GIT_HTTP_BACKEND):
@@ -303,15 +327,15 @@ def main():
         print(f"ERROR: GIT_PROJECT_ROOT does not exist: {GIT_PROJECT_ROOT}", file=sys.stderr)
         sys.exit(1)
 
-    # Ensure environment is ready for backend
     os.environ["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
     os.environ["GIT_HTTP_EXPORT_ALL"] = "1"
 
     httpd = ThreadedHTTPServer((HOST, PORT), GitHTTPHandler)
     print("=" * 60)
-    print(f"Git Smart HTTP server on port {PORT}")
+    print(f"Git Smart HTTP server running on port {PORT}")
     print(f"URL prefix: {URL_PREFIX}")
     print(f"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}")
+    print(f"Authentication: {'Enabled' if REQUIRE_AUTH else 'Disabled'}")
     print("=" * 60)
     try:
         httpd.serve_forever()

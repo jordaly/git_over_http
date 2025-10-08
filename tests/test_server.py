@@ -15,6 +15,7 @@ import server as srv
 
 # ---------- helpers ----------
 
+
 def _find_free_port() -> int:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))
@@ -43,6 +44,7 @@ class ServerRunner:
     - Patches server constants to point to a temporary project root
     - Sets per-instance allowlist that the handler reads from
     """
+
     def __init__(
         self,
         allow_ips=None,
@@ -55,7 +57,9 @@ class ServerRunner:
         self.allow_ips = set(allow_ips or {"127.0.0.1"})
         self.url_prefix = url_prefix
         self.trace_log = trace_log
-        self.project_root = project_root or tempfile.mkdtemp(prefix="git-http-projroot-")
+        self.project_root = project_root or tempfile.mkdtemp(
+            prefix="git-http-projroot-"
+        )
         self.backend_path = backend_path or _which_git_backend()
         self.port = _find_free_port()
         self.bind_host = bind_host
@@ -74,15 +78,21 @@ class ServerRunner:
         self._patches.append(patch.object(srv, "ALLOWED_CLIENT_IPS", self.allow_ips))
         self._patches.append(patch.object(srv, "URL_PREFIX", self.url_prefix))
         if self.backend_path:
-            self._patches.append(patch.object(srv, "GIT_HTTP_BACKEND", self.backend_path))
+            self._patches.append(
+                patch.object(srv, "GIT_HTTP_BACKEND", self.backend_path)
+            )
         # Ensure HTTP/1.1
-        self._patches.append(patch.object(srv.GitHTTPHandler, "protocol_version", "HTTP/1.1"))
+        self._patches.append(
+            patch.object(srv.GitHTTPHandler, "protocol_version", "HTTP/1.1")
+        )
 
         for p in self._patches:
             p.start()
 
         # Bind on loopback for tests
-        self.httpd = srv.ThreadedHTTPServer((self.bind_host, self.port), srv.GitHTTPHandler)
+        self.httpd = srv.ThreadedHTTPServer(
+            (self.bind_host, self.port), srv.GitHTTPHandler
+        )
         # Per-instance allowlist (handler reads from here)
         self.httpd.allowlist = self.allow_ips
 
@@ -194,7 +204,9 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 git_local("config", "user.email", "test@example.com")
 
                 # Create file, add, commit
-                with open(os.path.join(clone_dir, "hello.txt"), "w", encoding="utf-8") as f:
+                with open(
+                    os.path.join(clone_dir, "hello.txt"), "w", encoding="utf-8"
+                ) as f:
                     f.write("hello over http\n")
                 git_local("add", "hello.txt")
                 git_local("commit", "-m", "Add hello.txt")
@@ -205,12 +217,14 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 # Verify commit in bare repo
                 log = subprocess.check_output(
                     [self.git, "--git-dir", bare, "log", "--oneline", "--branches"],
-                    text=True
+                    text=True,
                 )
                 self.assertIn("Add hello.txt", log)
 
     # TODO: fix this test
-    @unittest.skip("Not workig for some reason but when usign it in a real environment it works")
+    @unittest.skip(
+        "Not workig for some reason but when usign it in a real environment it works"
+    )
     def test_forbidden_ip(self):
         # Request should be blocked by allowlist check BEFORE backend
         with ServerRunner(
@@ -251,4 +265,3 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-

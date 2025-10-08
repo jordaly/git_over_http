@@ -11,23 +11,27 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
 # ---- CONFIG: adjust to your machine ----
-HOST = ""            # bind all interfaces
+HOST = ""  # bind all interfaces
 PORT = 8000
 
 CURRENT_PLATFORM = platform.system()
 
 if CURRENT_PLATFORM == "Windows":
     GIT_PROJECT_ROOT = r"C:\Servidor_Git"
-    GIT_HTTP_BACKEND = r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
+    GIT_HTTP_BACKEND = (
+        r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
+    )
     TRACE_LOG = r"C:\temp\git-http-backend.log"
 
 elif CURRENT_PLATFORM == "Linux":
     GIT_PROJECT_ROOT = "/srv/git"  # e.g., put bare repos in /srv/git/*.git
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
-    TRACE_LOG = None  # set to a path (e.g. "/tmp/git-http-backend.log") to log backend stderr
+    TRACE_LOG = (
+        None  # set to a path (e.g. "/tmp/git-http-backend.log") to log backend stderr
+    )
 
 elif CURRENT_PLATFORM == "Darwin":
-    git_project_path = (Path.home() / "git/")
+    git_project_path = Path.home() / "git/"
     git_project_path.mkdir(exist_ok=True)
     GIT_PROJECT_ROOT = str(git_project_path)
     GIT_HTTP_BACKEND = "/opt/homebrew/opt/git/libexec/git-core/git-http-backend"
@@ -39,7 +43,7 @@ else:
 URL_PREFIX = "/git"  # URL prefix that maps to git-http-backend
 
 ALLOWED_CLIENT_IPS = {
-    "127.0.0.1",
+    "127.0.0.1"
     # Example: "192.168.16.0/24"
 }
 
@@ -47,11 +51,11 @@ ALLOWED_CLIENT_IPS = {
 REQUIRE_AUTH = True
 REALM = "Git Repositories"
 VALID_USERS = {
-    "jordaly": "clave123",
-    "edwin": "dev123",
+    "admin": "admin",
 }
 
 # ----------------------------------------
+
 
 def _ip_allowed(ip: str, allow: set[str]) -> bool:
     """Allow exact IPs or CIDRs; handles IPv4/IPv6. Empty allowlist denies all."""
@@ -75,7 +79,9 @@ def _ip_allowed(ip: str, allow: set[str]) -> bool:
     return False
 
 
-def _write_request_body_to_stdin(handler: BaseHTTPRequestHandler, proc: subprocess.Popen, content_len: int):
+def _write_request_body_to_stdin(
+    handler: BaseHTTPRequestHandler, proc: subprocess.Popen, content_len: int
+):
     """Stream request body into backend stdin without buffering the whole thing."""
     remaining = content_len
     CHUNK = 65536
@@ -127,19 +133,28 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             return self._request_auth()
 
         if VALID_USERS.get(username) == password:
+            # Save for downstream (git-http-backend can log/use it)
+            self.remote_user = username  # set attribute on handler instance
             return True
+
         return self._request_auth()
 
-    def _request_auth(self):
-        """Send the 401 challenge so Git prompts for login."""
+    def _request_auth(self) -> bool:
+        """Send 401 with proper headers and close connection cleanly."""
+        body = b"Authentication required.\n"
         self.send_response(401, "Unauthorized")
         self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         try:
-            self.wfile.write(b"Authentication required.\n")
+            self.wfile.write(body)
+            self.wfile.flush()
         except Exception:
             pass
+        finally:
+            self.close_connection = True
         return False
 
     # -------- response helpers --------
@@ -173,7 +188,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             return self._not_found()
 
         parsed = urlparse(self.path)
-        path_info = parsed.path[len(URL_PREFIX):]
+        path_info = parsed.path[len(URL_PREFIX) :]
         query = parsed.query or ""
 
         env = os.environ.copy()
@@ -182,13 +197,19 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
         env["REQUEST_METHOD"] = self.command
         env["GIT_COMMITTER_NAME"] = env.get("GIT_COMMITTER_NAME", "git-http")
-        env["GIT_COMMITTER_EMAIL"] = env.get("GIT_COMMITTER_EMAIL", "git-http@localhost")
+        env["GIT_COMMITTER_EMAIL"] = env.get(
+            "GIT_COMMITTER_EMAIL", "git-http@localhost"
+        )
         env["PATH_INFO"] = path_info
         env["QUERY_STRING"] = query
         env["SCRIPT_NAME"] = URL_PREFIX
         env["REMOTE_ADDR"] = self._client_ip()
         env["SERVER_PROTOCOL"] = self.request_version
         env["SERVER_SOFTWARE"] = "PyGitHTTP/1.0"
+
+        # If we authenticated a user, pass it along
+        if hasattr(self, "remote_user"):
+            env["REMOTE_USER"] = self.remote_user
 
         ctype = self.headers.get("Content-Type")
         if ctype:
@@ -197,18 +218,24 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if clen:
             env["CONTENT_LENGTH"] = str(clen)
 
-        stderr_target = open(TRACE_LOG, "ab", buffering=0) if TRACE_LOG else subprocess.DEVNULL
+        stderr_target = (
+            open(TRACE_LOG, "ab", buffering=0) if TRACE_LOG else subprocess.DEVNULL
+        )
         proc = subprocess.Popen(
             [GIT_HTTP_BACKEND],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_target,
             env=env,
-            bufsize=0
+            bufsize=0,
         )
 
         if clen > 0:
-            t = threading.Thread(target=_write_request_body_to_stdin, args=(self, proc, clen), daemon=True)
+            t = threading.Thread(
+                target=_write_request_body_to_stdin,
+                args=(self, proc, clen),
+                daemon=True,
+            )
             t.start()
 
         # Parse headers
@@ -324,7 +351,10 @@ def main():
         print(f"ERROR: backend not found: {GIT_HTTP_BACKEND}", file=sys.stderr)
         sys.exit(1)
     if not os.path.isdir(GIT_PROJECT_ROOT):
-        print(f"ERROR: GIT_PROJECT_ROOT does not exist: {GIT_PROJECT_ROOT}", file=sys.stderr)
+        print(
+            f"ERROR: GIT_PROJECT_ROOT does not exist: {GIT_PROJECT_ROOT}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     os.environ["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
@@ -347,4 +377,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

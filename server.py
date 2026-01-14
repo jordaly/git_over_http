@@ -35,7 +35,8 @@ elif CURRENT_PLATFORM == "Linux":
     GIT_PROJECT_ROOT = "/home/jordaly/git_repos"
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
     TRACE_LOG = None
-    DB_PATH = "/home/jordaly/pygithost.db"
+    # user-writable by default (no sudo needed)
+    DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
 
 elif CURRENT_PLATFORM == "Darwin":
     git_project_path = Path.home() / "git"
@@ -43,7 +44,8 @@ elif CURRENT_PLATFORM == "Darwin":
     GIT_PROJECT_ROOT = str(git_project_path)
     GIT_HTTP_BACKEND = "/opt/homebrew/opt/git/libexec/git-core/git-http-backend"
     TRACE_LOG = "/tmp/git-http-backend.log"
-    DB_PATH = str(Path.home() / "pygithost.db")
+    DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
+
 else:
     raise NotImplementedError()
 
@@ -60,12 +62,8 @@ REALM = "Git Repositories"
 # UI owner name for flat repos (repos directly under GIT_PROJECT_ROOT)
 FLAT_OWNER_UI = "root"
 
-# If True: allow login with username:token (PAT) for git operations
-# If False: username:password
-USE_PAT_FOR_BASIC_AUTH = False
-
 # ============================================================
-# HELPERS: Security & DB
+# HELPERS: validation
 # ============================================================
 SAFE_SEG = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -74,6 +72,50 @@ def _safe_seg(s: str) -> bool:
     return bool(s) and SAFE_SEG.match(s) and ".." not in s and "/" not in s and "\\" not in s
 
 
+def _safe_branch_name(name: str) -> bool:
+    """
+    Allow common git branch names, including slashes (feature/x).
+    Keep it conservative to avoid traversal/refs attacks.
+    """
+    if not name:
+        return False
+    if name.startswith("/") or name.endswith("/"):
+        return False
+    if name.startswith("-"):
+        return False
+    if "\\" in name:
+        return False
+    if " " in name or "\t" in name or "\n" in name or "\r" in name:
+        return False
+    if ".." in name:
+        return False
+    if "//" in name:
+        return False
+    if name.endswith(".lock"):
+        return False
+    # only allow a safe charset (includes /)
+    for ch in name:
+        ok = (
+            ("a" <= ch <= "z")
+            or ("A" <= ch <= "Z")
+            or ("0" <= ch <= "9")
+            or ch in "._-/"
+        )
+        if not ok:
+            return False
+    return True
+
+
+def _has_write_scope(handler) -> bool:
+    scopes = getattr(handler, "remote_scopes", set()) or set()
+    if getattr(handler, "remote_is_admin", False):
+        return True
+    return "write" in {s.lower() for s in scopes}
+
+
+# ============================================================
+# HELPERS: DB (SQLite)
+# ============================================================
 def _ensure_dir(path: str):
     d = os.path.dirname(path)
     if d:
@@ -130,7 +172,6 @@ def _pbkdf2_hash_password(password: str, salt: bytes, iterations: int = 200_000)
 
 
 def _token_hash(token: str) -> bytes:
-    # Fast hash is OK for tokens because tokens should be high-entropy (random).
     return hashlib.sha256(token.encode("utf-8")).digest()
 
 
@@ -170,13 +211,17 @@ def db_verify_password(username: str, password: str):
         return None
     computed = _pbkdf2_hash_password(password, salt)
     if hmac.compare_digest(computed, ph):
-        return {"user_id": uid, "username": uname, "is_admin": bool(is_admin)}
+        return {
+            "user_id": uid,
+            "username": uname,
+            "is_admin": bool(is_admin),
+            "scopes": {"read", "write"},  # password login => full by default
+        }
     return None
 
 
 def db_create_token(user_id: int, name: str, scopes: str = "read,write") -> str:
-    # returns the plaintext token once
-    token = secrets.token_urlsafe(32)  # high entropy
+    token = secrets.token_urlsafe(32)
     th = _token_hash(token)
     conn = _db_connect()
     try:
@@ -213,12 +258,12 @@ def db_verify_token(username: str, token: str):
     scopes, token_active = row
     if not token_active:
         return None
+
     scopes_set = {s.strip().lower() for s in (scopes or "").split(",") if s.strip()}
     return {"user_id": uid, "username": uname, "is_admin": bool(is_admin), "scopes": scopes_set}
 
 
 def db_ensure_default_admin():
-    # If no users exist, create admin/admin and generate a token.
     conn = _db_connect()
     try:
         cur = conn.execute("SELECT COUNT(*) FROM users")
@@ -236,7 +281,7 @@ def db_ensure_default_admin():
 
 
 # ============================================================
-# HELPERS: repos + HTML
+# HELPERS: repos + git + HTTP
 # ============================================================
 def _is_bare_repo_dir(p: Path) -> bool:
     return p.is_dir() and (p / "HEAD").is_file()
@@ -293,6 +338,112 @@ def _run_cmd(cmd: list[str], cwd: str | None = None) -> tuple[int, bytes, bytes]
     return p.returncode, out, err
 
 
+def _git_default_branch(repo_git: str) -> str:
+    code, out, _ = _run_git(repo_git, ["symbolic-ref", "HEAD"])
+    if code == 0:
+        head = out.decode("utf-8", "replace").strip()
+        if head.startswith("refs/heads/"):
+            return head[len("refs/heads/") :]
+    return "main"
+
+
+def _git_list_branches(repo_git: str) -> list[str]:
+    # local branches only
+    code, out, _ = _run_git(repo_git, ["for-each-ref", "refs/heads", "--format=%(refname:short)"])
+    if code != 0:
+        return []
+    branches = []
+    for ln in out.decode("utf-8", "replace").splitlines():
+        ln = ln.strip()
+        if ln:
+            branches.append(ln)
+    # stable order
+    branches.sort(key=lambda s: s.lower())
+    return branches
+
+
+def _git_resolve_commit(repo_git: str, refish: str) -> str | None:
+    # refish can be branch, tag, commit
+    code, out, _ = _run_git(repo_git, ["rev-parse", "--verify", refish + "^{commit}"])
+    if code != 0:
+        return None
+    return out.decode("utf-8", "replace").strip()
+
+
+def _git_create_branch(repo_git: str, new_branch: str, from_ref: str) -> tuple[bool, str]:
+    commit = _git_resolve_commit(repo_git, from_ref)
+    if not commit:
+        return False, f"Could not resolve '{from_ref}' to a commit."
+    # Create/update ref safely:
+    # - ensure it doesn't already exist
+    existing = _git_resolve_commit(repo_git, f"refs/heads/{new_branch}")
+    if existing:
+        return False, "Branch already exists."
+    code, _out, err = _run_git(repo_git, ["update-ref", f"refs/heads/{new_branch}", commit])
+    if code != 0:
+        return False, err.decode("utf-8", "replace").strip() or "git update-ref failed."
+    return True, "Branch created."
+
+
+def _git_delete_branch(repo_git: str, branch: str) -> tuple[bool, str]:
+    code, _out, err = _run_git(repo_git, ["update-ref", "-d", f"refs/heads/{branch}"])
+    if code != 0:
+        return False, err.decode("utf-8", "replace").strip() or "git update-ref -d failed."
+    return True, "Branch deleted."
+
+
+def _ip_allowed(ip: str, allow: set[str]) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if not allow:
+        return False
+    for item in allow:
+        try:
+            if addr in ipaddress.ip_network(item, strict=False):
+                return True
+        except ValueError:
+            try:
+                if ipaddress.ip_address(item) == addr:
+                    return True
+            except ValueError:
+                if item == ip:
+                    return True
+    return False
+
+
+def _write_request_body_to_stdin(handler: BaseHTTPRequestHandler, proc: subprocess.Popen, content_len: int):
+    remaining = content_len
+    CHUNK = 65536
+    try:
+        while remaining > 0:
+            to_read = CHUNK if remaining > CHUNK else remaining
+            data = handler.rfile.read(to_read)
+            if not data:
+                break
+            proc.stdin.write(data)
+            remaining -= len(data)
+        proc.stdin.flush()
+    except Exception:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+
+
+def _read_form_urlencoded(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+    clen = int(handler.headers.get("Content-Length") or 0)
+    if clen <= 0:
+        return {}
+    raw = handler.rfile.read(clen)
+    text = raw.decode("utf-8", "replace")
+    qs = parse_qs(text, keep_blank_values=True)
+    return {k: (v[0] if v else "") for k, v in qs.items()}
+
+
 def _html_page(title: str, body_html: str) -> bytes:
     return (
         f"<!doctype html><html><head><meta charset='utf-8'>"
@@ -312,9 +463,11 @@ def _html_page(title: str, body_html: str) -> bytes:
         f".box{{border:1px solid #eee;border-radius:14px;padding:14px;background:#fff}}"
         f".row{{display:flex;gap:10px;flex-wrap:wrap;align-items:end}}"
         f"label{{display:block;font-size:12px;color:#555;margin-bottom:4px}}"
-        f"input{{padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px}}"
+        f"input,select{{padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px}}"
         f"button{{padding:10px 14px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer}}"
         f"button:hover{{opacity:.92}}"
+        f".danger{{border-color:#7f1d1d;background:#7f1d1d}}"
+        f".danger:hover{{opacity:.92}}"
         f".warn{{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;padding:10px;border-radius:12px}}"
         f".ok{{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;padding:10px;border-radius:12px}}"
         f"</style></head><body>{body_html}</body></html>"
@@ -344,66 +497,6 @@ def _send_text(handler: BaseHTTPRequestHandler, status: int, text: str):
     handler.close_connection = True
 
 
-def _ip_allowed(ip: str, allow: set[str]) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    if not allow:
-        return False
-    for item in allow:
-        try:
-            if addr in ipaddress.ip_network(item, strict=False):
-                return True
-        except ValueError:
-            try:
-                if ipaddress.ip_address(item) == addr:
-                    return True
-            except ValueError:
-                if item == ip:
-                    return True
-    return False
-
-
-def _write_request_body_to_stdin(
-    handler: BaseHTTPRequestHandler, proc: subprocess.Popen, content_len: int
-):
-    remaining = content_len
-    CHUNK = 65536
-    try:
-        while remaining > 0:
-            to_read = CHUNK if remaining > CHUNK else remaining
-            data = handler.rfile.read(to_read)
-            if not data:
-                break
-            proc.stdin.write(data)
-            remaining -= len(data)
-        proc.stdin.flush()
-    except Exception:
-        pass
-    finally:
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-
-
-def _read_form_urlencoded(handler: BaseHTTPRequestHandler) -> dict[str, str]:
-    clen = int(handler.headers.get("Content-Length") or 0)
-    if clen <= 0:
-        return {}
-    raw = handler.rfile.read(clen)
-    try:
-        text = raw.decode("utf-8", "replace")
-    except Exception:
-        return {}
-    qs = parse_qs(text, keep_blank_values=True)
-    out: dict[str, str] = {}
-    for k, v in qs.items():
-        out[k] = v[0] if v else ""
-    return out
-
-
 # ============================================================
 # SERVER
 # ============================================================
@@ -419,14 +512,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
     def _allowlist(self) -> set[str]:
         return getattr(self.server, "allowlist", ALLOWED_CLIENT_IPS)
 
-    # -------- AUTHENTICATION via SQLite --------
+    # -------- AUTHENTICATION (accept token OR password) --------
     def _require_auth(self) -> bool:
-        """
-        Git-native HTTP Basic Auth.
-        Modes:
-          - USE_PAT_FOR_BASIC_AUTH=True  : username:token (token in sqlite)
-          - USE_PAT_FOR_BASIC_AUTH=False : username:password (password in sqlite)
-        """
         if not REQUIRE_AUTH:
             return True
 
@@ -443,16 +530,16 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if not _safe_seg(username):
             return self._request_auth()
 
-        if USE_PAT_FOR_BASIC_AUTH:
-            info = db_verify_token(username, secret)
-        else:
+        # Try token first, then password (prevents lockout / allows both)
+        info = db_verify_token(username, secret)
+        if not info:
             info = db_verify_password(username, secret)
 
         if info:
             self.remote_user = info["username"]
             self.remote_user_id = info["user_id"]
             self.remote_is_admin = bool(info.get("is_admin"))
-            self.remote_scopes = info.get("scopes", set(["read", "write"]))
+            self.remote_scopes = info.get("scopes", {"read"})
             return True
 
         return self._request_auth()
@@ -474,7 +561,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             self.close_connection = True
         return False
 
-    # -------- response helpers --------
     def _forbidden(self, msg=b"403 Forbidden\n"):
         _send_text(self, 403, msg.decode("utf-8", "replace"))
 
@@ -482,7 +568,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         _send_text(self, 404, "404 Not Found\n")
 
     # ========================================================
-    # UI
+    # UI: Home + Create Repo + Token
     # ========================================================
     def _ui_home(self, notice: str = "", notice_kind: str = "ok"):
         repos = _scan_repos(GIT_PROJECT_ROOT)
@@ -502,13 +588,11 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             cls = "ok" if notice_kind == "ok" else "warn"
             notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
 
-        auth_mode = "username:TOKEN" if USE_PAT_FOR_BASIC_AUTH else "username:PASSWORD"
-
         body = _html_page(
             "Repos",
             f"<div class='topbar'>"
             f"<h1 style='margin:0'>Repos</h1>"
-            f"<span class='pill'>Auth: <code>{html.escape(auth_mode)}</code></span>"
+            f"<span class='pill'>User: <code>{html.escape(getattr(self, 'remote_user', '?'))}</code></span>"
             f"</div>"
             f"{notice_html}"
             f"<div class='box' style='margin-bottom:14px'>"
@@ -521,193 +605,49 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"<input name='repo' placeholder='my-repo' required /></div>"
             f"<div><button type='submit'>Create</button></div>"
             f"</div>"
-            f"<p class='muted' style='margin:10px 0 0 0'>"
-            f"• Owner empty or '{html.escape(FLAT_OWNER_UI)}' => <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;repo&gt;.git</code><br>"
-            f"• Otherwise => <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;owner&gt;/&lt;repo&gt;.git</code>"
-            f"</p>"
+            f"<p class='muted' style='margin:10px 0 0 0'>Create requires <code>write</code> scope.</p>"
+            f"</form>"
+            f"</div>"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Tokens</h2>"
+            f"<p class='muted'>Generate a new token for your user.</p>"
+            f"<form method='POST' action='/admin/token'>"
+            f"<div class='row'>"
+            f"<div><label>Token name</label><input name='name' placeholder='laptop' required /></div>"
+            f"<div><label>Scopes</label><input name='scopes' placeholder='read,write' value='read,write' /></div>"
+            f"<div><button type='submit'>Generate</button></div>"
+            f"</div>"
             f"</form>"
             f"</div>"
             f"<div class='box'>"
             f"<p class='muted'>GIT_PROJECT_ROOT: <code>{html.escape(GIT_PROJECT_ROOT)}</code></p>"
-            f"<table>"
-            f"{''.join(rows) if rows else '<tr><td class=muted>No bare repos found (folders ending with .git containing HEAD).</td><td></td></tr>'}"
-            f"</table>"
-            f"</div>",
-        )
-        _send_html(self, 200, body)
-
-    def _ui_repo(self, owner: str, repo: str):
-        if not (_safe_seg(owner) and _safe_seg(repo)):
-            return self._forbidden(b"403 Forbidden\n")
-
-        repo_git = _repo_bare_path(owner, repo)
-        if not os.path.isdir(repo_git):
-            return self._not_found()
-
-        code, out, _ = _run_git(repo_git, ["symbolic-ref", "HEAD"])
-        ref = "main"
-        if code == 0:
-            head = out.decode("utf-8", "replace").strip()
-            if head.startswith("refs/heads/"):
-                ref = head[len("refs/heads/") :]
-
-        # Clone URL depends on flat vs owner layout
-        if owner == FLAT_OWNER_UI:
-            clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{repo}.git"
-        else:
-            clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{owner}/{repo}.git"
-
-        body = _html_page(
-            f"{owner}/{repo}",
-            f"<div class='topbar'>"
-            f"<div><h1 style='margin:0'>{html.escape(owner)}/{html.escape(repo)}</h1>"
-            f"<div class='muted'>Default branch: <code>{html.escape(ref)}</code></div></div>"
-            f"<div><a class='pill' href='/'>All repos</a></div>"
+            f"<table>{''.join(rows) if rows else '<tr><td class=muted>No bare repos found.</td><td></td></tr>'}</table>"
             f"</div>"
-            f"<div class='box'>"
-            f"<p><a href='/r/{html.escape(owner)}/{html.escape(repo)}/commits?ref={html.escape(ref)}'>Commits</a> | "
-            f"<a href='/r/{html.escape(owner)}/{html.escape(repo)}/tree/{html.escape(ref)}/'>Browse</a></p>"
-            f"<p class='muted' style='margin-top:14px'>Clone:</p>"
-            f"<pre><code>{html.escape(clone_url)}</code></pre>"
-            f"</div>",
         )
         _send_html(self, 200, body)
 
-    def _ui_commits(self, owner: str, repo: str, ref: str):
-        if not (_safe_seg(owner) and _safe_seg(repo)):
-            return self._forbidden(b"403 Forbidden\n")
-
-        repo_git = _repo_bare_path(owner, repo)
-        if not os.path.isdir(repo_git):
-            return self._not_found()
-
-        fmt = "%H|%an|%ad|%s"
-        code, out, err = _run_git(
-            repo_git, ["log", "--date=iso", f"--format={fmt}", "-n", "50", ref]
-        )
-        if code != 0:
-            msg = html.escape(err.decode("utf-8", "replace"))
-            body = _html_page("Commits", f"<h1>Commits</h1><pre>{msg}</pre>")
-            return _send_html(self, 400, body)
-
-        rows = []
-        for ln in out.decode("utf-8", "replace").splitlines():
-            parts = ln.split("|", 3)
-            if len(parts) != 4:
-                continue
-            h, an, ad, subj = parts
-            rows.append(
-                f"<tr><td><code>{html.escape(h[:8])}</code></td>"
-                f"<td>{html.escape(subj)}</td>"
-                f"<td>{html.escape(an)}</td>"
-                f"<td><small class='muted'>{html.escape(ad)}</small></td></tr>"
-            )
-
-        base = f"/r/{owner}/{repo}"
+    def _ui_show_token(self, token: str):
         body = _html_page(
-            f"Commits · {owner}/{repo}",
-            f"<div class='topbar'><h1 style='margin:0'>Commits</h1>"
-            f"<div><a class='pill' href='{base}'>Repo</a> "
-            f"<a class='pill' href='{base}/tree/{html.escape(ref)}/'>Browse</a></div></div>"
-            f"<div class='box'><table>{''.join(rows) or '<tr><td class=muted>No commits.</td></tr>'}</table></div>",
+            "Token created",
+            f"<div class='ok'>Token created. Copy it now (it won’t be shown again).</div>"
+            f"<pre><code>{html.escape(token)}</code></pre>"
+            f"<p><a class='pill' href='/'>Back</a></p>",
         )
         _send_html(self, 200, body)
 
-    def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
-        if not (_safe_seg(owner) and _safe_seg(repo)):
-            return self._forbidden(b"403 Forbidden\n")
-
-        repo_git = _repo_bare_path(owner, repo)
-        if not os.path.isdir(repo_git):
-            return self._not_found()
-
-        subpath = subpath.strip("/")
-        target = f"{ref}:{subpath}" if subpath else ref
-
-        code, out, err = _run_git(repo_git, ["ls-tree", target])
-        if code != 0:
-            msg = html.escape(err.decode("utf-8", "replace"))
-            body = _html_page("Tree", f"<h1>Tree</h1><pre>{msg}</pre>")
-            return _send_html(self, 400, body)
-
-        entries = []
-        for ln in out.decode("utf-8", "replace").splitlines():
-            if "\t" not in ln:
-                continue
-            meta, name = ln.split("\t", 1)
-            parts = meta.split()
-            if len(parts) < 2:
-                continue
-            typ = parts[1]
-            entries.append((typ, name))
-
-        base = f"/r/{owner}/{repo}"
-        up = ""
-        if subpath:
-            parent = "/".join(subpath.split("/")[:-1])
-            up = f"<p><a class='pill' href='{base}/tree/{html.escape(ref)}/{html.escape(parent)}/'>⬅ Up</a></p>"
-
-        rows = []
-        for typ, name in entries:
-            if typ == "tree":
-                newpath = f"{subpath}/{name}" if subpath else name
-                href = f"{base}/tree/{ref}/{newpath}/"
-                rows.append(
-                    f"<tr><td style='width:40px'>📁</td><td><a href='{href}'>{html.escape(name)}</a></td></tr>"
-                )
-            else:
-                newpath = f"{subpath}/{name}" if subpath else name
-                href = f"{base}/blob/{ref}/{newpath}"
-                rows.append(
-                    f"<tr><td style='width:40px'>📄</td><td><a href='{href}'>{html.escape(name)}</a></td></tr>"
-                )
-
-        body = _html_page(
-            f"Browse · {owner}/{repo}",
-            f"<div class='topbar'>"
-            f"<div><h1 style='margin:0'>{html.escape(owner)}/{html.escape(repo)}</h1>"
-            f"<div class='muted'>ref: <code>{html.escape(ref)}</code></div></div>"
-            f"<div><a class='pill' href='{base}'>Repo</a> "
-            f"<a class='pill' href='{base}/commits?ref={html.escape(ref)}'>Commits</a></div>"
-            f"</div>"
-            f"{up}"
-            f"<div class='box'><table>{''.join(rows) or '<tr><td class=muted>Empty.</td></tr>'}</table></div>",
-        )
-        _send_html(self, 200, body)
-
-    def _ui_blob(self, owner: str, repo: str, ref: str, filepath: str):
-        if not (_safe_seg(owner) and _safe_seg(repo)):
-            return self._forbidden(b"403 Forbidden\n")
-
-        repo_git = _repo_bare_path(owner, repo)
-        if not os.path.isdir(repo_git):
-            return self._not_found()
-
-        filepath = filepath.lstrip("/")
-        spec = f"{ref}:{filepath}"
-        code, out, err = _run_git(repo_git, ["show", spec])
-        if code != 0:
-            msg = html.escape(err.decode("utf-8", "replace"))
-            body = _html_page("File", f"<h1>File</h1><pre>{msg}</pre>")
-            return _send_html(self, 400, body)
-
-        text = out.decode("utf-8", "replace")
-        escaped = html.escape(text)
-
-        back = f"/r/{owner}/{repo}/tree/{ref}/"
-        if "/" in filepath:
-            folder = "/".join(filepath.split("/")[:-1])
-            back = f"/r/{owner}/{repo}/tree/{ref}/{folder}/"
-
-        body = _html_page(
-            f"{filepath} · {owner}/{repo}",
-            f"<p><a class='pill' href='{back}'>⬅ Back</a></p>"
-            f"<h1 style='margin-top:10px'><code>{html.escape(filepath)}</code></h1>"
-            f"<div class='box'><pre>{escaped}</pre></div>",
-        )
-        _send_html(self, 200, body)
+    def _ui_create_token(self):
+        form = _read_form_urlencoded(self)
+        name = (form.get("name") or "").strip()
+        scopes = (form.get("scopes") or "read,write").strip() or "read,write"
+        if not name:
+            return self._ui_home("Token name is required.", "warn")
+        token = db_create_token(int(self.remote_user_id), name, scopes=scopes)
+        return self._ui_show_token(token)
 
     def _ui_create_repo(self):
+        if not _has_write_scope(self):
+            return self._ui_home("You need write scope to create repos.", "warn")
+
         form = _read_form_urlencoded(self)
         owner = (form.get("owner") or "").strip()
         repo = (form.get("repo") or "").strip()
@@ -740,14 +680,320 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         return self._ui_home(f"Repo created: {owner_ui}/{repo}", "ok")
 
     # ========================================================
-    # Git Smart HTTP backend
+    # UI: Repo + Branch dropdown + Branch management
+    # ========================================================
+    def _ui_repo(self, owner: str, repo: str):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        default_branch = _git_default_branch(repo_git)
+        branches = _git_list_branches(repo_git)
+
+        # Clone URL depends on flat vs owner layout
+        if owner == FLAT_OWNER_UI:
+            clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{repo}.git"
+        else:
+            clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{owner}/{repo}.git"
+
+        # Branch selector: go to tree/<branch>/
+        options = []
+        for b in branches:
+            sel = " selected" if b == default_branch else ""
+            options.append(f"<option value='{html.escape(b)}'{sel}>{html.escape(b)}</option>")
+
+        base = f"/r/{owner}/{repo}"
+
+        body = _html_page(
+            f"{owner}/{repo}",
+            f"<div class='topbar'>"
+            f"<div>"
+            f"<h1 style='margin:0'>{html.escape(owner)}/{html.escape(repo)}</h1>"
+            f"<div class='muted'>Default branch: <code>{html.escape(default_branch)}</code></div>"
+            f"</div>"
+            f"<div>"
+            f"<a class='pill' href='/'>All repos</a> "
+            f"<a class='pill' href='{base}/branches'>Branches</a>"
+            f"</div>"
+            f"</div>"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<div class='row'>"
+            f"<div>"
+            f"<label>Switch branch</label>"
+            f"<select id='branchSel'>{''.join(options) if options else '<option>(none)</option>'}</select>"
+            f"</div>"
+            f"<div><button type='button' onclick=\"goBranch()\">Browse</button></div>"
+            f"</div>"
+            f"<script>"
+            f"function goBranch(){{"
+            f"var b=document.getElementById('branchSel').value;"
+            f"if(!b) return;"
+            f"window.location='{base}/tree/' + encodeURIComponent(b) + '/';"
+            f"}}"
+            f"</script>"
+            f"</div>"
+            f"<div class='box'>"
+            f"<p>"
+            f"<a href='{base}/commits?ref={html.escape(default_branch)}'>Commits</a> | "
+            f"<a href='{base}/tree/{html.escape(default_branch)}/'>Browse default</a>"
+            f"</p>"
+            f"<p class='muted' style='margin-top:14px'>Clone:</p>"
+            f"<pre><code>{html.escape(clone_url)}</code></pre>"
+            f"</div>",
+        )
+        _send_html(self, 200, body)
+
+    def _ui_branches(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        default_branch = _git_default_branch(repo_git)
+        branches = _git_list_branches(repo_git)
+        base = f"/r/{owner}/{repo}"
+
+        notice_html = ""
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
+
+        can_write = _has_write_scope(self)
+
+        # list
+        rows = []
+        for b in branches:
+            pill = " (default)" if b == default_branch else ""
+            browse = f"{base}/tree/{html.escape(b)}/"
+            del_html = ""
+            if can_write and b != default_branch:
+                del_html = (
+                    f"<form method='POST' action='{base}/branches/delete' style='display:inline'>"
+                    f"<input type='hidden' name='branch' value='{html.escape(b)}'/>"
+                    f"<button class='danger' type='submit'>Delete</button>"
+                    f"</form>"
+                )
+            elif b == default_branch:
+                del_html = "<span class='muted'>protected</span>"
+            else:
+                del_html = "<span class='muted'>no write scope</span>"
+
+            rows.append(
+                f"<tr>"
+                f"<td><code>{html.escape(b)}</code><span class='muted'>{html.escape(pill)}</span></td>"
+                f"<td><a class='pill' href='{browse}'>Browse</a> "
+                f"<a class='pill' href='{base}/commits?ref={html.escape(b)}'>Commits</a></td>"
+                f"<td style='text-align:right'>{del_html}</td>"
+                f"</tr>"
+            )
+
+        # create branch form
+        create_box = ""
+        if can_write:
+            create_box = (
+                f"<div class='box' style='margin-bottom:14px'>"
+                f"<h2 style='margin:0 0 10px 0;font-size:16px'>Create branch</h2>"
+                f"<form method='POST' action='{base}/branches/create'>"
+                f"<div class='row'>"
+                f"<div><label>New branch name</label><input name='new_branch' placeholder='feature/x' required/></div>"
+                f"<div><label>From (branch/tag/commit)</label><input name='from_ref' value='{html.escape(default_branch)}' required/></div>"
+                f"<div><button type='submit'>Create</button></div>"
+                f"</div>"
+                f"<p class='muted' style='margin:10px 0 0 0'>Uses <code>git update-ref</code> to create <code>refs/heads/&lt;new&gt;</code>.</p>"
+                f"</form>"
+                f"</div>"
+            )
+        else:
+            create_box = (
+                f"<div class='box warn' style='margin-bottom:14px'>"
+                f"You don’t have <code>write</code> scope, so branch create/delete is disabled."
+                f"</div>"
+            )
+
+        body = _html_page(
+            f"Branches · {owner}/{repo}",
+            f"<div class='topbar'>"
+            f"<h1 style='margin:0'>Branches</h1>"
+            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='/'>All repos</a></div>"
+            f"</div>"
+            f"{notice_html}"
+            f"{create_box}"
+            f"<div class='box'>"
+            f"<table>{''.join(rows) if rows else '<tr><td class=muted>No branches.</td><td></td><td></td></tr>'}</table>"
+            f"</div>",
+        )
+        _send_html(self, 200, body)
+
+    def _ui_branch_create(self, owner: str, repo: str):
+        if not _has_write_scope(self):
+            return self._ui_branches(owner, repo, "You need write scope to create branches.", "warn")
+
+        form = _read_form_urlencoded(self)
+        new_branch = (form.get("new_branch") or "").strip()
+        from_ref = (form.get("from_ref") or "").strip()
+
+        if not _safe_branch_name(new_branch):
+            return self._ui_branches(owner, repo, "Invalid branch name.", "warn")
+        if not from_ref:
+            return self._ui_branches(owner, repo, "From ref is required.", "warn")
+
+        repo_git = _repo_bare_path(owner, repo)
+        ok, msg = _git_create_branch(repo_git, new_branch, from_ref)
+        return self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
+
+    def _ui_branch_delete(self, owner: str, repo: str):
+        if not _has_write_scope(self):
+            return self._ui_branches(owner, repo, "You need write scope to delete branches.", "warn")
+
+        form = _read_form_urlencoded(self)
+        branch = (form.get("branch") or "").strip()
+        if not _safe_branch_name(branch):
+            return self._ui_branches(owner, repo, "Invalid branch name.", "warn")
+
+        repo_git = _repo_bare_path(owner, repo)
+        default_branch = _git_default_branch(repo_git)
+        if branch == default_branch:
+            return self._ui_branches(owner, repo, "Default branch is protected and cannot be deleted.", "warn")
+
+        ok, msg = _git_delete_branch(repo_git, branch)
+        return self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
+
+    # ========================================================
+    # UI: Commits / Tree / Blob (read-only) — branch via URL
+    # ========================================================
+    def _ui_commits(self, owner: str, repo: str, ref: str):
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        fmt = "%H|%an|%ad|%s"
+        code, out, err = _run_git(repo_git, ["log", "--date=iso", f"--format={fmt}", "-n", "50", ref])
+        if code != 0:
+            msg = html.escape(err.decode("utf-8", "replace"))
+            body = _html_page("Commits", f"<h1>Commits</h1><pre>{msg}</pre><p><a class='pill' href='/'>Back</a></p>")
+            return _send_html(self, 400, body)
+
+        rows = []
+        for ln in out.decode("utf-8", "replace").splitlines():
+            parts = ln.split("|", 3)
+            if len(parts) != 4:
+                continue
+            h, an, ad, subj = parts
+            rows.append(
+                f"<tr><td><code>{html.escape(h[:8])}</code></td>"
+                f"<td>{html.escape(subj)}</td>"
+                f"<td>{html.escape(an)}</td>"
+                f"<td><small class='muted'>{html.escape(ad)}</small></td></tr>"
+            )
+
+        base = f"/r/{owner}/{repo}"
+        body = _html_page(
+            f"Commits · {owner}/{repo}",
+            f"<div class='topbar'><h1 style='margin:0'>Commits</h1>"
+            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='{base}/branches'>Branches</a></div></div>"
+            f"<div class='box'><p class='muted'>ref: <code>{html.escape(ref)}</code></p>"
+            f"<table>{''.join(rows) or '<tr><td class=muted>No commits.</td></tr>'}</table></div>",
+        )
+        _send_html(self, 200, body)
+
+    def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        subpath = subpath.strip("/")
+        target = f"{ref}:{subpath}" if subpath else ref
+
+        code, out, err = _run_git(repo_git, ["ls-tree", target])
+        if code != 0:
+            msg = html.escape(err.decode("utf-8", "replace"))
+            body = _html_page("Tree", f"<h1>Tree</h1><pre>{msg}</pre><p><a class='pill' href='/'>Back</a></p>")
+            return _send_html(self, 400, body)
+
+        entries = []
+        for ln in out.decode("utf-8", "replace").splitlines():
+            if "\t" not in ln:
+                continue
+            meta, name = ln.split("\t", 1)
+            parts = meta.split()
+            if len(parts) < 2:
+                continue
+            typ = parts[1]
+            entries.append((typ, name))
+
+        base = f"/r/{owner}/{repo}"
+        up = ""
+        if subpath:
+            parent = "/".join(subpath.split("/")[:-1])
+            up = f"<p><a class='pill' href='{base}/tree/{html.escape(ref)}/{html.escape(parent)}/'>⬅ Up</a></p>"
+
+        rows = []
+        for typ, name in entries:
+            if typ == "tree":
+                newpath = f"{subpath}/{name}" if subpath else name
+                href = f"{base}/tree/{ref}/{newpath}/"
+                rows.append(f"<tr><td style='width:40px'>📁</td><td><a href='{href}'>{html.escape(name)}</a></td></tr>")
+            else:
+                newpath = f"{subpath}/{name}" if subpath else name
+                href = f"{base}/blob/{ref}/{newpath}"
+                rows.append(f"<tr><td style='width:40px'>📄</td><td><a href='{href}'>{html.escape(name)}</a></td></tr>")
+
+        body = _html_page(
+            f"Browse · {owner}/{repo}",
+            f"<div class='topbar'>"
+            f"<div><h1 style='margin:0'>{html.escape(owner)}/{html.escape(repo)}</h1>"
+            f"<div class='muted'>ref: <code>{html.escape(ref)}</code></div></div>"
+            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='{base}/branches'>Branches</a></div>"
+            f"</div>"
+            f"{up}"
+            f"<div class='box'><table>{''.join(rows) or '<tr><td class=muted>Empty.</td></tr>'}</table></div>",
+        )
+        _send_html(self, 200, body)
+
+    def _ui_blob(self, owner: str, repo: str, ref: str, filepath: str):
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        filepath = filepath.lstrip("/")
+        spec = f"{ref}:{filepath}"
+        code, out, err = _run_git(repo_git, ["show", spec])
+        if code != 0:
+            msg = html.escape(err.decode("utf-8", "replace"))
+            body = _html_page("File", f"<h1>File</h1><pre>{msg}</pre><p><a class='pill' href='/'>Back</a></p>")
+            return _send_html(self, 400, body)
+
+        text = out.decode("utf-8", "replace")
+        escaped = html.escape(text)
+
+        base = f"/r/{owner}/{repo}"
+        back = f"{base}/tree/{ref}/"
+        if "/" in filepath:
+            folder = "/".join(filepath.split("/")[:-1])
+            back = f"{base}/tree/{ref}/{folder}/"
+
+        body = _html_page(
+            f"{filepath} · {owner}/{repo}",
+            f"<p><a class='pill' href='{back}'>⬅ Back</a> <a class='pill' href='{base}/branches'>Branches</a></p>"
+            f"<h1 style='margin-top:10px'><code>{html.escape(filepath)}</code></h1>"
+            f"<div class='box'><pre>{escaped}</pre></div>",
+        )
+        _send_html(self, 200, body)
+
+    # ========================================================
+    # Git smart HTTP backend
     # ========================================================
     def _handle_git(self):
         if not self.path.startswith(URL_PREFIX + "/"):
             return self._not_found()
 
         parsed = urlparse(self.path)
-        path_info = parsed.path[len(URL_PREFIX) :]
+        path_info = parsed.path[len(URL_PREFIX):]
         query = parsed.query or ""
 
         env = os.environ.copy()
@@ -755,8 +1001,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         env["GIT_HTTP_EXPORT_ALL"] = "1"
 
         env["REQUEST_METHOD"] = self.command
-        env["GIT_COMMITTER_NAME"] = env.get("GIT_COMMITTER_NAME", "git-http")
-        env["GIT_COMMITTER_EMAIL"] = env.get("GIT_COMMITTER_EMAIL", "git-http@localhost")
         env["PATH_INFO"] = path_info
         env["QUERY_STRING"] = query
         env["SCRIPT_NAME"] = URL_PREFIX
@@ -768,8 +1012,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             env["REMOTE_USER"] = self.remote_user
 
         for k, v in self.headers.items():
-            hk = "HTTP_" + k.upper().replace("-", "_")
-            env[hk] = v
+            env["HTTP_" + k.upper().replace("-", "_")] = v
 
         ctype = self.headers.get("Content-Type")
         if ctype:
@@ -796,6 +1039,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             )
             t.start()
 
+        # parse headers from backend
         header_bytes = bytearray()
         while True:
             b = proc.stdout.read(1)
@@ -849,10 +1093,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             pass
         finally:
             try:
-                if hasattr(proc.stdout, "close_reader"):
-                    proc.stdout.close_reader()
-                elif hasattr(proc.stdout, "close"):
-                    proc.stdout.close()
+                proc.stdout.close()
             except Exception:
                 pass
             try:
@@ -889,21 +1130,30 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if p == "/":
             return self._ui_home()
 
+        # /r/<owner>/<repo>
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
             return self._ui_repo(m.group(1), m.group(2))
 
+        # /r/<owner>/<repo>/branches
+        m = re.match(r"^/r/([^/]+)/([^/]+)/branches$", p)
+        if m:
+            return self._ui_branches(m.group(1), m.group(2))
+
+        # commits
         m = re.match(r"^/r/([^/]+)/([^/]+)/commits$", p)
         if m:
             qs = parse_qs(parsed.query or "")
             ref = (qs.get("ref") or ["main"])[0]
             return self._ui_commits(m.group(1), m.group(2), ref)
 
+        # tree
         m = re.match(r"^/r/([^/]+)/([^/]+)/tree/([^/]+)(/.*)?$", p)
         if m:
             subpath = unquote(m.group(4) or "/")
             return self._ui_tree(m.group(1), m.group(2), m.group(3), subpath)
 
+        # blob
         m = re.match(r"^/r/([^/]+)/([^/]+)/blob/([^/]+)(/.*)$", p)
         if m:
             filepath = unquote(m.group(4) or "")
@@ -923,11 +1173,25 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             return self._handle_git()
 
         parsed = urlparse(self.path)
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if "application/x-www-form-urlencoded" not in ctype:
+            return _send_text(self, 415, "Unsupported Media Type\n")
+
         if parsed.path == "/create-repo":
-            ctype = (self.headers.get("Content-Type") or "").lower()
-            if "application/x-www-form-urlencoded" not in ctype:
-                return _send_text(self, 415, "Unsupported Media Type\n")
             return self._ui_create_repo()
+
+        if parsed.path == "/admin/token":
+            return self._ui_create_token()
+
+        # /r/<owner>/<repo>/branches/create
+        m = re.match(r"^/r/([^/]+)/([^/]+)/branches/create$", parsed.path)
+        if m:
+            return self._ui_branch_create(m.group(1), m.group(2))
+
+        # /r/<owner>/<repo>/branches/delete
+        m = re.match(r"^/r/([^/]+)/([^/]+)/branches/delete$", parsed.path)
+        if m:
+            return self._ui_branch_delete(m.group(1), m.group(2))
 
         return self._not_found()
 
@@ -965,10 +1229,7 @@ def main():
     print(f"UI: http://localhost:{PORT}/")
     print(f"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}")
     print(f"DB: {DB_PATH}")
-    print(f"Auth mode: {'username:TOKEN (PAT)' if USE_PAT_FOR_BASIC_AUTH else 'username:PASSWORD'}")
-    print(f"Repo layouts supported:")
-    print(f"  - Flat:  {GIT_PROJECT_ROOT}{os.sep}<repo>.git")
-    print(f"  - Owner: {GIT_PROJECT_ROOT}{os.sep}<owner>{os.sep}<repo>.git")
+    print("Auth: accepts either username:password OR username:token")
     print("=" * 60)
     try:
         httpd.serve_forever()

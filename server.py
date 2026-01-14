@@ -35,7 +35,6 @@ elif CURRENT_PLATFORM == "Linux":
     GIT_PROJECT_ROOT = "/home/jordaly/git_repos"
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
     TRACE_LOG = None
-    # user-writable by default (no sudo needed)
     DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
 
 elif CURRENT_PLATFORM == "Darwin":
@@ -49,21 +48,16 @@ elif CURRENT_PLATFORM == "Darwin":
 else:
     raise NotImplementedError()
 
-URL_PREFIX = "/git"  # URL prefix that maps to git-http-backend
-
-ALLOWED_CLIENT_IPS = {
-    "127.0.0.1",
-    # Example: "192.168.16.0/24"
-}
+URL_PREFIX = "/git"
+ALLOWED_CLIENT_IPS = {"127.0.0.1"}  # add CIDRs if needed
 
 REQUIRE_AUTH = True
 REALM = "Git Repositories"
 
-# UI owner name for flat repos (repos directly under GIT_PROJECT_ROOT)
 FLAT_OWNER_UI = "root"
 
 # ============================================================
-# HELPERS: validation
+# HELPERS: validation / permissions
 # ============================================================
 SAFE_SEG = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -73,10 +67,6 @@ def _safe_seg(s: str) -> bool:
 
 
 def _safe_branch_name(name: str) -> bool:
-    """
-    Allow common git branch names, including slashes (feature/x).
-    Keep it conservative to avoid traversal/refs attacks.
-    """
     if not name:
         return False
     if name.startswith("/") or name.endswith("/"):
@@ -85,15 +75,12 @@ def _safe_branch_name(name: str) -> bool:
         return False
     if "\\" in name:
         return False
-    if " " in name or "\t" in name or "\n" in name or "\r" in name:
+    if any(c in name for c in [" ", "\t", "\n", "\r"]):
         return False
-    if ".." in name:
-        return False
-    if "//" in name:
+    if ".." in name or "//" in name:
         return False
     if name.endswith(".lock"):
         return False
-    # only allow a safe charset (includes /)
     for ch in name:
         ok = (
             ("a" <= ch <= "z")
@@ -111,6 +98,10 @@ def _has_write_scope(handler) -> bool:
     if getattr(handler, "remote_is_admin", False):
         return True
     return "write" in {s.lower() for s in scopes}
+
+
+def _require_admin(handler) -> bool:
+    return bool(getattr(handler, "remote_is_admin", False))
 
 
 # ============================================================
@@ -198,6 +189,55 @@ def db_get_user_by_username(username: str):
             (username,),
         )
         return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def db_get_user_by_id(user_id: int):
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "SELECT id, username, is_admin, is_active, created_at FROM users WHERE id=?",
+            (user_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def db_list_users():
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "SELECT id, username, is_admin, is_active, created_at FROM users ORDER BY username COLLATE NOCASE"
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def db_set_user_active(user_id: int, is_active: bool) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE users SET is_active=? WHERE id=?", (1 if is_active else 0, user_id))
+    finally:
+        conn.close()
+
+
+def db_set_user_admin(user_id: int, is_admin: bool) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE users SET is_admin=? WHERE id=?", (1 if is_admin else 0, user_id))
+    finally:
+        conn.close()
+
+
+def db_reset_password(user_id: int, new_password: str) -> None:
+    salt = secrets.token_bytes(16)
+    ph = _pbkdf2_hash_password(new_password, salt)
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (salt, ph, user_id))
     finally:
         conn.close()
 
@@ -293,13 +333,11 @@ def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
     if not root.exists():
         return results
 
-    # Flat: <root>/*.git
     for p in sorted(root.glob("*.git")):
         if _is_bare_repo_dir(p):
             repo = p.name[:-4]
             results.append((FLAT_OWNER_UI, repo, p.name))
 
-    # Owner: <root>/<owner>/*.git
     for owner_dir in sorted([x for x in root.iterdir() if x.is_dir()]):
         owner = owner_dir.name
         for p in sorted(owner_dir.glob("*.git")):
@@ -308,7 +346,6 @@ def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
                 rel = f"{owner}/{p.name}"
                 results.append((owner, repo, rel))
 
-    # Deduplicate
     seen = set()
     uniq = []
     for o, r, rel in results:
@@ -348,22 +385,15 @@ def _git_default_branch(repo_git: str) -> str:
 
 
 def _git_list_branches(repo_git: str) -> list[str]:
-    # local branches only
     code, out, _ = _run_git(repo_git, ["for-each-ref", "refs/heads", "--format=%(refname:short)"])
     if code != 0:
         return []
-    branches = []
-    for ln in out.decode("utf-8", "replace").splitlines():
-        ln = ln.strip()
-        if ln:
-            branches.append(ln)
-    # stable order
+    branches = [ln.strip() for ln in out.decode("utf-8", "replace").splitlines() if ln.strip()]
     branches.sort(key=lambda s: s.lower())
     return branches
 
 
 def _git_resolve_commit(repo_git: str, refish: str) -> str | None:
-    # refish can be branch, tag, commit
     code, out, _ = _run_git(repo_git, ["rev-parse", "--verify", refish + "^{commit}"])
     if code != 0:
         return None
@@ -374,8 +404,6 @@ def _git_create_branch(repo_git: str, new_branch: str, from_ref: str) -> tuple[b
     commit = _git_resolve_commit(repo_git, from_ref)
     if not commit:
         return False, f"Could not resolve '{from_ref}' to a commit."
-    # Create/update ref safely:
-    # - ensure it doesn't already exist
     existing = _git_resolve_commit(repo_git, f"refs/heads/{new_branch}")
     if existing:
         return False, "Branch already exists."
@@ -512,7 +540,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
     def _allowlist(self) -> set[str]:
         return getattr(self.server, "allowlist", ALLOWED_CLIENT_IPS)
 
-    # -------- AUTHENTICATION (accept token OR password) --------
+    # -------- AUTH: accept token OR password --------
     def _require_auth(self) -> bool:
         if not REQUIRE_AUTH:
             return True
@@ -530,7 +558,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if not _safe_seg(username):
             return self._request_auth()
 
-        # Try token first, then password (prevents lockout / allows both)
         info = db_verify_token(username, secret)
         if not info:
             info = db_verify_password(username, secret)
@@ -568,7 +595,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         _send_text(self, 404, "404 Not Found\n")
 
     # ========================================================
-    # UI: Home + Create Repo + Token
+    # UI: Home / Tokens / Create Repo
     # ========================================================
     def _ui_home(self, notice: str = "", notice_kind: str = "ok"):
         repos = _scan_repos(GIT_PROJECT_ROOT)
@@ -588,11 +615,18 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             cls = "ok" if notice_kind == "ok" else "warn"
             notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
 
+        admin_link = ""
+        if _require_admin(self):
+            admin_link = "<a class='pill' href='/admin/users'>Admin: Users</a>"
+
         body = _html_page(
             "Repos",
             f"<div class='topbar'>"
             f"<h1 style='margin:0'>Repos</h1>"
+            f"<div>"
+            f"{admin_link} "
             f"<span class='pill'>User: <code>{html.escape(getattr(self, 'remote_user', '?'))}</code></span>"
+            f"</div>"
             f"</div>"
             f"{notice_html}"
             f"<div class='box' style='margin-bottom:14px'>"
@@ -680,7 +714,167 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         return self._ui_home(f"Repo created: {owner_ui}/{repo}", "ok")
 
     # ========================================================
-    # UI: Repo + Branch dropdown + Branch management
+    # UI: Admin Users (create users + reset passwords)
+    # ========================================================
+    def _ui_admin_users(self, notice: str = "", notice_kind: str = "ok"):
+        if not _require_admin(self):
+            return self._forbidden(b"403 Forbidden: admin only.\n")
+
+        notice_html = ""
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
+
+        users = db_list_users()
+        rows = []
+
+        for uid, uname, is_admin, is_active, created_at in users:
+            pill_admin = "<span class='pill'>admin</span>" if is_admin else "<span class='pill muted'>user</span>"
+            pill_active = "<span class='pill'>active</span>" if is_active else "<span class='pill muted'>disabled</span>"
+
+            toggle_label = "Disable" if is_active else "Enable"
+            toggle_btn_class = "danger" if is_active else ""
+
+            # do not allow disabling yourself in UI? (optional)
+            disable_self_guard = ""
+            if int(uid) == int(getattr(self, "remote_user_id", -1)):
+                disable_self_guard = "<span class='muted'> (you)</span>"
+
+            rows.append(
+                f"<tr>"
+                f"<td><code>{html.escape(uname)}</code> {pill_admin} {pill_active}{disable_self_guard}</td>"
+                f"<td class='muted'>{html.escape(str(created_at))}</td>"
+                f"<td style='text-align:right'>"
+                f"<form method='POST' action='/admin/users/toggle' style='display:inline'>"
+                f"<input type='hidden' name='user_id' value='{uid}'/>"
+                f"<input type='hidden' name='make_active' value='{0 if is_active else 1}'/>"
+                f"<button type='submit' class='{toggle_btn_class}'>{toggle_label}</button>"
+                f"</form>"
+                f"</td>"
+                f"</tr>"
+            )
+
+        # user dropdown for password reset
+        options = []
+        for uid, uname, _is_admin, _is_active, _created_at in users:
+            options.append(f"<option value='{uid}'>{html.escape(uname)}</option>")
+
+        body = _html_page(
+            "Admin · Users",
+            f"<div class='topbar'>"
+            f"<h1 style='margin:0'>Admin · Users</h1>"
+            f"<div><a class='pill' href='/'>Home</a></div>"
+            f"</div>"
+            f"{notice_html}"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Create user</h2>"
+            f"<form method='POST' action='/admin/users/create'>"
+            f"<div class='row'>"
+            f"<div><label>Username</label><input name='username' placeholder='john' required /></div>"
+            f"<div><label>Password</label><input name='password' type='password' placeholder='••••••••' required /></div>"
+            f"<div><label>Admin?</label>"
+            f"<select name='is_admin'>"
+            f"<option value='0' selected>No</option>"
+            f"<option value='1'>Yes</option>"
+            f"</select></div>"
+            f"<div><button type='submit'>Create</button></div>"
+            f"</div>"
+            f"</form>"
+            f"</div>"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Reset password</h2>"
+            f"<form method='POST' action='/admin/users/reset'>"
+            f"<div class='row'>"
+            f"<div><label>User</label><select name='user_id'>{''.join(options)}</select></div>"
+            f"<div><label>New password</label><input name='new_password' type='password' required /></div>"
+            f"<div><button type='submit'>Reset</button></div>"
+            f"</div>"
+            f"</form>"
+            f"</div>"
+            f"<div class='box'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>All users</h2>"
+            f"<table>{''.join(rows) if rows else '<tr><td class=muted>No users.</td></tr>'}</table>"
+            f"</div>",
+        )
+        _send_html(self, 200, body)
+
+    def _ui_admin_users_create(self):
+        if not _require_admin(self):
+            return self._forbidden(b"403 Forbidden: admin only.\n")
+
+        form = _read_form_urlencoded(self)
+        username = (form.get("username") or "").strip()
+        password = (form.get("password") or "").strip()
+        is_admin = (form.get("is_admin") or "0").strip() == "1"
+
+        if not _safe_seg(username):
+            return self._ui_admin_users("Invalid username (use letters/numbers/._-).", "warn")
+        if len(password) < 4:
+            return self._ui_admin_users("Password too short (min 4).", "warn")
+
+        try:
+            db_create_user(username, password, is_admin=is_admin)
+        except sqlite3.IntegrityError:
+            return self._ui_admin_users("User already exists.", "warn")
+        except Exception as e:
+            return self._ui_admin_users(f"Failed to create user: {e}", "warn")
+
+        return self._ui_admin_users(f"User created: {username}", "ok")
+
+    def _ui_admin_users_reset(self):
+        if not _require_admin(self):
+            return self._forbidden(b"403 Forbidden: admin only.\n")
+
+        form = _read_form_urlencoded(self)
+        try:
+            user_id = int((form.get("user_id") or "0").strip())
+        except Exception:
+            return self._ui_admin_users("Invalid user id.", "warn")
+
+        new_password = (form.get("new_password") or "").strip()
+        if len(new_password) < 4:
+            return self._ui_admin_users("Password too short (min 4).", "warn")
+
+        u = db_get_user_by_id(user_id)
+        if not u:
+            return self._ui_admin_users("User not found.", "warn")
+
+        try:
+            db_reset_password(user_id, new_password)
+        except Exception as e:
+            return self._ui_admin_users(f"Failed to reset password: {e}", "warn")
+
+        return self._ui_admin_users(f"Password updated for: {u[1]}", "ok")
+
+    def _ui_admin_users_toggle(self):
+        if not _require_admin(self):
+            return self._forbidden(b"403 Forbidden: admin only.\n")
+
+        form = _read_form_urlencoded(self)
+        try:
+            user_id = int((form.get("user_id") or "0").strip())
+        except Exception:
+            return self._ui_admin_users("Invalid user id.", "warn")
+
+        make_active = (form.get("make_active") or "0").strip() == "1"
+
+        u = db_get_user_by_id(user_id)
+        if not u:
+            return self._ui_admin_users("User not found.", "warn")
+
+        # prevent disabling yourself (safety)
+        if int(user_id) == int(getattr(self, "remote_user_id", -1)) and not make_active:
+            return self._ui_admin_users("You cannot disable your own account from the UI.", "warn")
+
+        try:
+            db_set_user_active(user_id, make_active)
+        except Exception as e:
+            return self._ui_admin_users(f"Failed to update user: {e}", "warn")
+
+        return self._ui_admin_users(f"User '{u[1]}' is now {'active' if make_active else 'disabled'}.", "ok")
+
+    # ========================================================
+    # UI: Repo + Branches (same as before)
     # ========================================================
     def _ui_repo(self, owner: str, repo: str):
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -693,13 +887,11 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         default_branch = _git_default_branch(repo_git)
         branches = _git_list_branches(repo_git)
 
-        # Clone URL depends on flat vs owner layout
         if owner == FLAT_OWNER_UI:
             clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{repo}.git"
         else:
             clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{owner}/{repo}.git"
 
-        # Branch selector: go to tree/<branch>/
         options = []
         for b in branches:
             sel = " selected" if b == default_branch else ""
@@ -765,12 +957,9 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
         can_write = _has_write_scope(self)
 
-        # list
         rows = []
         for b in branches:
-            pill = " (default)" if b == default_branch else ""
             browse = f"{base}/tree/{html.escape(b)}/"
-            del_html = ""
             if can_write and b != default_branch:
                 del_html = (
                     f"<form method='POST' action='{base}/branches/delete' style='display:inline'>"
@@ -785,15 +974,13 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
             rows.append(
                 f"<tr>"
-                f"<td><code>{html.escape(b)}</code><span class='muted'>{html.escape(pill)}</span></td>"
+                f"<td><code>{html.escape(b)}</code>{' <span class=pill>default</span>' if b == default_branch else ''}</td>"
                 f"<td><a class='pill' href='{browse}'>Browse</a> "
                 f"<a class='pill' href='{base}/commits?ref={html.escape(b)}'>Commits</a></td>"
                 f"<td style='text-align:right'>{del_html}</td>"
                 f"</tr>"
             )
 
-        # create branch form
-        create_box = ""
         if can_write:
             create_box = (
                 f"<div class='box' style='margin-bottom:14px'>"
@@ -804,7 +991,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 f"<div><label>From (branch/tag/commit)</label><input name='from_ref' value='{html.escape(default_branch)}' required/></div>"
                 f"<div><button type='submit'>Create</button></div>"
                 f"</div>"
-                f"<p class='muted' style='margin:10px 0 0 0'>Uses <code>git update-ref</code> to create <code>refs/heads/&lt;new&gt;</code>.</p>"
                 f"</form>"
                 f"</div>"
             )
@@ -819,7 +1005,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"Branches · {owner}/{repo}",
             f"<div class='topbar'>"
             f"<h1 style='margin:0'>Branches</h1>"
-            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='/'>All repos</a></div>"
+            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='/'>Home</a></div>"
             f"</div>"
             f"{notice_html}"
             f"{create_box}"
@@ -863,9 +1049,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         ok, msg = _git_delete_branch(repo_git, branch)
         return self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
 
-    # ========================================================
-    # UI: Commits / Tree / Blob (read-only) — branch via URL
-    # ========================================================
     def _ui_commits(self, owner: str, repo: str, ref: str):
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
@@ -1039,7 +1222,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             )
             t.start()
 
-        # parse headers from backend
         header_bytes = bytearray()
         while True:
             b = proc.stdout.read(1)
@@ -1130,30 +1312,40 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if p == "/":
             return self._ui_home()
 
-        # /r/<owner>/<repo>
+        if p == "/logout":
+            self.send_response(401, "Unauthorized")
+            self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", "9")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"Logged out")
+            self.wfile.flush()
+            self.close_connection = True
+            return
+
+        if p == "/admin/users":
+            return self._ui_admin_users()
+
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
             return self._ui_repo(m.group(1), m.group(2))
 
-        # /r/<owner>/<repo>/branches
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches$", p)
         if m:
             return self._ui_branches(m.group(1), m.group(2))
 
-        # commits
         m = re.match(r"^/r/([^/]+)/([^/]+)/commits$", p)
         if m:
             qs = parse_qs(parsed.query or "")
             ref = (qs.get("ref") or ["main"])[0]
             return self._ui_commits(m.group(1), m.group(2), ref)
 
-        # tree
         m = re.match(r"^/r/([^/]+)/([^/]+)/tree/([^/]+)(/.*)?$", p)
         if m:
             subpath = unquote(m.group(4) or "/")
             return self._ui_tree(m.group(1), m.group(2), m.group(3), subpath)
 
-        # blob
         m = re.match(r"^/r/([^/]+)/([^/]+)/blob/([^/]+)(/.*)$", p)
         if m:
             filepath = unquote(m.group(4) or "")
@@ -1177,18 +1369,26 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if "application/x-www-form-urlencoded" not in ctype:
             return _send_text(self, 415, "Unsupported Media Type\n")
 
+
         if parsed.path == "/create-repo":
             return self._ui_create_repo()
 
         if parsed.path == "/admin/token":
             return self._ui_create_token()
 
-        # /r/<owner>/<repo>/branches/create
+        if parsed.path == "/admin/users/create":
+            return self._ui_admin_users_create()
+
+        if parsed.path == "/admin/users/reset":
+            return self._ui_admin_users_reset()
+
+        if parsed.path == "/admin/users/toggle":
+            return self._ui_admin_users_toggle()
+
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches/create$", parsed.path)
         if m:
             return self._ui_branch_create(m.group(1), m.group(2))
 
-        # /r/<owner>/<repo>/branches/delete
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches/delete$", parsed.path)
         if m:
             return self._ui_branch_delete(m.group(1), m.group(2))
@@ -1230,6 +1430,7 @@ def main():
     print(f"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}")
     print(f"DB: {DB_PATH}")
     print("Auth: accepts either username:password OR username:token")
+    print("Admin users page: /admin/users")
     print("=" * 60)
     try:
         httpd.serve_forever()

@@ -13,31 +13,35 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs, unquote
 
-# ---- CONFIG: adjust to your machine ----
-HOST = ""  # bind all interfaces
+# ============================================================
+# CONFIG
+# ============================================================
+HOST = ""   # bind all interfaces
 PORT = 8000
 
 CURRENT_PLATFORM = platform.system()
 
 if CURRENT_PLATFORM == "Windows":
-    GIT_PROJECT_ROOT = r"C:\Servidor_Git"  # recommended layout: C:\Servidor_Git\<owner>\<repo>.git
-    GIT_HTTP_BACKEND = (
-        r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
-    )
+    # You can use either:
+    #  - Flat layout: C:\Servidor_Git\repo.git
+    #  - Owner layout: C:\Servidor_Git\owner\repo.git
+    GIT_PROJECT_ROOT = r"C:\Servidor_Git"
+    GIT_HTTP_BACKEND = r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
     TRACE_LOG = r"C:\temp\git-http-backend.log"
 
 elif CURRENT_PLATFORM == "Linux":
-    GIT_PROJECT_ROOT = "/home/jordaly/git_repos"  # recommended layout: /srv/git/<owner>/<repo>.git
+    # Flat layout: /srv/git/repo.git
+    # Owner layout: /srv/git/owner/repo.git
+    GIT_PROJECT_ROOT = "/home/jordaly/git_repos"
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
     TRACE_LOG = None  # e.g. "/tmp/git-http-backend.log" to log backend stderr
 
 elif CURRENT_PLATFORM == "Darwin":
     git_project_path = Path.home() / "git"
     git_project_path.mkdir(exist_ok=True)
-    GIT_PROJECT_ROOT = str(git_project_path)  # layout: ~/git/<owner>/<repo>.git
+    GIT_PROJECT_ROOT = str(git_project_path)
     GIT_HTTP_BACKEND = "/opt/homebrew/opt/git/libexec/git-core/git-http-backend"
     TRACE_LOG = "/tmp/git-http-backend.log"
-
 else:
     raise NotImplementedError()
 
@@ -49,15 +53,19 @@ ALLOWED_CLIENT_IPS = {
 }
 
 # ---- BASIC AUTH CONFIG ----
-# For MVP: user/pass. Recommended next: username + PAT token (store in sqlite3).
+# MVP: user/pass (Git will prompt). Later you can switch to PAT tokens in sqlite.
 REQUIRE_AUTH = True
 REALM = "Git Repositories"
 VALID_USERS = {
     "admin": "admin",
 }
 
-# ----------------------------------------
+# UI owner name for flat repos (repos directly under GIT_PROJECT_ROOT)
+FLAT_OWNER_UI = "root"
 
+# ============================================================
+# HELPERS
+# ============================================================
 SAFE_SEG = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -65,14 +73,69 @@ def _safe_seg(s: str) -> bool:
     return bool(s) and SAFE_SEG.match(s) and ".." not in s and "/" not in s and "\\" not in s
 
 
-def _repo_bare_path(owner: str, repo: str) -> str:
-    # UI route uses repo without .git, on disk it is <repo>.git
-    return os.path.join(GIT_PROJECT_ROOT, owner, repo + ".git")
+def _is_bare_repo_dir(p: Path) -> bool:
+    # Bare repo has a HEAD file; most have objects/ and refs/, but HEAD is the best quick indicator.
+    return p.is_dir() and (p / "HEAD").is_file()
+
+
+def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
+    """
+    Returns list of (owner_ui, repo_name, rel_git_path)
+      - owner_ui is FLAT_OWNER_UI for flat repos
+      - rel_git_path is relative path inside GIT_PROJECT_ROOT, like:
+            "repo.git" or "owner/repo.git"
+    """
+    root = Path(project_root)
+    results: list[tuple[str, str, str]] = []
+    if not root.exists():
+        return results
+
+    # Case A: flat layout: <root>/*.git
+    for p in sorted(root.glob("*.git")):
+        if _is_bare_repo_dir(p):
+            repo = p.name[:-4]
+            results.append((FLAT_OWNER_UI, repo, p.name))
+
+    # Case B: owner layout: <root>/<owner>/*.git
+    for owner_dir in sorted([x for x in root.iterdir() if x.is_dir()]):
+        owner = owner_dir.name
+        for p in sorted(owner_dir.glob("*.git")):
+            if _is_bare_repo_dir(p):
+                repo = p.name[:-4]
+                rel = f"{owner}/{p.name}"
+                results.append((owner, repo, rel))
+
+    # Deduplicate while preserving order
+    seen = set()
+    uniq = []
+    for o, r, rel in results:
+        key = (o, r, rel)
+        if key not in seen:
+            seen.add(key)
+            uniq.append((o, r, rel))
+    return uniq
+
+
+def _repo_bare_path(owner_ui: str, repo: str) -> str:
+    """
+    Map UI owner/repo -> filesystem bare repo directory.
+    - owner_ui == FLAT_OWNER_UI => <root>/<repo>.git
+    - else => <root>/<owner>/<repo>.git
+    """
+    if owner_ui == FLAT_OWNER_UI:
+        return os.path.join(GIT_PROJECT_ROOT, repo + ".git")
+    return os.path.join(GIT_PROJECT_ROOT, owner_ui, repo + ".git")
 
 
 def _run_git(repo_git_dir: str, args: list[str]) -> tuple[int, bytes, bytes]:
     cmd = ["git", f"--git-dir={repo_git_dir}"] + args
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = p.communicate()
+    return p.returncode, out, err
+
+
+def _run_cmd(cmd: list[str], cwd: str | None = None) -> tuple[int, bytes, bytes]:
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = p.communicate()
     return p.returncode, out, err
 
@@ -83,16 +146,24 @@ def _html_page(title: str, body_html: str) -> bytes:
         f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{html.escape(title)}</title>"
         f"<style>"
-        f"body{{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:1100px}}"
+        f"body{{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:1200px}}"
         f"a{{text-decoration:none}} a:hover{{text-decoration:underline}}"
         f"code,pre{{font-family:ui-monospace,Consolas,monospace}}"
         f"pre{{padding:12px;border:1px solid #ddd;border-radius:10px;overflow:auto;background:#fafafa}}"
         f"table{{border-collapse:collapse;width:100%}}"
         f"td{{padding:8px 10px;border-bottom:1px solid #eee;vertical-align:top}}"
-        f".muted{{color:#666}} .pill{{display:inline-block;padding:2px 8px;border:1px solid #ddd;"
-        f"border-radius:999px;font-size:12px;color:#444;background:#fff}}"
+        f".muted{{color:#666}}"
+        f".pill{{display:inline-block;padding:2px 10px;border:1px solid #ddd;border-radius:999px;"
+        f"font-size:12px;color:#444;background:#fff}}"
         f".topbar{{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}}"
         f".box{{border:1px solid #eee;border-radius:14px;padding:14px;background:#fff}}"
+        f".row{{display:flex;gap:10px;flex-wrap:wrap;align-items:end}}"
+        f"label{{display:block;font-size:12px;color:#555;margin-bottom:4px}}"
+        f"input{{padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px}}"
+        f"button{{padding:10px 14px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer}}"
+        f"button:hover{{opacity:.92}}"
+        f".warn{{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;padding:10px;border-radius:12px}}"
+        f".ok{{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;padding:10px;border-radius:12px}}"
         f"</style></head><body>{body_html}</body></html>"
     ).encode("utf-8")
 
@@ -100,6 +171,18 @@ def _html_page(title: str, body_html: str) -> bytes:
 def _send_html(handler: BaseHTTPRequestHandler, status: int, body: bytes):
     handler.send_response(status)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    handler.wfile.write(body)
+    handler.wfile.flush()
+    handler.close_connection = True
+
+
+def _send_text(handler: BaseHTTPRequestHandler, status: int, text: str):
+    body = text.encode("utf-8", "replace")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/plain; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Connection", "close")
     handler.end_headers()
@@ -154,6 +237,30 @@ def _write_request_body_to_stdin(
             pass
 
 
+def _read_form_urlencoded(handler: BaseHTTPRequestHandler) -> dict[str, str]:
+    """
+    Read application/x-www-form-urlencoded body into {key: value}.
+    (No external deps)
+    """
+    clen = int(handler.headers.get("Content-Length") or 0)
+    if clen <= 0:
+        return {}
+    raw = handler.rfile.read(clen)
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:
+        return {}
+    # parse_qs returns lists
+    qs = parse_qs(text, keep_blank_values=True)
+    out: dict[str, str] = {}
+    for k, v in qs.items():
+        out[k] = v[0] if v else ""
+    return out
+
+
+# ============================================================
+# SERVER
+# ============================================================
 class GitHTTPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -184,14 +291,12 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             return self._request_auth()
 
         if VALID_USERS.get(username) == password:
-            # Save for downstream (git-http-backend can log/use it)
-            self.remote_user = username  # set attribute on handler instance
+            self.remote_user = username
             return True
 
         return self._request_auth()
 
     def _request_auth(self) -> bool:
-        """Send 401 with proper headers and close connection cleanly."""
         body = b"Authentication required.\n"
         self.send_response(401, "Unauthorized")
         self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
@@ -210,54 +315,68 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
     # -------- response helpers --------
     def _forbidden(self, msg=b"403 Forbidden\n"):
-        self.send_response(403, "Forbidden")
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        try:
-            self.wfile.write(msg)
-            self.wfile.flush()
-        except Exception:
-            pass
-        self.close_connection = True
+        _send_text(self, 403, msg.decode("utf-8", "replace"))
 
     def _not_found(self):
-        self.send_response(404, "Not Found")
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        try:
-            self.wfile.write(b"404 Not Found\n")
-            self.wfile.flush()
-        except Exception:
-            pass
-        self.close_connection = True
+        _send_text(self, 404, "404 Not Found\n")
 
-    # -------- UI handlers --------
-    def _ui_home(self):
-        items = []
-        root = Path(GIT_PROJECT_ROOT)
-        if root.exists():
-            # expected layout: <root>/<owner>/*.git
-            for owner_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
-                owner = owner_dir.name
-                for repo_git in sorted(owner_dir.glob("*.git")):
-                    repo = repo_git.name[:-4]
-                    items.append((owner, repo))
+    # ========================================================
+    # UI
+    # ========================================================
+    def _ui_home(self, notice: str = "", notice_kind: str = "ok"):
+        repos = _scan_repos(GIT_PROJECT_ROOT)
 
-        rows = "".join(
-            f"<tr><td><a href='/r/{html.escape(o)}/{html.escape(r)}'>{html.escape(o)}/{html.escape(r)}</a></td></tr>"
-            for o, r in items
-        )
+        rows = []
+        for owner, repo, rel in repos:
+            rows.append(
+                f"<tr>"
+                f"<td><a href='/r/{html.escape(owner)}/{html.escape(repo)}'>"
+                f"{html.escape(owner)}/{html.escape(repo)}</a></td>"
+                f"<td class='muted'><code>{html.escape(rel)}</code></td>"
+                f"</tr>"
+            )
+
+        notice_html = ""
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
+
         body = _html_page(
             "Repos",
-            f"<div class='topbar'><h1 style='margin:0'>Repos</h1>"
-            f"<span class='pill'>Smart HTTP at <code>{html.escape(URL_PREFIX)}/</code></span></div>"
-            f"<div class='box'><table>{rows or '<tr><td class=muted>No repos found.</td></tr>'}</table></div>",
+            f"<div class='topbar'>"
+            f"<h1 style='margin:0'>Repos</h1>"
+            f"<span class='pill'>Smart HTTP: <code>{html.escape(URL_PREFIX)}/</code></span>"
+            f"</div>"
+            f"{notice_html}"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Create repository</h2>"
+            f"<form method='POST' action='/create-repo'>"
+            f"<div class='row'>"
+            f"<div><label>Owner (optional)</label>"
+            f"<input name='owner' placeholder='{html.escape(FLAT_OWNER_UI)} for flat layout' /></div>"
+            f"<div><label>Repo name</label>"
+            f"<input name='repo' placeholder='my-repo' required /></div>"
+            f"<div><button type='submit'>Create</button></div>"
+            f"</div>"
+            f"<p class='muted' style='margin:10px 0 0 0'>"
+            f"• If owner is empty or '{html.escape(FLAT_OWNER_UI)}', repo is created as <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;repo&gt;.git</code><br>"
+            f"• Otherwise repo is created as <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;owner&gt;/&lt;repo&gt;.git</code>"
+            f"</p>"
+            f"</form>"
+            f"</div>"
+            f"<div class='box'>"
+            f"<p class='muted'>GIT_PROJECT_ROOT: <code>{html.escape(GIT_PROJECT_ROOT)}</code></p>"
+            f"<table>"
+            f"{''.join(rows) if rows else '<tr><td class=muted>No bare repos found (folders ending with .git containing HEAD).</td><td></td></tr>'}"
+            f"</table>"
+            f"</div>",
         )
         _send_html(self, 200, body)
 
     def _ui_repo(self, owner: str, repo: str):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return self._not_found()
@@ -270,6 +389,10 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 ref = head[len("refs/heads/") :]
 
         clone_url = f"http://USER:PASS@HOST:{PORT}{URL_PREFIX}/{owner}/{repo}.git"
+        if owner == FLAT_OWNER_UI:
+            # For flat repos, the git-http-backend path is /git/<repo>.git
+            clone_url = f"http://USER:PASS@HOST:{PORT}{URL_PREFIX}/{repo}.git"
+
         body = _html_page(
             f"{owner}/{repo}",
             f"<div class='topbar'>"
@@ -287,6 +410,9 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         _send_html(self, 200, body)
 
     def _ui_commits(self, owner: str, repo: str, ref: str):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return self._not_found()
@@ -300,16 +426,14 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             body = _html_page("Commits", f"<h1>Commits</h1><pre>{msg}</pre>")
             return _send_html(self, 400, body)
 
-        lines = out.decode("utf-8", "replace").splitlines()
         rows = []
-        for ln in lines:
+        for ln in out.decode("utf-8", "replace").splitlines():
             parts = ln.split("|", 3)
             if len(parts) != 4:
                 continue
             h, an, ad, subj = parts
-            short = h[:8]
             rows.append(
-                f"<tr><td><code>{html.escape(short)}</code></td>"
+                f"<tr><td><code>{html.escape(h[:8])}</code></td>"
                 f"<td>{html.escape(subj)}</td>"
                 f"<td>{html.escape(an)}</td>"
                 f"<td><small class='muted'>{html.escape(ad)}</small></td></tr>"
@@ -326,6 +450,9 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         _send_html(self, 200, body)
 
     def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return self._not_found()
@@ -362,15 +489,13 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 newpath = f"{subpath}/{name}" if subpath else name
                 href = f"{base}/tree/{ref}/{newpath}/"
                 rows.append(
-                    f"<tr><td style='width:40px'>📁</td>"
-                    f"<td><a href='{href}'>{html.escape(name)}</a></td></tr>"
+                    f"<tr><td style='width:40px'>📁</td><td><a href='{href}'>{html.escape(name)}</a></td></tr>"
                 )
             else:
                 newpath = f"{subpath}/{name}" if subpath else name
                 href = f"{base}/blob/{ref}/{newpath}"
                 rows.append(
-                    f"<tr><td style='width:40px'>📄</td>"
-                    f"<td><a href='{href}'>{html.escape(name)}</a></td></tr>"
+                    f"<tr><td style='width:40px'>📄</td><td><a href='{href}'>{html.escape(name)}</a></td></tr>"
                 )
 
         body = _html_page(
@@ -387,6 +512,9 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         _send_html(self, 200, body)
 
     def _ui_blob(self, owner: str, repo: str, ref: str, filepath: str):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return self._not_found()
@@ -399,12 +527,10 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             body = _html_page("File", f"<h1>File</h1><pre>{msg}</pre>")
             return _send_html(self, 400, body)
 
-        # MVP: treat as text
         text = out.decode("utf-8", "replace")
         escaped = html.escape(text)
 
         back = f"/r/{owner}/{repo}/tree/{ref}/"
-        # Back to folder if inside subdir
         if "/" in filepath:
             folder = "/".join(filepath.split("/")[:-1])
             back = f"/r/{owner}/{repo}/tree/{ref}/{folder}/"
@@ -417,7 +543,56 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         )
         _send_html(self, 200, body)
 
-    # -------- main git backend handler --------
+    def _ui_create_repo(self):
+        """
+        POST /create-repo  (application/x-www-form-urlencoded)
+          owner: optional (if empty or "root" => flat)
+          repo: required
+        """
+        form = _read_form_urlencoded(self)
+        owner = (form.get("owner") or "").strip()
+        repo = (form.get("repo") or "").strip()
+
+        # Normalize owner
+        if not owner or owner == FLAT_OWNER_UI:
+            owner_ui = FLAT_OWNER_UI
+        else:
+            owner_ui = owner
+
+        # Validate
+        if owner_ui != FLAT_OWNER_UI and not _safe_seg(owner_ui):
+            return self._ui_home("Invalid owner name (allowed: A-Z a-z 0-9 . _ -).", "warn")
+        if not _safe_seg(repo):
+            return self._ui_home("Invalid repo name (allowed: A-Z a-z 0-9 . _ -).", "warn")
+
+        repo_git = _repo_bare_path(owner_ui, repo)
+
+        # Create path
+        try:
+            if owner_ui == FLAT_OWNER_UI:
+                os.makedirs(GIT_PROJECT_ROOT, exist_ok=True)
+            else:
+                os.makedirs(os.path.join(GIT_PROJECT_ROOT, owner_ui), exist_ok=True)
+        except Exception as e:
+            return self._ui_home(f"Failed to create owner folder: {e}", "warn")
+
+        # Already exists?
+        if os.path.exists(repo_git):
+            return self._ui_home("Repo already exists.", "warn")
+
+        # Create bare repo
+        # (We prefer: git init --bare <path>)
+        code, out, err = _run_cmd(["git", "init", "--bare", repo_git])
+        if code != 0:
+            msg = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
+            return self._ui_home(f"git init --bare failed: {msg}", "warn")
+
+        # Success
+        return self._ui_home(f"Repo created: {owner_ui}/{repo}", "ok")
+
+    # ========================================================
+    # Git Smart HTTP backend (unchanged, plus forwards HTTP_* headers)
+    # ========================================================
     def _handle_git(self):
         if not self.path.startswith(URL_PREFIX + "/"):
             return self._not_found()
@@ -440,11 +615,10 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         env["SERVER_PROTOCOL"] = self.request_version
         env["SERVER_SOFTWARE"] = "PyGitHTTP/1.0"
 
-        # If we authenticated a user, pass it along
         if hasattr(self, "remote_user"):
             env["REMOTE_USER"] = self.remote_user
 
-        # Forward some HTTP_* headers (helps git-http-backend in some setups)
+        # Forward HTTP headers (CGI format)
         for k, v in self.headers.items():
             hk = "HTTP_" + k.upper().replace("-", "_")
             env[hk] = v
@@ -456,9 +630,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if clen:
             env["CONTENT_LENGTH"] = str(clen)
 
-        stderr_target = (
-            open(TRACE_LOG, "ab", buffering=0) if TRACE_LOG else subprocess.DEVNULL
-        )
+        stderr_target = open(TRACE_LOG, "ab", buffering=0) if TRACE_LOG else subprocess.DEVNULL
         proc = subprocess.Popen(
             [GIT_HTTP_BACKEND],
             stdin=subprocess.PIPE,
@@ -550,14 +722,14 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-    # -------- routing --------
+    # ========================================================
+    # ROUTING
+    # ========================================================
     def do_GET(self):
         ip = self._client_ip()
         if not _ip_allowed(ip, self._allowlist()):
-            self._forbidden(b"403 Forbidden: IP not allowed.\n")
-            return
+            return self._forbidden(b"403 Forbidden: IP not allowed.\n")
 
-        # Require auth for both UI and git endpoints (GitHub-like). Change if you want public browsing.
         if not self._require_auth():
             return
 
@@ -570,44 +742,52 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if p == "/":
             return self._ui_home()
 
+        # /r/<owner>/<repo>
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
-            owner, repo = m.group(1), m.group(2)
-            if not (_safe_seg(owner) and _safe_seg(repo)):
-                return self._forbidden(b"403 Forbidden\n")
-            return self._ui_repo(owner, repo)
+            return self._ui_repo(m.group(1), m.group(2))
 
+        # /r/<owner>/<repo>/commits?ref=...
         m = re.match(r"^/r/([^/]+)/([^/]+)/commits$", p)
         if m:
-            owner, repo = m.group(1), m.group(2)
             qs = parse_qs(parsed.query or "")
             ref = (qs.get("ref") or ["main"])[0]
-            return self._ui_commits(owner, repo, ref)
+            return self._ui_commits(m.group(1), m.group(2), ref)
 
+        # /r/<owner>/<repo>/tree/<ref>/<path...>
         m = re.match(r"^/r/([^/]+)/([^/]+)/tree/([^/]+)(/.*)?$", p)
         if m:
-            owner, repo, ref = m.group(1), m.group(2), m.group(3)
-            subpath = m.group(4) or "/"
-            subpath = unquote(subpath)
-            return self._ui_tree(owner, repo, ref, subpath)
+            subpath = unquote(m.group(4) or "/")
+            return self._ui_tree(m.group(1), m.group(2), m.group(3), subpath)
 
+        # /r/<owner>/<repo>/blob/<ref>/<path...>
         m = re.match(r"^/r/([^/]+)/([^/]+)/blob/([^/]+)(/.*)$", p)
         if m:
-            owner, repo, ref = m.group(1), m.group(2), m.group(3)
             filepath = unquote(m.group(4) or "")
-            return self._ui_blob(owner, repo, ref, filepath)
+            return self._ui_blob(m.group(1), m.group(2), m.group(3), filepath)
 
         return self._not_found()
 
     def do_POST(self):
         ip = self._client_ip()
         if not _ip_allowed(ip, self._allowlist()):
-            self._forbidden(b"403 Forbidden: IP not allowed.\n")
-            return
+            return self._forbidden(b"403 Forbidden: IP not allowed.\n")
+
         if not self._require_auth():
             return
+
         if self.path.startswith(URL_PREFIX + "/"):
             return self._handle_git()
+
+        # UI POST
+        parsed = urlparse(self.path)
+        if parsed.path == "/create-repo":
+            # Only allow standard form posts
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            if "application/x-www-form-urlencoded" not in ctype:
+                return _send_text(self, 415, "Unsupported Media Type\n")
+            return self._ui_create_repo()
+
         return self._not_found()
 
 
@@ -622,9 +802,11 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 def main():
     if TRACE_LOG:
         os.makedirs(os.path.dirname(TRACE_LOG), exist_ok=True)
+
     if not os.path.exists(GIT_HTTP_BACKEND):
         print(f"ERROR: backend not found: {GIT_HTTP_BACKEND}", file=sys.stderr)
         sys.exit(1)
+
     if not os.path.isdir(GIT_PROJECT_ROOT):
         print(f"ERROR: GIT_PROJECT_ROOT does not exist: {GIT_PROJECT_ROOT}", file=sys.stderr)
         sys.exit(1)
@@ -634,12 +816,14 @@ def main():
 
     httpd = ThreadedHTTPServer((HOST, PORT), GitHTTPHandler)
     print("=" * 60)
-    print(f"Git Smart HTTP + UI server running on port {PORT}")
+    print(f"Git Smart HTTP + Web UI running on port {PORT}")
     print(f"Git URL prefix: {URL_PREFIX}")
-    print(f"UI: http://localhost:{PORT}/ (repos)  |  /r/<owner>/<repo> (repo)")
+    print(f"UI: http://localhost:{PORT}/")
     print(f"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}")
     print(f"Authentication: {'Enabled' if REQUIRE_AUTH else 'Disabled'}")
-    print("Repo layout expected: <root>/<owner>/<repo>.git (bare repos)")
+    print(f"Repo layouts supported:")
+    print(f"  - Flat:  {GIT_PROJECT_ROOT}{os.sep}<repo>.git")
+    print(f"  - Owner: {GIT_PROJECT_ROOT}{os.sep}<owner>{os.sep}<repo>.git")
     print("=" * 60)
     try:
         httpd.serve_forever()

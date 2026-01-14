@@ -8,6 +8,10 @@ import platform
 import base64
 import re
 import html
+import sqlite3
+import secrets
+import hashlib
+import hmac
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
@@ -22,19 +26,16 @@ PORT = 8000
 CURRENT_PLATFORM = platform.system()
 
 if CURRENT_PLATFORM == "Windows":
-    # You can use either:
-    #  - Flat layout: C:\Servidor_Git\repo.git
-    #  - Owner layout: C:\Servidor_Git\owner\repo.git
     GIT_PROJECT_ROOT = r"C:\Servidor_Git"
     GIT_HTTP_BACKEND = r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
     TRACE_LOG = r"C:\temp\git-http-backend.log"
+    DB_PATH = r"C:\temp\pygithost.db"
 
 elif CURRENT_PLATFORM == "Linux":
-    # Flat layout: /srv/git/repo.git
-    # Owner layout: /srv/git/owner/repo.git
     GIT_PROJECT_ROOT = "/home/jordaly/git_repos"
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
-    TRACE_LOG = None  # e.g. "/tmp/git-http-backend.log" to log backend stderr
+    TRACE_LOG = None
+    DB_PATH = "/home/jordaly/pygithost.db"
 
 elif CURRENT_PLATFORM == "Darwin":
     git_project_path = Path.home() / "git"
@@ -42,6 +43,7 @@ elif CURRENT_PLATFORM == "Darwin":
     GIT_PROJECT_ROOT = str(git_project_path)
     GIT_HTTP_BACKEND = "/opt/homebrew/opt/git/libexec/git-core/git-http-backend"
     TRACE_LOG = "/tmp/git-http-backend.log"
+    DB_PATH = str(Path.home() / "pygithost.db")
 else:
     raise NotImplementedError()
 
@@ -52,19 +54,18 @@ ALLOWED_CLIENT_IPS = {
     # Example: "192.168.16.0/24"
 }
 
-# ---- BASIC AUTH CONFIG ----
-# MVP: user/pass (Git will prompt). Later you can switch to PAT tokens in sqlite.
 REQUIRE_AUTH = True
 REALM = "Git Repositories"
-VALID_USERS = {
-    "admin": "admin",
-}
 
 # UI owner name for flat repos (repos directly under GIT_PROJECT_ROOT)
 FLAT_OWNER_UI = "root"
 
+# If True: allow login with username:token (PAT) for git operations
+# If False: username:password
+USE_PAT_FOR_BASIC_AUTH = False
+
 # ============================================================
-# HELPERS
+# HELPERS: Security & DB
 # ============================================================
 SAFE_SEG = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -73,30 +74,187 @@ def _safe_seg(s: str) -> bool:
     return bool(s) and SAFE_SEG.match(s) and ".." not in s and "/" not in s and "\\" not in s
 
 
+def _ensure_dir(path: str):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def _db_connect() -> sqlite3.Connection:
+    _ensure_dir(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def _db_init():
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                pass_salt BLOB NOT NULL,
+                pass_hash BLOB NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                token_hash BLOB NOT NULL,
+                scopes TEXT NOT NULL DEFAULT 'read,write',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)")
+    finally:
+        conn.close()
+
+
+def _pbkdf2_hash_password(password: str, salt: bytes, iterations: int = 200_000) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+
+
+def _token_hash(token: str) -> bytes:
+    # Fast hash is OK for tokens because tokens should be high-entropy (random).
+    return hashlib.sha256(token.encode("utf-8")).digest()
+
+
+def db_create_user(username: str, password: str, is_admin: bool = False) -> None:
+    if not _safe_seg(username):
+        raise ValueError("Invalid username format.")
+    salt = secrets.token_bytes(16)
+    ph = _pbkdf2_hash_password(password, salt)
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO users(username, pass_salt, pass_hash, is_admin, is_active) VALUES(?,?,?,?,1)",
+            (username, salt, ph, 1 if is_admin else 0),
+        )
+    finally:
+        conn.close()
+
+
+def db_get_user_by_username(username: str):
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "SELECT id, username, pass_salt, pass_hash, is_admin, is_active FROM users WHERE username=?",
+            (username,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def db_verify_password(username: str, password: str):
+    row = db_get_user_by_username(username)
+    if not row:
+        return None
+    uid, uname, salt, ph, is_admin, is_active = row
+    if not is_active:
+        return None
+    computed = _pbkdf2_hash_password(password, salt)
+    if hmac.compare_digest(computed, ph):
+        return {"user_id": uid, "username": uname, "is_admin": bool(is_admin)}
+    return None
+
+
+def db_create_token(user_id: int, name: str, scopes: str = "read,write") -> str:
+    # returns the plaintext token once
+    token = secrets.token_urlsafe(32)  # high entropy
+    th = _token_hash(token)
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO tokens(user_id, name, token_hash, scopes, is_active) VALUES(?,?,?,?,1)",
+            (user_id, name, th, scopes),
+        )
+    finally:
+        conn.close()
+    return token
+
+
+def db_verify_token(username: str, token: str):
+    user = db_get_user_by_username(username)
+    if not user:
+        return None
+    uid, uname, _salt, _ph, is_admin, is_active = user
+    if not is_active:
+        return None
+
+    th = _token_hash(token)
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "SELECT scopes, is_active FROM tokens WHERE user_id=? AND token_hash=? LIMIT 1",
+            (uid, th),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return None
+    scopes, token_active = row
+    if not token_active:
+        return None
+    scopes_set = {s.strip().lower() for s in (scopes or "").split(",") if s.strip()}
+    return {"user_id": uid, "username": uname, "is_admin": bool(is_admin), "scopes": scopes_set}
+
+
+def db_ensure_default_admin():
+    # If no users exist, create admin/admin and generate a token.
+    conn = _db_connect()
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM users")
+        count = int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+    if count == 0:
+        print("[DB] No users found. Creating default admin user: admin / admin")
+        db_create_user("admin", "admin", is_admin=True)
+        u = db_get_user_by_username("admin")
+        if u:
+            token = db_create_token(u[0], "default", scopes="read,write,admin")
+            print(f"[DB] Default admin token (save it now): {token}")
+
+
+# ============================================================
+# HELPERS: repos + HTML
+# ============================================================
 def _is_bare_repo_dir(p: Path) -> bool:
-    # Bare repo has a HEAD file; most have objects/ and refs/, but HEAD is the best quick indicator.
     return p.is_dir() and (p / "HEAD").is_file()
 
 
 def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
-    """
-    Returns list of (owner_ui, repo_name, rel_git_path)
-      - owner_ui is FLAT_OWNER_UI for flat repos
-      - rel_git_path is relative path inside GIT_PROJECT_ROOT, like:
-            "repo.git" or "owner/repo.git"
-    """
     root = Path(project_root)
     results: list[tuple[str, str, str]] = []
     if not root.exists():
         return results
 
-    # Case A: flat layout: <root>/*.git
+    # Flat: <root>/*.git
     for p in sorted(root.glob("*.git")):
         if _is_bare_repo_dir(p):
             repo = p.name[:-4]
             results.append((FLAT_OWNER_UI, repo, p.name))
 
-    # Case B: owner layout: <root>/<owner>/*.git
+    # Owner: <root>/<owner>/*.git
     for owner_dir in sorted([x for x in root.iterdir() if x.is_dir()]):
         owner = owner_dir.name
         for p in sorted(owner_dir.glob("*.git")):
@@ -105,7 +263,7 @@ def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
                 rel = f"{owner}/{p.name}"
                 results.append((owner, repo, rel))
 
-    # Deduplicate while preserving order
+    # Deduplicate
     seen = set()
     uniq = []
     for o, r, rel in results:
@@ -117,11 +275,6 @@ def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
 
 
 def _repo_bare_path(owner_ui: str, repo: str) -> str:
-    """
-    Map UI owner/repo -> filesystem bare repo directory.
-    - owner_ui == FLAT_OWNER_UI => <root>/<repo>.git
-    - else => <root>/<owner>/<repo>.git
-    """
     if owner_ui == FLAT_OWNER_UI:
         return os.path.join(GIT_PROJECT_ROOT, repo + ".git")
     return os.path.join(GIT_PROJECT_ROOT, owner_ui, repo + ".git")
@@ -192,7 +345,6 @@ def _send_text(handler: BaseHTTPRequestHandler, status: int, text: str):
 
 
 def _ip_allowed(ip: str, allow: set[str]) -> bool:
-    """Allow exact IPs or CIDRs; handles IPv4/IPv6. Empty allowlist denies all."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -216,7 +368,6 @@ def _ip_allowed(ip: str, allow: set[str]) -> bool:
 def _write_request_body_to_stdin(
     handler: BaseHTTPRequestHandler, proc: subprocess.Popen, content_len: int
 ):
-    """Stream request body into backend stdin without buffering the whole thing."""
     remaining = content_len
     CHUNK = 65536
     try:
@@ -238,10 +389,6 @@ def _write_request_body_to_stdin(
 
 
 def _read_form_urlencoded(handler: BaseHTTPRequestHandler) -> dict[str, str]:
-    """
-    Read application/x-www-form-urlencoded body into {key: value}.
-    (No external deps)
-    """
     clen = int(handler.headers.get("Content-Length") or 0)
     if clen <= 0:
         return {}
@@ -250,7 +397,6 @@ def _read_form_urlencoded(handler: BaseHTTPRequestHandler) -> dict[str, str]:
         text = raw.decode("utf-8", "replace")
     except Exception:
         return {}
-    # parse_qs returns lists
     qs = parse_qs(text, keep_blank_values=True)
     out: dict[str, str] = {}
     for k, v in qs.items():
@@ -264,7 +410,6 @@ def _read_form_urlencoded(handler: BaseHTTPRequestHandler) -> dict[str, str]:
 class GitHTTPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    # -------- small helpers --------
     def _client_ip(self) -> str:
         ip = self.client_address[0]
         if ip == "::1":
@@ -274,9 +419,14 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
     def _allowlist(self) -> set[str]:
         return getattr(self.server, "allowlist", ALLOWED_CLIENT_IPS)
 
-    # -------- AUTHENTICATION --------
+    # -------- AUTHENTICATION via SQLite --------
     def _require_auth(self) -> bool:
-        """Ask for username/password via HTTP Basic Auth (Git-native prompt)."""
+        """
+        Git-native HTTP Basic Auth.
+        Modes:
+          - USE_PAT_FOR_BASIC_AUTH=True  : username:token (token in sqlite)
+          - USE_PAT_FOR_BASIC_AUTH=False : username:password (password in sqlite)
+        """
         if not REQUIRE_AUTH:
             return True
 
@@ -286,12 +436,23 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
         try:
             decoded = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
-            username, password = decoded.split(":", 1)
+            username, secret = decoded.split(":", 1)
         except Exception:
             return self._request_auth()
 
-        if VALID_USERS.get(username) == password:
-            self.remote_user = username
+        if not _safe_seg(username):
+            return self._request_auth()
+
+        if USE_PAT_FOR_BASIC_AUTH:
+            info = db_verify_token(username, secret)
+        else:
+            info = db_verify_password(username, secret)
+
+        if info:
+            self.remote_user = info["username"]
+            self.remote_user_id = info["user_id"]
+            self.remote_is_admin = bool(info.get("is_admin"))
+            self.remote_scopes = info.get("scopes", set(["read", "write"]))
             return True
 
         return self._request_auth()
@@ -341,11 +502,13 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             cls = "ok" if notice_kind == "ok" else "warn"
             notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
 
+        auth_mode = "username:TOKEN" if USE_PAT_FOR_BASIC_AUTH else "username:PASSWORD"
+
         body = _html_page(
             "Repos",
             f"<div class='topbar'>"
             f"<h1 style='margin:0'>Repos</h1>"
-            f"<span class='pill'>Smart HTTP: <code>{html.escape(URL_PREFIX)}/</code></span>"
+            f"<span class='pill'>Auth: <code>{html.escape(auth_mode)}</code></span>"
             f"</div>"
             f"{notice_html}"
             f"<div class='box' style='margin-bottom:14px'>"
@@ -359,8 +522,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"<div><button type='submit'>Create</button></div>"
             f"</div>"
             f"<p class='muted' style='margin:10px 0 0 0'>"
-            f"• If owner is empty or '{html.escape(FLAT_OWNER_UI)}', repo is created as <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;repo&gt;.git</code><br>"
-            f"• Otherwise repo is created as <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;owner&gt;/&lt;repo&gt;.git</code>"
+            f"• Owner empty or '{html.escape(FLAT_OWNER_UI)}' => <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;repo&gt;.git</code><br>"
+            f"• Otherwise => <code>{html.escape(GIT_PROJECT_ROOT)}/&lt;owner&gt;/&lt;repo&gt;.git</code>"
             f"</p>"
             f"</form>"
             f"</div>"
@@ -388,10 +551,11 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             if head.startswith("refs/heads/"):
                 ref = head[len("refs/heads/") :]
 
-        clone_url = f"http://USER:PASS@HOST:{PORT}{URL_PREFIX}/{owner}/{repo}.git"
+        # Clone URL depends on flat vs owner layout
         if owner == FLAT_OWNER_UI:
-            # For flat repos, the git-http-backend path is /git/<repo>.git
-            clone_url = f"http://USER:PASS@HOST:{PORT}{URL_PREFIX}/{repo}.git"
+            clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{repo}.git"
+        else:
+            clone_url = f"http://USER:SECRET@HOST:{PORT}{URL_PREFIX}/{owner}/{repo}.git"
 
         body = _html_page(
             f"{owner}/{repo}",
@@ -544,30 +708,19 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         _send_html(self, 200, body)
 
     def _ui_create_repo(self):
-        """
-        POST /create-repo  (application/x-www-form-urlencoded)
-          owner: optional (if empty or "root" => flat)
-          repo: required
-        """
         form = _read_form_urlencoded(self)
         owner = (form.get("owner") or "").strip()
         repo = (form.get("repo") or "").strip()
 
-        # Normalize owner
-        if not owner or owner == FLAT_OWNER_UI:
-            owner_ui = FLAT_OWNER_UI
-        else:
-            owner_ui = owner
+        owner_ui = FLAT_OWNER_UI if (not owner or owner == FLAT_OWNER_UI) else owner
 
-        # Validate
         if owner_ui != FLAT_OWNER_UI and not _safe_seg(owner_ui):
-            return self._ui_home("Invalid owner name (allowed: A-Z a-z 0-9 . _ -).", "warn")
+            return self._ui_home("Invalid owner name.", "warn")
         if not _safe_seg(repo):
-            return self._ui_home("Invalid repo name (allowed: A-Z a-z 0-9 . _ -).", "warn")
+            return self._ui_home("Invalid repo name.", "warn")
 
         repo_git = _repo_bare_path(owner_ui, repo)
 
-        # Create path
         try:
             if owner_ui == FLAT_OWNER_UI:
                 os.makedirs(GIT_PROJECT_ROOT, exist_ok=True)
@@ -576,22 +729,18 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._ui_home(f"Failed to create owner folder: {e}", "warn")
 
-        # Already exists?
         if os.path.exists(repo_git):
             return self._ui_home("Repo already exists.", "warn")
 
-        # Create bare repo
-        # (We prefer: git init --bare <path>)
         code, out, err = _run_cmd(["git", "init", "--bare", repo_git])
         if code != 0:
             msg = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
             return self._ui_home(f"git init --bare failed: {msg}", "warn")
 
-        # Success
         return self._ui_home(f"Repo created: {owner_ui}/{repo}", "ok")
 
     # ========================================================
-    # Git Smart HTTP backend (unchanged, plus forwards HTTP_* headers)
+    # Git Smart HTTP backend
     # ========================================================
     def _handle_git(self):
         if not self.path.startswith(URL_PREFIX + "/"):
@@ -618,7 +767,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if hasattr(self, "remote_user"):
             env["REMOTE_USER"] = self.remote_user
 
-        # Forward HTTP headers (CGI format)
         for k, v in self.headers.items():
             hk = "HTTP_" + k.upper().replace("-", "_")
             env[hk] = v
@@ -648,7 +796,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             )
             t.start()
 
-        # Parse headers from git-http-backend
         header_bytes = bytearray()
         while True:
             b = proc.stdout.read(1)
@@ -742,25 +889,21 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if p == "/":
             return self._ui_home()
 
-        # /r/<owner>/<repo>
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
             return self._ui_repo(m.group(1), m.group(2))
 
-        # /r/<owner>/<repo>/commits?ref=...
         m = re.match(r"^/r/([^/]+)/([^/]+)/commits$", p)
         if m:
             qs = parse_qs(parsed.query or "")
             ref = (qs.get("ref") or ["main"])[0]
             return self._ui_commits(m.group(1), m.group(2), ref)
 
-        # /r/<owner>/<repo>/tree/<ref>/<path...>
         m = re.match(r"^/r/([^/]+)/([^/]+)/tree/([^/]+)(/.*)?$", p)
         if m:
             subpath = unquote(m.group(4) or "/")
             return self._ui_tree(m.group(1), m.group(2), m.group(3), subpath)
 
-        # /r/<owner>/<repo>/blob/<ref>/<path...>
         m = re.match(r"^/r/([^/]+)/([^/]+)/blob/([^/]+)(/.*)$", p)
         if m:
             filepath = unquote(m.group(4) or "")
@@ -779,10 +922,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if self.path.startswith(URL_PREFIX + "/"):
             return self._handle_git()
 
-        # UI POST
         parsed = urlparse(self.path)
         if parsed.path == "/create-repo":
-            # Only allow standard form posts
             ctype = (self.headers.get("Content-Type") or "").lower()
             if "application/x-www-form-urlencoded" not in ctype:
                 return _send_text(self, 415, "Unsupported Media Type\n")
@@ -811,6 +952,9 @@ def main():
         print(f"ERROR: GIT_PROJECT_ROOT does not exist: {GIT_PROJECT_ROOT}", file=sys.stderr)
         sys.exit(1)
 
+    _db_init()
+    db_ensure_default_admin()
+
     os.environ["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
     os.environ["GIT_HTTP_EXPORT_ALL"] = "1"
 
@@ -820,7 +964,8 @@ def main():
     print(f"Git URL prefix: {URL_PREFIX}")
     print(f"UI: http://localhost:{PORT}/")
     print(f"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}")
-    print(f"Authentication: {'Enabled' if REQUIRE_AUTH else 'Disabled'}")
+    print(f"DB: {DB_PATH}")
+    print(f"Auth mode: {'username:TOKEN (PAT)' if USE_PAT_FOR_BASIC_AUTH else 'username:PASSWORD'}")
     print(f"Repo layouts supported:")
     print(f"  - Flat:  {GIT_PROJECT_ROOT}{os.sep}<repo>.git")
     print(f"  - Owner: {GIT_PROJECT_ROOT}{os.sep}<owner>{os.sep}<repo>.git")

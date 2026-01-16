@@ -32,7 +32,7 @@ if CURRENT_PLATFORM == "Windows":
     DB_PATH = r"C:\temp\pygithost.db"
 
 elif CURRENT_PLATFORM == "Linux":
-    GIT_PROJECT_ROOT = "/home/jordaly/git_repos"
+    GIT_PROJECT_ROOT = "/home/jordaly/projects"
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
     TRACE_LOG = None
     DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
@@ -626,6 +626,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"<div>"
             f"{admin_link} "
             f"<span class='pill'>User: <code>{html.escape(getattr(self, 'remote_user', '?'))}</code></span>"
+            "<a class='pill' href='/logout'>Logout</a>"
             f"</div>"
             f"</div>"
             f"{notice_html}"
@@ -1316,7 +1317,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             self.send_response(401, "Unauthorized")
             self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", "9")
+            self.send_header("Content-Length", "10")
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(b"Logged out")

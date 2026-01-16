@@ -32,7 +32,7 @@ if CURRENT_PLATFORM == "Windows":
     DB_PATH = r"C:\temp\pygithost.db"
 
 elif CURRENT_PLATFORM == "Linux":
-    GIT_PROJECT_ROOT = "/home/jordaly/projects"
+    GIT_PROJECT_ROOT = "/home/jordaly/git_repos"
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
     TRACE_LOG = None
     DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
@@ -418,6 +418,68 @@ def _git_delete_branch(repo_git: str, branch: str) -> tuple[bool, str]:
     if code != 0:
         return False, err.decode("utf-8", "replace").strip() or "git update-ref -d failed."
     return True, "Branch deleted."
+
+
+
+
+# helper functions for seen commits content
+def _git_commit_meta(repo_git: str, commit: str) -> dict[str, str] | None:
+    # NUL-separated to safely capture multiline fields
+    fmt = "%H%x00%P%x00%an%x00%ae%x00%ad%x00%s%x00%b"
+    code, out, _ = _run_git(repo_git, ["show", "-s", "--date=iso", f"--format={fmt}", commit])
+    if code != 0:
+        return None
+    parts = out.decode("utf-8", "replace").split("\x00")
+    if len(parts) < 7:
+        return None
+    return {
+        "hash": parts[0].strip(),
+        "parents": parts[1].strip(),
+        "author_name": parts[2].strip(),
+        "author_email": parts[3].strip(),
+        "date": parts[4].strip(),
+        "subject": parts[5].strip(),
+        "body": parts[6].rstrip(),
+    }
+
+
+def _git_commit_name_status(repo_git: str, commit: str) -> list[tuple[str, str]]:
+    # returns [("M","path"), ("A","path"), ("D","path"), ("R100","old -> new"), ...]
+    code, out, _ = _run_git(repo_git, ["show", "--name-status", "--format=", commit])
+    if code != 0:
+        return []
+    rows = []
+    for ln in out.decode("utf-8", "replace").splitlines():
+        ln = ln.rstrip("\n")
+        if not ln.strip():
+            continue
+        # name-status lines are tab separated
+        parts = ln.split("\t")
+        if len(parts) >= 2:
+            status = parts[0].strip()
+            path = parts[-1].strip()  # for renames, last is new path
+            rows.append((status, path))
+    return rows
+
+
+def _git_commit_patch(repo_git: str, commit: str, max_bytes: int = 600_000) -> tuple[str, bool]:
+    # Return patch text, and whether it was truncated
+    code, out, _ = _run_git(repo_git, ["show", "--no-color", "--format=", commit])
+    if code != 0:
+        return "Could not render patch.", False
+    if len(out) > max_bytes:
+        return out[:max_bytes].decode("utf-8", "replace") + "\n\n[... truncated ...]\n", True
+    return out.decode("utf-8", "replace"), False
+
+
+
+
+
+
+
+
+
+
 
 
 def _ip_allowed(ip: str, allow: set[str]) -> bool:
@@ -1068,12 +1130,23 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             if len(parts) != 4:
                 continue
             h, an, ad, subj = parts
+
+            base = f"/r/{owner}/{repo}"
+            commit_href = f"{base}/commit/{html.escape(h)}"
+
             rows.append(
-                f"<tr><td><code>{html.escape(h[:8])}</code></td>"
+                f"<tr><td><a href='{commit_href}'><code>{html.escape(h[:8])}</code></a></td>"
                 f"<td>{html.escape(subj)}</td>"
                 f"<td>{html.escape(an)}</td>"
                 f"<td><small class='muted'>{html.escape(ad)}</small></td></tr>"
             )
+
+            # rows.append(
+            #     f"<tr><td><code>{html.escape(h[:8])}</code></td>"
+            #     f"<td>{html.escape(subj)}</td>"
+            #     f"<td>{html.escape(an)}</td>"
+            #     f"<td><small class='muted'>{html.escape(ad)}</small></td></tr>"
+            # )
 
         base = f"/r/{owner}/{repo}"
         body = _html_page(
@@ -1084,6 +1157,110 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"<table>{''.join(rows) or '<tr><td class=muted>No commits.</td></tr>'}</table></div>",
         )
         _send_html(self, 200, body)
+
+
+
+
+
+
+
+
+
+    def _ui_commit(self, owner: str, repo: str, commitish: str):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        commit = _git_resolve_commit(repo_git, commitish)
+        if not commit:
+            return self._not_found()
+
+        meta = _git_commit_meta(repo_git, commit)
+        if not meta:
+            return self._not_found()
+
+        files = _git_commit_name_status(repo_git, commit)
+        patch_text, truncated = _git_commit_patch(repo_git, commit)
+
+        base = f"/r/{owner}/{repo}"
+        parents = [p for p in (meta["parents"] or "").split() if p.strip()]
+        parents_html = ""
+        if parents:
+            links = []
+            for p in parents:
+                links.append(f"<a class='pill' href='{base}/commit/{html.escape(p)}'><code>{html.escape(p[:8])}</code></a>")
+            parents_html = f"<div class='muted' style='margin-top:6px'>Parents: {' '.join(links)}</div>"
+
+        # Files list with links to blob at this commit
+        file_rows = []
+        for status, path in files:
+            # For deleted files, blob will fail; still show the path without link
+            safe_path = html.escape(path)
+            if status.startswith("D"):
+                file_rows.append(
+                    f"<tr><td style='width:70px'><span class='pill'>{html.escape(status)}</span></td>"
+                    f"<td><code>{safe_path}</code></td></tr>"
+                )
+            else:
+                href = f"{base}/blob/{html.escape(commit)}/{path}"
+                file_rows.append(
+                    f"<tr><td style='width:70px'><span class='pill'>{html.escape(status)}</span></td>"
+                    f"<td><a href='{href}'><code>{safe_path}</code></a></td></tr>"
+                )
+
+        message_html = html.escape(meta["subject"])
+        if meta["body"].strip():
+            message_html += "<br><br>" + "<pre style='margin:0'>" + html.escape(meta["body"]) + "</pre>"
+
+        trunc_note = ""
+        if truncated:
+            trunc_note = "<div class='warn' style='margin-top:12px'>Patch truncated (too large).</div>"
+
+        body = _html_page(
+            f"Commit {meta['hash'][:8]} · {owner}/{repo}",
+            f"<div class='topbar'>"
+            f"<div>"
+            f"<h1 style='margin:0'>Commit <code>{html.escape(meta['hash'][:8])}</code></h1>"
+            f"<div class='muted'><code>{html.escape(meta['hash'])}</code></div>"
+            f"{parents_html}"
+            f"</div>"
+            f"<div>"
+            f"<a class='pill' href='{base}/commits?ref={html.escape(_git_default_branch(repo_git))}'>Commits</a> "
+            f"<a class='pill' href='{base}/tree/{html.escape(meta['hash'])}/'>Browse</a>"
+            f"</div>"
+            f"</div>"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<div><span class='muted'>Author:</span> {html.escape(meta['author_name'])} "
+            f"&lt;{html.escape(meta['author_email'])}&gt;</div>"
+            f"<div><span class='muted'>Date:</span> {html.escape(meta['date'])}</div>"
+            f"<div style='margin-top:10px'>{message_html}</div>"
+            f"</div>"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Files changed</h2>"
+            f"<table>{''.join(file_rows) if file_rows else '<tr><td class=muted>No files.</td></tr>'}</table>"
+            f"</div>"
+            f"<div class='box'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Patch</h2>"
+            f"{trunc_note}"
+            f"<pre>{html.escape(patch_text)}</pre>"
+            f"</div>"
+        )
+        _send_html(self, 200, body)
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
         repo_git = _repo_bare_path(owner, repo)
@@ -1341,6 +1518,11 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query or "")
             ref = (qs.get("ref") or ["main"])[0]
             return self._ui_commits(m.group(1), m.group(2), ref)
+
+
+        m = re.match(r"^/r/([^/]+)/([^/]+)/commit/([^/]+)$", p)
+        if m:
+            return self._ui_commit(m.group(1), m.group(2), m.group(3))
 
         m = re.match(r"^/r/([^/]+)/([^/]+)/tree/([^/]+)(/.*)?$", p)
         if m:

@@ -56,6 +56,12 @@ REALM = "Git Repositories"
 
 FLAT_OWNER_UI = "root"
 
+# Pull Requests feature:
+# - Stores PR metadata in SQLite (not in git)
+# - Shows PR list + PR page with commits and diff
+# - Supports "fast-forward only" merge (safe for bare repos without checkout)
+PR_PATCH_MAX_BYTES = 800_000
+
 # ============================================================
 # HELPERS: validation / permissions
 # ============================================================
@@ -154,6 +160,30 @@ def _db_init():
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)")
+
+        # Pull requests (metadata only)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pull_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                source_branch TEXT NOT NULL,
+                target_branch TEXT NOT NULL,
+                author_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',   -- open|closed|merged
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                closed_at TEXT,
+                merged_at TEXT,
+                merge_method TEXT,                     -- ff-only
+                merge_commit TEXT,                     -- new target hash after merge
+                FOREIGN KEY(author_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pr_repo ON pull_requests(owner, repo, status, id)")
     finally:
         conn.close()
 
@@ -320,6 +350,93 @@ def db_ensure_default_admin():
             print(f"[DB] Default admin token (save it now): {token}")
 
 
+# ---------- PR DB helpers ----------
+def db_pr_create(owner: str, repo: str, title: str, body: str, source_branch: str, target_branch: str, author_user_id: int) -> int:
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO pull_requests(owner, repo, title, body, source_branch, target_branch, author_user_id, status)
+            VALUES(?,?,?,?,?,?,?, 'open')
+            """,
+            (owner, repo, title, body or "", source_branch, target_branch, int(author_user_id)),
+        )
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_pr_get(pr_id: int):
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            """
+            SELECT id, owner, repo, title, body, source_branch, target_branch,
+                   author_user_id, status, created_at, closed_at, merged_at, merge_method, merge_commit
+            FROM pull_requests
+            WHERE id=?
+            """,
+            (int(pr_id),),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def db_pr_list(owner: str, repo: str, status: str | None = None):
+    conn = _db_connect()
+    try:
+        if status:
+            cur = conn.execute(
+                """
+                SELECT id, title, source_branch, target_branch, status, created_at
+                FROM pull_requests
+                WHERE owner=? AND repo=? AND status=?
+                ORDER BY id DESC
+                """,
+                (owner, repo, status),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT id, title, source_branch, target_branch, status, created_at
+                FROM pull_requests
+                WHERE owner=? AND repo=?
+                ORDER BY id DESC
+                """,
+                (owner, repo),
+            )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def db_pr_close(pr_id: int):
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "UPDATE pull_requests SET status='closed', closed_at=datetime('now') WHERE id=? AND status='open'",
+            (int(pr_id),),
+        )
+    finally:
+        conn.close()
+
+
+def db_pr_mark_merged(pr_id: int, method: str, merge_commit: str):
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            UPDATE pull_requests
+            SET status='merged', merged_at=datetime('now'), merge_method=?, merge_commit=?
+            WHERE id=? AND status='open'
+            """,
+            (method, merge_commit, int(pr_id)),
+        )
+    finally:
+        conn.close()
+
+
 # ============================================================
 # HELPERS: repos + git + HTTP
 # ============================================================
@@ -420,11 +537,8 @@ def _git_delete_branch(repo_git: str, branch: str) -> tuple[bool, str]:
     return True, "Branch deleted."
 
 
-
-
 # helper functions for seen commits content
 def _git_commit_meta(repo_git: str, commit: str) -> dict[str, str] | None:
-    # NUL-separated to safely capture multiline fields
     fmt = "%H%x00%P%x00%an%x00%ae%x00%ad%x00%s%x00%b"
     code, out, _ = _run_git(repo_git, ["show", "-s", "--date=iso", f"--format={fmt}", commit])
     if code != 0:
@@ -444,7 +558,6 @@ def _git_commit_meta(repo_git: str, commit: str) -> dict[str, str] | None:
 
 
 def _git_commit_name_status(repo_git: str, commit: str) -> list[tuple[str, str]]:
-    # returns [("M","path"), ("A","path"), ("D","path"), ("R100","old -> new"), ...]
     code, out, _ = _run_git(repo_git, ["show", "--name-status", "--format=", commit])
     if code != 0:
         return []
@@ -453,23 +566,90 @@ def _git_commit_name_status(repo_git: str, commit: str) -> list[tuple[str, str]]
         ln = ln.rstrip("\n")
         if not ln.strip():
             continue
-        # name-status lines are tab separated
         parts = ln.split("\t")
         if len(parts) >= 2:
             status = parts[0].strip()
-            path = parts[-1].strip()  # for renames, last is new path
+            path = parts[-1].strip()
             rows.append((status, path))
     return rows
 
 
 def _git_commit_patch(repo_git: str, commit: str, max_bytes: int = 600_000) -> tuple[str, bool]:
-    # Return patch text, and whether it was truncated
     code, out, _ = _run_git(repo_git, ["show", "--no-color", "--format=", commit])
     if code != 0:
         return "Could not render patch.", False
     if len(out) > max_bytes:
         return out[:max_bytes].decode("utf-8", "replace") + "\n\n[... truncated ...]\n", True
     return out.decode("utf-8", "replace"), False
+
+
+# ---------- PR git helpers ----------
+def _git_is_ancestor(repo_git: str, maybe_ancestor: str, maybe_descendant: str) -> bool:
+    code, _out, _err = _run_git(repo_git, ["merge-base", "--is-ancestor", maybe_ancestor, maybe_descendant])
+    return code == 0
+
+
+def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100) -> list[dict[str, str]]:
+    """
+    rev_range examples:
+      - "A..B" (commits reachable from B but not A)
+    """
+    fmt = "%H%x00%an%x00%ae%x00%ad%x00%s"
+    code, out, _err = _run_git(repo_git, ["log", "--date=iso", f"--format={fmt}", f"-n{limit}", rev_range])
+    if code != 0:
+        return []
+    commits = []
+    for ln in out.decode("utf-8", "replace").splitlines():
+        parts = ln.split("\x00")
+        if len(parts) != 5:
+            continue
+        commits.append(
+            {
+                "hash": parts[0].strip(),
+                "author_name": parts[1].strip(),
+                "author_email": parts[2].strip(),
+                "date": parts[3].strip(),
+                "subject": parts[4].strip(),
+            }
+        )
+    return commits
+
+
+def _git_diff_between(repo_git: str, base: str, head: str, max_bytes: int = PR_PATCH_MAX_BYTES) -> tuple[str, bool]:
+    # Use three-dot? For PR we typically show base...head; but diff base..head is ok for content.
+    code, out, err = _run_git(repo_git, ["diff", "--no-color", f"{base}..{head}"])
+    if code != 0:
+        return err.decode("utf-8", "replace") or "Could not render diff.", False
+    if len(out) > max_bytes:
+        return out[:max_bytes].decode("utf-8", "replace") + "\n\n[... truncated ...]\n", True
+    return out.decode("utf-8", "replace"), False
+
+
+def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str) -> tuple[bool, str, str | None]:
+    """
+    Fast-forward only merge: if target is ancestor of source, update target ref to source commit.
+    Returns (ok, msg, new_target_commit)
+    """
+    tgt_ref = f"refs/heads/{target_branch}"
+    src_ref = f"refs/heads/{source_branch}"
+
+    tgt = _git_resolve_commit(repo_git, tgt_ref)
+    src = _git_resolve_commit(repo_git, src_ref)
+    if not tgt:
+        return False, f"Target branch '{target_branch}' not found.", None
+    if not src:
+        return False, f"Source branch '{source_branch}' not found.", None
+
+    if tgt == src:
+        return True, "Already up to date.", tgt
+
+    if not _git_is_ancestor(repo_git, tgt, src):
+        return False, "Non fast-forward merge required (this server supports ff-only merges).", None
+
+    code, _out, err = _run_git(repo_git, ["update-ref", tgt_ref, src])
+    if code != 0:
+        return False, (err.decode("utf-8", "replace").strip() or "git update-ref failed."), None
+    return True, "Merged (fast-forward).", src
 
 
 def _ip_allowed(ip: str, allow: set[str]) -> bool:
@@ -543,7 +723,8 @@ def _html_page(title: str, body_html: str) -> bytes:
         f".box{{border:1px solid #eee;border-radius:14px;padding:14px;background:#fff}}"
         f".row{{display:flex;gap:10px;flex-wrap:wrap;align-items:end}}"
         f"label{{display:block;font-size:12px;color:#555;margin-bottom:4px}}"
-        f"input,select{{padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px}}"
+        f"input,select,textarea{{padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px}}"
+        f"textarea{{width:100%;min-height:90px}}"
         f"button{{padding:10px 14px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer}}"
         f"button:hover{{opacity:.92}}"
         f".danger{{border-color:#7f1d1d;background:#7f1d1d}}"
@@ -788,7 +969,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             toggle_label = "Disable" if is_active else "Enable"
             toggle_btn_class = "danger" if is_active else ""
 
-            # do not allow disabling yourself in UI? (optional)
             disable_self_guard = ""
             if int(uid) == int(getattr(self, "remote_user_id", -1)):
                 disable_self_guard = "<span class='muted'> (you)</span>"
@@ -807,7 +987,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 f"</tr>"
             )
 
-        # user dropdown for password reset
         options = []
         for uid, uname, _is_admin, _is_active, _created_at in users:
             options.append(f"<option value='{uid}'>{html.escape(uname)}</option>")
@@ -915,7 +1094,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if not u:
             return self._ui_admin_users("User not found.", "warn")
 
-        # prevent disabling yourself (safety)
         if int(user_id) == int(getattr(self, "remote_user_id", -1)) and not make_active:
             return self._ui_admin_users("You cannot disable your own account from the UI.", "warn")
 
@@ -927,7 +1105,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         return self._ui_admin_users(f"User '{u[1]}' is now {'active' if make_active else 'disabled'}.", "ok")
 
     # ========================================================
-    # UI: Repo + Branches (same as before)
+    # UI: Repo + Branches + PRs
     # ========================================================
     def _ui_repo(self, owner: str, repo: str):
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -961,7 +1139,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"</div>"
             f"<div>"
             f"<a class='pill' href='/'>All repos</a> "
-            f"<a class='pill' href='{base}/branches'>Branches</a>"
+            f"<a class='pill' href='{base}/branches'>Branches</a> "
+            f"<a class='pill' href='{base}/pulls'>Pull requests</a>"
             f"</div>"
             f"</div>"
             f"<div class='box' style='margin-bottom:14px'>"
@@ -1058,7 +1237,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"Branches · {owner}/{repo}",
             f"<div class='topbar'>"
             f"<h1 style='margin:0'>Branches</h1>"
-            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='/'>Home</a></div>"
+            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='/'>Home</a> "
+            f"<a class='pill' href='{base}/pulls'>Pull requests</a></div>"
             f"</div>"
             f"{notice_html}"
             f"{create_box}"
@@ -1102,6 +1282,308 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         ok, msg = _git_delete_branch(repo_git, branch)
         return self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
 
+    # ---------------- Pull Requests UI ----------------
+    def _ui_pulls(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        qs = parse_qs(urlparse(self.path).query or "")
+        status = (qs.get("status") or ["open"])[0].strip().lower()
+        if status not in ("open", "closed", "merged", "all"):
+            status = "open"
+
+        rows_db = db_pr_list(owner, repo, None if status == "all" else status)
+        base = f"/r/{owner}/{repo}"
+
+        notice_html = ""
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
+
+        rows = []
+        for pr_id, title, src, tgt, st, created_at in rows_db:
+            st_pill = f"<span class='pill'>{html.escape(st)}</span>"
+            rows.append(
+                f"<tr>"
+                f"<td><a href='{base}/pulls/{pr_id}'>PR #{pr_id}: {html.escape(title)}</a></td>"
+                f"<td class='muted'><code>{html.escape(src)}</code> → <code>{html.escape(tgt)}</code></td>"
+                f"<td>{st_pill}</td>"
+                f"<td class='muted'>{html.escape(str(created_at))}</td>"
+                f"</tr>"
+            )
+
+        default_branch = _git_default_branch(repo_git)
+        branches = _git_list_branches(repo_git)
+        opt_src = "".join([f"<option value='{html.escape(b)}'>{html.escape(b)}</option>" for b in branches])
+        opt_tgt = "".join(
+            [f"<option value='{html.escape(b)}'{' selected' if b==default_branch else ''}>{html.escape(b)}</option>" for b in branches]
+        )
+
+        can_write = _has_write_scope(self)
+        warn_merge = (
+            "<div class='warn' style='margin-top:10px'>Merging is <b>fast-forward only</b> on this server.</div>"
+            if can_write
+            else "<div class='warn' style='margin-top:10px'>You don’t have <code>write</code> scope; you can open PRs but cannot merge.</div>"
+        )
+
+        body = _html_page(
+            f"Pull requests · {owner}/{repo}",
+            f"<div class='topbar'>"
+            f"<h1 style='margin:0'>Pull requests</h1>"
+            f"<div>"
+            f"<a class='pill' href='{base}'>Repo</a> "
+            f"<a class='pill' href='{base}/branches'>Branches</a> "
+            f"<a class='pill' href='/'>Home</a>"
+            f"</div>"
+            f"</div>"
+            f"{notice_html}"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<div class='row' style='justify-content:space-between;align-items:center'>"
+            f"<div>"
+            f"<a class='pill' href='{base}/pulls?status=open'>Open</a> "
+            f"<a class='pill' href='{base}/pulls?status=merged'>Merged</a> "
+            f"<a class='pill' href='{base}/pulls?status=closed'>Closed</a> "
+            f"<a class='pill' href='{base}/pulls?status=all'>All</a>"
+            f"</div>"
+            f"<div class='muted'>Filter: <code>{html.escape(status)}</code></div>"
+            f"</div>"
+            f"</div>"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Open a pull request</h2>"
+            f"<form method='POST' action='{base}/pulls/create'>"
+            f"<div class='row'>"
+            f"<div style='min-width:220px'><label>Source branch</label><select name='source_branch' required>{opt_src}</select></div>"
+            f"<div style='min-width:220px'><label>Target branch</label><select name='target_branch' required>{opt_tgt}</select></div>"
+            f"</div>"
+            f"<div class='row' style='margin-top:10px'>"
+            f"<div style='flex:1;min-width:260px'><label>Title</label><input name='title' placeholder='Add feature X' required style='width:100%'/></div>"
+            f"</div>"
+            f"<div style='margin-top:10px'>"
+            f"<label>Description</label><textarea name='body' placeholder='What does this change?'></textarea>"
+            f"</div>"
+            f"<div style='margin-top:10px'><button type='submit'>Create PR</button></div>"
+            f"</form>"
+            f"{warn_merge}"
+            f"</div>"
+            f"<div class='box'>"
+            f"<table>{''.join(rows) if rows else '<tr><td class=muted>No pull requests.</td><td></td><td></td><td></td></tr>'}</table>"
+            f"</div>",
+        )
+        _send_html(self, 200, body)
+
+    def _ui_pulls_create(self, owner: str, repo: str):
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return self._forbidden(b"403 Forbidden\n")
+
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        form = _read_form_urlencoded(self)
+        title = (form.get("title") or "").strip()
+        body = (form.get("body") or "").strip()
+        source_branch = (form.get("source_branch") or "").strip()
+        target_branch = (form.get("target_branch") or "").strip()
+
+        if not title:
+            return self._ui_pulls(owner, repo, "Title is required.", "warn")
+        if not (_safe_branch_name(source_branch) and _safe_branch_name(target_branch)):
+            return self._ui_pulls(owner, repo, "Invalid branch name.", "warn")
+        if source_branch == target_branch:
+            return self._ui_pulls(owner, repo, "Source and target must be different.", "warn")
+
+        src = _git_resolve_commit(repo_git, f"refs/heads/{source_branch}")
+        tgt = _git_resolve_commit(repo_git, f"refs/heads/{target_branch}")
+        if not src:
+            return self._ui_pulls(owner, repo, f"Source branch not found: {source_branch}", "warn")
+        if not tgt:
+            return self._ui_pulls(owner, repo, f"Target branch not found: {target_branch}", "warn")
+
+        pr_id = db_pr_create(owner, repo, title, body, source_branch, target_branch, int(self.remote_user_id))
+        base = f"/r/{owner}/{repo}"
+        self.send_response(303)
+        self.send_header("Location", f"{base}/pulls/{pr_id}")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _ui_pull_view(self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"):
+        row = db_pr_get(pr_id)
+        if not row:
+            return self._not_found()
+
+        (
+            _id, db_owner, db_repo, title, body, src_branch, tgt_branch,
+            author_user_id, status, created_at, closed_at, merged_at, merge_method, merge_commit
+        ) = row
+
+        if db_owner != owner or db_repo != repo:
+            return self._not_found()
+
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return self._not_found()
+
+        base = f"/r/{owner}/{repo}"
+
+        src_ref = f"refs/heads/{src_branch}"
+        tgt_ref = f"refs/heads/{tgt_branch}"
+        src_commit = _git_resolve_commit(repo_git, src_ref)
+        tgt_commit = _git_resolve_commit(repo_git, tgt_ref)
+
+        # Range for commits "target..source" (what source adds over target)
+        commits = []
+        if src_commit and tgt_commit and src_commit != tgt_commit:
+            commits = _git_list_commits(repo_git, f"{tgt_commit}..{src_commit}", limit=200)
+
+        diff_text, diff_trunc = ("", False)
+        if src_commit and tgt_commit and src_commit != tgt_commit:
+            diff_text, diff_trunc = _git_diff_between(repo_git, tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES)
+        elif src_commit and tgt_commit and src_commit == tgt_commit:
+            diff_text = "(No changes; branches point to the same commit.)"
+            diff_trunc = False
+        else:
+            diff_text = "(Could not resolve one or both branches.)"
+            diff_trunc = False
+
+        notice_html = ""
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = f"<div class='{cls}' style='margin-bottom:12px'>{html.escape(notice)}</div>"
+
+        status_pill = f"<span class='pill'>{html.escape(status)}</span>"
+        merge_note = ""
+        if status == "merged":
+            merge_note = f"<div class='ok' style='margin-top:10px'>Merged ({html.escape(merge_method or '')}). Target now at <code>{html.escape((merge_commit or '')[:8])}</code>.</div>"
+        elif status == "closed":
+            merge_note = f"<div class='warn' style='margin-top:10px'>Closed.</div>"
+
+        can_write = _has_write_scope(self)
+        merge_box = ""
+        if status == "open":
+            if can_write:
+                merge_box = (
+                    f"<div class='box' style='margin-bottom:14px'>"
+                    f"<h2 style='margin:0 0 10px 0;font-size:16px'>Merge</h2>"
+                    f"<div class='muted'>This server supports <b>fast-forward only</b> merges.</div>"
+                    f"<form method='POST' action='{base}/pulls/{pr_id}/merge' style='margin-top:10px'>"
+                    f"<button type='submit'>Merge (ff-only)</button>"
+                    f"</form>"
+                    f"<form method='POST' action='{base}/pulls/{pr_id}/close' style='margin-top:10px'>"
+                    f"<button class='danger' type='submit'>Close PR</button>"
+                    f"</form>"
+                    f"</div>"
+                )
+            else:
+                merge_box = (
+                    f"<div class='box warn' style='margin-bottom:14px'>"
+                    f"You don’t have <code>write</code> scope. You can’t merge/close this PR from the UI."
+                    f"</div>"
+                )
+
+        commits_rows = []
+        for c in commits:
+            ch = c["hash"]
+            commits_rows.append(
+                f"<tr>"
+                f"<td style='width:110px'><a href='{base}/commit/{html.escape(ch)}'><code>{html.escape(ch[:8])}</code></a></td>"
+                f"<td>{html.escape(c['subject'])}</td>"
+                f"<td class='muted'>{html.escape(c['author_name'])}</td>"
+                f"<td class='muted'><small>{html.escape(c['date'])}</small></td>"
+                f"</tr>"
+            )
+
+        trunc_note = ""
+        if diff_trunc:
+            trunc_note = "<div class='warn' style='margin-top:12px'>Diff truncated (too large).</div>"
+
+        header_meta = (
+            f"<div class='muted'>"
+            f"<code>{html.escape(src_branch)}</code> → <code>{html.escape(tgt_branch)}</code> "
+            f"| Created: {html.escape(str(created_at))}"
+            f"</div>"
+        )
+
+        body_html = (
+            f"<div class='topbar'>"
+            f"<div>"
+            f"<h1 style='margin:0'>PR #{pr_id}: {html.escape(title)}</h1>"
+            f"{header_meta}"
+            f"</div>"
+            f"<div>"
+            f"<a class='pill' href='{base}/pulls'>All PRs</a> "
+            f"<a class='pill' href='{base}'>Repo</a>"
+            f"</div>"
+            f"</div>"
+            f"{notice_html}"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"{status_pill}"
+            f"{merge_note}"
+            f"<div style='margin-top:10px'>{html.escape(body or '') if (body or '').strip() else '<span class=muted>(no description)</span>'}</div>"
+            f"<div class='muted' style='margin-top:10px'>"
+            f"Source: <code>{html.escape(src_branch)}</code> @ <code>{html.escape((src_commit or '')[:8])}</code><br>"
+            f"Target: <code>{html.escape(tgt_branch)}</code> @ <code>{html.escape((tgt_commit or '')[:8])}</code>"
+            f"</div>"
+            f"</div>"
+            f"{merge_box}"
+            f"<div class='box' style='margin-bottom:14px'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Commits</h2>"
+            f"<table>{''.join(commits_rows) if commits_rows else '<tr><td class=muted>No commits (or branches not resolvable).</td></tr>'}</table>"
+            f"</div>"
+            f"<div class='box'>"
+            f"<h2 style='margin:0 0 10px 0;font-size:16px'>Diff</h2>"
+            f"{trunc_note}"
+            f"<pre>{html.escape(diff_text)}</pre>"
+            f"</div>"
+        )
+        _send_html(self, 200, _html_page(f"PR #{pr_id} · {owner}/{repo}", body_html))
+
+    def _ui_pull_close(self, owner: str, repo: str, pr_id: int):
+        if not _has_write_scope(self):
+            return self._forbidden(b"403 Forbidden: write scope required.\n")
+
+        pr = db_pr_get(pr_id)
+        if not pr:
+            return self._not_found()
+        if pr[1] != owner or pr[2] != repo:
+            return self._not_found()
+
+        db_pr_close(pr_id)
+        return self._ui_pull_view(owner, repo, pr_id, "Pull request closed.", "ok")
+
+    def _ui_pull_merge(self, owner: str, repo: str, pr_id: int):
+        if not _has_write_scope(self):
+            return self._forbidden(b"403 Forbidden: write scope required.\n")
+
+        pr = db_pr_get(pr_id)
+        if not pr:
+            return self._not_found()
+
+        (
+            _id, db_owner, db_repo, _title, _body, src_branch, tgt_branch,
+            _author_user_id, status, _created_at, _closed_at, _merged_at, _merge_method, _merge_commit
+        ) = pr
+        if db_owner != owner or db_repo != repo:
+            return self._not_found()
+        if status != "open":
+            return self._ui_pull_view(owner, repo, pr_id, "PR is not open.", "warn")
+
+        repo_git = _repo_bare_path(owner, repo)
+        ok, msg, new_commit = _git_ff_merge(repo_git, tgt_branch, src_branch)
+        if not ok:
+            return self._ui_pull_view(owner, repo, pr_id, msg, "warn")
+
+        if new_commit:
+            db_pr_mark_merged(pr_id, "ff-only", new_commit)
+        return self._ui_pull_view(owner, repo, pr_id, msg, "ok")
+
+    # ========================================================
+    # UI: Commits, Commit, Tree, Blob
+    # ========================================================
     def _ui_commits(self, owner: str, repo: str, ref: str):
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
@@ -1131,23 +1613,16 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 f"<td><small class='muted'>{html.escape(ad)}</small></td></tr>"
             )
 
-            # rows.append(
-            #     f"<tr><td><code>{html.escape(h[:8])}</code></td>"
-            #     f"<td>{html.escape(subj)}</td>"
-            #     f"<td>{html.escape(an)}</td>"
-            #     f"<td><small class='muted'>{html.escape(ad)}</small></td></tr>"
-            # )
-
         base = f"/r/{owner}/{repo}"
         body = _html_page(
             f"Commits · {owner}/{repo}",
             f"<div class='topbar'><h1 style='margin:0'>Commits</h1>"
-            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='{base}/branches'>Branches</a></div></div>"
+            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='{base}/branches'>Branches</a> "
+            f"<a class='pill' href='{base}/pulls'>Pull requests</a></div></div>"
             f"<div class='box'><p class='muted'>ref: <code>{html.escape(ref)}</code></p>"
             f"<table>{''.join(rows) or '<tr><td class=muted>No commits.</td></tr>'}</table></div>",
         )
         _send_html(self, 200, body)
-
 
     def _ui_commit(self, owner: str, repo: str, commitish: str):
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -1177,10 +1652,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
                 links.append(f"<a class='pill' href='{base}/commit/{html.escape(p)}'><code>{html.escape(p[:8])}</code></a>")
             parents_html = f"<div class='muted' style='margin-top:6px'>Parents: {' '.join(links)}</div>"
 
-        # Files list with links to blob at this commit
         file_rows = []
         for status, path in files:
-            # For deleted files, blob will fail; still show the path without link
             safe_path = html.escape(path)
             if status.startswith("D"):
                 file_rows.append(
@@ -1212,7 +1685,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"</div>"
             f"<div>"
             f"<a class='pill' href='{base}/commits?ref={html.escape(_git_default_branch(repo_git))}'>Commits</a> "
-            f"<a class='pill' href='{base}/tree/{html.escape(meta['hash'])}/'>Browse</a>"
+            f"<a class='pill' href='{base}/tree/{html.escape(meta['hash'])}/'>Browse</a> "
+            f"<a class='pill' href='{base}/pulls'>Pull requests</a>"
             f"</div>"
             f"</div>"
             f"<div class='box' style='margin-bottom:14px'>"
@@ -1232,7 +1706,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"</div>"
         )
         _send_html(self, 200, body)
-
 
     def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
         repo_git = _repo_bare_path(owner, repo)
@@ -1281,7 +1754,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"<div class='topbar'>"
             f"<div><h1 style='margin:0'>{html.escape(owner)}/{html.escape(repo)}</h1>"
             f"<div class='muted'>ref: <code>{html.escape(ref)}</code></div></div>"
-            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='{base}/branches'>Branches</a></div>"
+            f"<div><a class='pill' href='{base}'>Repo</a> <a class='pill' href='{base}/branches'>Branches</a> "
+            f"<a class='pill' href='{base}/pulls'>Pull requests</a></div>"
             f"</div>"
             f"{up}"
             f"<div class='box'><table>{''.join(rows) or '<tr><td class=muted>Empty.</td></tr>'}</table></div>",
@@ -1312,7 +1786,8 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
         body = _html_page(
             f"{filepath} · {owner}/{repo}",
-            f"<p><a class='pill' href='{back}'>⬅ Back</a> <a class='pill' href='{base}/branches'>Branches</a></p>"
+            f"<p><a class='pill' href='{back}'>⬅ Back</a> <a class='pill' href='{base}/branches'>Branches</a> "
+            f"<a class='pill' href='{base}/pulls'>Pull requests</a></p>"
             f"<h1 style='margin-top:10px'><code>{html.escape(filepath)}</code></h1>"
             f"<div class='box'><pre>{escaped}</pre></div>",
         )
@@ -1485,12 +1960,19 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if m:
             return self._ui_branches(m.group(1), m.group(2))
 
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls$", p)
+        if m:
+            return self._ui_pulls(m.group(1), m.group(2))
+
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)$", p)
+        if m:
+            return self._ui_pull_view(m.group(1), m.group(2), int(m.group(3)))
+
         m = re.match(r"^/r/([^/]+)/([^/]+)/commits$", p)
         if m:
             qs = parse_qs(parsed.query or "")
             ref = (qs.get("ref") or ["main"])[0]
             return self._ui_commits(m.group(1), m.group(2), ref)
-
 
         m = re.match(r"^/r/([^/]+)/([^/]+)/commit/([^/]+)$", p)
         if m:
@@ -1524,7 +2006,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if "application/x-www-form-urlencoded" not in ctype:
             return _send_text(self, 415, "Unsupported Media Type\n")
 
-
         if parsed.path == "/create-repo":
             return self._ui_create_repo()
 
@@ -1539,6 +2020,18 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/admin/users/toggle":
             return self._ui_admin_users_toggle()
+
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/create$", parsed.path)
+        if m:
+            return self._ui_pulls_create(m.group(1), m.group(2))
+
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/close$", parsed.path)
+        if m:
+            return self._ui_pull_close(m.group(1), m.group(2), int(m.group(3)))
+
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/merge$", parsed.path)
+        if m:
+            return self._ui_pull_merge(m.group(1), m.group(2), int(m.group(3)))
 
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches/create$", parsed.path)
         if m:
@@ -1586,6 +2079,7 @@ def main():
     print(f"DB: {DB_PATH}")
     print("Auth: accepts either username:password OR username:token")
     print("Admin users page: /admin/users")
+    print("Pull requests: /r/<owner>/<repo>/pulls (ff-only merge)")
     print("=" * 60)
     try:
         httpd.serve_forever()

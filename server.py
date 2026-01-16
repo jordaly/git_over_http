@@ -472,16 +472,6 @@ def _git_commit_patch(repo_git: str, commit: str, max_bytes: int = 600_000) -> t
     return out.decode("utf-8", "replace"), False
 
 
-
-
-
-
-
-
-
-
-
-
 def _ip_allowed(ip: str, allow: set[str]) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
@@ -1159,13 +1149,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         _send_html(self, 200, body)
 
 
-
-
-
-
-
-
-
     def _ui_commit(self, owner: str, repo: str, commitish: str):
         if not (_safe_seg(owner) and _safe_seg(repo)):
             return self._forbidden(b"403 Forbidden\n")
@@ -1249,17 +1232,6 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             f"</div>"
         )
         _send_html(self, 200, body)
-
-
-
-
-
-
-
-
-
-
-
 
 
     def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):

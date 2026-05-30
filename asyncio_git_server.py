@@ -2361,81 +2361,53 @@ class GitHTTPHandler:
 <h1 style="margin-top:10px"><code>{filepath}</code>
 </h1><div class="box"><pre><code class="language-{lang}">{text}</code></pre>
 <script>
-    //function loadScript(src) {{
-    //    return new Promise((resolve, reject) => {{
-    //        // Avoid loading it twice
-    //        if (document.querySelector(`script[src="${{src}}"]`)) {{
-    //            resolve();
-    //            return;
-    //        }}
 
-    //        const script = document.createElement("script");
-    //        script.src = src;
-    //        script.async = false;
+    window.Prism = window.Prism || {{}};
+    window.Prism.manual = true;
 
-    //        script.onload = () => {{
-    //            resolve();
-    //        }};
+    function loadScript(src) {{
+        return new Promise((resolve, reject) => {{
+            if (document.querySelector(`script[src="${{src}}"]`)) {{
+                resolve();
+                return;
+            }}
 
-    //        script.onerror = () => {{
-    //            reject(new Error(`Failed to load script: ${{src}}`));
-    //        }};
+            const script = document.createElement("script");
+            script.src = src;
+            script.async = false;
 
-    //        document.head.appendChild(script);
-    //    }});
-    //}}
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error(`Failed to load script: ${{src}}`));
 
-    //document.addEventListener("load", async () => {{
-    //    await loadScript("/static/assets/prismjs/components/prism-{lang}.min.js")
-    //    window.Prism.highlightAll();
-    //}});
+            document.head.appendChild(script);
+        }});
+    }}
 
-window.Prism = window.Prism || {{}};
-window.Prism.manual = true;
+    async function loadPrismLanguage(lang) {{
+        const base = "/static/assets/prismjs/components";
 
-function loadScript(src) {{
-    return new Promise((resolve, reject) => {{
-        if (document.querySelector(`script[src="${{src}}"]`)) {{
-            resolve();
-            return;
+        await loadScript(`${{base}}/prism-core.min.js`);
+
+        if (lang === "csharp" || lang === "javascript" || lang === "java" || lang === "c" || lang === "cpp") {{
+            await loadScript(`${{base}}/prism-clike.min.js`);
         }}
 
-        const script = document.createElement("script");
-        script.src = src;
-        script.async = false;
+        if (lang && lang !== "none") {{
+            await loadScript(`${{base}}/prism-${{lang}}.min.js`);
+        }}
+    }}
 
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error(`Failed to load script: ${{src}}`));
+    document.addEventListener("DOMContentLoaded", async () => {{
+        try {{
+            await loadPrismLanguage("{lang}");
 
-        document.head.appendChild(script);
+            if (window.Prism) {{
+                Prism.highlightAll();
+            }}
+        }} catch (error) {{
+            console.error("Prism failed:", error);
+        }}
     }});
-}}
-
-async function loadPrismLanguage(lang) {{
-    const base = "/static/assets/prismjs/components";
-
-    await loadScript(`${{base}}/prism-core.min.js`);
-
-    if (lang === "csharp" || lang === "javascript" || lang === "java" || lang === "c" || lang === "cpp") {{
-        await loadScript(`${{base}}/prism-clike.min.js`);
-    }}
-
-    if (lang && lang !== "none") {{
-        await loadScript(`${{base}}/prism-${{lang}}.min.js`);
-    }}
-}}
-
-document.addEventListener("DOMContentLoaded", async () => {{
-    try {{
-        await loadPrismLanguage("{lang}");
-
-        if (window.Prism) {{
-            Prism.highlightAll();
-        }}
-    }} catch (error) {{
-        console.error("Prism failed:", error);
-    }}
-}});
 
 </script>
 </div>"""

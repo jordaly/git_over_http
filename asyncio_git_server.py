@@ -19,6 +19,8 @@ from pathlib import Path
 from string.templatelib import Interpolation, Template
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -1007,7 +1009,18 @@ button:hover{{opacity:.92}}
 .danger:hover{{opacity:.92}}
 .warn{{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;padding:10px;border-radius:12px}}
 .ok{{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;padding:10px;border-radius:12px}}
-</style></head><body>{body}</body></html>"""
+</style>
+<link rel="stylesheet" href="/static/assets/prismjs/prism-okaidia.min.css" />
+</head>
+<body>
+
+{body}
+
+<script src="/static/assets/prismjs/prism.js"></script>
+<div id="load_scripts"></div>
+
+</body>
+</html>"""
     )
     return rendered.encode("utf-8")
 
@@ -2342,9 +2355,90 @@ class GitHTTPHandler:
         if "/" in filepath:
             folder = "/".join(filepath.split("/")[:-1])
             back = str_t(t"{base}/tree/{q(ref)}/{q(folder, safe='/')}/")
+        lang = PRISM_LANGUAGE_BY_EXTENSION.get("." + filepath.split(".")[-1], "")
         body = html_t(
             t"""<p><a class="pill" href="{back}">⬅ Back</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></p>
-<h1 style="margin-top:10px"><code>{filepath}</code></h1><div class="box"><pre>{text}</pre></div>"""
+<h1 style="margin-top:10px"><code>{filepath}</code>
+</h1><div class="box"><pre><code class="language-{lang}">{text}</code></pre>
+<script>
+    //function loadScript(src) {{
+    //    return new Promise((resolve, reject) => {{
+    //        // Avoid loading it twice
+    //        if (document.querySelector(`script[src="${{src}}"]`)) {{
+    //            resolve();
+    //            return;
+    //        }}
+
+    //        const script = document.createElement("script");
+    //        script.src = src;
+    //        script.async = false;
+
+    //        script.onload = () => {{
+    //            resolve();
+    //        }};
+
+    //        script.onerror = () => {{
+    //            reject(new Error(`Failed to load script: ${{src}}`));
+    //        }};
+
+    //        document.head.appendChild(script);
+    //    }});
+    //}}
+
+    //document.addEventListener("load", async () => {{
+    //    await loadScript("/static/assets/prismjs/components/prism-{lang}.min.js")
+    //    window.Prism.highlightAll();
+    //}});
+
+window.Prism = window.Prism || {{}};
+window.Prism.manual = true;
+
+function loadScript(src) {{
+    return new Promise((resolve, reject) => {{
+        if (document.querySelector(`script[src="${{src}}"]`)) {{
+            resolve();
+            return;
+        }}
+
+        const script = document.createElement("script");
+        script.src = src;
+        script.async = false;
+
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error(`Failed to load script: ${{src}}`));
+
+        document.head.appendChild(script);
+    }});
+}}
+
+async function loadPrismLanguage(lang) {{
+    const base = "/static/assets/prismjs/components";
+
+    await loadScript(`${{base}}/prism-core.min.js`);
+
+    if (lang === "csharp" || lang === "javascript" || lang === "java" || lang === "c" || lang === "cpp") {{
+        await loadScript(`${{base}}/prism-clike.min.js`);
+    }}
+
+    if (lang && lang !== "none") {{
+        await loadScript(`${{base}}/prism-${{lang}}.min.js`);
+    }}
+}}
+
+document.addEventListener("DOMContentLoaded", async () => {{
+    try {{
+        await loadPrismLanguage("{lang}");
+
+        if (window.Prism) {{
+            Prism.highlightAll();
+        }}
+    }} catch (error) {{
+        console.error("Prism failed:", error);
+    }}
+}});
+
+</script>
+</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{filepath} · {owner}/{repo}"), safe_html(body)))
 

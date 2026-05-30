@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import html
 import ipaddress
+import mimetypes
 import os
 import platform
 import re
@@ -13,6 +14,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from email.utils import formatdate
 from pathlib import Path
 from string.templatelib import Interpolation, Template
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -64,6 +66,16 @@ SESSION_COOKIE_NAME = "pygithost_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 SESSION_COOKIE_SECURE = False  # Set True when this server is served over HTTPS.
 LOGIN_PATH = "/login"
+
+# Static files. Put files in ./static and access them with /static/filename.ext.
+# Examples:
+#   ./static/css/site.css -> http://HOST:8000/static/css/site.css
+#   ./static/js/app.js    -> http://HOST:8000/static/js/app.js
+#   ./static/index.html   -> http://HOST:8000/static/index.html
+STATIC_URL_PREFIX = "/static"
+STATIC_ROOT = str(Path(__file__).resolve().parent / "static")
+STATIC_CACHE_SECONDS = 60 * 60
+STATIC_REQUIRES_AUTH = False  # Keep False so CSS/JS can load on /login.
 
 # ============================================================
 # t-string rendering helpers
@@ -1229,6 +1241,90 @@ def _safe_next_url(raw: str | None) -> str:
     return value or "/"
 
 
+def _is_static_request_path(path: str) -> bool:
+    return path == STATIC_URL_PREFIX or path.startswith(STATIC_URL_PREFIX + "/")
+
+
+def _static_root() -> Path:
+    return Path(STATIC_ROOT).resolve()
+
+
+def _static_path_from_url(path: str) -> Path | None:
+    """Map /static/... to STATIC_ROOT safely. Prevents path traversal."""
+    if not _is_static_request_path(path):
+        return None
+
+    rel_url = path[len(STATIC_URL_PREFIX) :].lstrip("/")
+    rel_url = unquote(rel_url)
+
+    if "\0" in rel_url or "\\" in rel_url:
+        return None
+
+    root = _static_root()
+    candidate = (root / rel_url).resolve()
+
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+
+    # Do not expose dotfiles or files inside hidden folders, for example .env.
+    try:
+        relative_parts = candidate.relative_to(root).parts
+    except ValueError:
+        return None
+    if any(part.startswith(".") for part in relative_parts):
+        return None
+
+    if candidate.is_dir():
+        for index_name in ("index.html", "index.htm"):
+            index_path = candidate / index_name
+            if index_path.is_file():
+                return index_path.resolve()
+        return None
+
+    if not candidate.is_file():
+        return None
+
+    return candidate
+
+
+def _static_content_type(path: Path) -> str:
+    content_type, _encoding = mimetypes.guess_type(str(path))
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    lower_type = content_type.lower()
+    text_like = (
+        lower_type.startswith("text/")
+        or lower_type in {
+            "application/javascript",
+            "application/json",
+            "application/xml",
+            "image/svg+xml",
+        }
+    )
+    if text_like and "charset=" not in lower_type:
+        content_type += "; charset=utf-8"
+    return content_type
+
+
+def _static_cache_control(path: Path) -> str:
+    if path.suffix.lower() in {".html", ".htm"}:
+        return "no-cache"
+    return str_t(t"public, max-age={STATIC_CACHE_SECONDS}")
+
+
+def _static_headers(path: Path) -> list[tuple[str, str]]:
+    stat = path.stat()
+    return [
+        ("Content-Type", _static_content_type(path)),
+        ("Cache-Control", _static_cache_control(path)),
+        ("Last-Modified", formatdate(stat.st_mtime, usegmt=True)),
+        ("X-Content-Type-Options", "nosniff"),
+    ]
+
+
 # ============================================================
 # SERVER HANDLER
 # ============================================================
@@ -1401,6 +1497,31 @@ class GitHTTPHandler:
 
     async def _not_found(self):
         await _send_text(self.request, 404, "404 Not Found\n")
+
+    async def _serve_static(self, include_body: bool = True):
+        parsed = urlparse(self.path)
+        static_path = _static_path_from_url(parsed.path)
+        if static_path is None:
+            return await self._not_found()
+
+        try:
+            if include_body:
+                body = await asyncio.to_thread(static_path.read_bytes)
+            else:
+                body = b""
+                # Keep Content-Length correct for HEAD requests.
+                size = static_path.stat().st_size
+                headers = _static_headers(static_path)
+                headers.append(("Content-Length", str(size)))
+                return await _send_response(self.request, 200, body, headers, include_body=False)
+        except PermissionError:
+            return await self._forbidden(b"403 Forbidden: static file is not readable.\n")
+        except FileNotFoundError:
+            return await self._not_found()
+        except OSError as e:
+            return await _send_text(self.request, 500, str_t(t"500 Static file error: {e}\n"))
+
+        return await _send_response(self.request, 200, body, _static_headers(static_path), include_body=include_body)
 
     async def _read_form_urlencoded(self) -> dict[str, str]:
         clen = int(self.headers.get("Content-Length") or 0)
@@ -2380,6 +2501,11 @@ class GitHTTPHandler:
         parsed = urlparse(self.path)
         p = parsed.path
 
+        if _is_static_request_path(p):
+            if STATIC_REQUIRES_AUTH and not await self._require_session_auth():
+                return
+            return await self._serve_static()
+
         if p == LOGIN_PATH:
             cookies = _parse_cookie_header(self.headers.get("Cookie"))
             info = await asyncio.to_thread(db_verify_session, cookies.get(SESSION_COOKIE_NAME))
@@ -2482,14 +2608,26 @@ class GitHTTPHandler:
             return await self._ui_branch_delete(m.group(1), m.group(2))
         return await self._not_found()
 
+    async def do_HEAD(self):
+        ip = self._client_ip()
+        if not _ip_allowed(ip, self._allowlist()):
+            return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
+
+        parsed = urlparse(self.path)
+        if _is_static_request_path(parsed.path):
+            if STATIC_REQUIRES_AUTH and not await self._require_session_auth():
+                return
+            return await self._serve_static(include_body=False)
+
+        return await _send_text(self.request, 400, "HEAD is only implemented for static files.\n")
+
     async def dispatch(self):
         if self.command == "GET":
             return await self.do_GET()
         if self.command == "POST":
             return await self.do_POST()
         if self.command == "HEAD":
-            # Keep it simple: return headers with a small body length for unsupported HEAD routes.
-            return await _send_text(self.request, 400, "HEAD is not implemented for this server.\n")
+            return await self.do_HEAD()
         return await _send_text(self.request, 400, "Unsupported method.\n")
 
 
@@ -2535,6 +2673,7 @@ async def main_async() -> None:
 
     await asyncio.to_thread(_db_init)
     await asyncio.to_thread(db_ensure_default_admin)
+    await asyncio.to_thread(os.makedirs, STATIC_ROOT, exist_ok=True)
 
     os.environ["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
     os.environ["GIT_HTTP_EXPORT_ALL"] = "1"
@@ -2548,6 +2687,7 @@ async def main_async() -> None:
     print(str_t(t"UI: http://localhost:{PORT}/"))
     print(str_t(t"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}"))
     print(str_t(t"DB: {DB_PATH}"))
+    print(str_t(t"Static files: {STATIC_ROOT} -> {STATIC_URL_PREFIX}/"))
     print("Web UI auth: /login uses username/password + secure HttpOnly session cookie")
     print("Git auth: accepts username:password, username:token, or token:TOKEN_VALUE")
     print("Admin users page: /admin/users")

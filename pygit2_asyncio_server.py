@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from string.templatelib import Interpolation, Template
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -58,6 +58,12 @@ FLAT_OWNER_UI = "root"
 PR_PATCH_MAX_BYTES = 800_000
 MAX_HEADER_BYTES = 64 * 1024
 READ_CHUNK = 64 * 1024
+
+# Web UI sessions. Git clients still use Basic Auth with password/token.
+SESSION_COOKIE_NAME = "pygithost_session"
+SESSION_TTL_SECONDS = 12 * 60 * 60
+SESSION_COOKIE_SECURE = False  # Set True when this server is served over HTTPS.
+LOGIN_PATH = "/login"
 
 # ============================================================
 # t-string rendering helpers
@@ -213,6 +219,25 @@ def _db_init() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_status ON tokens(user_id, is_active, expires_at, revoked_at)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                session_hash BLOB NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                expires_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                revoked_at TEXT,
+                ip TEXT,
+                user_agent TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_hash ON sessions(session_hash)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at, revoked_at)")
+        conn.execute("DELETE FROM sessions WHERE expires_at <= datetime('now', 'localtime')")
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS pull_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner TEXT NOT NULL,
@@ -337,6 +362,78 @@ def db_verify_password(username: str, password: str):
             "scopes": {"read", "write"},
         }
     return None
+
+
+def db_create_session(user_id: int, ip: str = "", user_agent: str = "") -> str:
+    token = secrets.token_urlsafe(48)
+    session_hash = _token_hash(token)
+    expires_at = (datetime.now() + timedelta(seconds=SESSION_TTL_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO sessions(user_id, session_hash, expires_at, ip, user_agent)
+            VALUES(?,?,?,?,?)
+            """,
+            (int(user_id), session_hash, expires_at, ip[:80], user_agent[:300]),
+        )
+    finally:
+        conn.close()
+    return token
+
+
+def db_verify_session(session_token: str | None):
+    if not session_token:
+        return None
+    session_hash = _token_hash(session_token)
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            """
+            SELECT s.id, u.id, u.username, u.is_admin, u.is_active, s.expires_at, s.revoked_at
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.session_hash=?
+            LIMIT 1
+            """,
+            (session_hash,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        session_id, uid, uname, is_admin, is_active, expires_at, revoked_at = row
+        if not is_active or revoked_at or _token_is_expired(expires_at):
+            return None
+        conn.execute(
+            "UPDATE sessions SET last_seen_at=datetime('now', 'localtime') WHERE id=?",
+            (int(session_id),),
+        )
+        return {
+            "user_id": uid,
+            "username": uname,
+            "is_admin": bool(is_admin),
+            "scopes": {"read", "write"},
+        }
+    finally:
+        conn.close()
+
+
+def db_revoke_session(session_token: str | None) -> None:
+    if not session_token:
+        return
+    session_hash = _token_hash(session_token)
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET revoked_at=COALESCE(revoked_at, datetime('now', 'localtime'))
+            WHERE session_hash=?
+            """,
+            (session_hash,),
+        )
+    finally:
+        conn.close()
 
 
 def _normalize_token_expires_at(raw: str | None) -> str | None:
@@ -548,8 +645,10 @@ def db_ensure_default_admin() -> None:
         conn.close()
 
     if count == 0:
-        print("[DB] No users found. Creating default admin user: admin / admin")
-        db_create_user("admin", "admin", is_admin=True)
+        default_password = os.environ.get("PYGITHOST_DEFAULT_ADMIN_PASSWORD") or secrets.token_urlsafe(18)
+        print("[DB] No users found. Creating default admin user: admin")
+        print(str_t(t"[DB] Default admin password (save it now): {default_password}"))
+        db_create_user("admin", default_password, is_admin=True)
         u = db_get_user_by_username("admin")
         if u:
             token = db_create_token(u[0], "default", scopes="read,write,admin")
@@ -1071,8 +1170,63 @@ async def _send_text(req: Request, status: int, text: str) -> None:
     await _send_response(req, status, text.encode("utf-8", "replace"), [("Content-Type", "text/plain; charset=utf-8")])
 
 
-async def _send_redirect(req: Request, location: str) -> None:
-    await _send_response(req, 303, b"", [("Location", location)])
+async def _send_redirect(req: Request, location: str, headers: list[tuple[str, str]] | None = None) -> None:
+    response_headers = [("Location", location)]
+    if headers:
+        response_headers.extend(headers)
+    await _send_response(req, 303, b"", response_headers)
+
+
+def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    if not cookie_header:
+        return cookies
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def _session_cookie_header(session_token: str) -> str:
+    parts = [
+        str_t(t"{SESSION_COOKIE_NAME}={session_token}"),
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        str_t(t"Max-Age={SESSION_TTL_SECONDS}"),
+    ]
+    if SESSION_COOKIE_SECURE:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def _delete_session_cookie_header() -> str:
+    parts = [
+        str_t(t"{SESSION_COOKIE_NAME}="),
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        "Max-Age=0",
+    ]
+    if SESSION_COOKIE_SECURE:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def _safe_next_url(raw: str | None) -> str:
+    value = (raw or "/").strip()
+    if not value.startswith("/") or value.startswith("//"):
+        return "/"
+    if "\r" in value or "\n" in value:
+        return "/"
+    if value.startswith(URL_PREFIX + "/"):
+        return "/"
+    return value or "/"
 
 
 # ============================================================
@@ -1128,14 +1282,7 @@ class GitHTTPHandler:
             info = await asyncio.to_thread(db_verify_password, username, secret)
 
         if info:
-            self.remote_user = info["username"]
-            self.remote_user_id = int(info["user_id"])
-            self.remote_is_admin = bool(info.get("is_admin"))
-            self.remote_scopes = set(info.get("scopes", {"read"}))
-            self.request.remote_user = self.remote_user
-            self.request.remote_user_id = self.remote_user_id
-            self.request.remote_is_admin = self.remote_is_admin
-            self.request.remote_scopes = self.remote_scopes
+            self._apply_auth_info(info)
             return True
 
         return await self._request_auth()
@@ -1153,6 +1300,101 @@ class GitHTTPHandler:
             reason="Unauthorized",
         )
         return False
+
+    def _apply_auth_info(self, info: dict[str, object]) -> None:
+        self.remote_user = str(info["username"])
+        self.remote_user_id = int(info["user_id"])
+        self.remote_is_admin = bool(info.get("is_admin"))
+        self.remote_scopes = set(info.get("scopes", {"read"}))
+        self.request.remote_user = self.remote_user
+        self.request.remote_user_id = self.remote_user_id
+        self.request.remote_is_admin = self.remote_is_admin
+        self.request.remote_scopes = self.remote_scopes
+
+    async def _require_session_auth(self) -> bool:
+        if not REQUIRE_AUTH:
+            return True
+
+        cookies = _parse_cookie_header(self.headers.get("Cookie"))
+        session_token = cookies.get(SESSION_COOKIE_NAME)
+        info = await asyncio.to_thread(db_verify_session, session_token)
+        if info:
+            self._apply_auth_info(info)
+            return True
+
+        next_url = _safe_next_url(self.request.target)
+        await _send_redirect(self.request, str_t(t"{LOGIN_PATH}?next={q(next_url)}"))
+        return False
+
+    async def _ui_login(self, notice: str = "", notice_kind: str = "warn"):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query or "")
+        next_url = _safe_next_url((qs.get("next") or ["/"])[0])
+        if not notice and (qs.get("loggedout") or [""])[0] == "1":
+            notice = "You have been logged out."
+            notice_kind = "ok"
+
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+
+        body = html_t(
+            t"""<div style="max-width:440px;margin:80px auto">
+<div class="box">
+<h1 style="margin:0 0 6px 0">Sign in</h1>
+<p class="muted" style="margin-top:0">Use your server username and password to manage repositories, branches, PRs, and tokens.</p>
+{notice_html}
+<form method="POST" action="/login">
+<input type="hidden" name="next" value="{next_url}" />
+<div style="margin-bottom:10px"><label>Username</label><input name="username" autocomplete="username" autofocus required style="width:100%;box-sizing:border-box" /></div>
+<div style="margin-bottom:14px"><label>Password</label><input name="password" type="password" autocomplete="current-password" required style="width:100%;box-sizing:border-box" /></div>
+<button type="submit" style="width:100%">Sign in</button>
+</form>
+<p class="muted" style="font-size:12px;margin-bottom:0">Git clients should continue to use <code>username:token</code> or <code>token:TOKEN_VALUE</code> against <code>{URL_PREFIX}</code>.</p>
+</div>
+</div>"""
+        )
+        await _send_html(self.request, 200, _html_page("Sign in", safe_html(body)))
+
+    async def _ui_do_login(self):
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if "application/x-www-form-urlencoded" not in ctype:
+            return await _send_text(self.request, 415, "Unsupported Media Type\n")
+
+        form = await self._read_form_urlencoded()
+        username = (form.get("username") or "").strip()
+        password = form.get("password") or ""
+        next_url = _safe_next_url(form.get("next") or "/")
+
+        if not _safe_seg(username):
+            return await self._ui_login("Invalid username or password.", "warn")
+
+        info = await asyncio.to_thread(db_verify_password, username, password)
+        if not info:
+            return await self._ui_login("Invalid username or password.", "warn")
+
+        session_token = await asyncio.to_thread(
+            db_create_session,
+            int(info["user_id"]),
+            self._client_ip(),
+            self.headers.get("User-Agent") or "",
+        )
+        self._apply_auth_info(info)
+        await _send_redirect(
+            self.request,
+            next_url,
+            [("Set-Cookie", _session_cookie_header(session_token))],
+        )
+
+    async def _ui_logout(self):
+        cookies = _parse_cookie_header(self.headers.get("Cookie"))
+        await asyncio.to_thread(db_revoke_session, cookies.get(SESSION_COOKIE_NAME))
+        await _send_redirect(
+            self.request,
+            str_t(t"{LOGIN_PATH}?loggedout=1"),
+            [("Set-Cookie", _delete_session_cookie_header())],
+        )
 
     async def _forbidden(self, msg: bytes = b"403 Forbidden\n"):
         await _send_text(self.request, 403, msg.decode("utf-8", "replace"))
@@ -2134,29 +2376,31 @@ class GitHTTPHandler:
         ip = self._client_ip()
         if not _ip_allowed(ip, self._allowlist()):
             return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
-        if not await self._require_auth():
-            return
-        if self.path.startswith(URL_PREFIX + "/"):
-            return await self._handle_git()
 
         parsed = urlparse(self.path)
         p = parsed.path
+
+        if p == LOGIN_PATH:
+            cookies = _parse_cookie_header(self.headers.get("Cookie"))
+            info = await asyncio.to_thread(db_verify_session, cookies.get(SESSION_COOKIE_NAME))
+            if info:
+                return await _send_redirect(self.request, "/")
+            return await self._ui_login()
+        if p == "/logout":
+            return await self._ui_logout()
+
+        if self.path.startswith(URL_PREFIX + "/"):
+            if not await self._require_auth():
+                return
+            return await self._handle_git()
+
+        if not await self._require_session_auth():
+            return
+
         if p == "/":
             return await self._ui_home()
         if p == "/tokens":
             return await self._ui_tokens()
-        if p == "/logout":
-            await _send_response(
-                self.request,
-                401,
-                b"Logged out",
-                [
-                    ("WWW-Authenticate", str_t(t'Basic realm="{REALM}"')),
-                    ("Content-Type", "text/plain; charset=utf-8"),
-                ],
-                reason="Unauthorized",
-            )
-            return
         if p == "/admin/users":
             return await self._ui_admin_users()
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
@@ -2193,12 +2437,19 @@ class GitHTTPHandler:
         ip = self._client_ip()
         if not _ip_allowed(ip, self._allowlist()):
             return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
-        if not await self._require_auth():
-            return
-        if self.path.startswith(URL_PREFIX + "/"):
-            return await self._handle_git()
 
         parsed = urlparse(self.path)
+        if parsed.path == LOGIN_PATH:
+            return await self._ui_do_login()
+
+        if self.path.startswith(URL_PREFIX + "/"):
+            if not await self._require_auth():
+                return
+            return await self._handle_git()
+
+        if not await self._require_session_auth():
+            return
+
         ctype = (self.headers.get("Content-Type") or "").lower()
         if "application/x-www-form-urlencoded" not in ctype:
             return await _send_text(self.request, 415, "Unsupported Media Type\n")
@@ -2297,7 +2548,8 @@ async def main_async() -> None:
     print(str_t(t"UI: http://localhost:{PORT}/"))
     print(str_t(t"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}"))
     print(str_t(t"DB: {DB_PATH}"))
-    print("Auth: accepts either username:password OR username:token")
+    print("Web UI auth: /login uses username/password + secure HttpOnly session cookie")
+    print("Git auth: accepts username:password, username:token, or token:TOKEN_VALUE")
     print("Admin users page: /admin/users")
     print("Tokens page: /tokens")
     print("Pull requests: /r/<owner>/<repo>/pulls (ff-only merge)")

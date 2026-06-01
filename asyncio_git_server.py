@@ -834,15 +834,21 @@ def _is_git_dir(p: Path) -> bool:
     """
     Return True for a real Git directory.
 
-    This supports both:
-      - bare repo folders, for example: repo.git/
-      - normal repo Git dirs, for example: repo/.git/
+    This supports:
+      - bare repo folders with .git suffix: repo.git/
+      - bare repo folders without .git suffix: repo/
+      - normal repo Git dirs: repo/.git/
     """
-    return p.is_dir() and (p / "HEAD").is_file()
+    return (
+        p.is_dir()
+        and (p / "HEAD").is_file()
+        and (p / "objects").is_dir()
+        and ((p / "refs").is_dir() or (p / "packed-refs").is_file())
+    )
 
 
 def _is_bare_repo_dir(p: Path) -> bool:
-    """Return True for a bare repository directory, for example repo.git/."""
+    """Return True for a bare repository directory, with or without a .git suffix."""
     return _is_git_dir(p)
 
 
@@ -851,15 +857,30 @@ def _is_worktree_repo_dir(p: Path) -> bool:
     return p.is_dir() and _is_git_dir(p / ".git")
 
 
+def _repo_name_from_git_dir_name(folder_name: str) -> str:
+    """
+    Convert a Git directory folder name to the public repo name.
+
+    Examples:
+      repo.git -> repo
+      repo     -> repo
+    """
+    if folder_name.endswith(".git"):
+        return folder_name[:-4]
+    return folder_name
+
+
 def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
     """
     Scan GIT_PROJECT_ROOT and return repositories for the web UI.
 
     Supported layouts:
-      Flat bare:      GIT_PROJECT_ROOT/repo.git
-      Flat non-bare:  GIT_PROJECT_ROOT/repo/.git
-      Owner bare:     GIT_PROJECT_ROOT/owner/repo.git
-      Owner non-bare: GIT_PROJECT_ROOT/owner/repo/.git
+      Flat bare with suffix:       GIT_PROJECT_ROOT/repo.git
+      Flat bare without suffix:    GIT_PROJECT_ROOT/repo
+      Flat non-bare:               GIT_PROJECT_ROOT/repo/.git
+      Owner bare with suffix:      GIT_PROJECT_ROOT/owner/repo.git
+      Owner bare without suffix:   GIT_PROJECT_ROOT/owner/repo
+      Owner non-bare:              GIT_PROJECT_ROOT/owner/repo/.git
     """
     root = Path(project_root)
     results: list[tuple[str, str, str]] = []
@@ -867,55 +888,57 @@ def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
     if not root.exists():
         return results
 
-    # Flat bare repos: GIT_PROJECT_ROOT/repo.git
-    for p in sorted(root.glob("*.git")):
+    root_dirs = sorted([x for x in root.iterdir() if x.is_dir()], key=lambda x: x.name.lower())
+
+    # Flat repos directly under GIT_PROJECT_ROOT.
+    for p in root_dirs:
         if p.name == ".git":
             continue
 
         if _is_bare_repo_dir(p):
-            repo = p.name[:-4]
+            repo = _repo_name_from_git_dir_name(p.name)
             if _safe_seg(repo):
                 results.append((FLAT_OWNER_UI, repo, p.name))
+            continue
 
-    # Flat normal repos: GIT_PROJECT_ROOT/repo/.git
-    for p in sorted([x for x in root.iterdir() if x.is_dir()]):
         if _is_worktree_repo_dir(p):
             repo = p.name
             if _safe_seg(repo):
                 results.append((FLAT_OWNER_UI, repo, str_t(t"{repo}/.git")))
-
-    # Owner layouts:
-    #   GIT_PROJECT_ROOT/owner/repo.git
-    #   GIT_PROJECT_ROOT/owner/repo/.git
-    for owner_dir in sorted([x for x in root.iterdir() if x.is_dir()]):
-        # If this folder itself is a normal repo, do not also treat it as an owner.
-        if _is_worktree_repo_dir(owner_dir):
             continue
 
-        # If this folder itself is a bare repo, do not treat it as an owner.
-        if _is_bare_repo_dir(owner_dir):
+    # Owner layouts under GIT_PROJECT_ROOT/owner/.
+    for owner_dir in root_dirs:
+        # If this folder itself is a repo, do not also treat it as an owner.
+        if _is_bare_repo_dir(owner_dir) or _is_worktree_repo_dir(owner_dir):
             continue
 
         owner = owner_dir.name
         if not _safe_seg(owner):
             continue
 
-        for p in sorted(owner_dir.glob("*.git")):
+        try:
+            repo_dirs = sorted([x for x in owner_dir.iterdir() if x.is_dir()], key=lambda x: x.name.lower())
+        except OSError:
+            continue
+
+        for p in repo_dirs:
             if p.name == ".git":
                 continue
 
             if _is_bare_repo_dir(p):
-                repo = p.name[:-4]
+                repo = _repo_name_from_git_dir_name(p.name)
                 if _safe_seg(repo):
                     rel = str_t(t"{owner}/{p.name}")
                     results.append((owner, repo, rel))
+                continue
 
-        for p in sorted([x for x in owner_dir.iterdir() if x.is_dir()]):
             if _is_worktree_repo_dir(p):
                 repo = p.name
                 if _safe_seg(repo):
                     rel = str_t(t"{owner}/{repo}/.git")
                     results.append((owner, repo, rel))
+                continue
 
     seen = set()
     uniq = []
@@ -934,12 +957,14 @@ def _repo_git_path(owner_ui: str, repo: str) -> str:
     Resolve the real Git directory for a repository.
 
     Supported layouts:
-      Flat bare:      GIT_PROJECT_ROOT/repo.git
-      Flat non-bare:  GIT_PROJECT_ROOT/repo/.git
-      Owner bare:     GIT_PROJECT_ROOT/owner/repo.git
-      Owner non-bare: GIT_PROJECT_ROOT/owner/repo/.git
+      Flat bare with suffix:       GIT_PROJECT_ROOT/repo.git
+      Flat bare without suffix:    GIT_PROJECT_ROOT/repo
+      Flat non-bare:               GIT_PROJECT_ROOT/repo/.git
+      Owner bare with suffix:      GIT_PROJECT_ROOT/owner/repo.git
+      Owner bare without suffix:   GIT_PROJECT_ROOT/owner/repo
+      Owner non-bare:              GIT_PROJECT_ROOT/owner/repo/.git
 
-    If neither repo exists, return the bare path. This keeps create-repo
+    If neither repo exists, return the .git bare path. This keeps create-repo
     working exactly like before, because new repos are still created as bare repos.
     """
     if owner_ui == FLAT_OWNER_UI:
@@ -947,42 +972,76 @@ def _repo_git_path(owner_ui: str, repo: str) -> str:
     else:
         base = Path(GIT_PROJECT_ROOT) / owner_ui
 
-    bare = base / (repo + ".git")
+    exact_bare = base / repo
+    bare_dotgit = base / (repo + ".git")
     worktree_git = base / repo / ".git"
 
-    if _is_bare_repo_dir(bare):
-        return str(bare)
+    # Prefer an exact bare repo folder first. This supports bare repos that do
+    # not end in .git, for example C:\\Servidor_Git\\ProjectA.
+    if _is_bare_repo_dir(exact_bare):
+        return str(exact_bare)
+
+    if _is_bare_repo_dir(bare_dotgit):
+        return str(bare_dotgit)
 
     if _is_git_dir(worktree_git):
         return str(worktree_git)
 
-    return str(bare)
+    return str(bare_dotgit)
 
 
 def _repo_bare_path(owner_ui: str, repo: str) -> str:
     """
     Backward-compatible name used by the rest of the code.
 
-    It now returns the real Git directory, which can be either:
-      - repo.git for a bare repo
+    It now returns the real Git directory, which can be:
+      - repo.git for a bare repo with the .git suffix
+      - repo for a bare repo without the .git suffix
       - repo/.git for a normal/non-bare repo
     """
     return _repo_git_path(owner_ui, repo)
+
+
+def _git_dir_path_info(owner_ui: str, repo: str, rest: list[str]) -> str | None:
+    """
+    Build the PATH_INFO git-http-backend needs for the resolved repository.
+
+    Returns None when the requested repo does not exist.
+    """
+    repo_git = Path(_repo_git_path(owner_ui, repo))
+
+    if not _is_git_dir(repo_git):
+        return None
+
+    if owner_ui == FLAT_OWNER_UI:
+        base = Path(GIT_PROJECT_ROOT)
+        try:
+            rel_parts = repo_git.relative_to(base).parts
+        except ValueError:
+            return None
+    else:
+        base = Path(GIT_PROJECT_ROOT)
+        try:
+            rel_parts = repo_git.relative_to(base).parts
+        except ValueError:
+            return None
+
+    path_parts = [*rel_parts, *rest]
+    return "/" + "/".join(path_parts)
 
 
 def _map_git_http_path_info(path_info: str) -> str:
     """
     Convert public Git smart HTTP URLs to the real on-disk Git directory.
 
-    Clients can keep using URLs like:
-      /git/repo.git
-      /git/owner/repo.git
+    Supported public URLs include:
+      /repo.git/...
+      /repo/...
+      /owner/repo.git/...
+      /owner/repo/...
 
-    If the repo is non-bare, the PATH_INFO sent to git-http-backend becomes:
-      /repo/.git/...
-      /owner/repo/.git/...
-
-    Bare repositories are left unchanged.
+    For bare repos without .git, /repo.git/... is mapped to /repo/...
+    For non-bare repos, /repo.git/... or /repo/... is mapped to /repo/.git/...
     """
     clean = path_info.lstrip("/")
     parts = clean.split("/") if clean else []
@@ -990,35 +1049,40 @@ def _map_git_http_path_info(path_info: str) -> str:
     if not parts:
         return path_info
 
-    # Flat URL: /repo.git/info/refs
-    if len(parts) >= 1 and parts[0].endswith(".git"):
+    # Flat URL with .git suffix: /repo.git/info/refs
+    if parts[0].endswith(".git"):
         repo = parts[0][:-4]
-
         if _safe_seg(repo):
-            actual_git = Path(_repo_git_path(FLAT_OWNER_UI, repo))
-            expected_worktree_git = Path(GIT_PROJECT_ROOT) / repo / ".git"
+            mapped = _git_dir_path_info(FLAT_OWNER_UI, repo, parts[1:])
+            if mapped:
+                return mapped
 
-            if actual_git == expected_worktree_git and _is_git_dir(expected_worktree_git):
-                parts[0] = repo
-                parts.insert(1, ".git")
-                return "/" + "/".join(parts)
-
-    # Owner URL: /owner/repo.git/info/refs
+    # Owner URL with .git suffix: /owner/repo.git/info/refs
     if len(parts) >= 2 and parts[1].endswith(".git"):
         owner = parts[0]
         repo = parts[1][:-4]
-
         if _safe_seg(owner) and _safe_seg(repo):
-            actual_git = Path(_repo_git_path(owner, repo))
-            expected_worktree_git = Path(GIT_PROJECT_ROOT) / owner / repo / ".git"
+            mapped = _git_dir_path_info(owner, repo, parts[2:])
+            if mapped:
+                return mapped
 
-            if actual_git == expected_worktree_git and _is_git_dir(expected_worktree_git):
-                parts[1] = repo
-                parts.insert(2, ".git")
-                return "/" + "/".join(parts)
+    # Flat URL without .git suffix: /repo/info/refs
+    repo = parts[0]
+    if _safe_seg(repo):
+        mapped = _git_dir_path_info(FLAT_OWNER_UI, repo, parts[1:])
+        if mapped:
+            return mapped
+
+    # Owner URL without .git suffix: /owner/repo/info/refs
+    if len(parts) >= 2:
+        owner = parts[0]
+        repo = parts[1]
+        if _safe_seg(owner) and _safe_seg(repo):
+            mapped = _git_dir_path_info(owner, repo, parts[2:])
+            if mapped:
+                return mapped
 
     return path_info
-
 
 async def _run_cmd(cmd: list[str], cwd: str | None = None) -> tuple[int, bytes, bytes]:
     proc = await asyncio.create_subprocess_exec(

@@ -125,6 +125,27 @@ def q(value: str, safe: str = "") -> str:
     return quote(value, safe=safe)
 
 
+TREE_FOLDER_ICON = safe_html(
+    """<span class="tree-icon folder" aria-hidden="true">
+<svg viewBox="0 0 24 24" focusable="false">
+<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4.2l2 2.2h6.8A2.5 2.5 0 0 1 21 9.7v7.8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-10Z"></path>
+<path d="M3.2 9h17.6"></path>
+</svg>
+</span>"""
+)
+
+TREE_FILE_ICON = safe_html(
+    """<span class="tree-icon file" aria-hidden="true">
+<svg viewBox="0 0 24 24" focusable="false">
+<path d="M6 3.5h8l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 20V3.5Z"></path>
+<path d="M14 3.5v4h4"></path>
+<path d="M8.5 12h7"></path>
+<path d="M8.5 15.5h7"></path>
+</svg>
+</span>"""
+)
+
+
 def _clean_repo_path(value: str | None) -> str:
     """
     Normalize a path inside a Git tree.
@@ -1243,13 +1264,10 @@ button:hover{{opacity:.92}}
 .warn{{background:var(--warn-bg);border:1px solid var(--warn-border);color:var(--warn-fg);padding:10px;border-radius:12px}}
 .ok{{background:var(--ok-bg);border:1px solid var(--ok-border);color:var(--ok-fg);padding:10px;border-radius:12px}}
 .theme-toggle{{position:fixed;right:18px;bottom:18px;z-index:9999;border-radius:999px;box-shadow:0 10px 30px rgba(0,0,0,.18)}}
-.tree-icon{{display:inline-block;width:20px;height:18px;position:relative;vertical-align:-4px}}
+.tree-icon{{display:inline-flex;width:22px;height:22px;align-items:center;justify-content:center;vertical-align:-6px;color:var(--muted)}}
+.tree-icon svg{{display:block;width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
 .tree-icon.folder{{color:#d97706}}
-.tree-icon.folder::before{{content:"";position:absolute;left:1px;top:6px;width:18px;height:11px;border:1.5px solid currentColor;border-radius:3px;background:rgba(217,119,6,.12)}}
-.tree-icon.folder::after{{content:"";position:absolute;left:2px;top:2px;width:9px;height:6px;border:1.5px solid currentColor;border-bottom:0;border-radius:3px 3px 0 0;background:rgba(217,119,6,.12)}}
 .tree-icon.file{{color:var(--muted)}}
-.tree-icon.file::before{{content:"";position:absolute;left:4px;top:1px;width:12px;height:16px;border:1.5px solid currentColor;border-radius:3px;background:transparent}}
-.tree-icon.file::after{{content:"";position:absolute;right:3px;top:1px;width:5px;height:5px;border-left:1.5px solid currentColor;border-bottom:1.5px solid currentColor;background:var(--box)}}
 .tree-name{{padding-left:2px}}
 @media (max-width:700px){{body{{margin:14px}}.topbar{{align-items:flex-start;flex-direction:column}}.theme-toggle{{right:12px;bottom:12px}}}}
 </style>
@@ -2674,11 +2692,11 @@ class GitHTTPHandler:
             if kind == "tree":
                 newpath = _join_repo_path(subpath, name)
                 href = str_t(t"{base}/tree/{q(ref)}/{q(newpath, safe='/')}/")
-                rows.append(html_t(t"<tr><td style=\"width:40px\"><span class=\"tree-icon folder\" aria-hidden=\"true\"></span></td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
+                rows.append(html_t(t"<tr><td style=\"width:40px\">{TREE_FOLDER_ICON}</td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
             else:
                 newpath = _join_repo_path(subpath, name)
                 href = str_t(t"{base}/blob/{q(ref)}/{q(newpath, safe='/')}")
-                rows.append(html_t(t"<tr><td style=\"width:40px\"><span class=\"tree-icon file\" aria-hidden=\"true\"></span></td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
+                rows.append(html_t(t"<tr><td style=\"width:40px\">{TREE_FILE_ICON}</td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
         up = safe_html("")
         if subpath:
             parent = "/".join(subpath.split("/")[:-1])

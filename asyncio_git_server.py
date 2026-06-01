@@ -53,9 +53,18 @@ else:
     raise NotImplementedError(CURRENT_PLATFORM)
 
 URL_PREFIX = "/git"
-ALLOWED_CLIENT_IPS = {"127.0.0.1"}  # add CIDRs if needed, e.g. "192.168.1.0/24"
+ALLOWED_CLIENT_IPS = {
+    "192.168.16.75",
+    "192.168.16.162",
+    "192.168.16.164",
+    "192.168.16.198",
+    "192.168.16.77",
+    "192.168.16.76",
+    "127.0.0.1",
+    "192.168.19.222",
+}  # add CIDRs if needed, e.g. "192.168.1.0/24"
 
-REQUIRE_AUTH = True
+REQUIRE_AUTH = False
 REALM = "Git Repositories"
 
 FLAT_OWNER_UI = "root"
@@ -218,6 +227,12 @@ def _safe_branch_name(name: str) -> bool:
 
 
 def _has_write_scope(handler: object) -> bool:
+    # When authentication is disabled, IP allowlist becomes the security boundary.
+    # The request has already passed ALLOWED_CLIENT_IPS in do_GET/do_POST before
+    # this function is reached, so Git push/write operations should be allowed.
+    if not REQUIRE_AUTH:
+        return True
+
     scopes = getattr(handler, "remote_scopes", set()) or set()
     if getattr(handler, "remote_is_admin", False):
         return True

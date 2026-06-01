@@ -36,7 +36,7 @@ if CURRENT_PLATFORM == "Windows":
     DB_PATH = r"C:\temp\pygithost.db"
 
 elif CURRENT_PLATFORM == "Linux":
-    GIT_PROJECT_ROOT = "/home/jordaly/git_repos"
+    GIT_PROJECT_ROOT = str(Path.home() / "git_repos")
     GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
     TRACE_LOG = None
     DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
@@ -60,6 +60,7 @@ REALM = "Git Repositories"
 
 FLAT_OWNER_UI = "root"
 PR_PATCH_MAX_BYTES = 800_000
+PRISM_DIFF_HIGHLIGHT_MAX_BYTES = 250_000
 MAX_HEADER_BYTES = 64 * 1024
 READ_CHUNK = 64 * 1024
 
@@ -122,6 +123,40 @@ def join_html(parts: list[str]) -> SafeHTML:
 
 def q(value: str, safe: str = "") -> str:
     return quote(value, safe=safe)
+
+
+def _clean_repo_path(value: str | None) -> str:
+    """
+    Normalize a path inside a Git tree.
+
+    This fixes URLs like /tree/master/Principal/ producing paths like
+    Principal//Fbase.cs when a file link is built from a directory URL that
+    already ends with /.
+    """
+    raw = unquote(value or "")
+    raw = raw.replace("\\", "/")
+
+    if "\0" in raw:
+        return ""
+
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            # Git tree paths should never need parent traversal.
+            return ""
+        parts.append(part)
+
+    return "/".join(parts)
+
+
+def _join_repo_path(base: str, name: str) -> str:
+    base = _clean_repo_path(base)
+    name = _clean_repo_path(name)
+    if base and name:
+        return base + "/" + name
+    return base or name
 
 
 # ============================================================
@@ -759,43 +794,194 @@ def db_pr_mark_merged(pr_id: int, method: str, merge_commit: str) -> None:
 # ============================================================
 # HELPERS: repos + git + HTTP
 # ============================================================
-def _is_bare_repo_dir(p: Path) -> bool:
+def _is_git_dir(p: Path) -> bool:
+    """
+    Return True for a real Git directory.
+
+    This supports both:
+      - bare repo folders, for example: repo.git/
+      - normal repo Git dirs, for example: repo/.git/
+    """
     return p.is_dir() and (p / "HEAD").is_file()
 
 
+def _is_bare_repo_dir(p: Path) -> bool:
+    """Return True for a bare repository directory, for example repo.git/."""
+    return _is_git_dir(p)
+
+
+def _is_worktree_repo_dir(p: Path) -> bool:
+    """Return True for a normal/non-bare repository, for example repo/.git/."""
+    return p.is_dir() and _is_git_dir(p / ".git")
+
+
 def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
+    """
+    Scan GIT_PROJECT_ROOT and return repositories for the web UI.
+
+    Supported layouts:
+      Flat bare:      GIT_PROJECT_ROOT/repo.git
+      Flat non-bare:  GIT_PROJECT_ROOT/repo/.git
+      Owner bare:     GIT_PROJECT_ROOT/owner/repo.git
+      Owner non-bare: GIT_PROJECT_ROOT/owner/repo/.git
+    """
     root = Path(project_root)
     results: list[tuple[str, str, str]] = []
+
     if not root.exists():
         return results
 
+    # Flat bare repos: GIT_PROJECT_ROOT/repo.git
     for p in sorted(root.glob("*.git")):
+        if p.name == ".git":
+            continue
+
         if _is_bare_repo_dir(p):
             repo = p.name[:-4]
-            results.append((FLAT_OWNER_UI, repo, p.name))
+            if _safe_seg(repo):
+                results.append((FLAT_OWNER_UI, repo, p.name))
 
+    # Flat normal repos: GIT_PROJECT_ROOT/repo/.git
+    for p in sorted([x for x in root.iterdir() if x.is_dir()]):
+        if _is_worktree_repo_dir(p):
+            repo = p.name
+            if _safe_seg(repo):
+                results.append((FLAT_OWNER_UI, repo, str_t(t"{repo}/.git")))
+
+    # Owner layouts:
+    #   GIT_PROJECT_ROOT/owner/repo.git
+    #   GIT_PROJECT_ROOT/owner/repo/.git
     for owner_dir in sorted([x for x in root.iterdir() if x.is_dir()]):
+        # If this folder itself is a normal repo, do not also treat it as an owner.
+        if _is_worktree_repo_dir(owner_dir):
+            continue
+
+        # If this folder itself is a bare repo, do not treat it as an owner.
+        if _is_bare_repo_dir(owner_dir):
+            continue
+
         owner = owner_dir.name
+        if not _safe_seg(owner):
+            continue
+
         for p in sorted(owner_dir.glob("*.git")):
+            if p.name == ".git":
+                continue
+
             if _is_bare_repo_dir(p):
                 repo = p.name[:-4]
-                rel = str_t(t"{owner}/{p.name}")
-                results.append((owner, repo, rel))
+                if _safe_seg(repo):
+                    rel = str_t(t"{owner}/{p.name}")
+                    results.append((owner, repo, rel))
+
+        for p in sorted([x for x in owner_dir.iterdir() if x.is_dir()]):
+            if _is_worktree_repo_dir(p):
+                repo = p.name
+                if _safe_seg(repo):
+                    rel = str_t(t"{owner}/{repo}/.git")
+                    results.append((owner, repo, rel))
 
     seen = set()
     uniq = []
-    for o, r, rel in results:
-        key = (o, r, rel)
+
+    for owner, repo, rel in results:
+        key = (owner, repo)
         if key not in seen:
             seen.add(key)
-            uniq.append((o, r, rel))
+            uniq.append((owner, repo, rel))
+
     return uniq
 
 
-def _repo_bare_path(owner_ui: str, repo: str) -> str:
+def _repo_git_path(owner_ui: str, repo: str) -> str:
+    """
+    Resolve the real Git directory for a repository.
+
+    Supported layouts:
+      Flat bare:      GIT_PROJECT_ROOT/repo.git
+      Flat non-bare:  GIT_PROJECT_ROOT/repo/.git
+      Owner bare:     GIT_PROJECT_ROOT/owner/repo.git
+      Owner non-bare: GIT_PROJECT_ROOT/owner/repo/.git
+
+    If neither repo exists, return the bare path. This keeps create-repo
+    working exactly like before, because new repos are still created as bare repos.
+    """
     if owner_ui == FLAT_OWNER_UI:
-        return os.path.join(GIT_PROJECT_ROOT, repo + ".git")
-    return os.path.join(GIT_PROJECT_ROOT, owner_ui, repo + ".git")
+        base = Path(GIT_PROJECT_ROOT)
+    else:
+        base = Path(GIT_PROJECT_ROOT) / owner_ui
+
+    bare = base / (repo + ".git")
+    worktree_git = base / repo / ".git"
+
+    if _is_bare_repo_dir(bare):
+        return str(bare)
+
+    if _is_git_dir(worktree_git):
+        return str(worktree_git)
+
+    return str(bare)
+
+
+def _repo_bare_path(owner_ui: str, repo: str) -> str:
+    """
+    Backward-compatible name used by the rest of the code.
+
+    It now returns the real Git directory, which can be either:
+      - repo.git for a bare repo
+      - repo/.git for a normal/non-bare repo
+    """
+    return _repo_git_path(owner_ui, repo)
+
+
+def _map_git_http_path_info(path_info: str) -> str:
+    """
+    Convert public Git smart HTTP URLs to the real on-disk Git directory.
+
+    Clients can keep using URLs like:
+      /git/repo.git
+      /git/owner/repo.git
+
+    If the repo is non-bare, the PATH_INFO sent to git-http-backend becomes:
+      /repo/.git/...
+      /owner/repo/.git/...
+
+    Bare repositories are left unchanged.
+    """
+    clean = path_info.lstrip("/")
+    parts = clean.split("/") if clean else []
+
+    if not parts:
+        return path_info
+
+    # Flat URL: /repo.git/info/refs
+    if len(parts) >= 1 and parts[0].endswith(".git"):
+        repo = parts[0][:-4]
+
+        if _safe_seg(repo):
+            actual_git = Path(_repo_git_path(FLAT_OWNER_UI, repo))
+            expected_worktree_git = Path(GIT_PROJECT_ROOT) / repo / ".git"
+
+            if actual_git == expected_worktree_git and _is_git_dir(expected_worktree_git):
+                parts[0] = repo
+                parts.insert(1, ".git")
+                return "/" + "/".join(parts)
+
+    # Owner URL: /owner/repo.git/info/refs
+    if len(parts) >= 2 and parts[1].endswith(".git"):
+        owner = parts[0]
+        repo = parts[1][:-4]
+
+        if _safe_seg(owner) and _safe_seg(repo):
+            actual_git = Path(_repo_git_path(owner, repo))
+            expected_worktree_git = Path(GIT_PROJECT_ROOT) / owner / repo / ".git"
+
+            if actual_git == expected_worktree_git and _is_git_dir(expected_worktree_git):
+                parts[1] = repo
+                parts.insert(2, ".git")
+                return "/" + "/".join(parts)
+
+    return path_info
 
 
 async def _run_cmd(cmd: list[str], cwd: str | None = None) -> tuple[int, bytes, bytes]:
@@ -989,40 +1175,204 @@ def _html_page(title: str, body_html: str | SafeHTML) -> bytes:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-body{{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:1200px}}
-a{{text-decoration:none}} a:hover{{text-decoration:underline}}
+:root{{
+  color-scheme:light;
+  --bg:#ffffff;
+  --fg:#111827;
+  --muted:#666666;
+  --link:#0f4c81;
+  --border:#eeeeee;
+  --border-strong:#dddddd;
+  --box:#ffffff;
+  --pre-bg:#fafafa;
+  --input-bg:#ffffff;
+  --input-fg:#111827;
+  --button-bg:#111111;
+  --button-fg:#ffffff;
+  --pill-bg:#ffffff;
+  --pill-fg:#444444;
+  --warn-bg:#fff7ed;
+  --warn-border:#fed7aa;
+  --warn-fg:#9a3412;
+  --ok-bg:#ecfdf5;
+  --ok-border:#a7f3d0;
+  --ok-fg:#065f46;
+}}
+html[data-theme="dark"]{{
+  color-scheme:dark;
+  --bg:#0b1220;
+  --fg:#e5e7eb;
+  --muted:#9ca3af;
+  --link:#93c5fd;
+  --border:#1f2937;
+  --border-strong:#374151;
+  --box:#111827;
+  --pre-bg:#030712;
+  --input-bg:#0f172a;
+  --input-fg:#e5e7eb;
+  --button-bg:#e5e7eb;
+  --button-fg:#111827;
+  --pill-bg:#0f172a;
+  --pill-fg:#e5e7eb;
+  --warn-bg:#431407;
+  --warn-border:#9a3412;
+  --warn-fg:#fed7aa;
+  --ok-bg:#052e16;
+  --ok-border:#047857;
+  --ok-fg:#a7f3d0;
+}}
+*{{box-sizing:border-box}}
+body{{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:1200px;background:var(--bg);color:var(--fg)}}
+a{{text-decoration:none;color:var(--link)}} a:hover{{text-decoration:underline}}
 code,pre{{font-family:ui-monospace,Consolas,monospace}}
-pre{{padding:12px;border:1px solid #ddd;border-radius:10px;overflow:auto;background:#fafafa}}
+pre{{padding:12px;border:1px solid var(--border-strong);border-radius:10px;overflow:auto;background:var(--pre-bg);color:var(--fg)}}
 table{{border-collapse:collapse;width:100%}}
-td{{padding:8px 10px;border-bottom:1px solid #eee;vertical-align:top}}
-.muted{{color:#666}}
-.pill{{display:inline-block;padding:2px 10px;border:1px solid #ddd;border-radius:999px;font-size:12px;color:#444;background:#fff}}
+td{{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}}
+.muted{{color:var(--muted)}}
+.pill{{display:inline-block;padding:2px 10px;border:1px solid var(--border-strong);border-radius:999px;font-size:12px;color:var(--pill-fg);background:var(--pill-bg)}}
 .topbar{{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}}
-.box{{border:1px solid #eee;border-radius:14px;padding:14px;background:#fff}}
+.box{{border:1px solid var(--border);border-radius:14px;padding:14px;background:var(--box)}}
 .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:end}}
-label{{display:block;font-size:12px;color:#555;margin-bottom:4px}}
-input,select,textarea{{padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px}}
+label{{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}}
+input,select,textarea{{padding:10px;border:1px solid var(--border-strong);border-radius:10px;font-size:14px;background:var(--input-bg);color:var(--input-fg)}}
 textarea{{width:100%;min-height:90px}}
-button{{padding:10px 14px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer}}
+button{{padding:10px 14px;border:1px solid var(--button-bg);border-radius:10px;background:var(--button-bg);color:var(--button-fg);cursor:pointer}}
 button:hover{{opacity:.92}}
-.danger{{border-color:#7f1d1d;background:#7f1d1d}}
+.danger{{border-color:#7f1d1d;background:#7f1d1d;color:#ffffff}}
 .danger:hover{{opacity:.92}}
-.warn{{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;padding:10px;border-radius:12px}}
-.ok{{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;padding:10px;border-radius:12px}}
+.warn{{background:var(--warn-bg);border:1px solid var(--warn-border);color:var(--warn-fg);padding:10px;border-radius:12px}}
+.ok{{background:var(--ok-bg);border:1px solid var(--ok-border);color:var(--ok-fg);padding:10px;border-radius:12px}}
+.theme-toggle{{position:fixed;right:18px;bottom:18px;z-index:9999;border-radius:999px;box-shadow:0 10px 30px rgba(0,0,0,.18)}}
+.tree-icon{{display:inline-block;width:20px;height:18px;position:relative;vertical-align:-4px}}
+.tree-icon.folder{{color:#d97706}}
+.tree-icon.folder::before{{content:"";position:absolute;left:1px;top:6px;width:18px;height:11px;border:1.5px solid currentColor;border-radius:3px;background:rgba(217,119,6,.12)}}
+.tree-icon.folder::after{{content:"";position:absolute;left:2px;top:2px;width:9px;height:6px;border:1.5px solid currentColor;border-bottom:0;border-radius:3px 3px 0 0;background:rgba(217,119,6,.12)}}
+.tree-icon.file{{color:var(--muted)}}
+.tree-icon.file::before{{content:"";position:absolute;left:4px;top:1px;width:12px;height:16px;border:1.5px solid currentColor;border-radius:3px;background:transparent}}
+.tree-icon.file::after{{content:"";position:absolute;right:3px;top:1px;width:5px;height:5px;border-left:1.5px solid currentColor;border-bottom:1.5px solid currentColor;background:var(--box)}}
+.tree-name{{padding-left:2px}}
+@media (max-width:700px){{body{{margin:14px}}.topbar{{align-items:flex-start;flex-direction:column}}.theme-toggle{{right:12px;bottom:12px}}}}
 </style>
+<script>
+(function() {{
+    const saved = localStorage.getItem("pygithost_theme");
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const theme = saved || (prefersDark ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", theme);
+}})();
+</script>
 <link rel="stylesheet" href="/static/assets/prismjs/prism-okaidia.min.css" />
 </head>
 <body>
+<button id="theme-toggle" class="theme-toggle" type="button" title="Toggle dark mode">Dark mode</button>
 
 {body}
 
 <script src="/static/assets/prismjs/prism.js"></script>
+<script>
+(function() {{
+    const button = document.getElementById("theme-toggle");
+    if (!button) return;
+
+    function updateButton() {{
+        const theme = document.documentElement.getAttribute("data-theme") || "light";
+        button.textContent = theme === "dark" ? "Light mode" : "Dark mode";
+        button.setAttribute("aria-label", theme === "dark" ? "Switch to light mode" : "Switch to dark mode");
+    }}
+
+    button.addEventListener("click", function() {{
+        const current = document.documentElement.getAttribute("data-theme") || "light";
+        const next = current === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        localStorage.setItem("pygithost_theme", next);
+        updateButton();
+    }});
+
+    updateButton();
+}})();
+</script>
 <div id="load_scripts"></div>
 
 </body>
 </html>"""
     )
     return rendered.encode("utf-8")
+
+
+def _prism_diff_patch_html(text: str, truncated: bool, truncated_label: str = "Diff") -> SafeHTML:
+    """
+    Render a Git diff/patch block.
+
+    Small diffs are syntax-highlighted with PrismJS' diff grammar.
+    Large/truncated diffs stay as plain escaped text to avoid freezing the browser.
+    """
+    patch_bytes = len((text or "").encode("utf-8", "replace"))
+    can_highlight = bool((text or "").strip()) and not truncated and patch_bytes <= PRISM_DIFF_HIGHLIGHT_MAX_BYTES
+
+    notes: list[str] = []
+    if truncated:
+        notes.append(html_t(t"""<div class="warn" style="margin-bottom:12px">{truncated_label} truncated because it is too large.</div>"""))
+    elif patch_bytes > PRISM_DIFF_HIGHLIGHT_MAX_BYTES:
+        notes.append(
+            html_t(
+                t"""<div class="warn" style="margin-bottom:12px">{truncated_label} is {patch_bytes:,} bytes, so syntax highlighting was skipped to keep the page responsive.</div>"""
+            )
+        )
+
+    if can_highlight:
+        notes.append(
+            html_t(
+                t"""<pre><code class="language-diff">{text}</code></pre>
+<script>
+(function() {{
+    window.Prism = window.Prism || {{}};
+    window.Prism.manual = true;
+
+    function loadScript(src) {{
+        return new Promise((resolve, reject) => {{
+            if (document.querySelector(`script[src="${{src}}"]`)) {{
+                resolve();
+                return;
+            }}
+
+            const script = document.createElement("script");
+            script.src = src;
+            script.async = false;
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error(`Failed to load script: ${{src}}`));
+            document.head.appendChild(script);
+        }});
+    }}
+
+    document.addEventListener("DOMContentLoaded", async function() {{
+        try {{
+            const base = "/static/assets/prismjs/components";
+
+            if (!window.Prism || !window.Prism.highlightElement) {{
+                await loadScript(`${{base}}/prism-core.min.js`);
+            }}
+
+            if (!window.Prism.languages || !window.Prism.languages.diff) {{
+                await loadScript(`${{base}}/prism-diff.min.js`);
+            }}
+
+            if (window.Prism && window.Prism.highlightElement) {{
+                document.querySelectorAll("code.language-diff").forEach(function(element) {{
+                    Prism.highlightElement(element);
+                }});
+            }}
+        }} catch (error) {{
+            console.error("Prism diff highlighting failed:", error);
+        }}
+    }});
+}})();
+</script>"""
+            )
+        )
+    else:
+        notes.append(html_t(t"""<pre>{text}</pre>"""))
+
+    return join_html(notes)
 
 
 # ============================================================
@@ -1569,7 +1919,7 @@ class GitHTTPHandler:
         if _require_admin(self):
             admin_link = safe_html("<a class=\"pill\" href=\"/admin/users\">Admin: Users</a>")
 
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No bare repos found.</td><td></td></tr>')
+        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No repos found.</td><td></td></tr>')
         body = html_t(
             t"""<div class="topbar">
 <h1 style="margin:0">Repos</h1>
@@ -2168,7 +2518,7 @@ class GitHTTPHandler:
                 )
             )
         commits_html = join_html(commit_rows) if commit_rows else safe_html('<tr><td class="muted">No commits (or branches not resolvable).</td></tr>')
-        trunc_note = safe_html('<div class="warn" style="margin-top:12px">Diff truncated (too large).</div>' if diff_trunc else "")
+        diff_html = _prism_diff_patch_html(diff_text, diff_trunc, "Diff")
         description = safe_html(html_t(t"{body}")) if (body or "").strip() else safe_html('<span class="muted">(no description)</span>')
         src_short = (src_commit or "")[:8]
         tgt_short = (tgt_commit or "")[:8]
@@ -2182,7 +2532,7 @@ class GitHTTPHandler:
 <div class="muted" style="margin-top:10px">Source: <code>{src_branch}</code> @ <code>{src_short}</code><br>Target: <code>{tgt_branch}</code> @ <code>{tgt_short}</code></div></div>
 {merge_box}
 <div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table></div>
-<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Diff</h2>{trunc_note}<pre>{diff_text}</pre></div>"""
+<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Diff</h2>{diff_html}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(body_html)))
 
@@ -2281,13 +2631,13 @@ class GitHTTPHandler:
                 href = str_t(t"{base}/blob/{q(commit)}/{q(path, safe='/')}")
                 file_rows.append(html_t(t"<tr><td style=\"width:70px\"><span class=\"pill\">{status}</span></td><td><a href=\"{href}\"><code>{path}</code></a></td></tr>"))
         files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No file list.</td></tr>')
-        trunc_note = safe_html('<div class="warn">Patch truncated (too large).</div>' if truncated else "")
+        patch_html = _prism_diff_patch_html(patch_text, truncated, "Patch")
         body = html_t(
             t"""<div class="topbar"><div><h1 style="margin:0"><code>{commit[:8]}</code> {meta['subject']}</h1>
 <div class="muted">{meta['author_name']} &lt;{meta['author_email']}&gt; · {meta['date']}</div>{parents_html}</div>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
 <div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
-<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Patch</h2>{trunc_note}<pre>{patch_text}</pre></div>"""
+<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Patch</h2>{patch_html}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Commit {commit[:8]} · {owner}/{repo}"), safe_html(body)))
 
@@ -2298,7 +2648,7 @@ class GitHTTPHandler:
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return await self._not_found()
-        subpath = (subpath or "/").lstrip("/")
+        subpath = _clean_repo_path(subpath)
         spec = ref + (":" + subpath if subpath else ":")
         code, out, err = await _run_git(repo_git, ["ls-tree", spec])
         if code != 0:
@@ -2306,7 +2656,7 @@ class GitHTTPHandler:
             body = html_t(t"<h1>Tree</h1><pre>{msg}</pre><p><a class=\"pill\" href=\"/\">Back</a></p>")
             return await _send_html(self.request, 400, _html_page("Tree", safe_html(body)))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        rows = []
+        entries: list[tuple[str, str]] = []
         for ln in out.decode("utf-8", "replace").splitlines():
             # git ls-tree: mode type object\tname
             if "\t" not in ln:
@@ -2314,19 +2664,26 @@ class GitHTTPHandler:
             meta_part, name = ln.split("\t", 1)
             parts = meta_part.split()
             kind = parts[1] if len(parts) >= 2 else "blob"
+            entries.append((kind, name))
+
+        # Show folders first, then files. Keep alphabetical order inside each group.
+        entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
+
+        rows = []
+        for kind, name in entries:
             if kind == "tree":
-                newpath = (subpath + "/" + name) if subpath else name
+                newpath = _join_repo_path(subpath, name)
                 href = str_t(t"{base}/tree/{q(ref)}/{q(newpath, safe='/')}/")
-                rows.append(html_t(t"<tr><td style=\"width:40px\">📁</td><td><a href=\"{href}\">{name}</a></td></tr>"))
+                rows.append(html_t(t"<tr><td style=\"width:40px\"><span class=\"tree-icon folder\" aria-hidden=\"true\"></span></td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
             else:
-                newpath = (subpath + "/" + name) if subpath else name
+                newpath = _join_repo_path(subpath, name)
                 href = str_t(t"{base}/blob/{q(ref)}/{q(newpath, safe='/')}")
-                rows.append(html_t(t"<tr><td style=\"width:40px\">📄</td><td><a href=\"{href}\">{name}</a></td></tr>"))
+                rows.append(html_t(t"<tr><td style=\"width:40px\"><span class=\"tree-icon file\" aria-hidden=\"true\"></span></td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
         up = safe_html("")
         if subpath:
             parent = "/".join(subpath.split("/")[:-1])
             parent_href = str_t(t"{base}/tree/{q(ref)}/{q(parent, safe='/')}/") if parent else str_t(t"{base}/tree/{q(ref)}/")
-            up = safe_html(html_t(t"<p><a class=\"pill\" href=\"{parent_href}\">⬅ Up</a></p>"))
+            up = safe_html(html_t(t"<p><a class=\"pill\" href=\"{parent_href}\">Up one level</a></p>"))
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">Empty.</td></tr>')
         body = html_t(
             t"""<div class="topbar"><div><h1 style="margin:0">{owner}/{repo}</h1><div class="muted">ref: <code>{ref}</code></div></div>
@@ -2342,7 +2699,9 @@ class GitHTTPHandler:
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return await self._not_found()
-        filepath = unquote(filepath or "").lstrip("/")
+        filepath = _clean_repo_path(filepath)
+        if not filepath:
+            return await self._not_found()
         spec = ref + ":" + filepath
         code, out, err = await _run_git(repo_git, ["show", spec])
         if code != 0:
@@ -2357,7 +2716,7 @@ class GitHTTPHandler:
             back = str_t(t"{base}/tree/{q(ref)}/{q(folder, safe='/')}/")
         lang = PRISM_LANGUAGE_BY_EXTENSION.get("." + filepath.split(".")[-1], "")
         body = html_t(
-            t"""<p><a class="pill" href="{back}">⬅ Back</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></p>
+            t"""<p><a class="pill" href="{back}">Back to folder</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></p>
 <h1 style="margin-top:10px"><code>{filepath}</code>
 </h1><div class="box"><pre><code class="language-{lang}">{text}</code></pre>
 <script>
@@ -2449,6 +2808,7 @@ class GitHTTPHandler:
 
         parsed = urlparse(self.path)
         path_info = parsed.path[len(URL_PREFIX) :]
+        path_info = _map_git_http_path_info(path_info)
         query = parsed.query or ""
 
         if self._git_request_needs_write(path_info, query) and not _has_write_scope(self):

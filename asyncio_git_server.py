@@ -1,4 +1,6 @@
+import argparse
 import asyncio
+import json
 import base64
 import contextlib
 import hashlib
@@ -24,70 +26,185 @@ from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 # ============================================================
 # CONFIG
 # ============================================================
-HOST = ""  # bind all interfaces
-PORT = 8000
-
+CONFIG_SCHEMA_VERSION = 1
+DEFAULT_CONFIG_FILENAME = "pygithost.config.json"
 CURRENT_PLATFORM = platform.system()
 
-if CURRENT_PLATFORM == "Windows":
-    GIT_PROJECT_ROOT = r"C:\Servidor_Git"
-    GIT_HTTP_BACKEND = r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe"
-    TRACE_LOG = r"C:\temp\git-http-backend.log"
-    DB_PATH = r"C:\temp\pygithost.db"
 
-elif CURRENT_PLATFORM == "Linux":
-    GIT_PROJECT_ROOT = str(Path.home() / "git_repos")
-    GIT_HTTP_BACKEND = "/usr/lib/git-core/git-http-backend"
-    TRACE_LOG = None
-    DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
+CONFIG_GLOBAL_MAP = {
+    "host": "HOST",
+    "port": "PORT",
+    "git_project_root": "GIT_PROJECT_ROOT",
+    "git_http_backend": "GIT_HTTP_BACKEND",
+    "trace_log": "TRACE_LOG",
+    "db_path": "DB_PATH",
+    "url_prefix": "URL_PREFIX",
+    "require_auth": "REQUIRE_AUTH",
+    "filter_ips": "FILTER_IPS",
+    "realm": "REALM",
+    "flat_owner_ui": "FLAT_OWNER_UI",
+    "pr_patch_max_bytes": "PR_PATCH_MAX_BYTES",
+    "prism_diff_highlight_max_bytes": "PRISM_DIFF_HIGHLIGHT_MAX_BYTES",
+    "max_header_bytes": "MAX_HEADER_BYTES",
+    "read_chunk": "READ_CHUNK",
+    "session_cookie_name": "SESSION_COOKIE_NAME",
+    "session_ttl_seconds": "SESSION_TTL_SECONDS",
+    "session_cookie_secure": "SESSION_COOKIE_SECURE",
+    "login_path": "LOGIN_PATH",
+    "static_url_prefix": "STATIC_URL_PREFIX",
+    "static_root": "STATIC_ROOT",
+    "static_cache_seconds": "STATIC_CACHE_SECONDS",
+    "static_requires_auth": "STATIC_REQUIRES_AUTH",
+}
 
-elif CURRENT_PLATFORM == "Darwin":
-    git_project_path = Path.home() / "git"
-    git_project_path.mkdir(exist_ok=True)
-    GIT_PROJECT_ROOT = str(git_project_path)
-    GIT_HTTP_BACKEND = "/opt/homebrew/opt/git/libexec/git-core/git-http-backend"
-    TRACE_LOG = "/tmp/git-http-backend.log"
-    DB_PATH = str(Path.home() / ".local/share/pygithost/pygithost.db")
 
-else:
-    raise NotImplementedError(CURRENT_PLATFORM)
+def _default_config_path() -> Path:
+    return Path(__file__).resolve().with_name(DEFAULT_CONFIG_FILENAME)
 
-URL_PREFIX = "/git"
-ALLOWED_CLIENT_IPS = {
-    "192.168.16.75",
-    "192.168.16.162",
-    "192.168.16.164",
-    "192.168.16.198",
-    "192.168.16.77",
-    "192.168.16.76",
-    "127.0.0.1",
-    "192.168.19.222",
-}  # add CIDRs if needed, e.g. "192.168.1.0/24"
 
-REQUIRE_AUTH = False
-REALM = "Git Repositories"
+def _default_static_root() -> str:
+    return str(Path(__file__).resolve().parent / "static")
 
-FLAT_OWNER_UI = "root"
-PR_PATCH_MAX_BYTES = 800_000
-PRISM_DIFF_HIGHLIGHT_MAX_BYTES = 250_000
-MAX_HEADER_BYTES = 64 * 1024
-READ_CHUNK = 64 * 1024
 
-# Web UI sessions. Git clients still use Basic Auth with password/token.
-SESSION_COOKIE_NAME = "pygithost_session"
-SESSION_TTL_SECONDS = 12 * 60 * 60
-SESSION_COOKIE_SECURE = False  # Set True when this server is served over HTTPS.
-LOGIN_PATH = "/login"
+def _platform_git_defaults(target_platform: str | None = None) -> dict[str, object]:
+    """
+    Return the same platform-dependent defaults the original CONFIG block used.
+    """
+    system_name = target_platform or platform.system()
 
-# Static files. Put files in ./static and access them with /static/filename.ext.
-# Examples:
-#   ./static/css/site.css -> http://HOST:8000/static/css/site.css
-#   ./static/js/app.js    -> http://HOST:8000/static/js/app.js
-#   ./static/index.html   -> http://HOST:8000/static/index.html
-STATIC_URL_PREFIX = "/static"
-STATIC_ROOT = str(Path(__file__).resolve().parent / "static")
-STATIC_CACHE_SECONDS = 60 * 60
-STATIC_REQUIRES_AUTH = False  # Keep False so CSS/JS can load on /login.
+    if system_name == "Windows":
+        return {
+            "git_project_root": r"C:\Servidor_Git",
+            "git_http_backend": r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe",
+            "trace_log": r"C:\temp\git-http-backend.log",
+            "db_path": r"C:\temp\pygithost.db",
+        }
+
+    if system_name == "Linux":
+        return {
+            "git_project_root": str(Path.home() / "git_repos"),
+            "git_http_backend": "/usr/lib/git-core/git-http-backend",
+            "trace_log": None,
+            "db_path": str(Path.home() / ".local/share/pygithost/pygithost.db"),
+        }
+
+    if system_name == "Darwin":
+        return {
+            "git_project_root": str(Path.home() / "git"),
+            "git_http_backend": "/opt/homebrew/opt/git/libexec/git-core/git-http-backend",
+            "trace_log": "/tmp/git-http-backend.log",
+            "db_path": str(Path.home() / ".local/share/pygithost/pygithost.db"),
+        }
+
+    raise NotImplementedError(system_name)
+
+
+def default_config_for_platform(target_platform: str | None = None) -> dict[str, object]:
+    """
+    Create a complete JSON-serializable configuration dictionary.
+    """
+    system_name = target_platform or platform.system()
+    cfg: dict[str, object] = {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "platform": system_name,
+        "host": "",  # bind all interfaces
+        "port": 8000,
+        **_platform_git_defaults(system_name),
+        "url_prefix": "/git",
+        "allowed_client_ips": [
+            "192.168.16.75",
+            "192.168.16.162",
+            "192.168.16.164",
+            "192.168.16.198",
+            "192.168.16.77",
+            "192.168.16.76",
+            "127.0.0.1",
+            "192.168.19.222",
+        ],
+        "require_auth": False,
+        "filter_ips": True,
+        "realm": "Git Repositories",
+        "flat_owner_ui": "root",
+        "pr_patch_max_bytes": 800_000,
+        "prism_diff_highlight_max_bytes": 250_000,
+        "max_header_bytes": 64 * 1024,
+        "read_chunk": 64 * 1024,
+        "session_cookie_name": "pygithost_session",
+        "session_ttl_seconds": 12 * 60 * 60,
+        "session_cookie_secure": False,
+        "login_path": "/login",
+        "static_url_prefix": "/static",
+        "static_root": _default_static_root(),
+        "static_cache_seconds": 60 * 60,
+        "static_requires_auth": False,
+    }
+    return cfg
+
+
+def _normalize_config(raw_config: dict[str, object]) -> dict[str, object]:
+    """
+    Merge a loaded JSON config with defaults so older config files can still run.
+    """
+    config_platform = str(raw_config.get("platform") or platform.system())
+    config = default_config_for_platform(config_platform)
+    config.update(raw_config)
+
+    allowed_ips = config.get("allowed_client_ips", [])
+    if isinstance(allowed_ips, str):
+        allowed_ips = [item.strip() for item in allowed_ips.split(",") if item.strip()]
+    if not isinstance(allowed_ips, list):
+        raise ValueError("allowed_client_ips must be a JSON array or a comma-separated string.")
+    config["allowed_client_ips"] = [str(item).strip() for item in allowed_ips if str(item).strip()]
+
+    for key in ("port", "pr_patch_max_bytes", "prism_diff_highlight_max_bytes", "max_header_bytes", "read_chunk", "session_ttl_seconds", "static_cache_seconds"):
+        config[key] = int(config[key])
+
+    for key in ("require_auth", "filter_ips", "session_cookie_secure", "static_requires_auth"):
+        config[key] = bool(config[key])
+
+    return config
+
+
+def load_config(path: str | os.PathLike[str]) -> dict[str, object]:
+    config_path = Path(path).expanduser()
+    with config_path.open("r", encoding="utf-8") as f:
+        raw_config = json.load(f)
+    if not isinstance(raw_config, dict):
+        raise ValueError("The config file root must be a JSON object.")
+    return _normalize_config(raw_config)
+
+
+def apply_config(config: dict[str, object]) -> None:
+    """
+    Apply JSON config values to the existing module-level names used by the server.
+    Keeping these globals avoids changing the rest of the server code.
+    """
+    global CURRENT_PLATFORM, ALLOWED_CLIENT_IPS
+
+    CURRENT_PLATFORM = str(config.get("platform") or platform.system())
+
+    for json_key, global_name in CONFIG_GLOBAL_MAP.items():
+        globals()[global_name] = config[json_key]
+
+    ALLOWED_CLIENT_IPS = set(str(ip) for ip in config.get("allowed_client_ips", []))
+
+
+def write_config_file(path: str | os.PathLike[str], target_platform: str | None = None, overwrite: bool = False) -> Path:
+    config_path = Path(path).expanduser()
+    if config_path.exists() and not overwrite:
+        raise FileExistsError(f"Config file already exists: {config_path}. Use --overwrite to replace it.")
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config = default_config_for_platform(target_platform)
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
+        f.write("\n")
+    return config_path
+
+
+# Initialize module globals with platform defaults. The CLI `run` command replaces
+# these values with the JSON file values before the server starts.
+apply_config(default_config_for_platform())
 
 # ============================================================
 # t-string rendering helpers
@@ -1248,6 +1365,9 @@ async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str) -
 
 
 def _ip_allowed(ip: str, allow: set[str]) -> bool:
+    if not FILTER_IPS:
+        return True
+
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -3186,7 +3306,14 @@ class AsyncGitServer:
                 await writer.wait_closed()
 
 
-async def main_async() -> None:
+async def main_async(config_path: str | os.PathLike[str]) -> None:
+    try:
+        config = load_config(config_path)
+        apply_config(config)
+    except Exception as exc:
+        print(str_t(t"ERROR: Could not load config file '{config_path}': {exc}"), file=sys.stderr)
+        sys.exit(1)
+
     if not os.path.isfile(GIT_HTTP_BACKEND):
         print(str_t(t"ERROR: GIT_HTTP_BACKEND not found: {GIT_HTTP_BACKEND}"), file=sys.stderr)
         sys.exit(1)
@@ -3206,6 +3333,8 @@ async def main_async() -> None:
 
     print("=" * 60)
     print(str_t(t"Async Git Smart HTTP + Web UI running on port {PORT}"))
+    print(str_t(t"Loaded config: {Path(config_path).expanduser()}"))
+    print(str_t(t"Platform config: {CURRENT_PLATFORM}"))
     print(str_t(t"Git URL prefix: {URL_PREFIX}"))
     print(str_t(t"UI: http://localhost:{PORT}/"))
     print(str_t(t"GIT_PROJECT_ROOT: {GIT_PROJECT_ROOT}"))
@@ -3222,11 +3351,75 @@ async def main_async() -> None:
         await server.serve_forever()
 
 
-def main() -> None:
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        pass
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pygithost",
+        description="Async Git Smart HTTP + Web UI server.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="Run the Git HTTP server using a JSON config file.")
+    run_parser.add_argument(
+        "--config",
+        default=str(_default_config_path()),
+        help=str_t(t"Path to the JSON config file. Default: {_default_config_path()}"),
+    )
+
+    generate_parser = subparsers.add_parser("generate-config", help="Generate a platform-dependent JSON config file.")
+    generate_parser.add_argument(
+        "--config",
+        default=str(_default_config_path()),
+        help=str_t(t"Path where the JSON config file will be written. Default: {_default_config_path()}"),
+    )
+    generate_parser.add_argument(
+        "--platform",
+        choices=["Windows", "Linux", "Darwin"],
+        default=platform.system(),
+        help="Platform defaults to generate. Defaults to the current platform.",
+    )
+    generate_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite the config file if it already exists.",
+    )
+    generate_parser.add_argument(
+        "--print",
+        dest="print_only",
+        action="store_true",
+        help="Print the generated config to stdout instead of writing a file.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "generate-config":
+        try:
+            if args.print_only:
+                print(json.dumps(default_config_for_platform(args.platform), indent=4))
+            else:
+                config_path = write_config_file(args.config, target_platform=args.platform, overwrite=args.overwrite)
+                print(str_t(t"Config file generated: {config_path}"))
+        except Exception as exc:
+            print(str_t(t"ERROR: {exc}"), file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "run":
+        config_path = Path(args.config).expanduser()
+        if not config_path.is_file():
+            print(str_t(t"ERROR: Config file not found: {config_path}"), file=sys.stderr)
+            print(str_t(t"Create one first with: {Path(sys.argv[0]).name} generate-config --config {config_path}"), file=sys.stderr)
+            sys.exit(1)
+        try:
+            asyncio.run(main_async(config_path))
+        except KeyboardInterrupt:
+            pass
+        return
+
+    parser.error("Unknown command.")
 
 
 if __name__ == "__main__":

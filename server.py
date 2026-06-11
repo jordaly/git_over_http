@@ -2313,6 +2313,17 @@ class GitHTTPHandler:
             msg = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
             return await self._ui_home(str_t(t"git init --bare failed: {msg}"), "warn")
 
+        code, out, err = await _run_cmd([
+            "git",
+            "--git-dir=" + repo_git,
+            "config",
+            "http.receivepack",
+            "true",
+        ])
+        if code != 0:
+            msg = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
+            return await self._ui_home(str_t(t"Repo created, but failed to enable push: {msg}"), "warn")
+
         return await self._ui_home(str_t(t"Repo created: {owner_ui}/{repo}"), "ok")
 
     # ========================================================
@@ -2998,26 +3009,91 @@ class GitHTTPHandler:
         services = {s for values in qs.values() for s in values}
         return path_info.endswith("/git-receive-pack") or "git-receive-pack" in services
 
-    async def _pipe_request_body_to_stdin(self, proc: asyncio.subprocess.Process, content_len: int) -> None:
-        try:
-            remaining = content_len
+    async def _send_continue_if_needed(self) -> None:
+        """Support clients that send: Expect: 100-continue."""
+        expect = (self.headers.get("Expect") or "").strip().lower()
+        if expect == "100-continue":
+            self.request.writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            await self.request.writer.drain()
+
+    async def _read_body_line(self, limit: int = 8192) -> bytes:
+        """Read one CRLF/LF terminated line from the already-parsed HTTP body."""
+        buf = bytearray()
+        while True:
+            ch = await self.request.reader.read(1)
+            if not ch:
+                raise ClientDisconnected()
+            buf.extend(ch)
+            if len(buf) > limit:
+                raise BadRequest("HTTP body line too large")
+            if ch == b"\n":
+                return bytes(buf)
+
+    async def _pipe_content_length_body_to_stdin(self, stdin: asyncio.StreamWriter, content_len: int) -> None:
+        remaining = content_len
+        while remaining > 0:
+            data = await self.request.reader.read(min(READ_CHUNK, remaining))
+            if not data:
+                raise asyncio.IncompleteReadError(b"", remaining)
+            stdin.write(data)
+            await stdin.drain()
+            remaining -= len(data)
+
+    async def _pipe_chunked_body_to_stdin(self, stdin: asyncio.StreamWriter) -> None:
+        """
+        Decode HTTP/1.1 Transfer-Encoding: chunked and pass the decoded bytes
+        to git-http-backend. CGI programs do not receive raw chunk framing.
+        """
+        while True:
+            line = await self._read_body_line()
+            size_part = line.strip().split(b";", 1)[0]
+            if not size_part:
+                continue
+
+            try:
+                chunk_size = int(size_part, 16)
+            except ValueError as exc:
+                raise BadRequest("Invalid chunk size") from exc
+
+            if chunk_size == 0:
+                # Drain optional trailer headers until the blank line.
+                while True:
+                    trailer = await self._read_body_line()
+                    if trailer in (b"\r\n", b"\n"):
+                        return
+
+            remaining = chunk_size
             while remaining > 0:
                 data = await self.request.reader.read(min(READ_CHUNK, remaining))
                 if not data:
-                    break
-                if proc.stdin is None:
-                    break
-                proc.stdin.write(data)
-                await proc.stdin.drain()
+                    raise asyncio.IncompleteReadError(b"", remaining)
+                stdin.write(data)
+                await stdin.drain()
                 remaining -= len(data)
-        except Exception:
+
+            # Each chunk is followed by CRLF.
+            crlf = await self.request.reader.readexactly(2)
+            if crlf != b"\r\n":
+                raise BadRequest("Invalid chunk terminator")
+
+    async def _pipe_request_body_to_stdin(self, proc: asyncio.subprocess.Process, content_len: int) -> None:
+        if proc.stdin is None:
+            return
+
+        try:
+            transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+            if "chunked" in transfer_encoding:
+                await self._pipe_chunked_body_to_stdin(proc.stdin)
+            else:
+                await self._pipe_content_length_body_to_stdin(proc.stdin, content_len)
+        except (asyncio.IncompleteReadError, ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError):
+            # Client disconnected or git-http-backend closed stdin early.
             pass
         finally:
-            if proc.stdin is not None:
-                with contextlib.suppress(Exception):
-                    proc.stdin.close()
-                with contextlib.suppress(Exception):
-                    await proc.stdin.wait_closed()
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+            with contextlib.suppress(Exception):
+                await proc.stdin.wait_closed()
 
     async def _handle_git(self):
         if not self.path.startswith(URL_PREFIX + "/"):
@@ -3031,6 +3107,15 @@ class GitHTTPHandler:
         if self._git_request_needs_write(path_info, query) and not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required for git push.\n")
 
+        raw_clen = self.headers.get("Content-Length")
+        try:
+            clen = int(raw_clen) if raw_clen else 0
+        except ValueError:
+            return await _send_text(self.request, 400, "400 Bad Request: invalid Content-Length\n")
+
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+        is_chunked = "chunked" in transfer_encoding
+
         env = os.environ.copy()
         env["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
         env["GIT_HTTP_EXPORT_ALL"] = "1"
@@ -3043,17 +3128,40 @@ class GitHTTPHandler:
         env["SERVER_SOFTWARE"] = "PyGitHTTP-Async/1.0"
         if self.remote_user:
             env["REMOTE_USER"] = self.remote_user
+
+        # CGI receives decoded stdin. Do not forward hop-by-hop HTTP headers,
+        # especially Transfer-Encoding: chunked, to git-http-backend.
+        skip_headers = {
+            "authorization",
+            "connection",
+            "content-length",
+            "content-type",
+            "expect",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        }
         for k, v in self.headers.items():
+            if k.lower() in skip_headers:
+                continue
             env["HTTP_" + k.upper().replace("-", "_")] = v
+
         ctype = self.headers.get("Content-Type")
         if ctype:
             env["CONTENT_TYPE"] = ctype
-        clen = int(self.headers.get("Content-Length") or 0)
-        if clen:
+        if raw_clen and not is_chunked:
             env["CONTENT_LENGTH"] = str(clen)
+        else:
+            env.pop("CONTENT_LENGTH", None)
 
         stderr_target = None
         trace_file = None
+        body_task = None
+        proc = None
         try:
             if TRACE_LOG:
                 _ensure_dir(TRACE_LOG)
@@ -3061,6 +3169,8 @@ class GitHTTPHandler:
                 stderr_target = trace_file
             else:
                 stderr_target = asyncio.subprocess.DEVNULL
+
+            await self._send_continue_if_needed()
 
             proc = await asyncio.create_subprocess_exec(
                 GIT_HTTP_BACKEND,
@@ -3121,13 +3231,23 @@ class GitHTTPHandler:
                 self.request.writer.write(chunk)
                 await self.request.writer.drain()
 
-            await body_task
+            if body_task is not None:
+                await body_task
+
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(proc.wait(), timeout=5)
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
         finally:
+            if body_task is not None and not body_task.done():
+                body_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await body_task
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    await proc.wait()
             if trace_file:
                 with contextlib.suppress(Exception):
                     trace_file.flush()

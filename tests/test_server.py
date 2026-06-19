@@ -1,5 +1,6 @@
 import os
 import socket
+import asyncio
 import threading
 import http.client
 import subprocess
@@ -7,7 +8,7 @@ import unittest
 import tempfile
 import shutil
 from contextlib import closing
-from unittest.mock import patch
+from dataclasses import replace
 
 # Import your server module
 import server as srv
@@ -54,60 +55,73 @@ class ServerRunner:
         backend_path=None,
         bind_host="127.0.0.1",
     ):
-        self.allow_ips = set(allow_ips or {"127.0.0.1"})
+        self.allow_ips = set({"127.0.0.1"} if allow_ips is None else allow_ips)
         self.url_prefix = url_prefix
         self.trace_log = trace_log
         self.project_root = project_root or tempfile.mkdtemp(
             prefix="git-http-projroot-"
         )
         self.backend_path = backend_path or _which_git_backend()
-        self.port = _find_free_port()
+        self.port = None
         self.bind_host = bind_host
 
         self.httpd = None
         self.thread = None
-        self._patches = []
+        self.loop = None
+        self.stop_event = None
+        self.ready = threading.Event()
+        self.start_error = None
         self._owns_projroot = project_root is None  # if we created it, we clean it
 
     def __enter__(self):
         os.makedirs(self.project_root, exist_ok=True)
 
-        # Patch module constants
-        self._patches.append(patch.object(srv, "TRACE_LOG", self.trace_log))
-        self._patches.append(patch.object(srv, "GIT_PROJECT_ROOT", self.project_root))
-        self._patches.append(patch.object(srv, "ALLOWED_CLIENT_IPS", self.allow_ips))
-        self._patches.append(patch.object(srv, "URL_PREFIX", self.url_prefix))
-        if self.backend_path:
-            self._patches.append(
-                patch.object(srv, "GIT_HTTP_BACKEND", self.backend_path)
-            )
-        # Ensure HTTP/1.1
-        self._patches.append(
-            patch.object(srv.GitHTTPHandler, "protocol_version", "HTTP/1.1")
+        config = replace(
+            srv.AppConfig.default_for_platform(),
+            host=self.bind_host,
+            port=0,
+            git_project_root=self.project_root,
+            git_http_backend=self.backend_path,
+            trace_log=self.trace_log,
+            db_path=os.path.join(self.project_root, "test.db"),
+            url_prefix=self.url_prefix,
+            allowed_client_ips=tuple(self.allow_ips),
+            require_auth=False,
+            filter_ips=True,
         )
+        app = srv.AsyncGitServer(srv.AppContext(config), allowlist=self.allow_ips)
 
-        for p in self._patches:
-            p.start()
+        async def serve():
+            self.loop = asyncio.get_running_loop()
+            self.stop_event = asyncio.Event()
+            try:
+                self.httpd = await asyncio.start_server(
+                    app.handle_client, self.bind_host, 0
+                )
+                self.port = self.httpd.sockets[0].getsockname()[1]
+                self.ready.set()
+                await self.stop_event.wait()
+                self.httpd.close()
+                await self.httpd.wait_closed()
+            except BaseException as exc:
+                self.start_error = exc
+                self.ready.set()
 
-        # Bind on loopback for tests
-        self.httpd = srv.ThreadedHTTPServer(
-            (self.bind_host, self.port), srv.GitHTTPHandler
+        self.thread = threading.Thread(
+            target=lambda: asyncio.run(serve()), daemon=True
         )
-        # Per-instance allowlist (handler reads from here)
-        self.httpd.allowlist = self.allow_ips
-
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
+        if not self.ready.wait(timeout=5):
+            raise RuntimeError("Async test server did not start")
+        if self.start_error:
+            raise self.start_error
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self.httpd:
-            self.httpd.shutdown()
-            self.httpd.server_close()
+        if self.loop and self.stop_event:
+            self.loop.call_soon_threadsafe(self.stop_event.set)
         if self.thread:
-            self.thread.join(timeout=1)
-        for p in reversed(self._patches):
-            p.stop()
+            self.thread.join(timeout=5)
         if self._owns_projroot:
             shutil.rmtree(self.project_root, ignore_errors=True)
 
@@ -221,10 +235,6 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 )
                 self.assertIn("Add hello.txt", log)
 
-    # TODO: fix this test
-    @unittest.skip(
-        "Not workig for some reason but when usign it in a real environment it works"
-    )
     def test_forbidden_ip(self):
         # Request should be blocked by allowlist check BEFORE backend
         with ServerRunner(

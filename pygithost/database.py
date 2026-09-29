@@ -642,7 +642,6 @@ def db_ci_run_create(owner: str, repo: str, event: str, branch: str, commit_hash
     try:
         cur = conn.execute("INSERT INTO ci_runs(owner,repo,event,branch,commit_hash,payload_json) VALUES(?,?,?,?,?,?)",
             (owner, repo, event, branch, commit_hash, payload_json))
-        conn.execute("DELETE FROM ci_runs WHERE owner=? AND repo=? AND id NOT IN (SELECT id FROM ci_runs WHERE owner=? AND repo=? ORDER BY id DESC LIMIT 100)", (owner, repo, owner, repo))
         return int(cur.lastrowid)
     finally:
         conn.close()
@@ -657,6 +656,10 @@ def db_ci_run_update(run_id: int, **values) -> None:
     try:
         cols = ", ".join(f"{key}=?" for key in values)
         conn.execute(f"UPDATE ci_runs SET {cols} WHERE id=?", (*values.values(), int(run_id)))
+        if values.get("status") in {"success", "failed", "timed_out", "interrupted"}:
+            row = conn.execute("SELECT owner,repo FROM ci_runs WHERE id=?", (int(run_id),)).fetchone()
+            if row:
+                _db_ci_prune_completed(conn, row[0], row[1])
     finally:
         conn.close()
 
@@ -697,8 +700,18 @@ def db_ci_recover_runs():
     conn = _db_connect()
     try:
         conn.execute("UPDATE ci_runs SET status='interrupted', finished_at=datetime('now') WHERE status='running'")
+        for owner, repo in conn.execute("SELECT DISTINCT owner,repo FROM ci_runs").fetchall():
+            _db_ci_prune_completed(conn, owner, repo)
     finally:
         conn.close()
+
+
+def _db_ci_prune_completed(conn, owner: str, repo: str) -> None:
+    conn.execute("""DELETE FROM ci_runs AS old
+        WHERE old.owner=? AND old.repo=? AND old.status NOT IN ('queued','running')
+          AND old.id NOT IN (SELECT newer.id FROM ci_runs AS newer
+            WHERE newer.owner=? AND newer.repo=? AND newer.status NOT IN ('queued','running')
+            ORDER BY newer.id DESC LIMIT 100)""", (owner, repo, owner, repo))
 
 
 def db_prs_for_source(owner: str, repo: str, branch: str):

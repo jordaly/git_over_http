@@ -99,6 +99,7 @@ class ServerRunner:
             self.loop = asyncio.get_running_loop()
             self.stop_event = asyncio.Event()
             try:
+                await asyncio.to_thread(database._db_init)
                 self.httpd = await asyncio.start_server(
                     app.handle_client, self.bind_host, 0
                 )
@@ -107,6 +108,7 @@ class ServerRunner:
                 await self.stop_event.wait()
                 self.httpd.close()
                 await self.httpd.wait_closed()
+                await app.shutdown()
             except BaseException as exc:
                 self.start_error = exc
                 self.ready.set()

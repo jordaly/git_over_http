@@ -1,12 +1,15 @@
 """Per-repository asynchronous CI jobs."""
 
 import asyncio
+import contextlib
 import fnmatch
 import json
 import os
 import re
 import signal
 import shutil
+import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +34,16 @@ BUILTINS = {
     "PYGITHOST_BASE_COMMIT",
     "PYGITHOST_WORKTREE",
 }
+
+
+def _thread_call(func, *args, **kwargs):
+    """Return a non-None result so executor completion is reliable on all runtimes."""
+    return (func(*args, **kwargs),)
+
+
+async def _db_call(func, *args, **kwargs):
+    (result,) = await asyncio.to_thread(_thread_call, func, *args, **kwargs)
+    return result
 
 
 def default_config():
@@ -83,37 +96,59 @@ def validate_config(raw):
 class CIManager:
     def __init__(self, repo_path):
         self.repo_path = repo_path
-        self.queue = asyncio.Queue()
-        self.workers = []
+        self.pending = {}
+        self.active = {}
+        self.dispatcher = None
+        self.wakeup = asyncio.Event()
+        self.lifecycle_lock = asyncio.Lock()
         self.started = False
-        self.repo_locks = {}
+        self.stopping = False
 
     async def start(self):
-        if self.started:
-            return
-        self.started = True
-        await asyncio.to_thread(database.db_ci_recover_runs)
-        for row in await asyncio.to_thread(database.db_ci_queued_runs):
-            await self.queue.put(row)
-        self.workers = [asyncio.create_task(self._worker()) for _ in range(2)]
+        async with self.lifecycle_lock:
+            if self.started:
+                return
+            await _db_call(database.db_ci_recover_runs)
+            rows = await _db_call(database.db_ci_queued_runs)
+            self.pending = {row[0]: row for row in rows}
+            self.stopping = False
+            self.started = True
+            self.dispatcher = asyncio.create_task(self._dispatch())
 
     async def stop(self):
-        for worker in self.workers:
-            worker.cancel()
-        if self.workers:
-            await asyncio.gather(*self.workers, return_exceptions=True)
-        self.workers.clear()
-        self.started = False
+        async with self.lifecycle_lock:
+            if not self.started:
+                return
+            self.stopping = True
+            if self.dispatcher:
+                self.dispatcher.cancel()
+            active = list(self.active.values())
+            tasks = [task for _row, task in active]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(
+                *(tasks + ([self.dispatcher] if self.dispatcher else [])),
+                return_exceptions=True,
+            )
+            self.active.clear()
+            self.pending.clear()
+            self.dispatcher = None
+            self.started = False
+
+    async def wait_idle(self):
+        while self.active:
+            await asyncio.gather(
+                *(task for _row, task in tuple(self.active.values())),
+                return_exceptions=True,
+            )
 
     async def config(self, owner, repo):
-        raw = await asyncio.to_thread(database.db_ci_config_get, owner, repo)
+        raw = await _db_call(database.db_ci_config_get, owner, repo)
         return validate_config(json.loads(raw)) if raw else default_config()
 
     async def save_config(self, owner, repo, config):
         config = validate_config(config)
-        await asyncio.to_thread(
-            database.db_ci_config_set, owner, repo, json.dumps(config)
-        )
+        await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
         return config
 
     @staticmethod
@@ -143,8 +178,10 @@ class CIManager:
             return None
         if not self.started:
             await self.start()
+        if self.stopping:
+            return None
         payload = payload or {}
-        run_id = await asyncio.to_thread(
+        run_id = await _db_call(
             database.db_ci_run_create,
             owner,
             repo,
@@ -154,41 +191,120 @@ class CIManager:
             json.dumps(payload),
         )
         row = (run_id, owner, repo, event, branch, commit, json.dumps(payload))
-        await self.queue.put(row)
+        self.pending[run_id] = row
+        self.wakeup.set()
         return run_id
 
-    async def _worker(self):
+    async def _dispatch(self):
         while True:
-            row = await self.queue.get()
-            try:
-                lock = self.repo_locks.setdefault((row[1], row[2]), asyncio.Lock())
-                async with lock:
-                    await self._execute(row)
-            except asyncio.CancelledError:
-                await asyncio.to_thread(
-                    database.db_ci_run_update,
-                    row[0],
-                    status="interrupted",
-                    finished_at=datetime.now(timezone.utc).isoformat(),
-                )
-                raise
-            except Exception as exc:
-                await asyncio.to_thread(
-                    database.db_ci_run_update,
-                    row[0],
-                    status="failed",
-                    output=str(exc)[:MAX_OUTPUT],
-                    finished_at=datetime.now(timezone.utc).isoformat(),
-                )
-            finally:
-                self.queue.task_done()
+            active_repos = {(row[1], row[2]) for row, _task in self.active.values()}
+            for run_id, row in sorted(tuple(self.pending.items())):
+                if len(self.active) >= 2:
+                    break
+                repository = (row[1], row[2])
+                if repository in active_repos:
+                    continue
+                self.pending.pop(run_id, None)
+                task = asyncio.create_task(self._run_one(row))
+                self.active[run_id] = (row, task)
+                active_repos.add(repository)
+            self.wakeup.clear()
+            await self.wakeup.wait()
+
+    async def _run_one(self, row):
+        try:
+            await self._execute(row)
+        except asyncio.CancelledError:
+            await _db_call(
+                database.db_ci_run_update,
+                row[0],
+                status="interrupted",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+            raise
+        except Exception as exc:
+            await _db_call(
+                database.db_ci_run_update,
+                row[0],
+                status="failed",
+                output=str(exc)[:MAX_OUTPUT],
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+        finally:
+            self.active.pop(row[0], None)
+            self.wakeup.set()
+
+    async def _capture_process(
+        self, command, *, shell, cwd, env, output, truncated, timeout
+    ):
+        if timeout <= 0:
+            raise asyncio.TimeoutError
+        if os.name == "nt":
+            launcher = str(Path(__file__).with_name("ci_windows_launcher.py"))
+            invocation = (
+                [sys.executable, launcher, "--shell", command]
+                if shell
+                else [sys.executable, launcher, "--exec", *command]
+            )
+            process = await asyncio.create_subprocess_exec(
+                *invocation,
+                cwd=cwd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            )
+        elif shell:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=cwd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+
+        async def drain_and_wait():
+            while True:
+                chunk = await process.stdout.read(65536)
+                if not chunk:
+                    break
+                available = MAX_OUTPUT - len(output)
+                if available > 0:
+                    output.extend(chunk[:available])
+                if len(chunk) > available:
+                    truncated[0] = True
+            return await process.wait()
+
+        try:
+            return await asyncio.wait_for(drain_and_wait(), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if os.name == "nt":
+                if process.returncode is None:
+                    process.kill()  # Killing the launcher closes its Job Object and its child tree.
+            else:
+                # The shell may have exited while a descendant still holds stdout open.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            if process.returncode is None:
+                await process.wait()
+            raise
 
     async def _execute(self, row):
         run_id, owner, repo, event, branch, commit, payload_json = row
         payload = json.loads(payload_json or "{}")
         config = await self.config(owner, repo)
         if not config["command"]:
-            await asyncio.to_thread(
+            await _db_call(
                 database.db_ci_run_update,
                 run_id,
                 status="failed",
@@ -199,40 +315,37 @@ class CIManager:
             return
         if not commit and branch:
             commit = payload.get("commit", "")
-        await asyncio.to_thread(
+        await _db_call(
             database.db_ci_run_update,
             run_id,
             status="running",
             started_at=datetime.now(timezone.utc).isoformat(),
         )
         output = bytearray()
-        truncated = False
+        truncated = [False]
         temp_root = tempfile.mkdtemp(prefix="pygithost-ci-")
         worktree = str(Path(temp_root) / "checkout")
         bare = self.repo_path(owner, repo)
-        rc, status = -1, "failed"
+        rc, status, cancelled = -1, "failed", False
+        deadline = asyncio.get_running_loop().time() + JOB_TIMEOUT
         try:
-            # Build a detached temporary checkout. Avoid importing repository values into shell source.
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "--git-dir",
-                bare,
-                "worktree",
-                "add",
-                "--detach",
-                worktree,
-                commit,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+            git_dir = ["git", "--git-dir", bare]
+            rc = await self._capture_process(
+                [*git_dir, "worktree", "add", "--detach", worktree, commit],
+                shell=False,
+                cwd=None,
+                env=os.environ.copy(),
+                output=output,
+                truncated=truncated,
+                timeout=deadline - asyncio.get_running_loop().time(),
             )
-            checkout = await proc.stdout.read() if proc.stdout else b""
-            rc = await proc.wait()
-            if rc:
-                output.extend(checkout[:MAX_OUTPUT])
-                truncated = len(checkout) > MAX_OUTPUT
-            else:
-                if event.startswith("pull_request") and payload.get("head_commit"):
-                    merge = await asyncio.create_subprocess_exec(
+            if (
+                rc == 0
+                and event.startswith("pull_request")
+                and payload.get("head_commit")
+            ):
+                rc = await self._capture_process(
+                    [
                         "git",
                         "-C",
                         worktree,
@@ -240,106 +353,103 @@ class CIManager:
                         "--no-commit",
                         "--no-ff",
                         payload["head_commit"],
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                    )
-                    merge_output = await merge.stdout.read() if merge.stdout else b""
-                    merge_rc = await merge.wait()
-                    output.extend(merge_output[:MAX_OUTPUT])
-                    truncated = len(merge_output) > MAX_OUTPUT
-                    if merge_rc:
-                        rc, status = merge_rc, "failed"
-                    else:
-                        rc = None
-                else:
-                    rc = None
-                if rc is None:
-                    env = os.environ.copy()
-                    env.update(
-                        {
-                            "CI": "true",
-                            "PYGITHOST_OWNER": owner,
-                            "PYGITHOST_REPO": repo,
-                            "PYGITHOST_REPOSITORY": f"{owner}/{repo}",
-                            "PYGITHOST_EVENT": event,
-                            "PYGITHOST_REF": f"refs/heads/{branch}" if branch else "",
-                            "PYGITHOST_BRANCH": branch,
-                            "PYGITHOST_COMMIT": commit,
-                            "PYGITHOST_OLD_COMMIT": payload.get("old_commit", ""),
-                            "PYGITHOST_PR_NUMBER": str(payload.get("pr_number", "")),
-                            "PYGITHOST_BASE_BRANCH": payload.get("base_branch", ""),
-                            "PYGITHOST_HEAD_BRANCH": payload.get("head_branch", branch),
-                            "PYGITHOST_BASE_COMMIT": payload.get("base_commit", ""),
-                            "PYGITHOST_WORKTREE": worktree,
-                        }
-                    )
-                    env.update(config["env"])
-                    process = await asyncio.create_subprocess_shell(
-                        config["command"],
-                        cwd=worktree,
-                        env=env,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        start_new_session=(os.name != "nt"),
-                    )
-                    try:
-
-                        async def capture():
-                            nonlocal truncated
-                            while True:
-                                chunk = await process.stdout.read(65536)
-                                if not chunk:
-                                    break
-                                available = MAX_OUTPUT - len(output)
-                                if available > 0:
-                                    output.extend(chunk[:available])
-                                if len(chunk) > available:
-                                    truncated = True
-
-                        async def capture_and_wait():
-                            await capture()
-                            return await process.wait()
-
-                        rc = await asyncio.wait_for(
-                            capture_and_wait(), timeout=JOB_TIMEOUT
-                        )
-                        status = "success" if rc == 0 else "failed"
-                    except asyncio.TimeoutError:
-                        if os.name != "nt":
-                            os.killpg(process.pid, signal.SIGKILL)
-                        else:
-                            process.kill()
-                        await process.wait()
-                        rc, status = -1, "timed_out"
-                    except asyncio.CancelledError:
-                        if process.returncode is None:
-                            if os.name != "nt":
-                                os.killpg(process.pid, signal.SIGKILL)
-                            else:
-                                process.kill()
-                            await process.wait()
-                        raise
-        finally:
-            if os.path.isdir(worktree):
-                remove = await asyncio.create_subprocess_exec(
-                    "git",
-                    "--git-dir",
-                    bare,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    worktree,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    ],
+                    shell=False,
+                    cwd=None,
+                    env=os.environ.copy(),
+                    output=output,
+                    truncated=truncated,
+                    timeout=deadline - asyncio.get_running_loop().time(),
                 )
-                await remove.wait()
-            shutil.rmtree(temp_root, ignore_errors=True)
-        await asyncio.to_thread(
+            if rc == 0:
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "CI": "true",
+                        "PYGITHOST_OWNER": owner,
+                        "PYGITHOST_REPO": repo,
+                        "PYGITHOST_REPOSITORY": f"{owner}/{repo}",
+                        "PYGITHOST_EVENT": event,
+                        "PYGITHOST_REF": f"refs/heads/{branch}" if branch else "",
+                        "PYGITHOST_BRANCH": branch,
+                        "PYGITHOST_COMMIT": commit,
+                        "PYGITHOST_OLD_COMMIT": payload.get("old_commit", ""),
+                        "PYGITHOST_PR_NUMBER": str(payload.get("pr_number", "")),
+                        "PYGITHOST_BASE_BRANCH": payload.get("base_branch", ""),
+                        "PYGITHOST_HEAD_BRANCH": payload.get("head_branch", branch),
+                        "PYGITHOST_BASE_COMMIT": payload.get("base_commit", ""),
+                        "PYGITHOST_WORKTREE": worktree,
+                    }
+                )
+                env.update(config["env"])
+                rc = await self._capture_process(
+                    config["command"],
+                    shell=True,
+                    cwd=worktree,
+                    env=env,
+                    output=output,
+                    truncated=truncated,
+                    timeout=deadline - asyncio.get_running_loop().time(),
+                )
+            status = "success" if rc == 0 else "failed"
+        except asyncio.TimeoutError:
+            rc, status = -1, "timed_out"
+            output.extend(
+                b"CI execution exceeded the 30 minute limit.\n"[
+                    : MAX_OUTPUT - len(output)
+                ]
+            )
+        except asyncio.CancelledError:
+            rc, status, cancelled = -1, "interrupted", True
+        except Exception as exc:
+            rc, status = -1, "failed"
+            message = (str(exc) + "\n").encode("utf-8", "replace")
+            output.extend(message[: MAX_OUTPUT - len(output)])
+        finally:
+            cleanup_error = None
+            if os.path.isdir(worktree):
+                try:
+                    remove_rc = await self._capture_process(
+                        [
+                            "git",
+                            "--git-dir",
+                            bare,
+                            "worktree",
+                            "remove",
+                            "--force",
+                            worktree,
+                        ],
+                        shell=False,
+                        cwd=None,
+                        env=os.environ.copy(),
+                        output=output,
+                        truncated=truncated,
+                        timeout=30,
+                    )
+                    if remove_rc:
+                        cleanup_error = "Git worktree removal failed."
+                except Exception as exc:
+                    cleanup_error = f"Git worktree removal failed: {exc}"
+            try:
+                await asyncio.wait_for(
+                    _db_call(shutil.rmtree, temp_root, True), timeout=30
+                )
+            except Exception as exc:
+                cleanup_error = f"Temporary directory cleanup failed: {exc}"
+            if cleanup_error:
+                output.extend(
+                    (cleanup_error + "\n").encode()[: MAX_OUTPUT - len(output)]
+                )
+                if status == "success":
+                    status = "failed"
+        await _db_call(
             database.db_ci_run_update,
             run_id,
             status=status,
             output=bytes(output).decode("utf-8", "replace"),
-            truncated=1 if truncated else 0,
+            truncated=int(truncated[0]),
             return_code=rc,
             finished_at=datetime.now(timezone.utc).isoformat(),
         )
+        if cancelled:
+            raise asyncio.CancelledError

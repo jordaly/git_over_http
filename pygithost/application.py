@@ -10,6 +10,7 @@ import platform
 import re
 import sqlite3
 import sys
+import signal
 from dataclasses import dataclass, field
 from email.utils import formatdate
 from pathlib import Path
@@ -49,6 +50,16 @@ from .database import (
     db_verify_token,
     db_verify_token_any_user,
 )
+
+
+def _thread_call(func, *args, **kwargs):
+    """Keep executor results non-None, including database misses and void writes."""
+    return (func(*args, **kwargs),)
+
+
+async def _call_in_thread(func, *args, **kwargs):
+    result, = await asyncio.to_thread(_thread_call, func, *args, **kwargs)
+    return result
 from .rendering import SafeHTML, html_t, join_html, q, safe_html, str_t
 
 # ============================================================
@@ -1818,7 +1829,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
 
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        latest_ci = await asyncio.to_thread(db_ci_latest_run, owner, repo)
+        latest_ci = await _call_in_thread(db_ci_latest_run, owner, repo)
         if latest_ci:
             ci_status = latest_ci[1]
             ci_color = {"success": "#16803c", "failed": "#b42318", "timed_out": "#b42318",
@@ -2206,7 +2217,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch, "base_commit": new_commit})
         return await self._ui_pull_view(owner, repo, pr_id, msg, "ok")
 
-    async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = ""):
+    async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = "", partial: bool = False):
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
@@ -2216,8 +2227,8 @@ document.addEventListener("DOMContentLoaded", function() {{
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
-        selected_run = await asyncio.to_thread(db_ci_run_get, owner, repo, run_id) if run_id else None
-        refresh = safe_html('<meta http-equiv="refresh" content="5">') if any(run[4] in ("queued", "running") for run in runs) else safe_html("")
+        selected_run = await _call_in_thread(db_ci_run_get, owner, repo, run_id) if run_id else None
+        results_active = any(run[4] in ("queued", "running") for run in runs)
         detail = safe_html("")
         if selected_run:
             detail = safe_html(html_t(t'<div class="box"><h2>Run #{selected_run[0]} · {selected_run[4]}</h2><div class="muted">{selected_run[1]} · {selected_run[2]} · <code>{selected_run[3][:8]}</code> · exit {selected_run[7]}</div><pre style="white-space:pre-wrap;max-height:600px;overflow:auto">{selected_run[5]}</pre>{"Output truncated at 1 MiB." if selected_run[6] else ""}</div>'))
@@ -2225,6 +2236,11 @@ document.addEventListener("DOMContentLoaded", function() {{
         for run in runs:
             rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7]}</td><td>{run[8]}</td></tr>'))
         runs_html = join_html(rows) if rows else safe_html('<tr><td colspan="7" class="muted">No CI runs yet.</td></tr>')
+        results_html = html_t(t'''<div id="ci-results" data-active="{"true" if results_active else "false"}">{detail}
+<div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div></div>''')
+        if partial:
+            return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
         admin_form = safe_html("")
         if _require_admin(self) or not REQUIRE_AUTH:
@@ -2240,9 +2256,9 @@ document.addEventListener("DOMContentLoaded", function() {{
 <label>Push branch filters (one glob per line; blank means all)</label><textarea name="push_branches">{config["push_branches"]}</textarea>
 <label>Pull request target branch filters</label><textarea name="pr_branches">{config["pr_branches"]}</textarea>
 <div class="row">{event_controls}</div><button type="submit">Save CI settings</button></form></div>'''))
-        body = html_t(t'''{refresh}<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div><div><a class="pill" href="{base}">Repo</a></div></div>{notice_html}{admin_form}
-<div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{detail}
-<div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div>''')
+        body = html_t(t'''<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div><div><a class="pill" href="{base}">Repo</a></div></div>{notice_html}{admin_form}
+<div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{results_html}
+<script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const response = await fetch(window.location.pathname + "?partial=1", {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
         await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(body)))
 
     async def _ui_ci_config(self, owner: str, repo: str):
@@ -2740,16 +2756,22 @@ document.addEventListener("DOMContentLoaded", function() {{
         proc = None
         push_identity = None
         push_lock = None
+        push_lock_acquired = False
         before_refs = {}
-        if self._git_request_needs_write(path_info, query):
+        connected = True
+        is_receive_pack_post = self.command == "POST" and path_info.endswith("/git-receive-pack")
+        if is_receive_pack_post:
             for candidate_owner, candidate_repo, rel in _scan_repos(GIT_PROJECT_ROOT):
                 if path_info.startswith("/" + rel.strip("/") + "/"):
                     push_identity = (candidate_owner, candidate_repo)
                     break
+        if push_identity:
+            self.server.push_requests.add(asyncio.current_task())
         try:
             if push_identity:
                 push_lock = self.server.push_locks.setdefault(push_identity, asyncio.Lock())
                 await push_lock.acquire()
+                push_lock_acquired = True
                 before_refs = await self.server._branch_refs(*push_identity)
             if TRACE_LOG:
                 _ensure_dir(TRACE_LOG)
@@ -2766,6 +2788,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 stdout=asyncio.subprocess.PIPE,
                 stderr=stderr_target,
                 env=env,
+                start_new_session=(os.name != "nt"),
             )
 
             body_task = asyncio.create_task(self._pipe_request_body_to_stdin(proc, clen))
@@ -2809,52 +2832,91 @@ document.addEventListener("DOMContentLoaded", function() {{
             if not has_conn:
                 response_lines.append("Connection: close\r\n")
             response_lines.append("\r\n")
-            self.request.writer.write("".join(response_lines).encode("iso-8859-1", "replace"))
-            await self.request.writer.drain()
+            connected = await self._write_git_response("".join(response_lines).encode("iso-8859-1", "replace"))
 
             while True:
-                chunk = await proc.stdout.read(READ_CHUNK)
+                if connected:
+                    chunk = await proc.stdout.read(READ_CHUNK)
+                else:
+                    chunk = await asyncio.wait_for(proc.stdout.read(READ_CHUNK), timeout=30)
                 if not chunk:
                     break
-                self.request.writer.write(chunk)
-                await self.request.writer.drain()
+                if connected:
+                    connected = await self._write_git_response(chunk)
 
             if body_task is not None:
                 await body_task
 
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            if push_identity and proc.returncode == 0:
-                owner, repo = push_identity
-                after_refs = await self.server._branch_refs(owner, repo)
-                for branch, commit in after_refs.items():
-                    old_commit = before_refs.get(branch)
-                    if old_commit == commit:
-                        continue
-                    await self.server.ci_manager.enqueue(owner, repo, "push", branch, commit, {"old_commit": old_commit or ""})
-                    for pr_id, target_branch in await asyncio.to_thread(db_prs_for_source, owner, repo, branch):
-                        base_commit = await _git_resolve_commit(_repo_bare_path(owner, repo), "refs/heads/" + target_branch) or ""
-                        await self.server.ci_manager.enqueue(owner, repo, "pull_request_updated", target_branch, base_commit,
-                            {"pr_number": pr_id, "base_branch": target_branch, "head_branch": branch,
-                             "base_commit": base_commit, "head_commit": commit})
-        finally:
-            if push_lock and push_lock.locked():
-                push_lock.release()
-            if body_task is not None and not body_task.done():
-                body_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await body_task
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(Exception):
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=30 if not connected else 5)
+            except asyncio.TimeoutError:
+                if os.name == "nt":
                     proc.kill()
-                    await proc.wait()
-            if trace_file:
-                with contextlib.suppress(Exception):
-                    trace_file.flush()
-                    trace_file.close()
+                else:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                await proc.wait()
+        finally:
+            try:
+                if push_identity and push_lock_acquired:
+                    if proc is not None and proc.returncode is None:
+                        try:
+                            if asyncio.current_task().cancelling():
+                                if os.name == "nt":
+                                    proc.kill()
+                                else:
+                                    with contextlib.suppress(ProcessLookupError):
+                                        os.killpg(proc.pid, signal.SIGKILL)
+                                await proc.wait()
+                            else:
+                                await asyncio.wait_for(proc.wait(), timeout=30 if not connected else 5)
+                        except asyncio.TimeoutError:
+                            if os.name == "nt":
+                                proc.kill()
+                            else:
+                                with contextlib.suppress(ProcessLookupError):
+                                    os.killpg(proc.pid, signal.SIGKILL)
+                            await proc.wait()
+                    finalizer = asyncio.create_task(self.server._queue_push_changes(*push_identity, before_refs))
+                    self.server.push_finalizers.add(finalizer)
+                    finalizer.add_done_callback(self.server.push_finalizers.discard)
+                    try:
+                        await asyncio.shield(finalizer)
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(Exception, asyncio.CancelledError):
+                            await asyncio.shield(finalizer)
+                        raise
+            finally:
+                try:
+                    if body_task is not None and not body_task.done():
+                        body_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await body_task
+                finally:
+                    try:
+                        if proc is not None and proc.returncode is None:
+                            with contextlib.suppress(Exception):
+                                proc.kill()
+                                await proc.wait()
+                    finally:
+                        try:
+                            if trace_file:
+                                with contextlib.suppress(Exception):
+                                    trace_file.flush()
+                                    trace_file.close()
+                        finally:
+                            if push_identity:
+                                self.server.push_requests.discard(asyncio.current_task())
+                            if push_lock and push_lock_acquired:
+                                push_lock.release()
+
+    async def _write_git_response(self, data: bytes) -> bool:
+        try:
+            self.request.writer.write(data)
+            await self.request.writer.drain()
+            return True
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return False
 
     # ========================================================
     # ROUTING
@@ -2897,10 +2959,14 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._ui_admin_users()
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci$", p)
         if m:
-            return await self._ui_ci(m.group(1), m.group(2))
+            qs = parse_qs(parsed.query or "")
+            partial = (qs.get("partial") or [""])[0] == "1"
+            return await self._ui_ci(m.group(1), m.group(2), partial=partial)
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/runs/(\d+)$", p)
         if m:
-            return await self._ui_ci(m.group(1), m.group(2), int(m.group(3)))
+            qs = parse_qs(parsed.query or "")
+            partial = (qs.get("partial") or [""])[0] == "1"
+            return await self._ui_ci(m.group(1), m.group(2), int(m.group(3)), partial=partial)
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
             return await self._ui_repo(m.group(1), m.group(2))
@@ -3019,17 +3085,48 @@ class AsyncGitServer:
         self.allowlist = allowlist if allowlist is not None else ALLOWED_CLIENT_IPS
         self.ci_manager = CIManager(_repo_bare_path)
         self.push_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self.push_requests: set[asyncio.Task] = set()
+        self.push_finalizers: set[asyncio.Task] = set()
 
-    async def _branch_refs(self, owner: str, repo: str) -> dict[str, str]:
+    async def _branch_refs(self, owner: str, repo: str) -> dict[str, str] | None:
         code, out, _ = await _run_git(_repo_bare_path(owner, repo), ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])
         if code:
-            return {}
+            return None
         refs = {}
         for line in out.decode("ascii", "replace").splitlines():
             ref, _, oid = line.partition(" ")
             if ref.startswith("refs/heads/") and oid:
                 refs[ref[len("refs/heads/"):]] = oid
         return refs
+
+    async def _queue_push_changes(self, owner: str, repo: str, before_refs: dict[str, str] | None) -> None:
+        after_refs = await self._branch_refs(owner, repo)
+        if after_refs is None or before_refs is None:
+            return
+        repo_git = _repo_bare_path(owner, repo)
+        for branch, commit in after_refs.items():
+            old_commit = before_refs.get(branch)
+            if old_commit == commit:
+                continue
+            await self.ci_manager.enqueue(owner, repo, "push", branch, commit, {"old_commit": old_commit or ""})
+            for pr_id, target_branch in await asyncio.to_thread(db_prs_for_source, owner, repo, branch):
+                base_commit = await _git_resolve_commit(repo_git, "refs/heads/" + target_branch) or ""
+                await self.ci_manager.enqueue(owner, repo, "pull_request_updated", target_branch, base_commit,
+                    {"pr_number": pr_id, "base_branch": target_branch, "head_branch": branch,
+                     "base_commit": base_commit, "head_commit": commit})
+
+    async def shutdown(self) -> None:
+        pending = tuple(self.push_requests)
+        if pending:
+            _done, pending = await asyncio.wait(pending, timeout=30)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        finalizers = tuple(self.push_finalizers)
+        if finalizers:
+            await asyncio.gather(*finalizers, return_exceptions=True)
+        await self.ci_manager.stop()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -3082,8 +3179,13 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     os.environ["GIT_HTTP_EXPORT_ALL"] = "1"
 
     app = AsyncGitServer(AppContext(config))
-    await app.ci_manager.start()
-    server = await asyncio.start_server(app.handle_client, HOST, PORT)
+    server = None
+    try:
+        await app.ci_manager.start()
+        server = await asyncio.start_server(app.handle_client, HOST, PORT)
+    except BaseException:
+        await app.shutdown()
+        raise
 
     print("=" * 60)
     print(str_t(t"Async Git Smart HTTP + Web UI running on port {PORT}"))
@@ -3105,7 +3207,7 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
         async with server:
             await server.serve_forever()
     finally:
-        await app.ci_manager.stop()
+        await app.shutdown()
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

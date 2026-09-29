@@ -2223,40 +2223,64 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._not_found()
         if run_id is not None:
             return await self._ui_ci_run_detail(owner, repo, run_id, partial=partial)
-        manager = self.server.ci_manager
-        config = await manager.config(owner, repo)
-        runs = await asyncio.to_thread(db_ci_runs_list, owner, repo, 100)
+        query_params = parse_qs(urlparse(getattr(self, "path", "")).query or "")
+        filters = {
+            key: (query_params.get(key) or [""])[0].strip()
+            for key in ("status", "event", "branch", "q")
+        }
+        allowed_statuses = {"queued", "running", "success", "failed", "timed_out", "interrupted"}
+        allowed_events = {"push", "pull_request", "pull_request_updated", "pull_request_reopened", "pull_request_merged", "manual"}
+        if filters["status"] not in allowed_statuses:
+            filters["status"] = ""
+        if filters["event"] not in allowed_events:
+            filters["event"] = ""
+        filters["q"] = filters["q"][:128]
+        runs = await _call_in_thread(
+            db_ci_runs_list, owner, repo, 100,
+            status=filters["status"], event=filters["event"],
+            branch=filters["branch"], query=filters["q"],
+        )
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
-        results_active = any(run[4] in ("queued", "running") for run in runs)
         rows = []
         for run in runs:
             rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7]}</td><td>{run[8]}</td></tr>'))
         runs_html = join_html(rows) if rows else safe_html('<tr><td colspan="7" class="muted">No CI runs yet.</td></tr>')
-        results_html = safe_html(html_t(t'''<div id="ci-results" data-active="{"true" if results_active else "false"}">
-<div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div></div>'''))
+        filter_options = {
+            "status": [("", "All statuses"), ("queued", "Queued"), ("running", "Running"),
+                ("success", "Success"), ("failed", "Failed"), ("timed_out", "Timed out"), ("interrupted", "Interrupted")],
+            "event": [("", "All events"), ("push", "Push"), ("pull_request", "PR opened"),
+                ("pull_request_updated", "PR updated"), ("pull_request_reopened", "PR reopened"),
+                ("pull_request_merged", "PR merged"), ("manual", "Manual")],
+        }
+        options_html = {}
+        for name, options in filter_options.items():
+            options_html[name] = join_html([
+                html_t(t'<option value="{value}"{safe_html(" selected" if value == filters[name] else "")}>{label}</option>')
+                for value, label in options
+            ])
+        branch_values = [("", "All branches")] + [(branch, branch) for branch in branches]
+        if filters["branch"] and filters["branch"] not in branches:
+            branch_values.append((filters["branch"], filters["branch"]))
+        branch_options = join_html([
+            html_t(t'<option value="{value}"{safe_html(" selected" if value == filters["branch"] else "")}>{label}</option>')
+            for value, label in branch_values
+        ])
+        filter_form = safe_html(html_t(t'''<div class="box"><h2>Find runs</h2><form method="GET" action="{base}/ci" class="row">
+<input name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
+<select name="status">{options_html["status"]}</select><select name="event">{options_html["event"]}</select>
+<select name="branch">{branch_options}</select><button type="submit">Filter runs</button>
+<a class="pill" href="{base}/ci">Clear filters</a></form></div>'''))
+        results_html = safe_html(html_t(t'''<div id="ci-results">
+<div class="box"><h2>CI runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
-        admin_form = safe_html("")
-        if _require_admin(self) or not REQUIRE_AUTH:
-            env_text = "\n".join(f"{key}={value}" for key, value in config["env"].items())
-            checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
-            event_controls = join_html([
-                html_t(t'<label><input type="checkbox" name="event_{key}"{checks[key]}/> {key.replace("_", " ")}</label>')
-                for key in checks
-            ])
-            admin_form = safe_html(html_t(t'''<div class="box"><h2>CI settings</h2><p class="muted">The command runs in the server’s default shell in a temporary checkout. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and pull request metadata such as <code>PYGITHOST_PR_NUMBER</code>.</p>
-<form method="POST" action="{base}/ci/config"><label>Command</label><textarea name="command" placeholder="python -m pytest" style="min-height:100px">{config["command"]}</textarea>
-<label>Environment variables (KEY=value, one per line)</label><textarea name="env" placeholder="EXAMPLE=value">{env_text}</textarea>
-<label>Push branch filters (one glob per line; blank means all)</label><textarea name="push_branches">{config["push_branches"]}</textarea>
-<label>Pull request target branch filters</label><textarea name="pr_branches">{config["pr_branches"]}</textarea>
-<div class="row">{event_controls}</div><button type="submit">Save CI settings</button></form></div>'''))
-        body = html_t(t'''<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div><div><a class="pill" href="{base}">Repo</a></div></div>{notice_html}{admin_form}
-<div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{results_html}
-<script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const response = await fetch(window.location.pathname + "?partial=1", {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
+        notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
+        body = html_t(t'''<div class="topbar"><div><h1>CI runs · {owner}/{repo}</h1></div><div><a class="pill" href="{base}/ci/config">CI settings</a> <a class="pill" href="{base}">Repo</a></div></div>{notice_html}
+<div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{filter_form}{results_html}
+<script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
         await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(body)))
 
     async def _ui_ci_run_detail(self, owner: str, repo: str, run_id: int, *, partial: bool = False):
@@ -2298,7 +2322,33 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         return await _send_html(self.request, 200,
             _html_page(str_t(t"CI run #{run[0]} · {owner}/{repo}"), body))
 
-    async def _ui_ci_config(self, owner: str, repo: str):
+    async def _ui_ci_config(self, owner: str, repo: str, notice: str = ""):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if REQUIRE_AUTH and not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\\n")
+        config = await self.server.ci_manager.config(owner, repo)
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        env_text = "\n".join(f"{key}={value}" for key, value in config["env"].items())
+        checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
+        event_controls = join_html([
+            html_t(t'<label><input type="checkbox" name="event_{key}"{checks[key]}/> {key.replace("_", " ")}</label>')
+            for key in checks
+        ])
+        notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
+        body = html_t(t'''<div class="topbar"><div><h1>CI settings · {owner}/{repo}</h1></div>
+<div><a class="pill" href="{base}/ci">CI runs</a> <a class="pill" href="{base}">Repo</a></div></div>{notice_html}
+<div class="box"><p class="muted">The command runs in the server’s default shell in a temporary checkout. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and pull request metadata such as <code>PYGITHOST_PR_NUMBER</code>.</p>
+<form method="POST" action="{base}/ci/config"><label>Command</label><textarea name="command" placeholder="python -m pytest" style="min-height:100px">{config["command"]}</textarea>
+<label>Environment variables (KEY=value, one per line)</label><textarea name="env" placeholder="EXAMPLE=value">{env_text}</textarea>
+<label>Push branch filters (one glob per line; blank means all)</label><textarea name="push_branches">{config["push_branches"]}</textarea>
+<label>Pull request target branch filters</label><textarea name="pr_branches">{config["pr_branches"]}</textarea>
+<div class="row">{event_controls}</div><button type="submit">Save CI settings</button></form></div>''')
+        return await _send_html(self.request, 200,
+            _html_page(str_t(t"CI settings · {owner}/{repo}"), safe_html(body)))
+
+    async def _ui_ci_config_save(self, owner: str, repo: str):
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
@@ -2310,7 +2360,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             line = line.strip()
             if not line: continue
             if "=" not in line:
-                return await self._ui_ci(owner, repo, notice="Each environment entry must use KEY=value.")
+                return await self._ui_ci_config(owner, repo, notice="Each environment entry must use KEY=value.")
             key, value = line.split("=", 1)
             env[key.strip()] = value
         config = {"command": form.get("command", ""), "env": env,
@@ -2319,8 +2369,8 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         try:
             await self.server.ci_manager.save_config(owner, repo, config)
         except ValueError as exc:
-            return await self._ui_ci(owner, repo, notice=str(exc))
-        return await self._ui_ci(owner, repo, notice="CI settings saved.")
+            return await self._ui_ci_config(owner, repo, notice=str(exc))
+        return await self._ui_ci_config(owner, repo, notice="CI settings saved.")
 
     async def _ui_ci_run(self, owner: str, repo: str):
         owner, repo = unquote(owner), unquote(repo)
@@ -2996,6 +3046,9 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             return await self._ui_tokens()
         if p == "/admin/users":
             return await self._ui_admin_users()
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", p)
+        if m:
+            return await self._ui_ci_config(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci$", p)
         if m:
             qs = parse_qs(parsed.query or "")
@@ -3082,7 +3135,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             return await self._ui_pull_merge(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", parsed.path)
         if m:
-            return await self._ui_ci_config(m.group(1), m.group(2))
+            return await self._ui_ci_config_save(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/run$", parsed.path)
         if m:
             return await self._ui_ci_run(m.group(1), m.group(2))

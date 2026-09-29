@@ -664,10 +664,39 @@ def db_ci_run_update(run_id: int, **values) -> None:
         conn.close()
 
 
-def db_ci_runs_list(owner: str, repo: str, limit: int = 100):
+def db_ci_runs_list(
+    owner: str,
+    repo: str,
+    limit: int = 100,
+    *,
+    status: str = "",
+    event: str = "",
+    branch: str = "",
+    query: str = "",
+):
     conn = _db_connect()
     try:
-        return conn.execute("SELECT id,event,branch,commit_hash,status,output,truncated,return_code,created_at,started_at,finished_at FROM ci_runs WHERE owner=? AND repo=? ORDER BY id DESC LIMIT ?", (owner, repo, limit)).fetchall()
+        conditions = ["owner=?", "repo=?"]
+        params = [owner, repo]
+        for column, value in (("status", status), ("event", event), ("branch", branch)):
+            if value:
+                conditions.append(f"{column}=?")
+                params.append(value)
+        query = (query or "").strip().lower()[:128]
+        if query:
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            conditions.append(
+                "(CAST(id AS TEXT) LIKE ? ESCAPE '\\' OR "
+                "lower(commit_hash) LIKE ? ESCAPE '\\' OR lower(output) LIKE ? ESCAPE '\\')"
+            )
+            params.extend((pattern, pattern, pattern))
+        params.append(max(1, min(int(limit), 500)))
+        return conn.execute(
+            "SELECT id,event,branch,commit_hash,status,output,truncated,return_code,created_at,started_at,finished_at "
+            f"FROM ci_runs WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
     finally:
         conn.close()
 

@@ -390,7 +390,12 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(handler._ui_ci("owner", "repo"), timeout=3)
             full_page = send_html.await_args.args[2].decode("utf-8")
-            self.assertIn('name="command"', full_page)
+            self.assertNotIn('name="command"', full_page)
+            self.assertIn('href="/r/owner/repo/ci/config"', full_page)
+            self.assertIn('name="status"', full_page)
+            self.assertIn('name="event"', full_page)
+            self.assertIn('name="branch"', full_page)
+            self.assertIn('name="q"', full_page)
             self.assertIn("setInterval(update, 5000)", full_page)
             self.assertIn("current.outerHTML = fragment", full_page)
             self.assertIn('<div id="ci-results"', full_page)
@@ -402,6 +407,49 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('id="ci-results"', fragment.decode("utf-8"))
             self.assertNotIn('name="command"', fragment.decode("utf-8"))
             self.assertIn(("Cache-Control", "no-store"), headers)
+
+    async def test_ci_run_filters_search_by_status_event_branch_and_output(self):
+        matching = self._queued_run("filtered", event="push")
+        other = self._queued_run("filtered", event="manual")
+        database.db_ci_run_update(
+            matching, status="failed", output="unit-test exploded", return_code=1
+        )
+        database.db_ci_run_update(
+            other, status="success", output="all green", return_code=0
+        )
+        handler = object.__new__(GitHTTPHandler)
+        handler.path = "/r/owner/filtered/ci?status=failed&event=push&branch=main&q=exploded"
+        handler.request = SimpleNamespace()
+
+        async def branches(_repo):
+            return ["main", "release"]
+
+        with (
+            mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),
+            mock.patch("pygithost.application._git_list_branches", side_effect=branches),
+            mock.patch("pygithost.application._send_html", new_callable=AsyncMock) as send_html,
+        ):
+            await handler._ui_ci("owner", "filtered")
+        page = send_html.await_args.args[2].decode("utf-8")
+        self.assertIn(f"/ci/runs/{matching}", page)
+        self.assertNotIn(f"/ci/runs/{other}", page)
+        self.assertIn('value="exploded"', page)
+
+    async def test_ci_configuration_is_on_its_own_page(self):
+        handler = object.__new__(GitHTTPHandler)
+        handler.server = SimpleNamespace(ci_manager=CIManager(lambda *_: ""))
+        handler.request = SimpleNamespace()
+        handler.remote_is_admin = True
+        with (
+            mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),
+            mock.patch("pygithost.application._send_html", new_callable=AsyncMock) as send_html,
+        ):
+            await asyncio.wait_for(handler._ui_ci_config("owner", "repo"), timeout=3)
+        page = send_html.await_args.args[2].decode("utf-8")
+        self.assertIn('name="command"', page)
+        self.assertIn('action="/r/owner/repo/ci/config"', page)
+        self.assertIn('href="/r/owner/repo/ci"', page)
+        self.assertNotIn("Recent runs", page)
 
     async def test_ci_run_has_a_separate_detail_screen(self):
         run_id = self._queued_run("repo")

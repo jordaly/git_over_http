@@ -187,6 +187,65 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_repo_page_displays_highlighted_root_readme_when_present(self):
+        repo = os.path.join(self.tmp_root, "repo")
+        self._git("init", "-b", "main", repo)
+        with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as readme:
+            readme.write("# Project\n\n<script>alert('unsafe')</script>\n")
+        self._git("-C", repo, "config", "user.name", "Test User")
+        self._git("-C", repo, "config", "user.email", "test@example.com")
+        self._git("-C", repo, "add", "README.md")
+        self._git("-C", repo, "commit", "-m", "Add README")
+
+        with ServerRunner(
+            allow_ips={"127.0.0.1"},
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+        ) as srvrun:
+            conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
+            try:
+                conn.request("GET", "/r/root/repo")
+                response = conn.getresponse()
+                body = response.read().decode("utf-8")
+
+                self.assertEqual(response.status, 200)
+                self.assertIn('class="language-markdown"', body)
+                self.assertIn("# Project", body)
+                self.assertIn("prism-markdown.min.js", body)
+                self.assertIn("&lt;script&gt;alert(&#x27;unsafe&#x27;)&lt;/script&gt;", body)
+                self.assertNotIn("<script>alert('unsafe')</script>", body)
+            finally:
+                conn.close()
+
+    def test_repo_page_omits_missing_root_readme(self):
+        repo = os.path.join(self.tmp_root, "repo")
+        self._git("init", "-b", "main", repo)
+        with open(os.path.join(repo, "file.txt"), "w", encoding="utf-8") as source:
+            source.write("source\n")
+        self._git("-C", repo, "config", "user.name", "Test User")
+        self._git("-C", repo, "config", "user.email", "test@example.com")
+        self._git("-C", repo, "add", "file.txt")
+        self._git("-C", repo, "commit", "-m", "Add source")
+
+        with ServerRunner(
+            allow_ips={"127.0.0.1"},
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+        ) as srvrun:
+            conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
+            try:
+                conn.request("GET", "/r/root/repo")
+                response = conn.getresponse()
+                body = response.read().decode("utf-8")
+
+                self.assertEqual(response.status, 200)
+                self.assertNotIn('id="readmeSource"', body)
+                self.assertNotIn("prism-markdown.min.js", body)
+            finally:
+                conn.close()
+
     def test_end_to_end_clone_commit_push(self):
         # Create a bare repo and enable receive-pack
         bare = os.path.join(self.tmp_root, "repo.git")

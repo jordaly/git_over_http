@@ -1766,6 +1766,28 @@ class GitHTTPHandler:
 
         default_branch = await _git_default_branch(repo_git)
         branches = await _git_list_branches(repo_git)
+        readme_code, readme_out, _ = await _run_git(repo_git, ["show", f"{default_branch}:README.md"])
+        readme_html = safe_html("")
+        if readme_code == 0:
+            readme_text = readme_out.decode("utf-8", "replace")
+            readme_html = safe_html(
+                html_t(
+                    t"""<div class="box" style="margin-top:14px">
+<h2 style="margin:0 0 10px 0;font-size:16px">README.md</h2>
+<pre><code id="readmeSource" class="language-markdown">{readme_text}</code></pre>
+<script>
+document.addEventListener("DOMContentLoaded", function() {{
+    const code = document.getElementById("readmeSource");
+    if (!code || !window.Prism) return;
+    const script = document.createElement("script");
+    script.src = "/static/assets/prismjs/components/prism-markdown.min.js";
+    script.onload = function() {{ Prism.highlightElement(code); }};
+    document.head.appendChild(script);
+}});
+</script>
+</div>"""
+                )
+            )
         if owner == FLAT_OWNER_UI:
             clone_path = str_t(t"{URL_PREFIX}/{q(repo)}.git")
         else:
@@ -1800,7 +1822,8 @@ class GitHTTPHandler:
         ":SECRET@" + window.location.host + element.dataset.path;
 }})();
 </script>
-</div>"""
+</div>
+{readme_html}"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(body)))
 

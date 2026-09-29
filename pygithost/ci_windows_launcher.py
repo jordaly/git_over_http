@@ -98,6 +98,20 @@ def _shell_executable():
     return os.path.join(system_root, "System32", "cmd.exe")
 
 
+def _exec_command(arguments):
+    if not arguments:
+        raise ValueError("--exec requires a command")
+    # With lpApplicationName supplied, CreateProcessW does not search PATH
+    # or append .exe. Resolve tools such as git before calling it.
+    executable = shutil.which(arguments[0])
+    if executable is None:
+        raise FileNotFoundError(
+            f"CI executable {arguments[0]!r} was not found on the server PATH."
+        )
+    executable = os.path.abspath(executable)
+    return executable, subprocess.list2cmdline([executable, *arguments[1:]])
+
+
 def _launch(arguments):
     if os.name != "nt":
         raise OSError("The CI Windows launcher can only run on Windows.")
@@ -188,10 +202,7 @@ def _launch(arguments):
                 [executable, "/d", "/s", "/c", arguments[1]]
             )
         else:
-            if len(arguments) < 2:
-                raise ValueError("--exec requires a command")
-            executable = arguments[1]
-            command_line = subprocess.list2cmdline(arguments[1:])
+            executable, command_line = _exec_command(arguments[1:])
 
         startup = _StartupInfo()
         startup.cb = ctypes.sizeof(startup)
@@ -212,7 +223,8 @@ def _launch(arguments):
             ctypes.byref(startup),
             ctypes.byref(process_info),
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.WinError(ctypes.get_last_error())
+            raise OSError(f"Cannot start CI executable {executable!r}: {error}") from error
         kernel.CloseHandle(write_pipe)
         write_pipe = None
 

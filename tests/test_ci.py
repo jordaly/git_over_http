@@ -16,6 +16,25 @@ from pygithost.application import AsyncGitServer, GitHTTPHandler, Headers, FLAT_
 from pygithost.config import AppConfig
 from pygithost.context import AppContext
 from pygithost.ci import CIManager
+from pygithost.ci_windows_launcher import _exec_command
+
+
+class WindowsExecutableLookupTests(unittest.TestCase):
+    def test_resolves_bare_tool_name_from_path_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="ci tools ") as directory:
+            tool = Path(directory) / ("git.exe" if os.name == "nt" else "git")
+            tool.touch()
+            tool.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": directory}):
+                executable, command_line = _exec_command(["git", "--version"])
+            self.assertEqual(executable, str(tool.resolve()))
+            self.assertEqual(command_line, f'"{tool.resolve()}" --version')
+
+    def test_missing_tool_error_identifies_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, {"PATH": directory}):
+                with self.assertRaisesRegex(FileNotFoundError, "ci-missing-tool.*server PATH"):
+                    _exec_command(["ci-missing-tool", "--version"])
 
 
 class CICoreTests(unittest.IsolatedAsyncioTestCase):
@@ -539,6 +558,29 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             timeout=10,
         )
         self.assertEqual(result, 7)
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("git"), "requires Windows and Git")
+    async def test_windows_ci_checks_out_commit_before_running_dir(self):
+        root = Path(self.temp.name)
+        source, bare = root / "source", root / "repo.git"
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        (source / "fixture.txt").write_text("CI checkout fixture", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "fixture.txt"], check=True, capture_output=True)
+        subprocess.run([
+            "git", "-C", str(source), "-c", "user.name=CI test",
+            "-c", "user.email=ci@example.test", "commit", "-m", "fixture",
+        ], check=True, capture_output=True)
+        subprocess.run(["git", "clone", "--bare", str(source), str(bare)], check=True, capture_output=True)
+        commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        database.db_ci_config_set("owner", "windows", json.dumps({"command": "dir"}))
+        run_id = self._queued_run("windows")
+        manager = CIManager(lambda *_: str(bare))
+        await asyncio.wait_for(manager._execute(
+            (run_id, "owner", "windows", "manual", "main", commit, "{}")
+        ), timeout=30)
+        result = database.db_ci_run_get("owner", "windows", run_id)
+        self.assertEqual(result[4], "success", result[5])
+        self.assertIn("fixture.txt", result[5])
 
 
 if __name__ == "__main__":

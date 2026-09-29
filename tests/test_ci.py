@@ -388,7 +388,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
                 "pygithost.application._send_response", new_callable=AsyncMock
             ) as send_response,
         ):
-            await handler._ui_ci("owner", "repo")
+            await asyncio.wait_for(handler._ui_ci("owner", "repo"), timeout=3)
             full_page = send_html.await_args.args[2].decode("utf-8")
             self.assertIn('name="command"', full_page)
             self.assertIn("setInterval(update, 5000)", full_page)
@@ -397,10 +397,35 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('&lt;div id="ci-results"', full_page)
             self.assertNotIn('http-equiv="refresh"', full_page)
 
-            await handler._ui_ci("owner", "repo", partial=True)
+            await asyncio.wait_for(handler._ui_ci("owner", "repo", partial=True), timeout=3)
             fragment, headers = send_response.await_args.args[2:4]
             self.assertIn('id="ci-results"', fragment.decode("utf-8"))
             self.assertNotIn('name="command"', fragment.decode("utf-8"))
+            self.assertIn(("Cache-Control", "no-store"), headers)
+
+    async def test_ci_run_has_a_separate_detail_screen(self):
+        run_id = self._queued_run("repo")
+        database.db_ci_run_update(
+            run_id, status="running", output="Running test output", started_at="now"
+        )
+        handler = object.__new__(GitHTTPHandler)
+        handler.request = SimpleNamespace()
+        with (
+            mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),
+            mock.patch("pygithost.application._send_html", new_callable=AsyncMock) as send_html,
+            mock.patch("pygithost.application._send_response", new_callable=AsyncMock) as send_response,
+        ):
+            await handler._ui_ci("owner", "repo", run_id)
+            page = send_html.await_args.args[2].decode("utf-8")
+            self.assertIn("CI run #", page)
+            self.assertIn("Running test output", page)
+            self.assertIn("CI settings and runs", page)
+            self.assertNotIn('name="command"', page)
+            self.assertIn("setInterval", page)
+
+            await handler._ui_ci("owner", "repo", run_id, partial=True)
+            fragment, headers = send_response.await_args.args[2:4]
+            self.assertIn('id="ci-run-result"', fragment.decode("utf-8"))
             self.assertIn(("Cache-Control", "no-store"), headers)
 
     @unittest.skipUnless(

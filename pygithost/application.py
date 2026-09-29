@@ -2221,22 +2221,20 @@ document.addEventListener("DOMContentLoaded", function() {{
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
+        if run_id is not None:
+            return await self._ui_ci_run_detail(owner, repo, run_id, partial=partial)
         manager = self.server.ci_manager
         config = await manager.config(owner, repo)
         runs = await asyncio.to_thread(db_ci_runs_list, owner, repo, 100)
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
-        selected_run = await _call_in_thread(db_ci_run_get, owner, repo, run_id) if run_id else None
         results_active = any(run[4] in ("queued", "running") for run in runs)
-        detail = safe_html("")
-        if selected_run:
-            detail = safe_html(html_t(t'<div class="box"><h2>Run #{selected_run[0]} · {selected_run[4]}</h2><div class="muted">{selected_run[1]} · {selected_run[2]} · <code>{selected_run[3][:8]}</code> · exit {selected_run[7]}</div><pre style="white-space:pre-wrap;max-height:600px;overflow:auto">{selected_run[5]}</pre>{"Output truncated at 1 MiB." if selected_run[6] else ""}</div>'))
         rows = []
         for run in runs:
             rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7]}</td><td>{run[8]}</td></tr>'))
         runs_html = join_html(rows) if rows else safe_html('<tr><td colspan="7" class="muted">No CI runs yet.</td></tr>')
-        results_html = safe_html(html_t(t'''<div id="ci-results" data-active="{"true" if results_active else "false"}">{detail}
+        results_html = safe_html(html_t(t'''<div id="ci-results" data-active="{"true" if results_active else "false"}">
 <div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
@@ -2260,6 +2258,45 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{results_html}
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const response = await fetch(window.location.pathname + "?partial=1", {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
         await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(body)))
+
+    async def _ui_ci_run_detail(self, owner: str, repo: str, run_id: int, *, partial: bool = False):
+        run = await _call_in_thread(db_ci_run_get, owner, repo, run_id)
+        if not run:
+            if partial:
+                return await _send_text(self.request, 404, "CI run not found.\n")
+            return await self._not_found()
+
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        active = run[4] in ("queued", "running")
+        output = run[5] or "No output yet."
+        exit_code = "pending" if run[7] is None else run[7]
+        started_at = run[9] or "—"
+        finished_at = run[10] or "—"
+        truncated_notice = safe_html('<p class="muted">Output truncated at 1 MiB.</p>') if run[6] else safe_html("")
+        result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active else "false"}">
+<div class="box"><h1>CI run #{run[0]} · {run[4]}</h1>
+<p class="muted">{run[1]} · {run[2]} · <code>{run[3]}</code></p>
+<table><tr><th>Exit code</th><td>{exit_code}</td></tr><tr><th>Created</th><td>{run[8]}</td></tr>
+<tr><th>Started</th><td>{started_at}</td></tr><tr><th>Finished</th><td>{finished_at}</td></tr></table>
+<h2>Output</h2><pre style="white-space:pre-wrap;max-height:70vh;overflow:auto">{output}</pre>
+{truncated_notice}</div></div>'''))
+        if partial:
+            return await _send_response(self.request, 200, str(result_html).encode("utf-8"),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+
+        body = safe_html(html_t(t'''<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div>
+<div><a class="pill" href="{base}/ci">CI settings and runs</a> <a class="pill" href="{base}">Repo</a></div></div>
+{result_html}
+<script>(function() {{ const current = document.getElementById("ci-run-result"); if (!current || current.dataset.active !== "true") return;
+let polling = false; const timer = setInterval(async function() {{ if (polling) return; polling = true; try {{
+const response = await fetch(window.location.pathname + "?partial=1", {{cache:"no-store", credentials:"same-origin"}});
+if (response.redirected || !response.ok) {{ clearInterval(timer); return; }}
+const fragment = await response.text(); const node = document.getElementById("ci-run-result");
+if (!node) {{ clearInterval(timer); return; }} node.outerHTML = fragment;
+if (document.getElementById("ci-run-result").dataset.active !== "true") clearInterval(timer);
+}} catch (_error) {{ /* Retry on the next interval. */ }} finally {{ polling = false; }} }}, 3000); }})();</script>'''))
+        return await _send_html(self.request, 200,
+            _html_page(str_t(t"CI run #{run[0]} · {owner}/{repo}"), body))
 
     async def _ui_ci_config(self, owner: str, repo: str):
         owner, repo = unquote(owner), unquote(repo)
@@ -2297,7 +2334,9 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not commit:
             return await self._ui_ci(owner, repo, notice="Select a valid branch.")
         run_id = await self.server.ci_manager.enqueue(owner, repo, "manual", branch, commit)
-        return await self._ui_ci(owner, repo, notice=f"Run #{run_id} queued." if run_id else "Manual runs are disabled or no command is configured.")
+        if run_id:
+            return await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}"))
+        return await self._ui_ci(owner, repo, notice="Manual runs are disabled or no command is configured.")
 
     # ========================================================
     # UI: Commits, Commit, Tree, Blob

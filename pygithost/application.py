@@ -603,9 +603,9 @@ async def _git_is_ancestor(repo_git: str, maybe_ancestor: str, maybe_descendant:
     return code == 0
 
 
-async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100) -> list[dict[str, str]]:
+async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100, skip: int = 0) -> list[dict[str, str]]:
     fmt = "%H%x00%an%x00%ae%x00%ad%x00%s"
-    code, out, _err = await _run_git(repo_git, ["log", "--date=iso", "--format=" + fmt, "-n" + str(limit), rev_range])
+    code, out, _err = await _run_git(repo_git, ["log", "--date=iso", "--format=" + fmt, "-n" + str(limit), "--skip=" + str(max(0, skip)), rev_range])
     if code != 0:
         return []
     commits = []
@@ -1792,14 +1792,55 @@ document.addEventListener("DOMContentLoaded", function() {{
             clone_path = str_t(t"{URL_PREFIX}/{q(repo)}.git")
         else:
             clone_path = str_t(t"{URL_PREFIX}/{q(owner)}/{q(repo)}.git")
-        clone_user = self.remote_user or "USER"
+        clone_variants = [("Clone URL", "")]
+        if REQUIRE_AUTH:
+            clone_variants.extend(
+                [
+                    ("Username and password", "USERNAME:PASSWORD@"),
+                    ("Username and token", "USERNAME:TOKEN@"),
+                    ("Token only", "token:TOKEN_VALUE@"),
+                ]
+            )
+        clone_urls = join_html(
+            [
+                html_t(
+                    t"""<div style="margin:10px 0"><label>{label}</label>
+<pre style="margin:4px 0"><code class="cloneUrl" data-credentials="{credentials}" data-path="{clone_path}"></code></pre></div>"""
+                )
+                for label, credentials in clone_variants
+            ]
+        )
+
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        tree_code, tree_out, _ = await _run_git(repo_git, ["ls-tree", f"{default_branch}:"])
+        root_entries: list[tuple[str, str]] = []
+        if tree_code == 0:
+            for line in tree_out.decode("utf-8", "replace").splitlines():
+                if "\t" not in line:
+                    continue
+                metadata, name = line.split("\t", 1)
+                parts = metadata.split()
+                kind = parts[1] if len(parts) >= 2 else "blob"
+                root_entries.append((kind, name))
+        root_entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
+        file_rows = []
+        for kind, name in root_entries:
+            if kind == "tree":
+                href = str_t(t"{base}/tree/{q(default_branch)}/{q(name, safe='/')}/")
+                icon = TREE_FOLDER_ICON
+            else:
+                href = str_t(t"{base}/blob/{q(default_branch)}/{q(name, safe='/')}")
+                icon = TREE_FILE_ICON
+            file_rows.append(
+                html_t(t"<tr><td style=\"width:40px\">{icon}</td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>")
+            )
+        files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No files on the default branch.</td></tr>')
 
         options = []
         for b in branches:
             selected = safe_html(" selected") if b == default_branch else safe_html("")
             options.append(html_t(t"<option value=\"{b}\"{selected}>{b}</option>"))
         options_html = join_html(options) if options else safe_html("<option>(none)</option>")
-        base = str_t(t"/r/{q(owner)}/{q(repo)}")
 
         body = html_t(
             t"""<div class="topbar">
@@ -1813,16 +1854,17 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="box">
 <p><a href="{base}/commits?ref={q(default_branch)}">Commits</a> | <a href="{base}/tree/{q(default_branch)}/">Browse default</a></p>
 <p class="muted" style="margin-top:14px">Clone:</p>
-<pre><code id="cloneUrl" data-user="{clone_user}" data-path="{clone_path}"></code></pre>
+{clone_urls}
 <script>
 (function() {{
-    const element = document.getElementById("cloneUrl");
-    const username = encodeURIComponent(element.dataset.user);
-    element.textContent = window.location.protocol + "//" + username +
-        ":SECRET@" + window.location.host + element.dataset.path;
+    document.querySelectorAll(".cloneUrl").forEach(function(element) {{
+        element.textContent = window.location.protocol + "//" +
+            element.dataset.credentials + window.location.host + element.dataset.path;
+    }});
 }})();
 </script>
 </div>
+<div class="box" style="margin-top:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
 {readme_html}"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(body)))
@@ -2133,25 +2175,105 @@ document.addEventListener("DOMContentLoaded", function() {{
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return await self._not_found()
-        fmt = "%H|%an|%ad|%s"
-        code, out, err = await _run_git(repo_git, ["log", "--date=iso", "--format=" + fmt, "-n", "50", ref])
-        base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        if code != 0:
-            msg = err.decode("utf-8", "replace")
-            body = html_t(t"<h1>Commits</h1><pre>{msg}</pre><p><a class=\"pill\" href=\"/\">Back</a></p>")
+        resolved_ref = await _git_resolve_commit(repo_git, ref)
+        if not resolved_ref:
+            if (parse_qs(urlparse(self.path).query or "").get("partial") or [""])[0] == "1":
+                return await _send_text(self.request, 400, "400 Bad Request: invalid commit ref.\n")
+            body = html_t(t"<h1>Commits</h1><p>Could not resolve ref: {ref}</p><p><a class=\"pill\" href=\"/\">Back</a></p>")
             return await _send_html(self.request, 400, _html_page("Commits", safe_html(body)))
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query or "")
+        try:
+            skip = max(0, int((qs.get("skip") or ["0"])[0]))
+        except ValueError:
+            skip = 0
+        partial = (qs.get("partial") or [""])[0] == "1"
+        commits = await _git_list_commits(repo_git, resolved_ref, limit=51, skip=skip)
+        has_more = len(commits) > 50
+        commits = commits[:50]
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows = []
-        for ln in out.decode("utf-8", "replace").splitlines():
-            parts = ln.split("|", 3)
-            if len(parts) != 4:
-                continue
-            hsh, an, ad, subj = parts
-            rows.append(html_t(t"<tr><td><a href=\"{base}/commit/{q(hsh)}\"><code>{hsh[:8]}</code></a></td><td>{subj}</td><td>{an}</td><td><small class=\"muted\">{ad}</small></td></tr>"))
+        for commit in commits:
+            hsh = commit["hash"]
+            rows.append(html_t(t"<tr><td><a href=\"{base}/commit/{q(hsh)}\"><code>{hsh[:8]}</code></a></td><td>{commit['subject']}</td><td>{commit['author_name']}</td><td><small class=\"muted\">{commit['date']}</small></td></tr>"))
+        if partial:
+            payload = json.dumps({"commits": commits, "has_more": has_more, "next_skip": skip + len(commits)})
+            return await _send_response(
+                self.request,
+                200,
+                payload.encode("utf-8"),
+                [("Content-Type", "application/json; charset=utf-8")],
+            )
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No commits.</td></tr>')
+        load_more = (
+            safe_html(
+                html_t(
+                    t"<button id=\"loadMoreCommits\" type=\"button\" data-ref=\"{resolved_ref}\" data-next-skip=\"{len(commits)}\">Load more commits</button>"
+                )
+            )
+            if has_more
+            else safe_html("")
+        )
         body = html_t(
             t"""<div class="topbar"><h1 style="margin:0">Commits</h1>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
-<div class="box"><p class="muted">ref: <code>{ref}</code></p><table>{rows_html}</table></div>"""
+<div class="box"><p class="muted">ref: <code>{ref}</code></p><table><tbody id="commitRows">{rows_html}</tbody></table>
+<div id="loadMoreStatus" class="muted" style="margin-top:10px">{load_more}</div></div>
+<script>
+(function() {{
+    const button = document.getElementById("loadMoreCommits");
+    if (!button) return;
+    const tbody = document.getElementById("commitRows");
+    const status = document.getElementById("loadMoreStatus");
+    button.addEventListener("click", async function() {{
+        button.disabled = true;
+        button.textContent = "Loading…";
+        const params = new URLSearchParams({{
+            ref: button.dataset.ref,
+            skip: button.dataset.nextSkip,
+            partial: "1"
+        }});
+        try {{
+            const response = await fetch("{base}/commits?" + params.toString());
+            if (!response.ok) throw new Error("Request failed");
+            const page = await response.json();
+            for (const commit of page.commits) {{
+                const row = document.createElement("tr");
+                const hashCell = document.createElement("td");
+                const link = document.createElement("a");
+                link.href = "{base}/commit/" + encodeURIComponent(commit.hash);
+                const hash = document.createElement("code");
+                hash.textContent = commit.hash.slice(0, 8);
+                link.appendChild(hash);
+                hashCell.appendChild(link);
+                row.appendChild(hashCell);
+                for (const value of [commit.subject, commit.author_name]) {{
+                    const cell = document.createElement("td");
+                    cell.textContent = value;
+                    row.appendChild(cell);
+                }}
+                const dateCell = document.createElement("td");
+                const date = document.createElement("small");
+                date.className = "muted";
+                date.textContent = commit.date;
+                dateCell.appendChild(date);
+                row.appendChild(dateCell);
+                tbody.appendChild(row);
+            }}
+            button.dataset.nextSkip = page.next_skip;
+            if (!page.has_more) {{
+                status.remove();
+            }} else {{
+                button.disabled = false;
+                button.textContent = "Load more commits";
+            }}
+        }} catch (_error) {{
+            button.disabled = false;
+            button.textContent = "Retry loading commits";
+        }}
+    }});
+}})();
+</script>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Commits · {owner}/{repo}"), safe_html(body)))
 

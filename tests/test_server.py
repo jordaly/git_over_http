@@ -7,11 +7,13 @@ import subprocess
 import unittest
 import tempfile
 import shutil
+import json
 from contextlib import closing
 from dataclasses import replace
 
 # Import your server module
 import server as srv
+from pygithost import database
 
 
 # ---------- helpers ----------
@@ -54,6 +56,7 @@ class ServerRunner:
         project_root=None,
         backend_path=None,
         bind_host="127.0.0.1",
+        require_auth=False,
     ):
         self.allow_ips = set({"127.0.0.1"} if allow_ips is None else allow_ips)
         self.url_prefix = url_prefix
@@ -64,6 +67,7 @@ class ServerRunner:
         self.backend_path = backend_path or _which_git_backend()
         self.port = None
         self.bind_host = bind_host
+        self.require_auth = require_auth
 
         self.httpd = None
         self.thread = None
@@ -86,7 +90,7 @@ class ServerRunner:
             db_path=os.path.join(self.project_root, "test.db"),
             url_prefix=self.url_prefix,
             allowed_client_ips=tuple(self.allow_ips),
-            require_auth=False,
+            require_auth=self.require_auth,
             filter_ips=True,
         )
         app = srv.AsyncGitServer(srv.AppContext(config), allowlist=self.allow_ips)
@@ -192,9 +196,11 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
         self._git("init", "-b", "main", repo)
         with open(os.path.join(repo, "README.md"), "w", encoding="utf-8") as readme:
             readme.write("# Project\n\n<script>alert('unsafe')</script>\n")
+        with open(os.path.join(repo, "source.txt"), "w", encoding="utf-8") as source:
+            source.write("project source\n")
         self._git("-C", repo, "config", "user.name", "Test User")
         self._git("-C", repo, "config", "user.email", "test@example.com")
-        self._git("-C", repo, "add", "README.md")
+        self._git("-C", repo, "add", "README.md", "source.txt")
         self._git("-C", repo, "commit", "-m", "Add README")
 
         with ServerRunner(
@@ -215,6 +221,12 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 self.assertIn("prism-markdown.min.js", body)
                 self.assertIn("&lt;script&gt;alert(&#x27;unsafe&#x27;)&lt;/script&gt;", body)
                 self.assertNotIn("<script>alert('unsafe')</script>", body)
+                self.assertIn('data-path="/git/repo.git"', body)
+                self.assertIn('data-credentials=""', body)
+                self.assertNotIn("USERNAME:PASSWORD", body)
+                self.assertNotIn("TOKEN_VALUE", body)
+                self.assertIn('href="/r/root/repo/blob/main/source.txt"', body)
+                self.assertLess(body.index(">Files</h2>"), body.index(">README.md</h2>"))
             finally:
                 conn.close()
 
@@ -243,6 +255,89 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertNotIn('id="readmeSource"', body)
                 self.assertNotIn("prism-markdown.min.js", body)
+            finally:
+                conn.close()
+
+    def test_repo_page_shows_clone_formats_for_auth_config_and_custom_prefix(self):
+        repo = os.path.join(self.tmp_root, "owner", "repo")
+        self._git("init", "-b", "main", repo)
+        with open(os.path.join(repo, "file.txt"), "w", encoding="utf-8") as source:
+            source.write("source\n")
+        self._git("-C", repo, "config", "user.name", "Test User")
+        self._git("-C", repo, "config", "user.email", "test@example.com")
+        self._git("-C", repo, "add", "file.txt")
+        self._git("-C", repo, "commit", "-m", "Add source")
+
+        with ServerRunner(
+            allow_ips={"127.0.0.1"},
+            url_prefix="/custom/git",
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+            require_auth=True,
+        ) as srvrun:
+            database._db_init()
+            conn = database._db_connect()
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO users(username, pass_salt, pass_hash) VALUES(?,?,?)",
+                    ("clone-test", b"", b""),
+                )
+                user_id = cursor.lastrowid
+            finally:
+                conn.close()
+            session = database.db_create_session(user_id)
+            conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
+            try:
+                conn.request("GET", "/r/owner/repo", headers={"Cookie": f"pygithost_session={session}"})
+                response = conn.getresponse()
+                body = response.read().decode("utf-8")
+
+                self.assertEqual(response.status, 200)
+                self.assertIn('data-path="/custom/git/owner/repo.git"', body)
+                self.assertIn('data-credentials="USERNAME:PASSWORD@"', body)
+                self.assertIn('data-credentials="USERNAME:TOKEN@"', body)
+                self.assertIn('data-credentials="token:TOKEN_VALUE@"', body)
+                self.assertIn('data-credentials=""', body)
+                self.assertIn('window.location.protocol + "//"', body)
+                self.assertIn("window.location.host", body)
+                self.assertNotIn("SECRET", body)
+            finally:
+                conn.close()
+
+    def test_commits_page_loads_additional_commits_in_batches(self):
+        repo = os.path.join(self.tmp_root, "repo")
+        self._git("init", "-b", "main", repo)
+        self._git("-C", repo, "config", "user.name", "Test User")
+        self._git("-C", repo, "config", "user.email", "test@example.com")
+        for index in range(51):
+            self._git("-C", repo, "commit", "--allow-empty", "-m", f"Commit {index}")
+
+        with ServerRunner(
+            allow_ips={"127.0.0.1"},
+            trace_log=None,
+            project_root=self.tmp_root,
+            backend_path=self.backend,
+        ) as srvrun:
+            conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
+            try:
+                conn.request("GET", "/r/root/repo/commits?ref=main")
+                response = conn.getresponse()
+                body = response.read().decode("utf-8")
+
+                self.assertEqual(response.status, 200)
+                self.assertIn('id="loadMoreCommits"', body)
+                self.assertEqual(body.count("<tr>"), 50)
+
+                conn.request("GET", "/r/root/repo/commits?ref=main&skip=50&partial=1")
+                response = conn.getresponse()
+                page = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(len(page["commits"]), 1)
+                self.assertEqual(page["commits"][0]["subject"], "Commit 0")
+                self.assertFalse(page["has_more"])
+                self.assertEqual(page["next_skip"], 51)
             finally:
                 conn.close()
 

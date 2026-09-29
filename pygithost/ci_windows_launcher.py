@@ -2,6 +2,7 @@
 
 import ctypes
 import os
+import shutil
 import subprocess
 import sys
 from ctypes import wintypes
@@ -84,6 +85,17 @@ class _ProcessInformation(ctypes.Structure):
         ("dwProcessId", wintypes.DWORD),
         ("dwThreadId", wintypes.DWORD),
     ]
+
+
+def _shell_executable():
+    configured = os.environ.get("COMSPEC", "cmd.exe")
+    resolved = shutil.which(configured)
+    if resolved:
+        return os.path.abspath(resolved)
+
+    # Services sometimes start with a reduced PATH or a stale COMSPEC value.
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    return os.path.join(system_root, "System32", "cmd.exe")
 
 
 def _launch(arguments):
@@ -171,7 +183,7 @@ def _launch(arguments):
             raise ctypes.WinError(ctypes.get_last_error())
 
         if arguments[0] == "--shell":
-            executable = os.environ.get("COMSPEC", "cmd.exe")
+            executable = _shell_executable()
             command_line = subprocess.list2cmdline(
                 [executable, "/d", "/s", "/c", arguments[1]]
             )

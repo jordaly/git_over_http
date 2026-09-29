@@ -500,6 +500,18 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_windows_launcher_preserves_environment_cwd_and_exit_code(self):
         manager = CIManager(lambda *_: "")
         output, truncated = bytearray(), [False]
+        listed_file = Path(self.temp.name) / "listing.txt"
+        listed_file.write_text("visible", encoding="utf-8")
+        restricted_env = os.environ.copy()
+        restricted_env.pop("COMSPEC", None)
+        restricted_env["PATH"] = ""
+        result = await manager._capture_process(
+            "dir", shell=True, cwd=self.temp.name, env=restricted_env,
+            output=output, truncated=truncated, timeout=10)
+        self.assertEqual(result, 0)
+        self.assertIn(b"listing.txt", output)
+
+        output.clear()
         env = os.environ.copy()
         env["PYGITHOST_LAUNCHER_TEST"] = "working"
         code = "import os; print(os.getcwd()); print(os.environ['PYGITHOST_LAUNCHER_TEST'])"

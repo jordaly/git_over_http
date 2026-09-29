@@ -38,6 +38,7 @@ from .database import (
     db_pr_mark_merged,
     db_ci_runs_list,
     db_ci_run_get,
+    db_ci_latest_run,
     db_prs_for_source,
     db_reset_password,
     db_revoke_session,
@@ -1817,6 +1818,14 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
 
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        latest_ci = await asyncio.to_thread(db_ci_latest_run, owner, repo)
+        if latest_ci:
+            ci_status = latest_ci[1]
+            ci_color = {"success": "#16803c", "failed": "#b42318", "timed_out": "#b42318",
+                        "queued": "#9a6700", "running": "#9a6700", "interrupted": "#667085"}.get(ci_status, "#667085")
+            ci_badge = safe_html(html_t(t'<a class="pill" style="border-color:{ci_color};color:{ci_color}" href="{base}/ci/runs/{latest_ci[0]}" title="Latest CI run: {latest_ci[2]} · {latest_ci[4][:8]}">CI: {ci_status}</a>'))
+        else:
+            ci_badge = safe_html(html_t(t'<a class="pill" href="{base}/ci">CI: no runs</a>'))
         tree_code, tree_out, _ = await _run_git(repo_git, ["ls-tree", f"{default_branch}:"])
         root_entries: list[tuple[str, str]] = []
         if tree_code == 0:
@@ -1850,7 +1859,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         body = html_t(
             t"""<div class="topbar">
 <div><h1 style="margin:0">{owner}/{repo}</h1><div class="muted">Default branch: <code>{default_branch}</code></div></div>
-<div><a class="pill" href="/">All repos</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a> <a class="pill" href="{base}/ci">CI</a></div>
+<div>{ci_badge} <a class="pill" href="/">All repos</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a> <a class="pill" href="{base}/ci">CI</a></div>
 </div>
 <div class="box" style="margin-bottom:14px">
 <div class="row"><div><label>Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div></div>
@@ -2221,12 +2230,16 @@ document.addEventListener("DOMContentLoaded", function() {{
         if _require_admin(self) or not REQUIRE_AUTH:
             env_text = "\n".join(f"{key}={value}" for key, value in config["env"].items())
             checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
+            event_controls = join_html([
+                html_t(t'<label><input type="checkbox" name="event_{key}"{checks[key]}/> {key.replace("_", " ")}</label>')
+                for key in checks
+            ])
             admin_form = safe_html(html_t(t'''<div class="box"><h2>CI settings</h2><p class="muted">The command runs in the server’s default shell in a temporary checkout. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and pull request metadata such as <code>PYGITHOST_PR_NUMBER</code>.</p>
 <form method="POST" action="{base}/ci/config"><label>Command</label><textarea name="command" placeholder="python -m pytest" style="min-height:100px">{config["command"]}</textarea>
 <label>Environment variables (KEY=value, one per line)</label><textarea name="env" placeholder="EXAMPLE=value">{env_text}</textarea>
 <label>Push branch filters (one glob per line; blank means all)</label><textarea name="push_branches">{config["push_branches"]}</textarea>
 <label>Pull request target branch filters</label><textarea name="pr_branches">{config["pr_branches"]}</textarea>
-<div class="row">{''.join(f'<label><input type="checkbox" name="event_{key}"{checks[key]}/> {key.replace("_", " ")}</label>' for key in checks)}</div><button type="submit">Save CI settings</button></form></div>'''))
+<div class="row">{event_controls}</div><button type="submit">Save CI settings</button></form></div>'''))
         body = html_t(t'''{refresh}<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div><div><a class="pill" href="{base}">Repo</a></div></div>{notice_html}{admin_form}
 <div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{detail}
 <div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div>''')

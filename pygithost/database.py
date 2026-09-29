@@ -677,6 +677,14 @@ def db_ci_run_get(owner: str, repo: str, run_id: int):
         conn.close()
 
 
+def db_ci_latest_run(owner: str, repo: str):
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT id,status,event,branch,commit_hash,created_at FROM ci_runs WHERE owner=? AND repo=? ORDER BY id DESC LIMIT 1", (owner, repo)).fetchone()
+    finally:
+        conn.close()
+
+
 def db_ci_queued_runs():
     conn = _db_connect()
     try:
@@ -707,4 +715,3 @@ def db_pr_reopen(pr_id: int) -> None:
         conn.execute("UPDATE pull_requests SET status='open', closed_at=NULL WHERE id=? AND status='closed'", (int(pr_id),))
     finally:
         conn.close()
-

@@ -24,11 +24,15 @@ def str_t(template: Template) -> str:
 def html_t(template: Template) -> str:
     """Render a t-string, escaping interpolated values unless marked safe."""
     return "".join(
-        str(part.value)
-        if isinstance(part, Interpolation) and isinstance(part.value, SafeHTML)
-        else html.escape(str(part.value), quote=True)
-        if isinstance(part, Interpolation)
-        else part
+        (
+            str(part.value)
+            if isinstance(part, Interpolation) and isinstance(part.value, SafeHTML)
+            else (
+                html.escape(str(part.value), quote=True)
+                if isinstance(part, Interpolation)
+                else part
+            )
+        )
         for part in template
     )
 

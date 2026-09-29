@@ -111,9 +111,7 @@ class ServerRunner:
                 self.start_error = exc
                 self.ready.set()
 
-        self.thread = threading.Thread(
-            target=lambda: asyncio.run(serve()), daemon=True
-        )
+        self.thread = threading.Thread(target=lambda: asyncio.run(serve()), daemon=True)
         self.thread.start()
         if not self.ready.wait(timeout=5):
             raise RuntimeError("Async test server did not start")
@@ -219,14 +217,18 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 self.assertIn('class="language-markdown"', body)
                 self.assertIn("# Project", body)
                 self.assertIn("prism-markdown.min.js", body)
-                self.assertIn("&lt;script&gt;alert(&#x27;unsafe&#x27;)&lt;/script&gt;", body)
+                self.assertIn(
+                    "&lt;script&gt;alert(&#x27;unsafe&#x27;)&lt;/script&gt;", body
+                )
                 self.assertNotIn("<script>alert('unsafe')</script>", body)
                 self.assertIn('data-path="/git/repo.git"', body)
                 self.assertIn('data-credentials=""', body)
                 self.assertNotIn("USERNAME:PASSWORD", body)
                 self.assertNotIn("TOKEN_VALUE", body)
                 self.assertIn('href="/r/root/repo/blob/main/source.txt"', body)
-                self.assertLess(body.index(">Files</h2>"), body.index(">README.md</h2>"))
+                self.assertLess(
+                    body.index(">Files</h2>"), body.index(">README.md</h2>")
+                )
             finally:
                 conn.close()
 
@@ -289,7 +291,11 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
             session = database.db_create_session(user_id)
             conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
             try:
-                conn.request("GET", "/r/owner/repo", headers={"Cookie": f"pygithost_session={session}"})
+                conn.request(
+                    "GET",
+                    "/r/owner/repo",
+                    headers={"Cookie": f"pygithost_session={session}"},
+                )
                 response = conn.getresponse()
                 body = response.read().decode("utf-8")
 

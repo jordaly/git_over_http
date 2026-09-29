@@ -123,6 +123,17 @@ def _db_init() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pr_repo ON pull_requests(owner, repo, status, id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS ci_configs (
+            owner TEXT NOT NULL, repo TEXT NOT NULL, config_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(owner, repo))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS ci_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, repo TEXT NOT NULL,
+            event TEXT NOT NULL, branch TEXT NOT NULL DEFAULT '', commit_hash TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'queued',
+            output TEXT NOT NULL DEFAULT '', truncated INTEGER NOT NULL DEFAULT 0,
+            return_code INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT, finished_at TEXT)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_repo ON ci_runs(owner, repo, id DESC)")
     finally:
         conn.close()
 
@@ -606,4 +617,94 @@ def db_pr_mark_merged(pr_id: int, method: str, merge_commit: str) -> None:
     finally:
         conn.close()
 
+
+def db_ci_config_get(owner: str, repo: str):
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT config_json FROM ci_configs WHERE owner=? AND repo=?", (owner, repo)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_ci_config_set(owner: str, repo: str, config_json: str) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("""INSERT INTO ci_configs(owner,repo,config_json) VALUES(?,?,?)
+            ON CONFLICT(owner,repo) DO UPDATE SET config_json=excluded.config_json, updated_at=datetime('now')""",
+            (owner, repo, config_json))
+    finally:
+        conn.close()
+
+
+def db_ci_run_create(owner: str, repo: str, event: str, branch: str, commit_hash: str, payload_json: str) -> int:
+    conn = _db_connect()
+    try:
+        cur = conn.execute("INSERT INTO ci_runs(owner,repo,event,branch,commit_hash,payload_json) VALUES(?,?,?,?,?,?)",
+            (owner, repo, event, branch, commit_hash, payload_json))
+        conn.execute("DELETE FROM ci_runs WHERE owner=? AND repo=? AND id NOT IN (SELECT id FROM ci_runs WHERE owner=? AND repo=? ORDER BY id DESC LIMIT 100)", (owner, repo, owner, repo))
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_ci_run_update(run_id: int, **values) -> None:
+    allowed = {"status", "output", "truncated", "return_code", "started_at", "finished_at"}
+    values = {key: val for key, val in values.items() if key in allowed}
+    if not values:
+        return
+    conn = _db_connect()
+    try:
+        cols = ", ".join(f"{key}=?" for key in values)
+        conn.execute(f"UPDATE ci_runs SET {cols} WHERE id=?", (*values.values(), int(run_id)))
+    finally:
+        conn.close()
+
+
+def db_ci_runs_list(owner: str, repo: str, limit: int = 100):
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT id,event,branch,commit_hash,status,output,truncated,return_code,created_at,started_at,finished_at FROM ci_runs WHERE owner=? AND repo=? ORDER BY id DESC LIMIT ?", (owner, repo, limit)).fetchall()
+    finally:
+        conn.close()
+
+
+def db_ci_run_get(owner: str, repo: str, run_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT id,event,branch,commit_hash,status,output,truncated,return_code,created_at,started_at,finished_at FROM ci_runs WHERE owner=? AND repo=? AND id=?", (owner, repo, int(run_id))).fetchone()
+    finally:
+        conn.close()
+
+
+def db_ci_queued_runs():
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT id,owner,repo,event,branch,commit_hash,payload_json FROM ci_runs WHERE status='queued' ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+
+def db_ci_recover_runs():
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE ci_runs SET status='interrupted', finished_at=datetime('now') WHERE status='running'")
+    finally:
+        conn.close()
+
+
+def db_prs_for_source(owner: str, repo: str, branch: str):
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT id,target_branch FROM pull_requests WHERE owner=? AND repo=? AND source_branch=? AND status='open'", (owner, repo, branch)).fetchall()
+    finally:
+        conn.close()
+
+
+def db_pr_reopen(pr_id: int) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE pull_requests SET status='open', closed_at=NULL WHERE id=? AND status='closed'", (int(pr_id),))
+    finally:
+        conn.close()
 

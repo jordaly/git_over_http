@@ -86,9 +86,14 @@ class AppConfig:
             **_platform_paths(target),
             url_prefix="/git",
             allowed_client_ips=(
-                "192.168.16.75", "192.168.16.162", "192.168.16.164",
-                "192.168.16.198", "192.168.16.77", "192.168.16.76",
-                "127.0.0.1", "192.168.19.222",
+                "192.168.16.75",
+                "192.168.16.162",
+                "192.168.16.164",
+                "192.168.16.198",
+                "192.168.16.77",
+                "192.168.16.76",
+                "127.0.0.1",
+                "192.168.19.222",
             ),
             require_auth=False,
             filter_ips=True,
@@ -119,16 +124,30 @@ class AppConfig:
         if isinstance(ips, str):
             ips = [part.strip() for part in ips.split(",") if part.strip()]
         if not isinstance(ips, (list, tuple)):
-            raise ValueError("allowed_client_ips must be an array or comma-separated string")
-        values["allowed_client_ips"] = tuple(str(ip).strip() for ip in ips if str(ip).strip())
+            raise ValueError(
+                "allowed_client_ips must be an array or comma-separated string"
+            )
+        values["allowed_client_ips"] = tuple(
+            str(ip).strip() for ip in ips if str(ip).strip()
+        )
 
         for key in (
-            "schema_version", "port", "pr_patch_max_bytes",
-            "prism_diff_highlight_max_bytes", "max_header_bytes", "read_chunk",
-            "session_ttl_seconds", "static_cache_seconds",
+            "schema_version",
+            "port",
+            "pr_patch_max_bytes",
+            "prism_diff_highlight_max_bytes",
+            "max_header_bytes",
+            "read_chunk",
+            "session_ttl_seconds",
+            "static_cache_seconds",
         ):
             values[key] = int(values[key])
-        for key in ("require_auth", "filter_ips", "session_cookie_secure", "static_requires_auth"):
+        for key in (
+            "require_auth",
+            "filter_ips",
+            "session_cookie_secure",
+            "static_requires_auth",
+        ):
             values[key] = bool(values[key])
 
         if not 0 <= values["port"] <= 65535:
@@ -155,7 +174,9 @@ class AppConfig:
     def write(self, path: str | Path, *, overwrite: bool = False) -> Path:
         destination = Path(path).expanduser()
         if destination.exists() and not overwrite:
-            raise FileExistsError(f"Config file already exists: {destination}. Use --overwrite to replace it.")
+            raise FileExistsError(
+                f"Config file already exists: {destination}. Use --overwrite to replace it."
+            )
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("w", encoding="utf-8") as stream:
             json.dump(self.to_dict(), stream, indent=4)

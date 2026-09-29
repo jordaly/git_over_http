@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 from .config import AppConfig
 from .context import AppContext
+from .ci import CIManager, default_config as ci_default_config
 from .database import (
     _db_init,
     _ensure_dir,
@@ -30,10 +31,14 @@ from .database import (
     db_list_tokens_for_user,
     db_list_users,
     db_pr_close,
+    db_pr_reopen,
     db_pr_create,
     db_pr_get,
     db_pr_list,
     db_pr_mark_merged,
+    db_ci_runs_list,
+    db_ci_run_get,
+    db_prs_for_source,
     db_reset_password,
     db_revoke_session,
     db_revoke_token,
@@ -1845,7 +1850,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         body = html_t(
             t"""<div class="topbar">
 <div><h1 style="margin:0">{owner}/{repo}</h1><div class="muted">Default branch: <code>{default_branch}</code></div></div>
-<div><a class="pill" href="/">All repos</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div>
+<div><a class="pill" href="/">All repos</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a> <a class="pill" href="{base}/ci">CI</a></div>
 </div>
 <div class="box" style="margin-bottom:14px">
 <div class="row"><div><label>Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div></div>
@@ -2053,6 +2058,9 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not tgt:
             return await self._ui_pulls(owner, repo, str_t(t"Target branch not found: {target_branch}"), "warn")
         pr_id = await asyncio.to_thread(db_pr_create, owner, repo, title, body, source_branch, target_branch, int(self.remote_user_id or 0))
+        await self.server.ci_manager.enqueue(owner, repo, "pull_request", target_branch, tgt,
+            {"pr_number": pr_id, "base_branch": target_branch, "head_branch": source_branch,
+             "base_commit": tgt, "head_commit": src})
         await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/pulls/{pr_id}"))
 
     async def _ui_pull_view(self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"):
@@ -2105,6 +2113,8 @@ document.addEventListener("DOMContentLoaded", function() {{
                 )
             else:
                 merge_box = safe_html('<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope. You can’t merge/close this PR from the UI.</div>')
+        elif status == "closed" and can_write:
+            merge_box = safe_html(html_t(t'<div class="box"><form method="POST" action="{base}/pulls/{pr_id}/reopen"><button type="submit">Reopen PR</button></form></div>'))
 
         commit_rows = []
         for c in commits:
@@ -2145,6 +2155,26 @@ document.addEventListener("DOMContentLoaded", function() {{
         await asyncio.to_thread(db_pr_close, pr_id)
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request closed.", "ok")
 
+    async def _ui_pull_reopen(self, owner: str, repo: str, pr_id: int):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._forbidden(b"403 Forbidden\\n")
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\\n")
+        pr = await asyncio.to_thread(db_pr_get, pr_id)
+        if not pr or pr[1] != owner or pr[2] != repo:
+            return await self._not_found()
+        if pr[8] == "merged":
+            return await self._ui_pull_view(owner, repo, pr_id, "Merged pull requests cannot be reopened.", "warn")
+        if pr[8] == "closed":
+            await asyncio.to_thread(db_pr_reopen, pr_id)
+            repo_git = _repo_bare_path(owner, repo)
+            base_commit = await _git_resolve_commit(repo_git, "refs/heads/" + pr[6]) or ""
+            head_commit = await _git_resolve_commit(repo_git, "refs/heads/" + pr[5]) or ""
+            await self.server.ci_manager.enqueue(owner, repo, "pull_request_reopened", pr[6], base_commit,
+                {"pr_number": pr_id, "base_branch": pr[6], "head_branch": pr[5], "base_commit": base_commit, "head_commit": head_commit})
+        return await self._ui_pull_view(owner, repo, pr_id, "Pull request reopened.", "ok")
+
     async def _ui_pull_merge(self, owner: str, repo: str, pr_id: int):
         owner = unquote(owner)
         repo = unquote(repo)
@@ -2163,7 +2193,82 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._ui_pull_view(owner, repo, pr_id, msg, "warn")
         if new_commit:
             await asyncio.to_thread(db_pr_mark_merged, pr_id, "ff-only", new_commit)
+            await self.server.ci_manager.enqueue(owner, repo, "pull_request_merged", tgt_branch, new_commit,
+                {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch, "base_commit": new_commit})
         return await self._ui_pull_view(owner, repo, pr_id, msg, "ok")
+
+    async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = ""):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        manager = self.server.ci_manager
+        config = await manager.config(owner, repo)
+        runs = await asyncio.to_thread(db_ci_runs_list, owner, repo, 100)
+        branches = await _git_list_branches(_repo_bare_path(owner, repo))
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
+        selected_run = await asyncio.to_thread(db_ci_run_get, owner, repo, run_id) if run_id else None
+        refresh = safe_html('<meta http-equiv="refresh" content="5">') if any(run[4] in ("queued", "running") for run in runs) else safe_html("")
+        detail = safe_html("")
+        if selected_run:
+            detail = safe_html(html_t(t'<div class="box"><h2>Run #{selected_run[0]} · {selected_run[4]}</h2><div class="muted">{selected_run[1]} · {selected_run[2]} · <code>{selected_run[3][:8]}</code> · exit {selected_run[7]}</div><pre style="white-space:pre-wrap;max-height:600px;overflow:auto">{selected_run[5]}</pre>{"Output truncated at 1 MiB." if selected_run[6] else ""}</div>'))
+        rows = []
+        for run in runs:
+            rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7]}</td><td>{run[8]}</td></tr>'))
+        runs_html = join_html(rows) if rows else safe_html('<tr><td colspan="7" class="muted">No CI runs yet.</td></tr>')
+        manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
+        admin_form = safe_html("")
+        if _require_admin(self):
+            env_text = "\n".join(f"{key}={value}" for key, value in config["env"].items())
+            checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
+            admin_form = safe_html(html_t(t'''<div class="box"><h2>CI settings</h2><p class="muted">The command runs in the server’s default shell in a temporary checkout. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and pull request metadata such as <code>PYGITHOST_PR_NUMBER</code>.</p>
+<form method="POST" action="{base}/ci/config"><label>Command</label><textarea name="command" placeholder="python -m pytest" style="min-height:100px">{config["command"]}</textarea>
+<label>Environment variables (KEY=value, one per line)</label><textarea name="env" placeholder="EXAMPLE=value">{env_text}</textarea>
+<label>Push branch filters (one glob per line; blank means all)</label><textarea name="push_branches">{config["push_branches"]}</textarea>
+<label>Pull request target branch filters</label><textarea name="pr_branches">{config["pr_branches"]}</textarea>
+<div class="row">{''.join(f'<label><input type="checkbox" name="event_{key}"{checks[key]}/> {key.replace("_", " ")}</label>' for key in checks)}</div><button type="submit">Save CI settings</button></form></div>'''))
+        body = html_t(t'''{refresh}<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div><div><a class="pill" href="{base}">Repo</a></div></div>{notice_html}{admin_form}
+<div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{detail}
+<div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div>''')
+        await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(body)))
+
+    async def _ui_ci_config(self, owner: str, repo: str):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\\n")
+        form = await self._read_form_urlencoded()
+        env = {}
+        for line in (form.get("env") or "").splitlines():
+            line = line.strip()
+            if not line: continue
+            if "=" not in line:
+                return await self._ui_ci(owner, repo, notice="Each environment entry must use KEY=value.")
+            key, value = line.split("=", 1)
+            env[key.strip()] = value
+        config = {"command": form.get("command", ""), "env": env,
+            "push_branches": form.get("push_branches", ""), "pr_branches": form.get("pr_branches", ""),
+            "events": {key: f"event_{key}" in form for key in ci_default_config()["events"]}}
+        try:
+            await self.server.ci_manager.save_config(owner, repo, config)
+        except ValueError as exc:
+            return await self._ui_ci(owner, repo, notice=str(exc))
+        return await self._ui_ci(owner, repo, notice="CI settings saved.")
+
+    async def _ui_ci_run(self, owner: str, repo: str):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\\n")
+        form = await self._read_form_urlencoded()
+        branch = (form.get("branch") or "").strip()
+        commit = await _git_resolve_commit(_repo_bare_path(owner, repo), "refs/heads/" + branch) if _safe_branch_name(branch) else None
+        if not commit:
+            return await self._ui_ci(owner, repo, notice="Select a valid branch.")
+        run_id = await self.server.ci_manager.enqueue(owner, repo, "manual", branch, commit)
+        return await self._ui_ci(owner, repo, notice=f"Run #{run_id} queued." if run_id else "Manual runs are disabled or no command is configured.")
 
     # ========================================================
     # UI: Commits, Commit, Tree, Blob
@@ -2620,7 +2725,19 @@ document.addEventListener("DOMContentLoaded", function() {{
         trace_file = None
         body_task = None
         proc = None
+        push_identity = None
+        push_lock = None
+        before_refs = {}
+        if self._git_request_needs_write(path_info, query):
+            for candidate_owner, candidate_repo, rel in _scan_repos(GIT_PROJECT_ROOT):
+                if path_info.startswith("/" + rel.strip("/") + "/"):
+                    push_identity = (candidate_owner, candidate_repo)
+                    break
         try:
+            if push_identity:
+                push_lock = self.server.push_locks.setdefault(push_identity, asyncio.Lock())
+                await push_lock.acquire()
+                before_refs = await self.server._branch_refs(*push_identity)
             if TRACE_LOG:
                 _ensure_dir(TRACE_LOG)
                 trace_file = open(TRACE_LOG, "ab", buffering=0)
@@ -2697,7 +2814,22 @@ document.addEventListener("DOMContentLoaded", function() {{
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
+            if push_identity and proc.returncode == 0:
+                owner, repo = push_identity
+                after_refs = await self.server._branch_refs(owner, repo)
+                for branch, commit in after_refs.items():
+                    old_commit = before_refs.get(branch)
+                    if old_commit == commit:
+                        continue
+                    await self.server.ci_manager.enqueue(owner, repo, "push", branch, commit, {"old_commit": old_commit or ""})
+                    for pr_id, target_branch in await asyncio.to_thread(db_prs_for_source, owner, repo, branch):
+                        base_commit = await _git_resolve_commit(_repo_bare_path(owner, repo), "refs/heads/" + target_branch) or ""
+                        await self.server.ci_manager.enqueue(owner, repo, "pull_request_updated", target_branch, base_commit,
+                            {"pr_number": pr_id, "base_branch": target_branch, "head_branch": branch,
+                             "base_commit": base_commit, "head_commit": commit})
         finally:
+            if push_lock and push_lock.locked():
+                push_lock.release()
             if body_task is not None and not body_task.done():
                 body_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2750,6 +2882,12 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._ui_tokens()
         if p == "/admin/users":
             return await self._ui_admin_users()
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci$", p)
+        if m:
+            return await self._ui_ci(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/runs/(\d+)$", p)
+        if m:
+            return await self._ui_ci(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
             return await self._ui_repo(m.group(1), m.group(2))
@@ -2818,9 +2956,18 @@ document.addEventListener("DOMContentLoaded", function() {{
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/close$", parsed.path)
         if m:
             return await self._ui_pull_close(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/reopen$", parsed.path)
+        if m:
+            return await self._ui_pull_reopen(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/merge$", parsed.path)
         if m:
             return await self._ui_pull_merge(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", parsed.path)
+        if m:
+            return await self._ui_ci_config(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/run$", parsed.path)
+        if m:
+            return await self._ui_ci_run(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches/create$", parsed.path)
         if m:
             return await self._ui_branch_create(m.group(1), m.group(2))
@@ -2857,6 +3004,19 @@ class AsyncGitServer:
         self.context = context or AppContext(AppConfig.from_mapping(default_config_for_platform()))
         apply_config(self.context.config)
         self.allowlist = allowlist if allowlist is not None else ALLOWED_CLIENT_IPS
+        self.ci_manager = CIManager(_repo_bare_path)
+        self.push_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    async def _branch_refs(self, owner: str, repo: str) -> dict[str, str]:
+        code, out, _ = await _run_git(_repo_bare_path(owner, repo), ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])
+        if code:
+            return {}
+        refs = {}
+        for line in out.decode("ascii", "replace").splitlines():
+            ref, _, oid = line.partition(" ")
+            if ref.startswith("refs/heads/") and oid:
+                refs[ref[len("refs/heads/"):]] = oid
+        return refs
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -2909,6 +3069,7 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     os.environ["GIT_HTTP_EXPORT_ALL"] = "1"
 
     app = AsyncGitServer(AppContext(config))
+    await app.ci_manager.start()
     server = await asyncio.start_server(app.handle_client, HOST, PORT)
 
     print("=" * 60)
@@ -2927,8 +3088,11 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     print("Pull requests: /r/<owner>/<repo>/pulls (ff-only merge)")
     print("=" * 60)
 
-    async with server:
-        await server.serve_forever()
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        await app.ci_manager.stop()
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

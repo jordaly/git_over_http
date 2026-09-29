@@ -8,11 +8,13 @@ from pygithost.config import AppConfig
 
 class AppConfigTests(unittest.TestCase):
     def test_mapping_merges_defaults_and_normalizes_ips(self):
-        config = AppConfig.from_mapping({
-            "platform": "Linux",
-            "port": "9000",
-            "allowed_client_ips": "127.0.0.1, 10.0.0.2",
-        })
+        config = AppConfig.from_mapping(
+            {
+                "platform": "Linux",
+                "port": "9000",
+                "allowed_client_ips": "127.0.0.1, 10.0.0.2",
+            }
+        )
         self.assertEqual(config.port, 9000)
         self.assertEqual(config.allowed_client_ips, ("127.0.0.1", "10.0.0.2"))
 

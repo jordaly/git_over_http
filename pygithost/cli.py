@@ -48,7 +48,9 @@ def main(argv: list[str] | None = None) -> None:
             if args.print_only:
                 print(json.dumps(config.to_dict(), indent=4))
             else:
-                print(f"Config file generated: {config.write(args.config, overwrite=args.overwrite)}")
+                print(
+                    f"Config file generated: {config.write(args.config, overwrite=args.overwrite)}"
+                )
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc

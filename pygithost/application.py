@@ -2236,8 +2236,8 @@ document.addEventListener("DOMContentLoaded", function() {{
         for run in runs:
             rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7]}</td><td>{run[8]}</td></tr>'))
         runs_html = join_html(rows) if rows else safe_html('<tr><td colspan="7" class="muted">No CI runs yet.</td></tr>')
-        results_html = html_t(t'''<div id="ci-results" data-active="{"true" if results_active else "false"}">{detail}
-<div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div></div>''')
+        results_html = safe_html(html_t(t'''<div id="ci-results" data-active="{"true" if results_active else "false"}">{detail}
+<div class="box"><h2>Recent runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])

@@ -374,6 +374,8 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('name="command"', full_page)
             self.assertIn("setInterval(update, 5000)", full_page)
             self.assertIn("current.outerHTML = fragment", full_page)
+            self.assertIn('<div id="ci-results"', full_page)
+            self.assertNotIn('&lt;div id="ci-results"', full_page)
             self.assertNotIn('http-equiv="refresh"', full_page)
 
             await handler._ui_ci("owner", "repo", partial=True)

@@ -2218,7 +2218,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         runs_html = join_html(rows) if rows else safe_html('<tr><td colspan="7" class="muted">No CI runs yet.</td></tr>')
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
         admin_form = safe_html("")
-        if _require_admin(self):
+        if _require_admin(self) or not REQUIRE_AUTH:
             env_text = "\n".join(f"{key}={value}" for key, value in config["env"].items())
             checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
             admin_form = safe_html(html_t(t'''<div class="box"><h2>CI settings</h2><p class="muted">The command runs in the server’s default shell in a temporary checkout. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and pull request metadata such as <code>PYGITHOST_PR_NUMBER</code>.</p>
@@ -2236,7 +2236,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
-        if not _require_admin(self):
+        if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
         form = await self._read_form_urlencoded()
         env = {}

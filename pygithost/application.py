@@ -2262,16 +2262,18 @@ document.addEventListener("DOMContentLoaded", function() {{
 <label>SMTP hostname</label><input name="host" value="{display.get("host", "")}" required autocomplete="off">
 <label>Port</label><input name="port" type="number" min="1" max="65535" value="{display.get("port", "587")}" required>
 <label>Transport security</label><select name="tls">{tls_options}</select>
+<label><input type="checkbox" name="trust_server_cert"{safe_html(" checked" if display.get("trust_server_cert", False) else "")}> Trust server certificate without verification (insecure)</label>
+<p class="warn">When checked, no pasted certificate is needed. TLS still encrypts the connection, but certificate, hostname, and expiry checks are disabled. An attacker could impersonate the mail server and steal SMTP credentials. This overrides certificate trust settings below.</p>
 <label>Trusted SMTP certificate / CA certificates (optional, PEM)</label>
 <textarea name="ca_cert" maxlength="65536" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----">{display.get("ca_cert", "")}</textarea>
-<p>For a self-signed server, paste its public certificate, or paste your internal CA certificate. Verify its fingerprint with your mail administrator first. Never paste a private key. Leave blank for system trust only. Hostname and expiry checks remain enabled.</p>
+<p>For verified TLS with a self-signed server, paste its public certificate, or paste your internal CA certificate. Verify its fingerprint with your mail administrator first. Never paste a private key. Leave blank for system trust only. Hostname and expiry checks remain enabled unless the checkbox above is checked.</p>
 <label>Sender email address</label><input name="sender" type="email" value="{display.get("sender", "")}" required>
 <label>Username (blank for no authentication)</label><input name="username" value="{display.get("username", "")}" autocomplete="off">
 <label>Password (leave blank to keep existing)</label><input name="password" type="password" value="" autocomplete="new-password">
 <p>{password_status}</p><label><input type="checkbox" name="clear_password"> Clear existing password</label>
 <label>Public server URL (optional, for run links)</label><input name="public_url" type="url" value="{display.get("public_url", "")}" placeholder="https://git.example.com">
 <button type="submit">Save email settings</button></form></div>
-<div class="box"><h2>Send test email</h2><p>Uses saved settings, not unsaved edits. TLS certificate verification is always enabled.</p>
+<div class="box"><h2>Send test email</h2><p>Uses saved settings, including the certificate verification choice, not unsaved edits.</p>
 <form method="POST" action="/admin/email/test"><input type="hidden" name="csrf" value="{token}">
 <label>Recipient</label><input type="email" name="recipient" required><button type="submit">Send test email</button></form>
 <p>Choose recipients and notification preferences separately in each repository's CI settings.</p></div>'''))
@@ -2299,6 +2301,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 return await self._ui_admin_email(notice=f"Test email failed ({type(exc).__name__}). Check SMTP settings and connectivity.", error=True)
             return await self._ui_admin_email(notice="Test email accepted by SMTP server. Check the recipient's inbox.")
         settings = {key: form.get(key, "") for key in ("host", "port", "tls", "sender", "username", "password", "public_url", "ca_cert")}
+        settings["trust_server_cert"] = "trust_server_cert" in form
         if "clear_password" in form:
             settings["password"] = ""
         elif not settings["password"]:

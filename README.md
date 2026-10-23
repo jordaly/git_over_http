@@ -172,9 +172,16 @@ the Email settings page. Obtain it from your mail administrator and verify its
 fingerprint through a trusted channel; do not blindly trust a certificate fetched
 from an unverified connection. Never paste a private key. Multiple PEM certificates
 are supported. These are added to system trust for SMTP only; hostname and expiry
-verification remain enabled for both STARTTLS and implicit TLS. The SMTP hostname
+verification remain enabled by default for both STARTTLS and implicit TLS. The SMTP hostname
 must match the certificate's Subject Alternative Name. Clear the field to return
 to system trust only, save, and use **Send test email** to check the result.
+
+Alternatively, check **Trust server certificate without verification (insecure)**
+and save to connect without pasting a certificate. This is disabled by default
+and applies only to SMTP, including test messages. TLS encryption remains required,
+but certificate-chain, expiry, and hostname verification are disabled; an attacker
+could impersonate the mail server and steal SMTP credentials. The checkbox takes
+precedence over pasted certificates. Uncheck it and save to restore verification.
 
 Environment-based setup is still supported when no web settings have been saved;
 saved web settings override the entire SMTP environment configuration. Example
@@ -191,7 +198,8 @@ export PYGITHOST_PUBLIC_URL=https://git.example.com
 ```
 
 `PYGITHOST_SMTP_TLS` accepts `starttls` (default, port 587) or `ssl` (default port
-465); TLS certificate verification is always enabled. Authentication is optional
+465); TLS certificate verification is enabled unless explicitly disabled using the
+web checkbox described above. Authentication is optional
 when the username is omitted. `PYGITHOST_PUBLIC_URL` is optional and may include
 a deployment path prefix; it supplies the run link in messages.
 

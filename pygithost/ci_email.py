@@ -44,6 +44,10 @@ def validate_settings(raw):
             tls_context(result)
         except (ssl.SSLError, ValueError) as exc:
             raise ValueError("Trusted SMTP certificate is not a valid PEM certificate.") from exc
+    trust_server_cert = raw.get("trust_server_cert", False)
+    if not isinstance(trust_server_cert, bool):
+        raise ValueError("Trust server certificate must be true or false.")
+    result["trust_server_cert"] = trust_server_cert
     if not result["host"] or any(c.isspace() for c in result["host"]) or "://" in result["host"]:
         raise ValueError("Enter an SMTP hostname, not a URL.")
     if result["tls"] not in ("starttls", "ssl"):
@@ -61,6 +65,12 @@ def validate_settings(raw):
 
 def tls_context(settings):
     context = ssl.create_default_context()
+    if settings.get("trust_server_cert", False):
+        # Explicit admin opt-in, limited to this SMTP connection. TLS remains
+        # required but no certificate chain, expiry, or hostname is verified.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
     if settings.get("ca_cert"):
         context.load_verify_locations(cadata=settings["ca_cert"])
     return context

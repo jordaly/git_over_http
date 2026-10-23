@@ -61,6 +61,16 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-password", page)
         self.assertIsNone(database.db_email_settings_get())
 
+    async def test_trust_checkbox_is_explicit_persisted_and_can_be_unchecked(self):
+        await self.post(self.settings)
+        self.assertFalse(load_settings()["trust_server_cert"])
+        page = await self.post({**self.settings, "trust_server_cert": "on"})
+        self.assertTrue(load_settings()["trust_server_cert"])
+        self.assertIn('name="trust_server_cert" checked', page)
+        self.assertEqual(load_settings()["ca_cert"], "")
+        await self.post(self.settings)
+        self.assertFalse(load_settings()["trust_server_cert"])
+
     async def test_nonadmins_cannot_view_save_or_send_test_email(self):
         self.handler.remote_is_admin = False
         self.handler._read_form_urlencoded = AsyncMock()
@@ -126,6 +136,23 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         for change in ({"host": "smtp://host"}, {"sender": "a@b,b@c"}, {"tls": "none"}, {"port": "65536"}, {"public_url": "https://user:password@host"}, {"public_url": "javascript:alert(1)"}, {"password": "bad\nvalue"}, {"ca_cert": "not a certificate"}, {"ca_cert": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}, {"ca_cert": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_settings({**self.settings, **change})
+
+    async def test_trust_flag_requires_boolean_and_defaults_to_verified_tls(self):
+        with self.assertRaises(ValueError):
+            validate_settings({**self.settings, "trust_server_cert": "false"})
+        context = tls_context(validate_settings(self.settings))
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    async def test_unverified_trust_applies_to_both_smtp_transports_without_pem(self):
+        for mode, transport in (("starttls", "SMTP"), ("ssl", "SMTP_SSL")):
+            with self.subTest(mode=mode), mock.patch(f"pygithost.ci_email.smtplib.{transport}") as smtp:
+                smtp.return_value.send_message.return_value = {}
+                settings = {**self.settings, "tls": mode, "trust_server_cert": True}
+                send_notification("server", "email-test", (0, "test", "", "", "test", "", 0, None), ["dev@example.test"], settings)
+                context = smtp.call_args.kwargs["context"] if mode == "ssl" else smtp.return_value.starttls.call_args.kwargs["context"]
+                self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+                self.assertFalse(context.check_hostname)
 
 
 @unittest.skipUnless(shutil.which("openssl"), "requires OpenSSL for a temporary self-signed certificate")

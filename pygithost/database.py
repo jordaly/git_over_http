@@ -134,6 +134,12 @@ def _db_init() -> None:
             return_code INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')),
             started_at TEXT, finished_at TEXT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_repo ON ci_runs(owner, repo, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_status ON ci_runs(status, id)")
+        conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(ci_runs)")}
+        for name in ("config_json", "phase", "reason", "notification"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE ci_runs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
     finally:
         conn.close()
 
@@ -627,6 +633,32 @@ def db_ci_config_get(owner: str, repo: str):
         conn.close()
 
 
+def db_email_settings_get():
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT value FROM server_settings WHERE key='smtp'").fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_email_settings_set(value: str):
+    conn = _db_connect()
+    try:
+        if os.name == "posix":
+            # SMTP credentials must not be readable by other OS users. SQLite
+            # creates future sidecars using the database's permissions.
+            os.chmod(DB_PATH, 0o600)
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.chmod(str(DB_PATH) + suffix, 0o600)
+                except FileNotFoundError:
+                    pass
+        conn.execute("INSERT INTO server_settings(key,value) VALUES('smtp',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (value,))
+    finally:
+        conn.close()
+
+
 def db_ci_config_set(owner: str, repo: str, config_json: str) -> None:
     conn = _db_connect()
     try:
@@ -637,18 +669,18 @@ def db_ci_config_set(owner: str, repo: str, config_json: str) -> None:
         conn.close()
 
 
-def db_ci_run_create(owner: str, repo: str, event: str, branch: str, commit_hash: str, payload_json: str) -> int:
+def db_ci_run_create(owner: str, repo: str, event: str, branch: str, commit_hash: str, payload_json: str, config_json: str = "", notification: str = "") -> int:
     conn = _db_connect()
     try:
-        cur = conn.execute("INSERT INTO ci_runs(owner,repo,event,branch,commit_hash,payload_json) VALUES(?,?,?,?,?,?)",
-            (owner, repo, event, branch, commit_hash, payload_json))
+        cur = conn.execute("INSERT INTO ci_runs(owner,repo,event,branch,commit_hash,payload_json,config_json,notification) VALUES(?,?,?,?,?,?,?,?)",
+            (owner, repo, event, branch, commit_hash, payload_json, config_json, notification))
         return int(cur.lastrowid)
     finally:
         conn.close()
 
 
 def db_ci_run_update(run_id: int, **values) -> None:
-    allowed = {"status", "output", "truncated", "return_code", "started_at", "finished_at"}
+    allowed = {"status", "output", "truncated", "return_code", "started_at", "finished_at", "phase", "reason", "notification"}
     values = {key: val for key, val in values.items() if key in allowed}
     if not values:
         return
@@ -656,7 +688,7 @@ def db_ci_run_update(run_id: int, **values) -> None:
     try:
         cols = ", ".join(f"{key}=?" for key in values)
         conn.execute(f"UPDATE ci_runs SET {cols} WHERE id=?", (*values.values(), int(run_id)))
-        if values.get("status") in {"success", "failed", "timed_out", "interrupted"}:
+        if values.get("status") in {"success", "failed", "timed_out", "interrupted", "cancelled"}:
             row = conn.execute("SELECT owner,repo FROM ci_runs WHERE id=?", (int(run_id),)).fetchone()
             if row:
                 _db_ci_prune_completed(conn, row[0], row[1])
@@ -673,11 +705,16 @@ def db_ci_runs_list(
     event: str = "",
     branch: str = "",
     query: str = "",
+    summary: bool = False,
+    before: int | None = None,
 ):
     conn = _db_connect()
     try:
         conditions = ["owner=?", "repo=?"]
         params = [owner, repo]
+        if before is not None:
+            conditions.append("id<?")
+            params.append(before)
         for column, value in (("status", status), ("event", event), ("branch", branch)):
             if value:
                 conditions.append(f"{column}=?")
@@ -692,8 +729,9 @@ def db_ci_runs_list(
             )
             params.extend((pattern, pattern, pattern))
         params.append(max(1, min(int(limit), 500)))
+        output_column = "''" if summary else "output"
         return conn.execute(
-            "SELECT id,event,branch,commit_hash,status,output,truncated,return_code,created_at,started_at,finished_at "
+            f"SELECT id,event,branch,commit_hash,status,{output_column},truncated,return_code,created_at,started_at,finished_at "
             f"FROM ci_runs WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ?",
             params,
         ).fetchall()
@@ -709,10 +747,49 @@ def db_ci_run_get(owner: str, repo: str, run_id: int):
         conn.close()
 
 
-def db_ci_latest_run(owner: str, repo: str):
+def db_ci_run_metadata(owner: str, repo: str, run_id: int):
     conn = _db_connect()
     try:
-        return conn.execute("SELECT id,status,event,branch,commit_hash,created_at FROM ci_runs WHERE owner=? AND repo=? ORDER BY id DESC LIMIT 1", (owner, repo)).fetchone()
+        row = conn.execute("SELECT payload_json,config_json,phase,reason,notification FROM ci_runs WHERE owner=? AND repo=? AND id=?", (owner, repo, run_id)).fetchone()
+        return dict(zip(("payload", "config", "phase", "reason", "notification"), row)) if row else None
+    finally:
+        conn.close()
+
+
+def db_ci_previous_result(owner: str, repo: str, branch: str, event: str, run_id: int, pr_number=None):
+    conn = _db_connect()
+    try:
+        if pr_number is not None and event != "pull_request_merged":
+            row = conn.execute("SELECT status FROM ci_runs WHERE owner=? AND repo=? AND event IN ('pull_request','pull_request_updated','pull_request_reopened') AND json_extract(payload_json,'$.pr_number')=? AND id<? AND status IN ('success','failed','timed_out') ORDER BY id DESC LIMIT 1", (owner, repo, pr_number, run_id)).fetchone()
+        else:
+            row = conn.execute("SELECT status FROM ci_runs WHERE owner=? AND repo=? AND branch=? AND event=? AND id<? AND status IN ('success','failed','timed_out') ORDER BY id DESC LIMIT 1", (owner, repo, branch, event, run_id)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_ci_pending_notifications():
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT id,owner,repo,event,branch,commit_hash,payload_json FROM ci_runs WHERE notification='queued' AND status NOT IN ('queued','running') ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+
+def db_prs_for_target(owner: str, repo: str, branch: str):
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT id,source_branch FROM pull_requests WHERE owner=? AND repo=? AND target_branch=? AND status='open'", (owner, repo, branch)).fetchall()
+    finally:
+        conn.close()
+
+
+def db_ci_latest_run(owner: str, repo: str, branch: str | None = None):
+    conn = _db_connect()
+    try:
+        condition = " AND branch=? AND event IN ('push','manual','pull_request_merged')" if branch is not None else ""
+        params = (owner, repo, branch) if branch is not None else (owner, repo)
+        return conn.execute(f"SELECT id,status,event,branch,commit_hash,created_at FROM ci_runs WHERE owner=? AND repo=?{condition} ORDER BY id DESC LIMIT 1", params).fetchone()
     finally:
         conn.close()
 
@@ -729,6 +806,7 @@ def db_ci_recover_runs():
     conn = _db_connect()
     try:
         conn.execute("UPDATE ci_runs SET status='interrupted', finished_at=datetime('now') WHERE status='running'")
+        conn.execute("UPDATE ci_runs SET notification='delivery unknown after restart (not retried)' WHERE notification='sending'")
         for owner, repo in conn.execute("SELECT DISTINCT owner,repo FROM ci_runs").fetchall():
             _db_ci_prune_completed(conn, owner, repo)
     finally:
@@ -736,11 +814,13 @@ def db_ci_recover_runs():
 
 
 def _db_ci_prune_completed(conn, owner: str, repo: str) -> None:
+    retention = max(1, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100"))))
     conn.execute("""DELETE FROM ci_runs AS old
         WHERE old.owner=? AND old.repo=? AND old.status NOT IN ('queued','running')
+          AND old.notification NOT IN ('queued','sending')
           AND old.id NOT IN (SELECT newer.id FROM ci_runs AS newer
             WHERE newer.owner=? AND newer.repo=? AND newer.status NOT IN ('queued','running')
-            ORDER BY newer.id DESC LIMIT 100)""", (owner, repo, owner, repo))
+            ORDER BY newer.id DESC LIMIT ?)""", (owner, repo, owner, repo, retention))
 
 
 def db_prs_for_source(owner: str, repo: str, branch: str):

@@ -8,18 +8,21 @@ import mimetypes
 import os
 import platform
 import re
+import secrets
 import sqlite3
 import sys
 import signal
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlencode
 
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 from .config import AppConfig
 from .context import AppContext
 from .ci import CIManager, default_config as ci_default_config
+from .ci_email import load_settings as load_email_settings, validate_settings as validate_email_settings, validate_recipients, send_notification
 from .database import (
     _db_init,
     _ensure_dir,
@@ -41,6 +44,10 @@ from .database import (
     db_ci_run_get,
     db_ci_latest_run,
     db_prs_for_source,
+    db_prs_for_target,
+    db_ci_run_metadata,
+    db_ci_config_get,
+    db_email_settings_set,
     db_reset_password,
     db_revoke_session,
     db_revoke_token,
@@ -55,6 +62,18 @@ from .database import (
 def _thread_call(func, *args, **kwargs):
     """Keep executor results non-None, including database misses and void writes."""
     return (func(*args, **kwargs),)
+
+
+def _ci_elapsed(start, end=None):
+    if not start:
+        return "—"
+    try:
+        begin = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+        finish = datetime.fromisoformat(end).replace(tzinfo=timezone.utc) if end else datetime.now(timezone.utc)
+        seconds = max(0, int((finish - begin).total_seconds()))
+        return f"{seconds // 60}m {seconds % 60}s"
+    except ValueError:
+        return "—"
 
 
 async def _call_in_thread(func, *args, **kwargs):
@@ -1446,7 +1465,9 @@ class GitHTTPHandler:
 
         admin_link = safe_html("")
         if _require_admin(self):
-            admin_link = safe_html("<a class=\"pill\" href=\"/admin/users\">Admin: Users</a>")
+            admin_link = safe_html('<a class="pill" href="/admin/users">Admin: Users</a> <a class="pill" href="/admin/email">Admin: Email</a>')
+        elif not REQUIRE_AUTH:
+            admin_link = safe_html('<a class="pill" href="/admin/email">Admin: Email</a>')
 
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No repos found.</td><td></td></tr>')
         body = html_t(
@@ -1829,12 +1850,15 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
 
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        latest_ci = await _call_in_thread(db_ci_latest_run, owner, repo)
+        latest_ci = await _call_in_thread(db_ci_latest_run, owner, repo, default_branch)
         if latest_ci:
             ci_status = latest_ci[1]
             ci_color = {"success": "#16803c", "failed": "#b42318", "timed_out": "#b42318",
                         "queued": "#9a6700", "running": "#9a6700", "interrupted": "#667085"}.get(ci_status, "#667085")
-            ci_badge = safe_html(html_t(t'<a class="pill" style="border-color:{ci_color};color:{ci_color}" href="{base}/ci/runs/{latest_ci[0]}" title="Latest CI run: {latest_ci[2]} · {latest_ci[4][:8]}">CI: {ci_status}</a>'))
+            current_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
+            if current_commit != latest_ci[4]:
+                ci_status, ci_color = "stale", "#667085"
+            ci_badge = safe_html(html_t(t'<a class="pill" style="border-color:{ci_color};color:{ci_color}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'))
         else:
             ci_badge = safe_html(html_t(t'<a class="pill" href="{base}/ci">CI: no runs</a>'))
         tree_code, tree_out, _ = await _run_git(repo_git, ["ls-tree", f"{default_branch}:"])
@@ -2217,6 +2241,72 @@ document.addEventListener("DOMContentLoaded", function() {{
                 {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch, "base_commit": new_commit})
         return await self._ui_pull_view(owner, repo, pr_id, msg, "ok")
 
+    def _email_csrf_token(self):
+        if not getattr(self.server, "email_csrf_token", None):
+            self.server.email_csrf_token = secrets.token_urlsafe(32)
+        return self.server.email_csrf_token
+
+    async def _ui_admin_email(self, notice="", error=False, submitted=None):
+        if REQUIRE_AUTH and not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
+        settings = await _call_in_thread(load_email_settings)
+        display = submitted if submitted is not None else settings
+        token = self._email_csrf_token()
+        password_status = "A password is configured." if settings.get("password") else "No password is configured."
+        notice_html = safe_html(html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')) if notice else safe_html("")
+        tls_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if display.get("tls") == value else "")}>{label}</option>') for value, label in (("starttls", "STARTTLS (usually port 587)"), ("ssl", "Implicit TLS (usually port 465)"))])
+        body = safe_html(html_t(t'''<div class="topbar"><h1>Email settings</h1><a class="pill" href="/">Repositories</a></div>{notice_html}
+<div class="box"><p>Server-wide SMTP settings for CI notifications. Saved web settings override SMTP environment settings immediately, without restarting.</p>
+<p class="warn">Use HTTPS. The SMTP password is stored in the server database, not encrypted. Protect database files and backups. It is never displayed or passed to job environments. Host CI still requires trusted code.</p>
+<form method="POST" action="/admin/email"><input type="hidden" name="csrf" value="{token}">
+<label>SMTP hostname</label><input name="host" value="{display.get("host", "")}" required autocomplete="off">
+<label>Port</label><input name="port" type="number" min="1" max="65535" value="{display.get("port", "587")}" required>
+<label>Transport security</label><select name="tls">{tls_options}</select>
+<label>Sender email address</label><input name="sender" type="email" value="{display.get("sender", "")}" required>
+<label>Username (blank for no authentication)</label><input name="username" value="{display.get("username", "")}" autocomplete="off">
+<label>Password (leave blank to keep existing)</label><input name="password" type="password" value="" autocomplete="new-password">
+<p>{password_status}</p><label><input type="checkbox" name="clear_password"> Clear existing password</label>
+<label>Public server URL (optional, for run links)</label><input name="public_url" type="url" value="{display.get("public_url", "")}" placeholder="https://git.example.com">
+<button type="submit">Save email settings</button></form></div>
+<div class="box"><h2>Send test email</h2><p>Uses saved settings, not unsaved edits. TLS certificate verification is always enabled.</p>
+<form method="POST" action="/admin/email/test"><input type="hidden" name="csrf" value="{token}">
+<label>Recipient</label><input type="email" name="recipient" required><button type="submit">Send test email</button></form>
+<p>Choose recipients and notification preferences separately in each repository's CI settings.</p></div>'''))
+        return await _send_response(self.request, 200, _html_page("Email settings", body),
+            [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+
+    async def _ui_admin_email_save(self, test=False):
+        if REQUIRE_AUTH and not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
+        form = await self._read_form_urlencoded()
+        if not secrets.compare_digest(str(form.get("csrf", "")).encode("utf-8"), self._email_csrf_token().encode("utf-8")):
+            return await self._forbidden(b"403 Forbidden: invalid form token.\n")
+        current = await _call_in_thread(load_email_settings)
+        if test:
+            try:
+                recipients = validate_recipients(form.get("recipient", ""))
+                if len(recipients) != 1:
+                    raise ValueError("Enter exactly one test recipient.")
+                validate_email_settings(current)
+            except ValueError as exc:
+                return await self._ui_admin_email(notice=str(exc), error=True)
+            try:
+                await _call_in_thread(send_notification, "server", "email-test", (0, "test", "", "", "test", "", 0, None), recipients, current)
+            except Exception as exc:
+                return await self._ui_admin_email(notice=f"Test email failed ({type(exc).__name__}). Check SMTP settings and connectivity.", error=True)
+            return await self._ui_admin_email(notice="Test email accepted by SMTP server. Check the recipient's inbox.")
+        settings = {key: form.get(key, "") for key in ("host", "port", "tls", "sender", "username", "password", "public_url")}
+        if "clear_password" in form:
+            settings["password"] = ""
+        elif not settings["password"]:
+            settings["password"] = current.get("password", "")
+        try:
+            settings = validate_email_settings(settings)
+        except ValueError as exc:
+            return await self._ui_admin_email(notice=str(exc), error=True, submitted=settings)
+        await _call_in_thread(db_email_settings_set, json.dumps(settings))
+        return await self._ui_admin_email(notice="Email settings saved.")
+
     async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = "", partial: bool = False):
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
@@ -2228,27 +2318,32 @@ document.addEventListener("DOMContentLoaded", function() {{
             key: (query_params.get(key) or [""])[0].strip()
             for key in ("status", "event", "branch", "q")
         }
-        allowed_statuses = {"queued", "running", "success", "failed", "timed_out", "interrupted"}
+        allowed_statuses = {"queued", "running", "success", "failed", "timed_out", "interrupted", "cancelled"}
         allowed_events = {"push", "pull_request", "pull_request_updated", "pull_request_reopened", "pull_request_merged", "manual"}
         if filters["status"] not in allowed_statuses:
             filters["status"] = ""
         if filters["event"] not in allowed_events:
             filters["event"] = ""
         filters["q"] = filters["q"][:128]
+        cursor = (query_params.get("before") or [""])[0]
+        before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
         runs = await _call_in_thread(
             db_ci_runs_list, owner, repo, 100,
             status=filters["status"], event=filters["event"],
             branch=filters["branch"], query=filters["q"],
+            summary=True,
+            before=before,
         )
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows = []
         for run in runs:
-            rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7]}</td><td>{run[8]}</td></tr>'))
-        runs_html = join_html(rows) if rows else safe_html('<tr><td colspan="7" class="muted">No CI runs yet.</td></tr>')
+            rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
+        empty = "No runs match these filters." if any(filters.values()) else "No CI runs yet."
+        runs_html = join_html(rows) if rows else safe_html(html_t(t'<tr><td colspan="8" class="muted">{empty}</td></tr>'))
         filter_options = {
             "status": [("", "All statuses"), ("queued", "Queued"), ("running", "Running"),
-                ("success", "Success"), ("failed", "Failed"), ("timed_out", "Timed out"), ("interrupted", "Interrupted")],
+                ("success", "Success"), ("failed", "Failed"), ("timed_out", "Timed out"), ("interrupted", "Interrupted"), ("cancelled", "Cancelled")],
             "event": [("", "All events"), ("push", "Push"), ("pull_request", "PR opened"),
                 ("pull_request_updated", "PR updated"), ("pull_request_reopened", "PR reopened"),
                 ("pull_request_merged", "PR merged"), ("manual", "Manual")],
@@ -2271,15 +2366,24 @@ document.addEventListener("DOMContentLoaded", function() {{
 <select name="status">{options_html["status"]}</select><select name="event">{options_html["event"]}</select>
 <select name="branch">{branch_options}</select><button type="submit">Filter runs</button>
 <a class="pill" href="{base}/ci">Clear filters</a></form></div>'''))
+        pagination = safe_html("")
+        if len(runs) == 100:
+            older_query = urlencode({**{key: value for key, value in filters.items() if value}, "before": runs[-1][0]})
+            pagination = safe_html(html_t(t'<a class="pill" href="{base}/ci?{older_query}">Older runs</a>'))
         results_html = safe_html(html_t(t'''<div id="ci-results">
-<div class="box"><h2>CI runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th></tr>{runs_html}</table></div></div>'''))
+<div class="box"><h2>CI runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table>{pagination}</div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
+        config_raw = await _call_in_thread(db_ci_config_get, owner, repo)
+        config = json.loads(config_raw) if config_raw else ci_default_config()
+        manual_enabled = bool(config.get("command") and config.get("events", {}).get("manual") and branches and _has_write_scope(self))
+        disabled = safe_html("" if manual_enabled else " disabled")
+        manual_notice = "" if manual_enabled else "Manual runs require write access, a command, the manual trigger, and an existing branch."
         notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
         body = html_t(t'''<div class="topbar"><div><h1>CI runs · {owner}/{repo}</h1></div><div><a class="pill" href="{base}/ci/config">CI settings</a> <a class="pill" href="{base}">Repo</a></div></div>{notice_html}
-<div class="box"><h2>Run manually</h2><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit">Queue run</button></form></div>{filter_form}{results_html}
+<div class="box"><h2>Run manually</h2><p>{manual_notice}</p><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button></form></div>{filter_form}{results_html}
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
         await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(body)))
 
@@ -2292,17 +2396,38 @@ document.addEventListener("DOMContentLoaded", function() {{
 
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         active = run[4] in ("queued", "running")
+        meta = await _call_in_thread(db_ci_run_metadata, owner, repo, run_id)
+        snapshot = json.loads(meta["config"] or "{}")
+        payload = json.loads(meta["payload"] or "{}")
+        command_details = safe_html("")
+        if not REQUIRE_AUTH or _require_admin(self):
+            command_details = safe_html(html_t(t'<h2>Configuration snapshot</h2><p>Image: {snapshot.get("image", "—")}</p><pre>{snapshot.get("command", "Legacy run: no snapshot available.")}</pre>'))
+        can_write = _has_write_scope(self)
+        actions = safe_html("")
+        if can_write:
+            action = "cancel" if active else "rerun"
+            unavailable = safe_html(' disabled title="Legacy run has no configuration snapshot"' if not active and not snapshot else "")
+            actions = safe_html(html_t(t'<form method="POST" action="{base}/ci/runs/{run_id}/{action}"><button{unavailable}>{action.capitalize()}</button></form>'))
+        email_action = safe_html("")
+        if (not REQUIRE_AUTH or _require_admin(self)) and meta["notification"].startswith(("failed", "delivery unknown")):
+            email_action = safe_html(html_t(t'<form method="POST" action="{base}/ci/runs/{run_id}/notify"><button>Retry email (may duplicate an uncertain delivery)</button></form>'))
+        waiting = "Waiting for a runner slot or an earlier run in this repository." if run[4] == "queued" else ""
         output = run[5] or "No output yet."
         exit_code = "pending" if run[7] is None else run[7]
         started_at = run[9] or "—"
         finished_at = run[10] or "—"
         truncated_notice = safe_html('<p class="muted">Output truncated at 1 MiB.</p>') if run[6] else safe_html("")
-        result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active else "false"}">
+        result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
 <div class="box"><h1>CI run #{run[0]} · {run[4]}</h1>
 <p class="muted">{run[1]} · {run[2]} · <code>{run[3]}</code></p>
 <table><tr><th>Exit code</th><td>{exit_code}</td></tr><tr><th>Created</th><td>{run[8]}</td></tr>
 <tr><th>Started</th><td>{started_at}</td></tr><tr><th>Finished</th><td>{finished_at}</td></tr></table>
-<h2>Output</h2><pre style="white-space:pre-wrap;max-height:70vh;overflow:auto">{output}</pre>
+<p>Duration: {_ci_elapsed(run[9], run[10])} · Queue wait: {_ci_elapsed(run[8], run[9] or run[10])}</p>
+<p>{waiting}</p><p>Phase: {meta["phase"] or "queued"} · {meta["reason"]}</p>
+<p>Email: {meta["notification"] or "not sent"}</p>
+<p>Runner: {snapshot.get("runner", "legacy host")} · Base: {payload.get("base_commit", "—")} · Head: {payload.get("head_commit", "—")}</p>
+{actions}{email_action}{command_details}<h2>Output</h2><a href="{base}/ci/runs/{run_id}/log">Download raw log</a>
+<pre id="ci-log" style="white-space:pre-wrap;max-height:70vh;overflow:auto">{output}</pre>
 {truncated_notice}</div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(result_html).encode("utf-8"),
@@ -2311,37 +2436,52 @@ document.addEventListener("DOMContentLoaded", function() {{
         body = safe_html(html_t(t'''<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div>
 <div><a class="pill" href="{base}/ci">CI settings and runs</a> <a class="pill" href="{base}">Repo</a></div></div>
 {result_html}
+<label><input id="ci-follow" type="checkbox" checked> Follow output</label>
+<button onclick="navigator.clipboard.writeText(document.getElementById('ci-log').textContent)">Copy output</button>
 <script>(function() {{ const current = document.getElementById("ci-run-result"); if (!current || current.dataset.active !== "true") return;
 let polling = false; const timer = setInterval(async function() {{ if (polling) return; polling = true; try {{
 const response = await fetch(window.location.pathname + "?partial=1", {{cache:"no-store", credentials:"same-origin"}});
 if (response.redirected || !response.ok) {{ clearInterval(timer); return; }}
 const fragment = await response.text(); const node = document.getElementById("ci-run-result");
-if (!node) {{ clearInterval(timer); return; }} node.outerHTML = fragment;
+if (!node) {{ clearInterval(timer); return; }} const oldLog = document.getElementById("ci-log"); const scroll = oldLog ? oldLog.scrollTop : 0; node.outerHTML = fragment;
+const log = document.getElementById("ci-log"); if (log) log.scrollTop = document.getElementById("ci-follow").checked ? log.scrollHeight : scroll;
 if (document.getElementById("ci-run-result").dataset.active !== "true") clearInterval(timer);
 }} catch (_error) {{ /* Retry on the next interval. */ }} finally {{ polling = false; }} }}, 3000); }})();</script>'''))
         return await _send_html(self.request, 200,
             _html_page(str_t(t"CI run #{run[0]} · {owner}/{repo}"), body))
 
-    async def _ui_ci_config(self, owner: str, repo: str, notice: str = ""):
+    async def _ui_ci_config(self, owner: str, repo: str, notice: str = "", submitted=None, error=False):
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
-        config = await self.server.ci_manager.config(owner, repo)
+        config = submitted if submitted is not None else await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        env_text = "\n".join(f"{key}={value}" for key, value in config["env"].items())
+        env_text = config.get("env_text", "\n".join(f"{key}={value}" for key, value in config["env"].items()))
         checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
         event_controls = join_html([
             html_t(t'<label><input type="checkbox" name="event_{key}"{checks[key]}/> {key.replace("_", " ")}</label>')
             for key in checks
         ])
-        notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
+        notice_html = safe_html(html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')) if notice else safe_html("")
+        runner_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("runner", "host") == value else "")}>{value}</option>') for value in ("host", "docker")])
+        email_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("email_mode", "off") == value else "")}>{label}</option>') for value, label in (("off", "Off"), ("failures", "Failures only"), ("all", "All completions"), ("recovery", "Failures and recovery"))])
+        shell_name = "cmd.exe" if os.name == "nt" else "/bin/sh"
+        smtp = await _call_in_thread(load_email_settings)
+        smtp_status = "SMTP host and sender are configured; verify delivery from Email settings." if smtp.get("host") and smtp.get("sender") else "SMTP is not configured: set up Email settings first."
         body = html_t(t'''<div class="topbar"><div><h1>CI settings · {owner}/{repo}</h1></div>
 <div><a class="pill" href="{base}/ci">CI runs</a> <a class="pill" href="{base}">Repo</a></div></div>{notice_html}
-<div class="box"><p class="muted">The command runs in the server’s default shell in a temporary checkout. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and pull request metadata such as <code>PYGITHOST_PR_NUMBER</code>.</p>
+<div class="box"><p class="warn">Host runner: trusted code only! Jobs have the server OS user's filesystem permissions. Use an unprivileged server account. Docker adds isolation and resource limits; it requires a local Docker daemon and an image with dependencies installed.</p>
+<p class="muted">Host shell: {shell_name}; Docker shell: /bin/sh. Commands use an independent checkout and a restricted environment. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and <code>PYGITHOST_PR_NUMBER</code>. Environment values are not a secret store.</p>
 <form method="POST" action="{base}/ci/config"><label>Command</label><textarea name="command" placeholder="python -m pytest" style="min-height:100px">{config["command"]}</textarea>
 <label>Environment variables (KEY=value, one per line)</label><textarea name="env" placeholder="EXAMPLE=value">{env_text}</textarea>
+<label>Runner</label><select name="runner">{runner_options}</select>
+<label>Docker image (prefer an immutable digest)</label><input name="image" value="{config.get("image", "python:3.14-slim")}">
+<label><input type="checkbox" name="cancel_superseded"{safe_html(" checked" if config.get("cancel_superseded") else "")}> Cancel superseded runs</label>
+<h2>Email notifications</h2><p>{smtp_status} <a href="/admin/email">Server email settings</a>. Messages contain run metadata, not logs or environment values.</p>
+<label>Recipients (one address per line)</label><textarea name="email_recipients">{config.get("email_recipients", "")}</textarea>
+<label>Send notifications</label><select name="email_mode">{email_options}</select>
 <label>Push branch filters (one glob per line; blank means all)</label><textarea name="push_branches">{config["push_branches"]}</textarea>
 <label>Pull request target branch filters</label><textarea name="pr_branches">{config["pr_branches"]}</textarea>
 <div class="row">{event_controls}</div><button type="submit">Save CI settings</button></form></div>''')
@@ -2355,21 +2495,26 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
         form = await self._read_form_urlencoded()
-        env = {}
-        for line in (form.get("env") or "").splitlines():
-            line = line.strip()
-            if not line: continue
-            if "=" not in line:
-                return await self._ui_ci_config(owner, repo, notice="Each environment entry must use KEY=value.")
-            key, value = line.split("=", 1)
-            env[key.strip()] = value
-        config = {"command": form.get("command", ""), "env": env,
+        config = {**ci_default_config(), "command": form.get("command", ""), "env_text": form.get("env", ""),
+            "runner": form.get("runner", "host"), "image": form.get("image", "python:3.14-slim"),
+            "email_mode": form.get("email_mode", "off"), "email_recipients": form.get("email_recipients", ""),
+            "cancel_superseded": "cancel_superseded" in form,
             "push_branches": form.get("push_branches", ""), "pr_branches": form.get("pr_branches", ""),
             "events": {key: f"event_{key}" in form for key in ci_default_config()["events"]}}
+        env = {}
+        for line in (form.get("env") or "").splitlines():
+            if not line.strip(): continue
+            if "=" not in line:
+                return await self._ui_ci_config(owner, repo, notice="Each environment entry must use KEY=value.", submitted=config, error=True)
+            key, value = line.split("=", 1)
+            if key.strip() in env:
+                return await self._ui_ci_config(owner, repo, notice="Environment variable names must be unique.", submitted=config, error=True)
+            env[key.strip()] = value
+        config["env"] = env
         try:
             await self.server.ci_manager.save_config(owner, repo, config)
         except ValueError as exc:
-            return await self._ui_ci_config(owner, repo, notice=str(exc))
+            return await self._ui_ci_config(owner, repo, notice=str(exc), submitted=config, error=True)
         return await self._ui_ci_config(owner, repo, notice="CI settings saved.")
 
     async def _ui_ci_run(self, owner: str, repo: str):
@@ -2383,10 +2528,44 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         commit = await _git_resolve_commit(_repo_bare_path(owner, repo), "refs/heads/" + branch) if _safe_branch_name(branch) else None
         if not commit:
             return await self._ui_ci(owner, repo, notice="Select a valid branch.")
-        run_id = await self.server.ci_manager.enqueue(owner, repo, "manual", branch, commit)
+        try:
+            run_id = await self.server.ci_manager.enqueue(owner, repo, "manual", branch, commit)
+        except ValueError as exc:
+            return await self._ui_ci(owner, repo, notice=str(exc))
         if run_id:
             return await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}"))
         return await self._ui_ci(owner, repo, notice="Manual runs are disabled or no command is configured.")
+
+    async def _ui_ci_action(self, owner, repo, run_id, action):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        if action == "notify" and REQUIRE_AUTH and not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
+        if not await _call_in_thread(db_ci_run_get, owner, repo, run_id):
+            return await self._not_found()
+        try:
+            if action == "cancel":
+                await self.server.ci_manager.cancel(owner, repo, run_id)
+            elif action == "notify":
+                await self.server.ci_manager.retry_email(owner, repo, run_id)
+            else:
+                run_id = await self.server.ci_manager.rerun(owner, repo, run_id)
+        except ValueError as exc:
+            return await self._ui_ci(owner, repo, notice=str(exc))
+        return await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}"))
+
+    async def _ui_ci_log(self, owner, repo, run_id):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        run = await _call_in_thread(db_ci_run_get, owner, repo, run_id)
+        if not run:
+            return await self._not_found()
+        return await _send_response(self.request, 200, run[5].encode("utf-8"),
+            [("Content-Type", "text/plain; charset=utf-8"), ("Content-Disposition", f'attachment; filename="ci-{run_id}.log"'), ("Cache-Control", "no-store")])
 
     # ========================================================
     # UI: Commits, Commit, Tree, Blob
@@ -3046,6 +3225,8 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             return await self._ui_tokens()
         if p == "/admin/users":
             return await self._ui_admin_users()
+        if p == "/admin/email":
+            return await self._ui_admin_email()
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", p)
         if m:
             return await self._ui_ci_config(m.group(1), m.group(2))
@@ -3059,6 +3240,9 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             qs = parse_qs(parsed.query or "")
             partial = (qs.get("partial") or [""])[0] == "1"
             return await self._ui_ci(m.group(1), m.group(2), int(m.group(3)), partial=partial)
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/runs/(\d+)/log$", p)
+        if m:
+            return await self._ui_ci_log(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
             return await self._ui_repo(m.group(1), m.group(2))
@@ -3117,6 +3301,10 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             return await self._ui_revoke_token()
         if parsed.path == "/admin/users/create":
             return await self._ui_admin_users_create()
+        if parsed.path == "/admin/email":
+            return await self._ui_admin_email_save()
+        if parsed.path == "/admin/email/test":
+            return await self._ui_admin_email_save(test=True)
         if parsed.path == "/admin/users/reset":
             return await self._ui_admin_users_reset()
         if parsed.path == "/admin/users/toggle":
@@ -3139,6 +3327,9 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/run$", parsed.path)
         if m:
             return await self._ui_ci_run(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/runs/(\d+)/(cancel|rerun|notify)$", parsed.path)
+        if m:
+            return await self._ui_ci_action(m.group(1), m.group(2), int(m.group(3)), m.group(4))
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches/create$", parsed.path)
         if m:
             return await self._ui_branch_create(m.group(1), m.group(2))
@@ -3205,7 +3396,16 @@ class AsyncGitServer:
                 base_commit = await _git_resolve_commit(repo_git, "refs/heads/" + target_branch) or ""
                 await self.ci_manager.enqueue(owner, repo, "pull_request_updated", target_branch, base_commit,
                     {"pr_number": pr_id, "base_branch": target_branch, "head_branch": branch,
-                     "base_commit": base_commit, "head_commit": commit})
+                      "base_commit": base_commit, "head_commit": commit})
+            for pr_id, source_branch in await asyncio.to_thread(db_prs_for_target, owner, repo, branch):
+                # A source+target update in one push must yield one check per PR.
+                if before_refs.get(source_branch) != after_refs.get(source_branch):
+                    continue
+                head_commit = await _git_resolve_commit(repo_git, "refs/heads/" + source_branch) or ""
+                if head_commit:
+                    await self.ci_manager.enqueue(owner, repo, "pull_request_updated", branch, commit,
+                        {"pr_number": pr_id, "base_branch": branch, "head_branch": source_branch,
+                         "base_commit": commit, "head_commit": head_commit})
 
     async def shutdown(self) -> None:
         pending = tuple(self.push_requests)

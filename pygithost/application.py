@@ -2262,6 +2262,9 @@ document.addEventListener("DOMContentLoaded", function() {{
 <label>SMTP hostname</label><input name="host" value="{display.get("host", "")}" required autocomplete="off">
 <label>Port</label><input name="port" type="number" min="1" max="65535" value="{display.get("port", "587")}" required>
 <label>Transport security</label><select name="tls">{tls_options}</select>
+<label>Trusted SMTP certificate / CA certificates (optional, PEM)</label>
+<textarea name="ca_cert" maxlength="65536" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----">{display.get("ca_cert", "")}</textarea>
+<p>For a self-signed server, paste its public certificate, or paste your internal CA certificate. Verify its fingerprint with your mail administrator first. Never paste a private key. Leave blank for system trust only. Hostname and expiry checks remain enabled.</p>
 <label>Sender email address</label><input name="sender" type="email" value="{display.get("sender", "")}" required>
 <label>Username (blank for no authentication)</label><input name="username" value="{display.get("username", "")}" autocomplete="off">
 <label>Password (leave blank to keep existing)</label><input name="password" type="password" value="" autocomplete="new-password">
@@ -2295,7 +2298,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             except Exception as exc:
                 return await self._ui_admin_email(notice=f"Test email failed ({type(exc).__name__}). Check SMTP settings and connectivity.", error=True)
             return await self._ui_admin_email(notice="Test email accepted by SMTP server. Check the recipient's inbox.")
-        settings = {key: form.get(key, "") for key in ("host", "port", "tls", "sender", "username", "password", "public_url")}
+        settings = {key: form.get(key, "") for key in ("host", "port", "tls", "sender", "username", "password", "public_url", "ca_cert")}
         if "clear_password" in form:
             settings["password"] = ""
         elif not settings["password"]:

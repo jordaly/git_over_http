@@ -1,5 +1,8 @@
 import json
 import os
+import shutil
+import ssl
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +13,7 @@ from unittest.mock import AsyncMock
 from pygithost import database
 from pygithost.application import GitHTTPHandler
 from pygithost.ci import CIManager, validate_config
-from pygithost.ci_email import load_settings, validate_settings
+from pygithost.ci_email import load_settings, validate_settings, tls_context, send_notification
 
 
 class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
@@ -24,7 +27,7 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.handler.request = SimpleNamespace()
         self.handler.remote_is_admin = True
         self.handler._forbidden = AsyncMock()
-        self.settings = {"host": "smtp.example.test", "port": "587", "tls": "starttls", "sender": "ci@example.test", "username": "ci", "password": "private-password", "public_url": "https://git.example.test"}
+        self.settings = {"host": "smtp.example.test", "port": "587", "tls": "starttls", "sender": "ci@example.test", "username": "ci", "password": "private-password", "public_url": "https://git.example.test", "ca_cert": ""}
 
     def tearDown(self):
         database.DB_PATH = self.old_db
@@ -43,9 +46,10 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(load_settings()["password"], "private-password")
         if os.name == "posix":
             self.assertEqual(Path(database.DB_PATH).stat().st_mode & 0o777, 0o600)
-        page = await self.post({**self.settings, "password": "", "host": "new.example.test"})
+        page = await self.post({**self.settings, "password": "", "host": "new.example.test", "port": "2525"})
         self.assertEqual(load_settings()["password"], "private-password")
         self.assertEqual(load_settings()["host"], "new.example.test")
+        self.assertEqual(load_settings()["port"], "2525")
         self.assertNotIn("private-password", page)
         await self.post({**self.settings, "password": "", "clear_password": "on"})
         self.assertEqual(load_settings()["password"], "")
@@ -119,6 +123,62 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(send.call_args.args[-1]["host"], "updated.example.test")
 
     async def test_validation_rejects_unsafe_values(self):
-        for change in ({"host": "smtp://host"}, {"sender": "a@b,b@c"}, {"tls": "none"}, {"port": "65536"}, {"public_url": "https://user:password@host"}, {"public_url": "javascript:alert(1)"}, {"password": "bad\nvalue"}):
+        for change in ({"host": "smtp://host"}, {"sender": "a@b,b@c"}, {"tls": "none"}, {"port": "65536"}, {"public_url": "https://user:password@host"}, {"public_url": "javascript:alert(1)"}, {"password": "bad\nvalue"}, {"ca_cert": "not a certificate"}, {"ca_cert": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}, {"ca_cert": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_settings({**self.settings, **change})
+
+
+@unittest.skipUnless(shutil.which("openssl"), "requires OpenSSL for a temporary self-signed certificate")
+class TrustedCertificateTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.cert = str(Path(cls.temp.name) / "certificate.pem")
+        cls.key = str(Path(cls.temp.name) / "key.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+                        "-addext", "basicConstraints=critical,CA:TRUE", "-keyout", cls.key, "-out", cls.cert], check=True, capture_output=True)
+        cls.pem = Path(cls.cert).read_text()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def settings(self, **extra):
+        return {"host": "localhost", "port": "587", "tls": "starttls", "sender": "ci@example.test", "ca_cert": self.pem, **extra}
+
+    async def test_self_signed_certificate_can_be_trusted_without_disabling_verification(self):
+        import asyncio
+
+        context = tls_context(validate_settings(self.settings()))
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        self.assertIn(ssl.PEM_cert_to_DER_cert(self.pem), context.get_ca_certs(binary_form=True))
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(self.cert, self.key)
+
+        async def connected(reader, writer):
+            writer.write(b"trusted\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(connected, "127.0.0.1", 0, ssl=server_context)
+        async with server:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1], ssl=context, server_hostname="localhost"), timeout=5)
+            self.assertEqual(await reader.readline(), b"trusted\n")
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_both_smtp_transports_receive_the_custom_trust_context(self):
+        run = (0, "test", "", "", "test", "", 0, None)
+        for mode, transport in (("starttls", "SMTP"), ("ssl", "SMTP_SSL")):
+            with self.subTest(mode=mode), mock.patch(f"pygithost.ci_email.smtplib.{transport}") as smtp:
+                smtp.return_value.send_message.return_value = {}
+                port = "2525" if mode == "starttls" else "1465"
+                send_notification("server", "email-test", run, ["dev@example.test"], self.settings(tls=mode, port=port))
+                self.assertEqual(smtp.call_args.args[1], int(port))
+                context = smtp.call_args.kwargs["context"] if mode == "ssl" else smtp.return_value.starttls.call_args.kwargs["context"]
+                self.assertTrue(context.check_hostname)
+                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                self.assertIn(ssl.PEM_cert_to_DER_cert(self.pem), context.get_ca_certs(binary_form=True))

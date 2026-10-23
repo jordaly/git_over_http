@@ -33,6 +33,17 @@ def validate_settings(raw):
         if not isinstance(value, str) or len(value) > 8192 or any(c in value for c in ("\r", "\n", "\0")):
             raise ValueError(f"Invalid SMTP {key}.")
         result[key] = value if key == "password" else value.strip()
+    certificate = raw.get("ca_cert", "")
+    if not isinstance(certificate, str) or len(certificate) > 65536 or "\0" in certificate:
+        raise ValueError("Trusted SMTP certificate must be PEM text up to 64 KiB.")
+    result["ca_cert"] = certificate.strip()
+    if result["ca_cert"]:
+        if not re.fullmatch(r"(?:\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+", result["ca_cert"]):
+            raise ValueError("Paste PEM certificates only, never a private key.")
+        try:
+            tls_context(result)
+        except (ssl.SSLError, ValueError) as exc:
+            raise ValueError("Trusted SMTP certificate is not a valid PEM certificate.") from exc
     if not result["host"] or any(c.isspace() for c in result["host"]) or "://" in result["host"]:
         raise ValueError("Enter an SMTP hostname, not a URL.")
     if result["tls"] not in ("starttls", "ssl"):
@@ -46,6 +57,13 @@ def validate_settings(raw):
         if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
             raise ValueError("Public URL must be an HTTP(S) URL without credentials, query, or fragment.")
     return result
+
+
+def tls_context(settings):
+    context = ssl.create_default_context()
+    if settings.get("ca_cert"):
+        context.load_verify_locations(cadata=settings["ca_cert"])
+    return context
 
 
 def validate_recipients(value):
@@ -84,7 +102,7 @@ def send_notification(owner, repo, run, recipients, settings=None):
         message.replace_header("Subject", "[CI] SMTP test email")
         text = "This is a test email from pygithost. SMTP settings are working.\n"
     message.set_content(text)
-    context = ssl.create_default_context()
+    context = tls_context(settings)
     client = smtplib.SMTP_SSL(host, port, timeout=15, context=context) if mode == "ssl" else smtplib.SMTP(host, port, timeout=15)
     with client:
         if mode == "starttls":

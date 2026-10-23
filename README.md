@@ -153,6 +153,8 @@ Open **Admin: Email** from the repository list (or `/admin/email`) to configure 
 SMTP hostname, port, TLS mode, sender, username, password, and optional public
 server URL. Save, then use **Send test email** to verify delivery. Changes take
 effect immediately. CI settings also link to this page.
+The port is fully editable (1–65535), including custom ports such as 2525;
+choose the TLS mode your mail server uses on that port.
 
 This page is administrator-only when authentication is enabled, uses protected
 POST forms, and never displays the password. Leave the password blank to retain
@@ -163,6 +165,16 @@ sidecars to owner-only permissions on POSIX; on Windows, configure appropriate
 file ACLs. Host-runner code has the server user's filesystem access and
 must remain trusted. With authentication disabled, the IP allowlist protects
 email administration as well as the rest of the application.
+
+For a self-signed SMTP server or internal certificate authority, paste its
+**public PEM certificate** in **Trusted SMTP certificate / CA certificates** on
+the Email settings page. Obtain it from your mail administrator and verify its
+fingerprint through a trusted channel; do not blindly trust a certificate fetched
+from an unverified connection. Never paste a private key. Multiple PEM certificates
+are supported. These are added to system trust for SMTP only; hostname and expiry
+verification remain enabled for both STARTTLS and implicit TLS. The SMTP hostname
+must match the certificate's Subject Alternative Name. Clear the field to return
+to system trust only, save, and use **Send test email** to check the result.
 
 Environment-based setup is still supported when no web settings have been saved;
 saved web settings override the entire SMTP environment configuration. Example

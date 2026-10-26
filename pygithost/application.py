@@ -2479,10 +2479,11 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         body = html_t(t'''<div class="topbar"><div><h1>CI settings · {owner}/{repo}</h1></div>
 <div><a class="pill" href="{base}/ci">CI runs</a> <a class="pill" href="{base}">Repo</a></div></div>{notice_html}
 <div class="box"><p class="warn">Host runner: trusted code only! Jobs have the server OS user's filesystem permissions. Use an unprivileged server account. Docker adds isolation and resource limits; it requires a local Docker daemon and an image with dependencies installed.</p>
-<p class="muted">Host shell: {shell_name}; Docker shell: /bin/sh. Commands use an independent checkout and a restricted environment. Output is capped at 1 MiB; jobs time out after 30 minutes. Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and <code>PYGITHOST_PR_NUMBER</code>. Environment values are not a secret store.</p>
+<p class="muted">Host shell: {shell_name}; Docker shell: /bin/sh. Commands use an independent checkout and a restricted environment. Output is capped at 1 MiB. The timeout covers setup and execution (default: 1800 seconds / 30 minutes). Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and <code>PYGITHOST_PR_NUMBER</code>. Environment values are not a secret store.</p>
 <form method="POST" action="{base}/ci/config"><label>Command</label><textarea name="command" placeholder="python -m pytest" style="min-height:100px">{config["command"]}</textarea>
 <label>Environment variables (KEY=value, one per line)</label><textarea name="env" placeholder="EXAMPLE=value">{env_text}</textarea>
 <label>Runner</label><select name="runner">{runner_options}</select>
+<label>Timeout (seconds)</label><input type="number" name="timeout_seconds" min="1" step="1" required value="{config.get('timeout_seconds', 1800)}">
 <label>Docker image (prefer an immutable digest)</label><input name="image" value="{config.get("image", "python:3.14-slim")}">
 <label><input type="checkbox" name="cancel_superseded"{safe_html(" checked" if config.get("cancel_superseded") else "")}> Cancel superseded runs</label>
 <h2>Email notifications</h2><p>{smtp_status} <a href="/admin/email">Server email settings</a>. Messages contain run metadata, not logs or environment values.</p>
@@ -2505,6 +2506,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             "runner": form.get("runner", "host"), "image": form.get("image", "python:3.14-slim"),
             "email_mode": form.get("email_mode", "off"), "email_recipients": form.get("email_recipients", ""),
             "cancel_superseded": "cancel_superseded" in form,
+            "timeout_seconds": form.get("timeout_seconds", "1800"),
             "push_branches": form.get("push_branches", ""), "pr_branches": form.get("pr_branches", ""),
             "events": {key: f"event_{key}" in form for key in ci_default_config()["events"]}}
         env = {}

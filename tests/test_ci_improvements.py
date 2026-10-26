@@ -19,6 +19,13 @@ from pygithost.ci_email import send_notification, validate_recipients
 
 
 class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
+    def test_timeout_configuration(self):
+        self.assertEqual(validate_config({})["timeout_seconds"], 1800)
+        self.assertEqual(validate_config({"timeout_seconds": "3600"})["timeout_seconds"], 3600)
+        for value in (0, -1, True, 1.5, "", "1.5", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_config({"timeout_seconds": value})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ci-improvements-")
         self.old_db = database.DB_PATH

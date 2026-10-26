@@ -516,12 +516,12 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             "push_branches": "",
             "pr_branches": "",
         }
+        config["timeout_seconds"] = 1
         database.db_ci_config_set("owner", "timeout", json.dumps(config))
         run_id = self._queued_run("timeout")
         row = (run_id, "owner", "timeout", "manual", "main", commit, "{}")
         manager = CIManager(lambda *_: str(bare))
-        with mock.patch("pygithost.ci.JOB_TIMEOUT", 0.2):
-            await manager._execute(row)
+        await manager._execute(row)
 
         result = database.db_ci_run_get("owner", "timeout", run_id)
         self.assertEqual(result[4], "timed_out")

@@ -52,6 +52,7 @@ async def _db_call(func, *args, **kwargs):
 def default_config():
     return {
         "command": "",
+        "timeout_seconds": JOB_TIMEOUT,
         "env": {},
         "events": {
             "push": False,
@@ -90,6 +91,11 @@ def validate_config(raw):
         if not isinstance(value, str) or "\0" in value or len(value) > 8192:
             raise ValueError(f"Invalid value for {key}.")
     defaults = default_config()
+    timeout = raw.get("timeout_seconds", JOB_TIMEOUT)
+    if isinstance(timeout, str) and timeout.isascii() and timeout.isdecimal():
+        timeout = int(timeout)
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError("Timeout must be a positive whole number of seconds.")
     runner = raw.get("runner", "host")
     image = raw.get("image", "python:3.14-slim")
     mode = raw.get("email_mode", "off")
@@ -115,6 +121,7 @@ def validate_config(raw):
             raise ValueError("Branch filters must be text up to 2048 characters.")
     defaults.update(
         command=command,
+        timeout_seconds=timeout,
         env=env,
         events={k: bool(events.get(k, False)) for k in defaults["events"]},
         push_branches=raw.get("push_branches", ""),
@@ -556,7 +563,7 @@ class CIManager:
         worktree = str(Path(temp_root) / "checkout")
         bare = self.repo_path(owner, repo)
         rc, status, cancelled = -1, "failed", False
-        deadline = asyncio.get_running_loop().time() + JOB_TIMEOUT
+        deadline = asyncio.get_running_loop().time() + config["timeout_seconds"]
         phase = "checkout"
         container = None
         env = runner_environment(temp_root)
@@ -672,7 +679,7 @@ class CIManager:
         except asyncio.TimeoutError:
             rc, status = -1, "timed_out"
             output.extend(
-                b"CI execution exceeded the 30 minute limit.\n"[
+                f"CI execution exceeded the {config['timeout_seconds']} second limit.\n".encode()[
                     : MAX_OUTPUT - len(output)
                 ]
             )

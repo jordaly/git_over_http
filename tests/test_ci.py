@@ -16,10 +16,27 @@ from pygithost.application import AsyncGitServer, GitHTTPHandler, Headers, FLAT_
 from pygithost.config import AppConfig
 from pygithost.context import AppContext
 from pygithost.ci import CIManager
-from pygithost.ci_windows_launcher import _exec_command
+from pygithost.ci_windows_launcher import _exec_command, _shell_command
 
 
 class WindowsExecutableLookupTests(unittest.TestCase):
+    def test_shell_preserves_connection_string_quotes_and_chaining(self):
+        command = (
+            'sqlpackage /Action:Extract '
+            '/SourceConnectionString:"Data Source=localhost;Initial Catalog=Example;User ID=test" '
+            '&& echo "next command"'
+        )
+        shell = r"C:\Program Files\shell\cmd.exe"
+        with mock.patch("pygithost.ci_windows_launcher._shell_executable", return_value=shell):
+            executable, command_line = _shell_command(command)
+        self.assertEqual(executable, shell)
+        self.assertEqual(command_line, f'"{shell}" /d /s /c "{command}"')
+
+    def test_shell_preserves_quoted_executable(self):
+        command = r'"C:\Program Files\tool.exe" "argument with spaces"'
+        with mock.patch("pygithost.ci_windows_launcher._shell_executable", return_value="cmd.exe"):
+            self.assertEqual(_shell_command(command)[1], f'cmd.exe /d /s /c "{command}"')
+
     def test_resolves_bare_tool_name_from_path_with_spaces(self):
         with tempfile.TemporaryDirectory(prefix="ci tools ") as directory:
             tool = Path(directory) / ("git.exe" if os.name == "nt" else "git")

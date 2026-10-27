@@ -98,6 +98,13 @@ def _shell_executable():
     return os.path.join(system_root, "System32", "cmd.exe")
 
 
+def _shell_command(command):
+    executable = _shell_executable()
+    # CMD /s /c strips the outer quote pair. Preserve the command inside it
+    # verbatim: list2cmdline escapes quotes for C argv parsing, not CMD syntax.
+    return executable, f'{subprocess.list2cmdline([executable])} /d /s /c "{command}"'
+
+
 def _exec_command(arguments):
     if not arguments:
         raise ValueError("--exec requires a command")
@@ -197,10 +204,7 @@ def _launch(arguments):
             raise ctypes.WinError(ctypes.get_last_error())
 
         if arguments[0] == "--shell":
-            executable = _shell_executable()
-            command_line = subprocess.list2cmdline(
-                [executable, "/d", "/s", "/c", arguments[1]]
-            )
+            executable, command_line = _shell_command(arguments[1])
         else:
             executable, command_line = _exec_command(arguments[1:])
 

@@ -2441,7 +2441,8 @@ document.addEventListener("DOMContentLoaded", function() {{
         payload = json.loads(meta["payload"] or "{}")
         command_details = safe_html("")
         if not REQUIRE_AUTH or _require_admin(self):
-            command_details = safe_html(html_t(t'<h2>Configuration snapshot</h2><p>Image: {snapshot.get("image", "—")}</p><pre>{snapshot.get("command", "Legacy run: no snapshot available.")}</pre>'))
+            saved_command = json.dumps(snapshot["steps"], indent=2) if snapshot.get("steps") else snapshot.get("command", "Legacy run: no snapshot available.")
+            command_details = safe_html(html_t(t'<details id="ci-run-config" class="ci-run-disclosure"><summary>Configuration snapshot</summary><p class="muted">Image: {snapshot.get("image", "—")}</p><pre>{saved_command}</pre></details>'))
         can_write = _has_write_scope(self)
         actions = safe_html("")
         if can_write:
@@ -2458,37 +2459,48 @@ document.addEventListener("DOMContentLoaded", function() {{
         finished_at = run[10] or "—"
         truncated_notice = safe_html('<p class="muted">Output truncated at 1 MiB.</p>') if run[6] else safe_html("")
         steps = json.loads(await _call_in_thread(db_ci_steps_get, run_id))
-        steps_html = join_html([html_t(t'''<details class="ci-step"><summary><strong>{step["name"]}</strong> · {step["status"]} · {step["duration"]}</summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre>{step["output"] or "No output."}</pre></details>''') for step in steps])
+        steps_html = join_html([html_t(t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><strong>{step["name"]}</strong><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>''') for index, step in enumerate(steps)])
+        steps_section = safe_html(html_t(t'<section class="box ci-run-steps"><div class="ci-section-heading"><h2>Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>')) if steps else safe_html("")
         artifact_size = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id)
-        artifact_html = safe_html(html_t(t'<h2>Artifacts</h2><p><a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download ZIP ({artifact_size} bytes)</a> · Retained for 7 days, or until this run is pruned.</p>')) if artifact_size else safe_html("")
+        artifact_html = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>')) if artifact_size else safe_html("")
+        reason_html = safe_html(html_t(t'<p class="warn" role="status">{waiting or meta["reason"]}</p>')) if waiting or meta["reason"] else safe_html("")
         result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
-<div class="box"><div class="ci-section-heading"><h1>CI run #{run[0]}</h1><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div>
-<p class="muted">{run[1]} · {run[2]} · <code>{run[3]}</code></p>
-<table><tr><th>Exit code</th><td>{exit_code}</td></tr><tr><th>Created</th><td>{run[8]}</td></tr>
-<tr><th>Started</th><td>{started_at}</td></tr><tr><th>Finished</th><td>{finished_at}</td></tr></table>
-<p>Duration: {_ci_elapsed(run[9], run[10])} · Queue wait: {_ci_elapsed(run[8], run[9] or run[10])}</p>
-<p>{waiting}</p><p>Phase: {meta["phase"] or "queued"} · {meta["reason"]}</p>
-<p>Email: {meta["notification"] or "not sent"}</p>
-<p>Runner: {snapshot.get("runner", "legacy host")} · Base: {payload.get("base_commit", "—")} · Head: {payload.get("head_commit", "—")}</p>
-{actions}{email_action}{command_details}{artifact_html}{steps_html}<h2>Output</h2><a href="{base}/ci/runs/{run_id}/log">Download raw log</a>
-<pre id="ci-log" tabindex="0" aria-label="Run output">{output}</pre>
-{truncated_notice}</div></div>'''))
+<section class="box ci-run-overview" aria-label="Run summary"><div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
+{reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
+<details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
+{steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
+<pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(result_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
 
-        body = safe_html(html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2>CI run #{run_id}</h2></div>
-<div><a class="pill" href="{base}/ci">CI settings and runs</a> <a class="pill" href="{base}">Repo</a></div></div>
+        title_commit = payload.get("head_commit") or run[3]
+        commit_meta = await _git_commit_meta(_repo_bare_path(owner, repo), title_commit) if title_commit else None
+        run_title = commit_meta["subject"] if commit_meta and commit_meta.get("subject") else str_t(t'{run[1].replace("_", " ").capitalize()} run on {run[2] or "repository"}')
+        body = safe_html(html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2 id="ci-run-title">{run_title}</h2><p class="muted">Run #{run_id} · {run[1].replace("_", " ")} · <code>{run[2]}</code> · <a href="{base}/commit/{q(title_commit)}"><code>{title_commit[:8]}</code></a></p></div>
+<div><a class="pill" href="{base}/ci">← All runs</a></div></div>
 {result_html}
-<label><input id="ci-follow" type="checkbox" checked> Follow output</label>
-<button onclick="navigator.clipboard.writeText(document.getElementById('ci-log').textContent)">Copy output</button>
-<script>(function() {{ const current = document.getElementById("ci-run-result"); if (!current || current.dataset.active !== "true") return;
+<script>(function() {{
+document.addEventListener("click", async event => {{ if (!event.target.closest("#ci-copy-output")) return;
+ const log = document.getElementById("ci-log"); const feedback = document.getElementById("ci-copy-feedback");
+ try {{ await navigator.clipboard.writeText(log.textContent); feedback.textContent = "Copied."; }}
+ catch (_error) {{ const selection = window.getSelection(); const range = document.createRange(); range.selectNodeContents(log); selection.removeAllRanges(); selection.addRange(range); feedback.textContent = "Output selected. Press Ctrl+C or Command+C."; }}
+}});
+const current = document.getElementById("ci-run-result"); if (!current || current.dataset.active !== "true") return;
 let polling = false; const timer = setInterval(async function() {{ if (polling) return; polling = true; try {{
 const response = await fetch(window.location.pathname + "?partial=1", {{cache:"no-store", credentials:"same-origin"}});
 if (response.redirected || !response.ok) {{ clearInterval(timer); return; }}
 const fragment = await response.text(); const node = document.getElementById("ci-run-result");
-if (!node) {{ clearInterval(timer); return; }} const oldLog = document.getElementById("ci-log"); const scroll = oldLog ? oldLog.scrollTop : 0; node.outerHTML = fragment;
-const log = document.getElementById("ci-log"); if (log) log.scrollTop = document.getElementById("ci-follow").checked ? log.scrollHeight : scroll;
+if (!node) {{ clearInterval(timer); return; }}
+const expanded = new Map([...node.querySelectorAll("details[id]")].map(item => [item.id, item.open]));
+const positions = new Map([...node.querySelectorAll("[data-ci-scroll]")].map(item => [item.id, item.scrollTop]));
+const follow = document.getElementById("ci-follow").checked; const focus = document.activeElement.id;
+node.outerHTML = fragment;
+const replacement = document.getElementById("ci-run-result");
+replacement.querySelectorAll("details[id]").forEach(item => {{ if (expanded.has(item.id)) item.open = expanded.get(item.id); }});
+document.getElementById("ci-follow").checked = follow;
+replacement.querySelectorAll("[data-ci-scroll]").forEach(item => item.scrollTop = follow ? item.scrollHeight : (positions.get(item.id) || 0));
+if (focus) {{ const focused = document.getElementById(focus); if (focused) focused.focus({{preventScroll:true}}); }}
 if (document.getElementById("ci-run-result").dataset.active !== "true") clearInterval(timer);
 }} catch (_error) {{ /* Retry on the next interval. */ }} finally {{ polling = false; }} }}, 3000); }})();</script>'''))
         return await _send_html(self.request, 200,

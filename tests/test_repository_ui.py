@@ -180,3 +180,40 @@ class RepositoryUITests(unittest.TestCase):
             self.assertEqual(status, 400)
         status, _ = self.request(self.base + "/archive.zip?ref=missing")
         self.assertEqual(status, 404)
+
+    def test_ci_run_details_have_commit_title_and_compact_disclosures(self):
+        config = {"command": "echo saved command", "runner": "host", "image": "python:3.14-slim"}
+        run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}", json.dumps(config))
+        database.db_ci_run_update(run_id, status="success", output="raw-output-marker\n" * 100,
+            return_code=0, started_at="2026-01-01T12:00:00+00:00", finished_at="2026-01-01T12:00:10+00:00")
+        path = self.base + f"/ci/runs/{run_id}"
+        status, page = self.request(path)
+        self.assertEqual(status, 200)
+        self.assertIn('id="ci-run-title">Initial UI fixture</h2>', page)
+        self.assertIn(f"Run #{run_id}", page)
+        self.assertIn('class="ci-run-summary"', page)
+        self.assertIn('<details id="ci-run-metadata" class="ci-run-disclosure">', page)
+        self.assertIn('<details id="ci-run-config" class="ci-run-disclosure">', page)
+        self.assertIn('<details id="ci-run-output" class="box ci-run-output" open>', page)
+        self.assertIn("saved command", page)
+        self.assertIn("raw-output-marker", page)
+        steps = [{"name": "Tests", "status": "success", "duration": "10s", "return_code": 0,
+                  "started_at": "2026-01-01T12:00:00+00:00", "finished_at": "2026-01-01T12:00:10+00:00",
+                  "output": "step-output-marker"}]
+        database.db_ci_steps_set(run_id, json.dumps(steps))
+        _, page = self.request(path)
+        self.assertIn("Combined run log", page)
+        self.assertIn('<details id="ci-run-output" class="box ci-run-output">', page)
+        self.assertIn('<details id="ci-step-0" class="ci-step">', page)
+        self.assertIn("step-output-marker", page)
+        self.assertIn('expanded.has(item.id)', page)
+        self.assertIn('positions.get(item.id)', page)
+        _, fragment = self.request(path + "?partial=1")
+        self.assertIn('id="ci-run-result"', fragment)
+        self.assertNotIn('id="ci-run-title"', fragment)
+        self.assertNotIn('class="app-header"', fragment)
+
+    def test_ci_run_title_falls_back_when_commit_is_unavailable(self):
+        run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "manual", "main", "a" * 40, "{}")
+        _, page = self.request(self.base + f"/ci/runs/{run_id}")
+        self.assertIn('id="ci-run-title">Manual run on main</h2>', page)

@@ -484,7 +484,8 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             page = send_html.await_args.args[2].decode("utf-8")
             self.assertIn("CI run #", page)
             self.assertIn("Running test output", page)
-            self.assertIn("CI settings and runs", page)
+            self.assertIn("All runs", page)
+            self.assertIn('id="ci-run-title"', page)
             self.assertNotIn('name="command"', page)
             self.assertIn("setInterval", page)
 

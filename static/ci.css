@@ -39,6 +39,35 @@
 .ci-step { margin: 14px 0; padding: 14px; border: 1px solid var(--border-strong); border-radius: 8px; }
 .ci-step summary { cursor: pointer; }
 .ci-step pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 45vh; }
+#ci-run-result { display: grid; gap: 16px; min-width: 0; }
+.ci-run-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 20px; }
+.ci-run-summary > div { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.ci-run-summary > div > span:first-child { color: var(--muted); font-size: 12px; }
+.ci-run-summary strong { font-size: 14px; font-weight: 600; }
+.ci-run-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; }
+.ci-run-actions form { margin: 0; }
+.ci-run-actions button { padding: 6px 11px; font-size: 13px; }
+.ci-run-disclosure { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 14px; }
+.ci-run-disclosure > summary, .ci-run-output > summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.ci-run-disclosure pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 260px; }
+.ci-run-metadata { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px 16px; font-size: 12px; line-height: 1.65; }
+.ci-run-metadata dt { color: var(--muted); }
+.ci-run-metadata dd { margin: 0; overflow-wrap: anywhere; }
+.ci-run-steps .ci-section-heading { margin-bottom: 12px; }
+.ci-run-steps .ci-step { margin: 8px 0 0; padding: 12px; }
+.ci-run-steps .ci-step summary { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; cursor: pointer; }
+.ci-run-steps .ci-step summary::before { content: "▸"; color: var(--muted); }
+.ci-run-steps .ci-step[open] summary::before { content: "▾"; }
+.ci-run-steps .ci-step summary > .muted { margin-left: auto; font-size: 12px; }
+.ci-run-steps .ci-step p { font-size: 12px; }
+.ci-run-steps .ci-step pre { max-height: 40vh; font-size: 12px; }
+.ci-run-output[open] > summary { margin-bottom: 14px; }
+.ci-log-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.ci-log-toolbar label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
+.ci-log-toolbar button { padding: 5px 10px; font-size: 12px; }
+.ci-log-toolbar .muted { font-size: 12px; }
+.ci-run-output #ci-log { max-height: 52vh; margin-bottom: 0; padding: 16px; font-size: 12px; }
+#ci-run-title { overflow-wrap: anywhere; }
 .ci-guide { scroll-margin-top: 20px; }
 .ci-guide details { border-top: 1px solid var(--border); padding: 16px 0; scroll-margin-top: 20px; }
 .ci-guide summary { cursor: pointer; font-size: 14px; font-weight: 600; }
@@ -116,6 +145,8 @@
   .ci-settings-sidebar nav > .ci-eyebrow, .ci-settings-sidebar p { display: none; }
 }
 @media (max-width: 700px) {
+  .ci-run-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ci-run-metadata { grid-template-columns: 85px minmax(0, 1fr); gap: 8px; }
   .repo-header h1 { font-size: 24px; }
   .ci-choice-grid, .ci-fields-grid, .ci-mode-picker, .ci-settings-overview { grid-template-columns: 1fr; }
   .ci-settings-overview > * + * { border-left: 0; border-top: 1px solid var(--border); }

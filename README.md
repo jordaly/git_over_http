@@ -66,6 +66,24 @@ The integration tests use the real `git-http-backend` and bind a loopback port.
   Search is case-insensitive and works without JavaScript; its URL can be bookmarked.
 - Repository tabs keep **Code**, **Branches**, **Pull requests**, **CI**, and
   **Artifacts** accessible while browsing files, commits, and pull requests.
+- The Code page's **Languages** sidebar estimates the default branch's language
+  percentages by tracked source-file bytes, with a colored distribution bar.
+  Detection uses Git tree metadata only—no checkout, compilation, or file-content
+  parsing. Common dependency/build folders, generated/minified files, symlinks,
+  submodules, binaries with unknown extensions, and documentation/data formats
+  are excluded. This is a conservative extension-based estimate, not Linguist.
+  SQLite caches results by repository and exact commit (10 recent commits per
+  repository), so unchanged commits are not rescanned. Metadata scans are bounded
+  to 15 seconds / 32 MiB; unavailable results do not prevent repository browsing.
+- File views include folder breadcrumbs, clickable line numbers (`#L42`), Raw,
+  Download, Copy contents, commit-pinned Permalink, and file-specific History.
+  Raw/download responses preserve original bytes and cannot execute HTML content.
+  Text files are displayed in full, with no 5000-line or 1 MiB preview cutoff.
+  Syntax highlighting is skipped automatically above 100 KiB or 2000 lines;
+  use **Highlight syntax** to opt in directly.
+  Highlighting can be disabled again without reloading the file. Line numbers,
+  copy, scrolling and downloads remain available without highlighting.
+  Binary files show a download prompt instead of an unreadable text preview.
 - The **Code** dropdown offers a copyable HTTP(S) clone URL and **Download ZIP**
   for the branch or commit currently being viewed. ZIPs contain tracked source
   files, not Git history or CI artifacts; Git archive attributes such as

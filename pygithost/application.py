@@ -25,6 +25,7 @@ from .context import AppContext
 from .ci import CIManager, default_config as ci_default_config, protected_branch, pipeline_config
 from .ci_protection import prepare_hooks
 from .ci_documentation import ci_configuration_guide
+from .languages import repository_languages
 from .ci_email import load_settings as load_email_settings, validate_settings as validate_email_settings, validate_recipients, send_notification
 from .database import (
     _db_init,
@@ -100,6 +101,40 @@ def _repo_tabs(base, active):
         current = safe_html(' aria-current="page"' if key == active else "")
         links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
     return safe_html(html_t(t'<div class="repo-navigation"><header class="repo-header"><div class="repo-eyebrow"><a href="/">Repositories</a></div><h1><a href="{base}">{owner} / <strong>{repo}</strong></a></h1></header><nav class="ci-tabs repo-tabs" aria-label="Repository navigation">{join_html(links)}</nav></div>'))
+
+
+def _repo_breadcrumbs(owner, repo, ref, path="", *, is_file=False):
+    base = str_t(t"/r/{q(owner)}/{q(repo)}")
+    crumbs = [html_t(t'<a href="{base}/tree/{q(ref)}/">{repo}</a>') if path else html_t(t'<strong>{repo}</strong>')]
+    parts = path.split("/") if path else []
+    for index, part in enumerate(parts):
+        if index < len(parts) - 1:
+            folder = "/".join(parts[:index + 1])
+            crumbs.append(html_t(t'<a href="{base}/tree/{q(ref)}/{q(folder, safe="/")}/">{part}</a>'))
+        else:
+            crumbs.append(html_t(t'<strong aria-current="page">{part}</strong>'))
+    result = []
+    for crumb in crumbs:
+        if result:
+            result.append(safe_html('<span aria-hidden="true">/</span>'))
+        result.append(crumb)
+    label = "File path" if is_file else "Folder path"
+    return safe_html(html_t(t'<nav class="repo-file-breadcrumbs" aria-label="{label}">{join_html(result)}</nav>'))
+
+
+def _language_panel(languages, branch):
+    if languages is None:
+        content = safe_html('<p class="muted">Language statistics are temporarily unavailable.</p>')
+    elif not languages:
+        content = safe_html('<p class="muted">No recognized source files found.</p>')
+    else:
+        segments = join_html([html_t(t'<span style="width:{item["percentage"]:.6f}%;background:{item["color"]}" title="{item["name"]}: {item["percentage"]:.1f}%"></span>') for item in languages])
+        entries = []
+        for item in languages:
+            percentage = "<0.1%" if item["percentage"] < .1 else f'{item["percentage"]:.1f}%'
+            entries.append(html_t(t'<li><span class="repo-language-dot" style="background:{item["color"]}" aria-hidden="true"></span><strong>{item["name"]}</strong><span class="muted">{percentage}</span></li>'))
+        content = safe_html(html_t(t'<div class="repo-language-bar" aria-hidden="true">{segments}</div><ul class="repo-language-list">{join_html(entries)}</ul>'))
+    return safe_html(html_t(t'<section class="box repo-language-panel" aria-labelledby="repo-languages-title"><h2 id="repo-languages-title">Languages</h2>{content}<p class="muted repo-language-note">Estimated from tracked source bytes on <code>{branch}</code>. Common generated files and dependencies are excluded.</p></section>'))
 
 
 def _repo_code_menu(owner, repo, ref):
@@ -694,9 +729,12 @@ async def _git_is_ancestor(repo_git: str, maybe_ancestor: str, maybe_descendant:
     return code == 0
 
 
-async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100, skip: int = 0) -> list[dict[str, str]]:
+async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100, skip: int = 0, path: str = "") -> list[dict[str, str]]:
     fmt = "%H%x00%an%x00%ae%x00%ad%x00%s"
-    code, out, _err = await _run_git(repo_git, ["log", "--date=iso", "--format=" + fmt, "-n" + str(limit), "--skip=" + str(max(0, skip)), rev_range])
+    args = ["--literal-pathspecs", "log", "--date=iso", "--format=" + fmt, "-n" + str(limit), "--skip=" + str(max(0, skip)), rev_range]
+    if path:
+        args += ["--", path]
+    code, out, _err = await _run_git(repo_git, args)
     if code != 0:
         return []
     commits = []
@@ -1817,6 +1855,9 @@ class GitHTTPHandler:
 
         default_branch = await _git_default_branch(repo_git)
         branches = await _git_list_branches(repo_git)
+        default_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
+        languages = await repository_languages(owner, repo, repo_git, default_commit)
+        language_html = _language_panel(languages, default_branch)
         readme_code, readme_out, _ = await _run_git(repo_git, ["show", f"{default_branch}:README.md"])
         readme_html = safe_html("")
         if readme_code == 0:
@@ -1843,7 +1884,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         latest_ci = await _call_in_thread(db_ci_latest_run, owner, repo, default_branch)
         if latest_ci:
             ci_status = latest_ci[1]
-            current_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
+            current_commit = default_commit
             if current_commit != latest_ci[4]:
                 ci_status = "stale"
             ci_badge = safe_html(html_t(t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'))
@@ -1888,8 +1929,8 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch)}</div>
 <script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
 </div>
-<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
-{readme_html}"""
+<div class="repo-content-layout"><div class="repo-content-main"><div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
+{readme_html}</div><aside class="repo-sidebar">{language_html}</aside></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
@@ -2792,7 +2833,8 @@ form.addEventListener("change", update); update();
         except ValueError:
             skip = 0
         partial = (qs.get("partial") or [""])[0] == "1"
-        commits = await _git_list_commits(repo_git, resolved_ref, limit=51, skip=skip)
+        history_path = _clean_repo_path((qs.get("path") or [""])[0])
+        commits = await _git_list_commits(repo_git, resolved_ref, limit=51, skip=skip, **({"path": history_path} if history_path else {}))
         has_more = len(commits) > 50
         commits = commits[:50]
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
@@ -2812,7 +2854,7 @@ form.addEventListener("change", update); update();
         load_more = (
             safe_html(
                 html_t(
-                    t"<button id=\"loadMoreCommits\" type=\"button\" data-ref=\"{resolved_ref}\" data-next-skip=\"{len(commits)}\">Load more commits</button>"
+                    t"<button id=\"loadMoreCommits\" type=\"button\" data-ref=\"{resolved_ref}\" data-path=\"{history_path}\" data-next-skip=\"{len(commits)}\">Load more commits</button>"
                 )
             )
             if has_more
@@ -2821,7 +2863,7 @@ form.addEventListener("change", update); update();
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><h2>Commits</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
-<div class="box"><p class="muted">ref: <code>{ref}</code></p><table><tbody id="commitRows">{rows_html}</tbody></table>
+<div class="box"><p class="muted">ref: <code>{ref}</code> {history_path}</p><table><tbody id="commitRows">{rows_html}</tbody></table>
 <div id="loadMoreStatus" class="muted" style="margin-top:10px">{load_more}</div></div>
 <script>
 (function() {{
@@ -2837,6 +2879,7 @@ form.addEventListener("change", update); update();
             skip: button.dataset.nextSkip,
             partial: "1"
         }});
+        if (button.dataset.path) params.set("path", button.dataset.path);
         try {{
             const response = await fetch("{base}/commits?" + params.toString());
             if (!response.ok) throw new Error("Request failed");
@@ -3016,7 +3059,7 @@ form.addEventListener("change", update); update();
             up = safe_html(html_t(t"<p><a class=\"pill\" href=\"{parent_href}\">Up one level</a></p>"))
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">Empty.</td></tr>')
         body = html_t(
-            t"""{_repo_tabs(base, "code")}<div class="topbar"><div><h2>Browse files</h2><div class="muted">ref: <code>{ref}</code></div></div>
+            t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{_repo_breadcrumbs(owner, repo, ref, subpath)}<p class="muted">ref: <code>{ref}</code></p></div>
 <div>{_repo_code_menu(owner, repo, ref)}</div></div>
 {up}<div class="box"><table>{rows_html}</table></div>"""
         )
@@ -3026,30 +3069,77 @@ form.addEventListener("change", update); update();
         owner = unquote(owner)
         repo = unquote(repo)
         ref = unquote(ref)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not ref or ref.startswith("-") or "\0" in ref:
+            return await self._not_found()
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return await self._not_found()
         filepath = _clean_repo_path(filepath)
         if not filepath:
             return await self._not_found()
-        spec = ref + ":" + filepath
+        commit = await _git_resolve_commit(repo_git, ref)
+        if not commit or not filepath:
+            return await self._not_found()
+        spec = commit + ":" + filepath
         code, out, err = await _run_git(repo_git, ["show", spec])
         if code != 0:
             msg = err.decode("utf-8", "replace")
             body = html_t(t"<h1>File</h1><pre>{msg}</pre><p><a class=\"pill\" href=\"/\">Back</a></p>")
             return await _send_html(self.request, 400, _html_page("File", safe_html(body)))
-        text = out.decode("utf-8", "replace")
+        params = parse_qs(urlparse(self.path).query or "")
+        download = (params.get("download") or [""])[0] == "1"
+        raw = (params.get("raw") or [""])[0] == "1"
+        binary = b"\0" in out
+        if download or raw:
+            filename = filepath.rsplit("/", 1)[-1]
+            disposition = "attachment; filename*=UTF-8''" + q(filename) if download else "inline"
+            return await _send_response(self.request, 200, out,
+                [("Content-Type", "application/octet-stream" if download or binary else "text/plain; charset=utf-8"),
+                 ("Content-Disposition", disposition), ("X-Content-Type-Options", "nosniff"),
+                 ("Content-Security-Policy", "sandbox; default-src 'none'"), ("Cache-Control", "no-store")])
+        text = out.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+        line_count = max(1, text.count("\n") + (0 if text.endswith("\n") else 1))
+        highlight_file = not binary and len(out) <= 100 * 1024 and line_count <= 2000
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         back = str_t(t"{base}/tree/{q(ref)}/")
         if "/" in filepath:
             folder = "/".join(filepath.split("/")[:-1])
             back = str_t(t"{base}/tree/{q(ref)}/{q(folder, safe='/')}/")
-        lang = PRISM_LANGUAGE_BY_EXTENSION.get("." + filepath.split(".")[-1], "")
+        file_language = PRISM_LANGUAGE_BY_EXTENSION.get("." + filepath.split(".")[-1], "none")
+        lang = file_language if highlight_file else "none"
+        file_url = str_t(t"{base}/blob/{q(commit)}/{q(filepath, safe='/')}")
+        breadcrumbs = _repo_breadcrumbs(owner, repo, ref, filepath, is_file=True)
+        numbers = join_html([html_t(t'<a id="L{index}" href="#L{index}" aria-label="Line {index}">{index}</a>') for index in range(1, line_count + 1)]) if not binary else safe_html("")
+        notice = safe_html("")
+        file_view = safe_html(html_t(t'<div id="repo-file-horizontal" class="repo-file-horizontal" tabindex="0" role="region" aria-label="Scroll file horizontally" hidden><div></div></div><div id="repo-file-viewport" class="repo-file-code" tabindex="0" role="region" aria-label="Scrollable file contents"><div class="repo-line-numbers" aria-label="Line numbers">{numbers}</div><pre><code id="repo-file-source" class="language-{lang}">{text}</code></pre></div>')) if not binary else safe_html('<div class="repo-empty"><h2>Binary file</h2><p class="muted">This file cannot be displayed as text. Use Download to save the original file.</p></div>')
+        copy_button = safe_html('<button id="repo-copy-file" type="button">Copy contents</button>') if not binary else safe_html("")
+        highlight_button = safe_html('<button id="repo-highlight-file" type="button" aria-pressed="false">Highlight syntax</button>') if not binary and file_language != "none" else safe_html("")
         body = html_t(
-            t"""{_repo_tabs(base, "code")}<div class="topbar"><a class="pill" href="{back}">Back to folder</a>{_repo_code_menu(owner, repo, ref)}</div>
-<h2><code>{filepath}</code>
-</h2><div class="box"><pre><code class="language-{lang}">{text}</code></pre>
+            t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{breadcrumbs}<p class="muted">{ref} · {len(out):,} bytes</p></div>{_repo_code_menu(owner, repo, ref)}</div>
+<section class="box repo-file-panel"><div class="repo-file-toolbar"><a class="pill" href="{back}">Back to folder</a><div class="repo-file-actions"><a class="pill" href="{file_url}?raw=1">Raw</a><a class="pill" href="{file_url}?download=1">Download</a>{copy_button}{highlight_button}<a class="pill" href="{file_url}">Permalink</a><a class="pill" href="{base}/commits?{urlencode({"ref": commit, "path": filepath})}">History</a></div></div><span id="repo-file-feedback" class="muted" role="status" aria-live="polite"></span>{notice}{file_view}
 <script>
+const fileViewport = document.getElementById("repo-file-viewport");
+const horizontalScroll = document.getElementById("repo-file-horizontal");
+function updateFileScroll() {{
+ if (!fileViewport || !horizontalScroll) return;
+ const overflows = fileViewport.scrollWidth > fileViewport.clientWidth;
+ horizontalScroll.hidden = !overflows;
+ horizontalScroll.style.width = fileViewport.clientWidth + "px";
+ horizontalScroll.firstElementChild.style.width = fileViewport.scrollWidth + "px";
+ horizontalScroll.scrollLeft = fileViewport.scrollLeft;
+}}
+if (fileViewport && horizontalScroll) {{
+ horizontalScroll.addEventListener("scroll", () => {{ if (fileViewport.scrollLeft !== horizontalScroll.scrollLeft) fileViewport.scrollLeft = horizontalScroll.scrollLeft; }});
+ fileViewport.addEventListener("scroll", () => {{ if (horizontalScroll.scrollLeft !== fileViewport.scrollLeft) horizontalScroll.scrollLeft = fileViewport.scrollLeft; }});
+ window.addEventListener("resize", updateFileScroll);
+ if (window.ResizeObserver) {{ const observer = new ResizeObserver(updateFileScroll); observer.observe(fileViewport); observer.observe(document.getElementById("repo-file-source")); }}
+ updateFileScroll();
+}}
+document.getElementById("repo-copy-file")?.addEventListener("click", async function() {{
+ const source = document.getElementById("repo-file-source"); const feedback = document.getElementById("repo-file-feedback");
+ try {{ await navigator.clipboard.writeText(source.textContent); feedback.textContent = "Contents copied."; }}
+ catch (_error) {{ const range = document.createRange(); range.selectNodeContents(source); const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); feedback.textContent = "Contents selected. Press Ctrl+C or Command+C to copy."; }}
+}});
 
     window.Prism = window.Prism || {{}};
     window.Prism.manual = true;
@@ -3066,7 +3156,7 @@ form.addEventListener("change", update); update();
             script.async = false;
 
             script.onload = () => resolve();
-            script.onerror = () => reject(new Error(`Failed to load script: ${{src}}`));
+            script.onerror = () => {{ script.remove(); reject(new Error(`Failed to load script: ${{src}}`)); }};
 
             document.head.appendChild(script);
         }});
@@ -3086,20 +3176,49 @@ form.addEventListener("change", update); update();
         }}
     }}
 
-    document.addEventListener("DOMContentLoaded", async () => {{
-        try {{
-            await loadPrismLanguage("{lang}");
-
-            if (window.Prism) {{
-                Prism.highlightAll();
-            }}
-        }} catch (error) {{
-            console.error("Prism failed:", error);
+    const highlightButton = document.getElementById("repo-highlight-file");
+    const fileSource = document.getElementById("repo-file-source");
+    const plainSource = fileSource ? fileSource.textContent : "";
+    let isHighlighted = false;
+    async function toggleFileHighlight() {{
+        if (!highlightButton || highlightButton.disabled) return;
+        const feedback = document.getElementById("repo-file-feedback");
+        if (isHighlighted) {{
+            fileSource.textContent = plainSource;
+            fileSource.className = fileSource.parentElement.className = "language-none";
+            isHighlighted = false; highlightButton.textContent = "Highlight syntax";
+            highlightButton.setAttribute("aria-pressed", "false");
+            feedback.textContent = "Highlighting disabled."; updateFileScroll(); return;
         }}
+        highlightButton.disabled = true;
+        highlightButton.textContent = "Highlighting…";
+        feedback.textContent = "Applying syntax highlighting…";
+        try {{
+            await loadPrismLanguage("{file_language}");
+            if (!window.Prism || !Prism.languages["{file_language}"]) throw new Error("Language unavailable");
+            await new Promise(resolve => setTimeout(resolve, 0));
+            fileSource.className = "language-{file_language}";
+            Prism.highlightElement(fileSource);
+            isHighlighted = true; highlightButton.textContent = "Disable highlighting";
+            highlightButton.setAttribute("aria-pressed", "true");
+            feedback.textContent = "Syntax highlighting enabled.";
+        }} catch (error) {{
+            fileSource.textContent = plainSource;
+            fileSource.className = fileSource.parentElement.className = "language-none";
+            highlightButton.textContent = "Highlight syntax";
+            feedback.textContent = "Could not load highlighting. You can try again; the complete file remains available.";
+        }} finally {{
+            highlightButton.disabled = false; updateFileScroll();
+        }}
+    }}
+    highlightButton?.addEventListener("click", toggleFileHighlight);
+    document.addEventListener("DOMContentLoaded", () => {{
+        if ({"true" if not highlight_file else "false"}) {{ updateFileScroll(); return; }}
+        toggleFileHighlight();
     }});
 
 </script>
-</div>"""
+</section>"""
         )
         await _send_html(
             self.request,

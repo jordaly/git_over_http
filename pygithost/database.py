@@ -137,6 +137,10 @@ def _db_init() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_repo ON ci_runs(owner, repo, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_status ON ci_runs(status, id)")
         conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS repository_languages (
+            owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
+            languages_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(owner,repo,commit_hash))""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(ci_runs)")}
         for name in ("config_json", "phase", "reason", "notification"):
             if name not in columns:
@@ -628,6 +632,25 @@ def db_pr_mark_merged(pr_id: int, method: str, merge_commit: str) -> None:
             """,
             (method, merge_commit, int(pr_id)),
         )
+    finally:
+        conn.close()
+
+
+def db_repository_languages_get(owner, repo, commit):
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT languages_json FROM repository_languages WHERE owner=? AND repo=? AND commit_hash=?", (owner, repo, commit)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_repository_languages_set(owner, repo, commit, languages_json):
+    conn = _db_connect()
+    try:
+        conn.execute("INSERT INTO repository_languages(owner,repo,commit_hash,languages_json) VALUES(?,?,?,?) ON CONFLICT(owner,repo,commit_hash) DO UPDATE SET languages_json=excluded.languages_json,updated_at=datetime('now')", (owner, repo, commit, languages_json))
+        conn.execute("""DELETE FROM repository_languages WHERE owner=? AND repo=? AND rowid NOT IN
+            (SELECT rowid FROM repository_languages WHERE owner=? AND repo=? ORDER BY updated_at DESC,rowid DESC LIMIT 10)""", (owner, repo, owner, repo))
     finally:
         conn.close()
 

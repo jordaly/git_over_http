@@ -217,3 +217,142 @@ class RepositoryUITests(unittest.TestCase):
         run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "manual", "main", "a" * 40, "{}")
         _, page = self.request(self.base + f"/ci/runs/{run_id}")
         self.assertIn('id="ci-run-title">Manual run on main</h2>', page)
+
+    def test_file_view_has_read_only_actions_breadcrumbs_and_line_links(self):
+        status, page = self.request(self.base + "/blob/main/README.md")
+        self.assertEqual(status, 200)
+        for label in ("Raw</a>", "Download</a>", "Copy contents</button>", "Permalink</a>", "History</a>"):
+            self.assertIn(label, page)
+        self.assertIn('aria-label="File path"', page)
+        self.assertIn('id="L1" href="#L1"', page)
+        self.assertIn(f'/blob/{self.sha}/README.md?raw=1', page)
+        self.assertIn(f'path=README.md', page)
+        self.assertIn('id="repo-file-source"', page)
+        self.assertIn('id="repo-file-viewport"', page)
+        self.assertIn('aria-label="Scrollable file contents"', page)
+        self.assertIn('id="repo-file-horizontal"', page)
+        self.assertIn('aria-label="Scroll file horizontally"', page)
+        self.assertIn('horizontalScroll.scrollLeft = fileViewport.scrollLeft', page)
+
+    def test_file_raw_and_download_preserve_bytes_and_have_safe_headers(self):
+        content = b'<script>alert("file contents")</script>\r\n'
+        (self.source / "example.html").write_bytes(content)
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "HTML fixture")
+        self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+        for mode in ("raw", "download"):
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.port)
+            try:
+                connection.request("GET", self.base + f"/blob/main/example.html?{mode}=1")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), content)
+                self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+                self.assertIn("sandbox", response.getheader("Content-Security-Policy"))
+                self.assertIn("attachment" if mode == "download" else "inline", response.getheader("Content-Disposition"))
+                self.assertNotIn("text/html", response.getheader("Content-Type"))
+            finally:
+                connection.close()
+        _, page = self.request(self.base + "/blob/main/example.html")
+        self.assertNotIn('<script>alert("file contents")</script>', page)
+        self.assertIn("&lt;script&gt;", page)
+
+    def test_file_history_excludes_unrelated_commits(self):
+        (self.source / "other.txt").write_text("unrelated")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Unrelated file change")
+        (self.source / "README.md").write_text("Updated documentation\n")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Update README fixture")
+        self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+        status, page = self.request(self.base + "/commits?ref=main&path=README.md")
+        self.assertEqual(status, 200)
+        self.assertIn("Update README fixture", page)
+        self.assertIn("Initial UI fixture", page)
+        self.assertNotIn("Unrelated file change", page)
+        _, response = self.request(self.base + "/commits?ref=main&path=README.md&partial=1")
+        history = json.loads(response)["commits"]
+        self.assertEqual(len(history), 2)
+
+    def test_binary_file_view_avoids_text_preview(self):
+        (self.source / "binary.bin").write_bytes(b"\0\xff\x01")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Binary fixture")
+        self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+        _, page = self.request(self.base + "/blob/main/binary.bin")
+        self.assertIn("Binary file", page)
+        self.assertNotIn('id="repo-file-source"', page)
+        self.assertNotIn('id="repo-copy-file"', page)
+
+    def test_large_files_skip_highlighting_but_keep_line_numbers_and_raw_download(self):
+        for name, content in (("large.py", "x" * (100 * 1024 + 1)),
+                              ("many-lines.py", 'print("line")\n' * 2001)):
+            with self.subTest(name=name):
+                (self.source / name).write_text(content)
+                self.git("-C", self.source, "add", ".")
+                self.git("-C", self.source, "commit", "-m", "Large file fixture")
+                self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+                status, page = self.request(self.base + "/blob/main/" + name)
+                self.assertEqual(status, 200)
+                self.assertIn('class="language-none"', page)
+                self.assertNotIn("Enable highlighting anyway?", page)
+                self.assertNotIn("temporarily unresponsive", page)
+                self.assertIn('id="repo-highlight-file"', page)
+                self.assertIn('id="L1"', page)
+                self.assertIn('if (true) { updateFileScroll(); return; }', page)
+                _, raw = self.request(self.base + "/blob/main/" + name + "?raw=1")
+                self.assertEqual(raw, content)
+
+    def test_file_view_has_no_line_or_byte_preview_cutoff(self):
+        fixtures = (("long.py", 'print("row")\n' * 6000 + "LAST_LINE_MARKER\n"),
+                    ("wide.py", "x" * (1024 * 1024 + 1) + "\nLAST_BYTE_MARKER\n"))
+        for name, content in fixtures:
+            with self.subTest(name=name):
+                (self.source / name).write_text(content)
+                self.git("-C", self.source, "add", ".")
+                self.git("-C", self.source, "commit", "-m", "Complete file fixture")
+                self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+                status, page = self.request(self.base + "/blob/main/" + name)
+                self.assertEqual(status, 200)
+                self.assertIn(content.splitlines()[-1], page)
+                self.assertNotIn("Preview limited", page)
+                self.assertIn('class="language-none"', page)
+                self.assertNotIn('role="note"', page)
+                if name == "long.py":
+                    self.assertIn('id="L6001"', page)
+
+    def test_folder_and_file_views_share_clickable_breadcrumbs(self):
+        folder = self.source / "CapaNegocio" / "Inventario"
+        folder.mkdir(parents=True)
+        (folder / "Productos_Datos.cs").write_text("class Productos_Datos {}\n")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Nested source fixture")
+        self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+        for kind, path in (("tree", "CapaNegocio/Inventario/"),
+                           ("blob", "CapaNegocio/Inventario/Productos_Datos.cs")):
+            with self.subTest(kind=kind):
+                status, page = self.request(self.base + f"/{kind}/main/{path}")
+                self.assertEqual(status, 200)
+                label = "Folder path" if kind == "tree" else "File path"
+                breadcrumb = page.split(f'aria-label="{label}">', 1)[1].split("</nav>", 1)[0]
+                self.assertIn(f'href="{self.base}/tree/main/"', breadcrumb)
+                self.assertIn(f'href="{self.base}/tree/main/CapaNegocio/"', breadcrumb)
+                self.assertIn("Inventario", breadcrumb)
+                if kind == "blob":
+                    self.assertIn(f'href="{self.base}/tree/main/CapaNegocio/Inventario/"', breadcrumb)
+                    self.assertIn('aria-current="page">Productos_Datos.cs', breadcrumb)
+                else:
+                    self.assertIn('aria-current="page">Inventario', breadcrumb)
+
+    def test_repository_language_sidebar_uses_default_branch(self):
+        (self.source / "Example.cs").write_text("class Example {}\n")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Language fixture")
+        self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+        status, page = self.request(self.base)
+        self.assertEqual(status, 200)
+        self.assertIn('id="repo-languages-title">Languages', page)
+        self.assertIn("C#", page)
+        self.assertIn("100.0%", page)
+        self.assertIn('class="repo-language-bar"', page)
+        self.assertIn('class="repo-sidebar"', page)

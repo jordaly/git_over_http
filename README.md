@@ -66,6 +66,19 @@ The integration tests use the real `git-http-backend` and bind a loopback port.
   Search is case-insensitive and works without JavaScript; its URL can be bookmarked.
 - Repository tabs keep **Code**, **Branches**, **Pull requests**, **CI**, and
   **Artifacts** accessible while browsing files, commits, and pull requests.
+- The Code overview shows the latest commit's author, message, short SHA, and
+  relative date. File/folder rows include their last commit message and date;
+  folder dates reflect changes to their contents. History metadata is cached by
+  commit (10 recent snapshots per repository). Cold lookups use at most four Git
+  processes at once and cover the first 200 root entries; unavailable metadata is
+  shown as a dash rather than a fabricated date.
+- The sidebar includes a README-derived About summary, commit/branch/tag counts,
+  recent tags with source ZIP links, Git contributors, and Languages. README and
+  license navigation leads to a safe README preview and the license text. The
+  built-in Markdown preview supports common headings, lists, code fences, inline
+  code, bold text, and HTTP(S) links; raw HTML is escaped. It is intentionally not
+  a complete GitHub Markdown implementation. Public/private labels, releases,
+  stars and forks are not invented when the server does not track those features.
 - The Code page's **Languages** sidebar estimates the default branch's language
   percentages by tracked source-file bytes, with a colored distribution bar.
   Detection uses Git tree metadata only—no checkout, compilation, or file-content

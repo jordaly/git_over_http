@@ -26,6 +26,8 @@ from .ci import CIManager, default_config as ci_default_config, protected_branch
 from .ci_protection import prepare_hooks
 from .ci_documentation import ci_configuration_guide
 from .languages import repository_languages
+from .repository_info import repository_overview
+from .readme import render_readme
 from .ci_email import load_settings as load_email_settings, validate_settings as validate_email_settings, validate_recipients, send_notification
 from .database import (
     _db_init,
@@ -82,6 +84,21 @@ def _ci_elapsed(start, end=None):
         return f"{seconds // 60}m {seconds % 60}s"
     except ValueError:
         return "—"
+
+
+def _relative_time(value):
+    try:
+        stamp = datetime.fromisoformat(value)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        seconds = max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
+    except (ValueError, TypeError):
+        return value or "—"
+    for unit, length in (("year", 31536000), ("month", 2592000), ("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= length:
+            count = seconds // length
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return "just now"
 
 
 def _ci_tabs(base, active):
@@ -1858,15 +1875,16 @@ class GitHTTPHandler:
         default_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
         languages = await repository_languages(owner, repo, repo_git, default_commit)
         language_html = _language_panel(languages, default_branch)
-        readme_code, readme_out, _ = await _run_git(repo_git, ["show", f"{default_branch}:README.md"])
+        readme_code, readme_out, _ = await _run_git(repo_git, ["show", f"{default_commit or default_branch}:README.md"])
+        readme_text = ""
         readme_html = safe_html("")
         if readme_code == 0:
             readme_text = readme_out.decode("utf-8", "replace")
             readme_html = safe_html(
                 html_t(
-                    t"""<div class="box" style="margin-top:14px">
+                    t"""<section id="repo-readme" class="box repo-document">
 <h2 style="margin:0 0 10px 0;font-size:16px">README.md</h2>
-<pre><code id="readmeSource" class="language-markdown">{readme_text}</code></pre>
+<div class="repo-markdown">{render_readme(readme_text)}</div><details><summary>View Markdown source</summary><pre><code id="readmeSource" class="language-markdown">{readme_text}</code></pre></details>
 <script>
 document.addEventListener("DOMContentLoaded", function() {{
     const code = document.getElementById("readmeSource");
@@ -1877,7 +1895,7 @@ document.addEventListener("DOMContentLoaded", function() {{
     document.head.appendChild(script);
 }});
 </script>
-</div>"""
+</section>"""
                 )
             )
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
@@ -1890,10 +1908,10 @@ document.addEventListener("DOMContentLoaded", function() {{
             ci_badge = safe_html(html_t(t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'))
         else:
             ci_badge = safe_html(html_t(t'<a class="pill" href="{base}/ci">CI: no runs</a>'))
-        tree_code, tree_out, _ = await _run_git(repo_git, ["ls-tree", f"{default_branch}:"])
+        tree_code, tree_out, _ = await _run_git(repo_git, ["ls-tree", "-z", f"{default_commit or default_branch}:"])
         root_entries: list[tuple[str, str]] = []
         if tree_code == 0:
-            for line in tree_out.decode("utf-8", "replace").splitlines():
+            for line in tree_out.decode("utf-8", "replace").split("\0"):
                 if "\t" not in line:
                     continue
                 metadata, name = line.split("\t", 1)
@@ -1901,6 +1919,12 @@ document.addEventListener("DOMContentLoaded", function() {{
                 kind = parts[1] if len(parts) >= 2 else "blob"
                 root_entries.append((kind, name))
         root_entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
+        overview = await repository_overview(owner, repo, repo_git, default_commit, root_entries)
+        latest = overview["latest"]
+        latest_html = safe_html("")
+        if latest:
+            initials = "".join(part[0] for part in latest["author"].split()[:2]).upper() or "?"
+            latest_html = safe_html(html_t(t'<div class="repo-latest-commit"><span class="repo-avatar" aria-hidden="true">{initials}</span><strong>{latest["author"]}</strong><a class="repo-latest-subject" href="{base}/commit/{latest["hash"]}">{latest["subject"]}</a><a href="{base}/commit/{latest["hash"]}"><code>{latest["hash"][:7]}</code></a><time class="muted" datetime="{latest["date"]}" title="{latest["date"]}">{_relative_time(latest["date"])}</time></div>'))
         file_rows = []
         for kind, name in root_entries:
             if kind == "tree":
@@ -1909,10 +1933,34 @@ document.addEventListener("DOMContentLoaded", function() {{
             else:
                 href = str_t(t"{base}/blob/{q(default_branch)}/{q(name, safe='/')}")
                 icon = TREE_FILE_ICON
-            file_rows.append(
-                html_t(t"<tr><td style=\"width:40px\">{icon}</td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>")
-            )
-        files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No files on the default branch.</td></tr>')
+            change = overview["entries"].get(name)
+            message = safe_html(html_t(t'<a href="{base}/commit/{change["hash"]}" title="{change["subject"]}">{change["subject"]}</a>')) if change else safe_html('<span class="muted">—</span>')
+            changed_at = safe_html(html_t(t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>')) if change else safe_html("—")
+            file_rows.append(html_t(t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'))
+        files_html = join_html(file_rows) if file_rows else safe_html('<tr><td colspan="3" class="muted">No files on the default branch.</td></tr>')
+        tag_code, tag_output, _ = await _run_git(repo_git, ["for-each-ref", "refs/tags", "--sort=-creatordate", "--format=%(refname:short)"])
+        tags = tag_output.decode("utf-8", "replace").splitlines() if tag_code == 0 else []
+        tags_html = join_html([html_t(t'<li><a href="{base}/tree/{q(tag)}/">{tag}</a><a href="{base}/archive.zip?{urlencode({"ref": tag})}" aria-label="Download source for tag {tag}">ZIP ↓</a></li>') for tag in tags[:5]]) if tags else safe_html('<li class="muted">No tags yet.</li>')
+        contributors = overview["contributors"]
+        contributors_html = join_html([html_t(t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>') for person in contributors[:5]]) if contributors else safe_html('<li class="muted">No contributors found.</li>')
+        more_contributors = safe_html("")
+        if len(contributors) > 5:
+            remaining = join_html([html_t(t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>') for person in contributors[5:]])
+            more_contributors = safe_html(html_t(t'<details class="repo-contributors-more"><summary>Show all {len(contributors)} contributors</summary><ul class="repo-summary-list">{remaining}</ul></details>'))
+        summary = next((line.strip() for line in readme_text.splitlines() if line.strip() and not line.lstrip().startswith(("#", "```", "-", "*", "|", "!"))), "")
+        summary = summary[:240] + ("…" if len(summary) > 240 else "")
+        license_html, license_link = safe_html(""), safe_html("")
+        for kind, filename in root_entries:
+            if kind == "blob" and filename.casefold() in ("license", "license.md", "license.txt", "copying", "copying.txt"):
+                license_code, license_bytes, _ = await _run_git(repo_git, ["show", f"{default_commit}:{filename}"])
+                if license_code == 0:
+                    license_text = license_bytes[:65536].decode("utf-8", "replace")
+                    license_label = "MIT license" if "Permission is hereby granted, free of charge" in license_text else "License"
+                    license_link = safe_html(html_t(t'<a href="#repo-license">{license_label}</a>'))
+                    license_html = safe_html(html_t(t'<section id="repo-license" class="box repo-document"><h2>{license_label}</h2><pre>{license_text}</pre><a href="{base}/blob/{q(default_branch)}/{q(filename)}">View full license file</a></section>'))
+                break
+        document_nav = safe_html(html_t(t'<nav class="repo-document-nav" aria-label="Repository files navigation">{safe_html("<a href=\"#repo-readme\">README</a>") if readme_text else safe_html("")}{license_link}</nav>')) if readme_text or license_html else safe_html("")
+        about_html = safe_html(html_t(t'<section class="box"><h2>About</h2><p class="muted">{summary or "No description available in README."}</p><div class="repo-about-counts"><a href="{base}/commits?ref={q(default_branch)}">{overview["commit_count"] if overview["commit_count"] is not None else "—"} commits</a><a href="{base}/branches">{len(branches)} branches</a><a href="#repo-tags">{len(tags)} tags</a></div>{license_link}</section><section id="repo-tags" class="box"><h2>Tags</h2><ul class="repo-summary-list">{tags_html}</ul></section><section class="box"><h2>Contributors <span class="muted">{len(contributors)}</span></h2><ul class="repo-summary-list">{contributors_html}</ul>{more_contributors}</section>'))
 
         options = []
         for b in branches:
@@ -1929,8 +1977,8 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch)}</div>
 <script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
 </div>
-<div class="repo-content-layout"><div class="repo-content-main"><div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
-{readme_html}</div><aside class="repo-sidebar">{language_html}</aside></div>"""
+<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div></div>
+{document_nav}{readme_html}{license_html}</div><aside class="repo-sidebar">{about_html}{language_html}</aside></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
@@ -2838,10 +2886,21 @@ form.addEventListener("change", update); update();
         has_more = len(commits) > 50
         commits = commits[:50]
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        rows = []
+        groups = {}
         for commit in commits:
-            hsh = commit["hash"]
-            rows.append(html_t(t"<tr><td><a href=\"{base}/commit/{q(hsh)}\"><code>{hsh[:8]}</code></a></td><td>{commit['subject']}</td><td>{commit['author_name']}</td><td><small class=\"muted\">{commit['date']}</small></td></tr>"))
+            try:
+                stamp = datetime.fromisoformat(commit["date"])
+                commit["date_key"] = stamp.date().isoformat()
+                commit["date_label"] = f"{stamp:%b} {stamp.day}, {stamp.year}"
+            except (ValueError, TypeError):
+                commit["date_key"], commit["date_label"] = "unknown", "Unknown date"
+            groups.setdefault(commit["date_key"], []).append(commit)
+        rows = []
+        for day, items in groups.items():
+            rows.append(html_t(t'<tr class="repo-commit-date" data-date-heading="{day}"><th colspan="4">Commits on {items[0]["date_label"]}</th></tr>'))
+            for commit in items:
+                hsh = commit["hash"]
+                rows.append(html_t(t'<tr data-commit-date="{day}"><td><a href="{base}/commit/{q(hsh)}"><code>{hsh[:8]}</code></a></td><td>{commit["subject"]}</td><td>{commit["author_name"]}</td><td><time class="muted" datetime="{commit["date"]}" title="{commit["date"]}">{commit["date"]}</time></td></tr>'))
         if partial:
             payload = json.dumps({"commits": commits, "has_more": has_more, "next_skip": skip + len(commits)})
             return await _send_response(
@@ -2885,7 +2944,15 @@ form.addEventListener("change", update); update();
             if (!response.ok) throw new Error("Request failed");
             const page = await response.json();
             for (const commit of page.commits) {{
+                let heading = [...tbody.querySelectorAll("[data-date-heading]")].find(item => item.dataset.dateHeading === commit.date_key);
+                if (!heading) {{
+                    heading = document.createElement("tr"); heading.className = "repo-commit-date";
+                    heading.dataset.dateHeading = commit.date_key;
+                    const label = document.createElement("th"); label.colSpan = 4;
+                    label.textContent = "Commits on " + commit.date_label; heading.appendChild(label); tbody.appendChild(heading);
+                }}
                 const row = document.createElement("tr");
+                row.dataset.commitDate = commit.date_key;
                 const hashCell = document.createElement("td");
                 const link = document.createElement("a");
                 link.href = "{base}/commit/" + encodeURIComponent(commit.hash);
@@ -2900,12 +2967,16 @@ form.addEventListener("change", update); update();
                     row.appendChild(cell);
                 }}
                 const dateCell = document.createElement("td");
-                const date = document.createElement("small");
+                const date = document.createElement("time");
                 date.className = "muted";
+                date.dateTime = commit.date;
+                date.title = commit.date;
                 date.textContent = commit.date;
                 dateCell.appendChild(date);
                 row.appendChild(dateCell);
-                tbody.appendChild(row);
+                let nextHeading = heading.nextElementSibling;
+                while (nextHeading && !nextHeading.hasAttribute("data-date-heading")) nextHeading = nextHeading.nextElementSibling;
+                tbody.insertBefore(row, nextHeading);
             }}
             button.dataset.nextSkip = page.next_skip;
             if (!page.has_more) {{

@@ -335,7 +335,8 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
 
                 self.assertEqual(response.status, 200)
                 self.assertIn('id="loadMoreCommits"', body)
-                self.assertEqual(body.count("<tr>"), 50)
+                self.assertEqual(body.count('data-commit-date="'), 50)
+                self.assertIn('class="repo-commit-date"', body)
 
                 conn.request("GET", "/r/root/repo/commits?ref=main&skip=50&partial=1")
                 response = conn.getresponse()

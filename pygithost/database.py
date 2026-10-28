@@ -141,6 +141,10 @@ def _db_init() -> None:
             owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
             languages_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY(owner,repo,commit_hash))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS repository_overviews (
+            owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
+            overview_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(owner,repo,commit_hash))""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(ci_runs)")}
         for name in ("config_json", "phase", "reason", "notification"):
             if name not in columns:
@@ -632,6 +636,25 @@ def db_pr_mark_merged(pr_id: int, method: str, merge_commit: str) -> None:
             """,
             (method, merge_commit, int(pr_id)),
         )
+    finally:
+        conn.close()
+
+
+def db_repository_overview_get(owner, repo, commit):
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT overview_json FROM repository_overviews WHERE owner=? AND repo=? AND commit_hash=?", (owner, repo, commit)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_repository_overview_set(owner, repo, commit, overview_json):
+    conn = _db_connect()
+    try:
+        conn.execute("INSERT INTO repository_overviews(owner,repo,commit_hash,overview_json) VALUES(?,?,?,?) ON CONFLICT(owner,repo,commit_hash) DO UPDATE SET overview_json=excluded.overview_json,updated_at=datetime('now')", (owner, repo, commit, overview_json))
+        conn.execute("""DELETE FROM repository_overviews WHERE owner=? AND repo=? AND rowid NOT IN
+            (SELECT rowid FROM repository_overviews WHERE owner=? AND repo=? ORDER BY updated_at DESC,rowid DESC LIMIT 10)""", (owner, repo, owner, repo))
     finally:
         conn.close()
 

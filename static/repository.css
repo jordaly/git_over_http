@@ -3,7 +3,45 @@
 .repo-page .topbar { margin-bottom: 0; }
 .repo-content-layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 20px; align-items: start; }
 .repo-content-main { min-width: 0; }
-.repo-sidebar { min-width: 0; }
+.repo-content-main { display: grid; gap: 20px; }
+.repo-sidebar { min-width: 0; display: grid; gap: 20px; }
+.repo-sidebar h2 { margin-bottom: 14px; }
+.repo-sidebar p { font-size: 13px; }
+.repo-about-counts { display: grid; gap: 8px; margin: 16px 0; font-size: 12px; }
+.repo-summary-list { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.repo-summary-list li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 8px 0; overflow-wrap: anywhere; }
+.repo-summary-list strong { font-weight: 600; }
+.repo-contributors-more { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.repo-contributors-more summary { cursor: pointer; color: var(--link); font-size: 12px; }
+.repo-contributors-more[open] summary { margin-bottom: 8px; }
+.repo-latest-commit { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 14px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--pre-bg); font-size: 12px; margin-bottom: 16px; }
+.repo-avatar { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent-bg); color: var(--link); font-size: 10px; font-weight: 650; flex-shrink: 0; }
+.repo-latest-subject { flex: 1 1 180px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.repo-files-scroll { overflow-x: auto; }
+.repo-files-scroll table { table-layout: fixed; min-width: 540px; }
+.repo-files-scroll th:nth-child(1) { width: 36%; }
+.repo-files-scroll th:nth-child(2) { width: 43%; }
+.repo-files-scroll th:nth-child(3) { width: 21%; }
+.repo-entry-name { overflow-wrap: anywhere; }
+.repo-entry-message { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.repo-entry-message a { color: var(--muted); }
+.repo-entry-date { text-align: right; font-size: 12px; }
+.repo-commit-date th { padding: 16px 12px; font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--fg); border-top: 1px solid var(--border-strong); background: var(--pre-bg); }
+.repo-commit-date:first-child th { border-top: 0; }
+#commitRows td { vertical-align: middle; }
+#commitRows time { font-size: 12px; white-space: nowrap; }
+.repo-document-nav { display: flex; gap: 20px; border-bottom: 1px solid var(--border-strong); padding: 10px 0; font-size: 13px; }
+.repo-document { scroll-margin-top: 20px; }
+.repo-document pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.repo-document details { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 14px; }
+.repo-document summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.repo-markdown { line-height: 1.75; overflow-wrap: anywhere; }
+.repo-markdown h2, .repo-markdown h3, .repo-markdown h4 { margin: 24px 0 12px; }
+.repo-markdown h2 { font-size: 22px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.repo-markdown h3 { font-size: 18px; }
+.repo-markdown > :first-child { margin-top: 0; }
+.repo-markdown li { margin: 6px 0; }
+.repo-markdown :not(pre) > code { background: var(--pre-bg); padding: 2px 5px; border-radius: 5px; font-size: .9em; }
 .repo-language-panel h2 { margin-bottom: 16px; }
 .repo-language-bar { display: flex; height: 9px; border-radius: 999px; overflow: hidden; background: var(--pre-bg); margin-bottom: 16px; }
 .repo-language-bar > span { display: block; height: 100%; }

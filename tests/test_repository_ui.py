@@ -356,3 +356,62 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("100.0%", page)
         self.assertIn('class="repo-language-bar"', page)
         self.assertIn('class="repo-sidebar"', page)
+
+    def test_code_page_shows_commit_metadata_readme_license_and_real_tags(self):
+        (self.source / "src").mkdir()
+        (self.source / "src" / "main.py").write_text("pass\n")
+        (self.source / "LICENSE").write_text("MIT License\nPermission is hereby granted, free of charge\n")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Add package and license")
+        (self.source / "README.md").write_text("# Project\n\nA **useful** repository.\n")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Update overview docs")
+        self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
+        self.git("--git-dir", self.bare, "tag", "v1.0", "main")
+        status, page = self.request(self.base)
+        self.assertEqual(status, 200)
+        self.assertIn('class="repo-latest-commit"', page)
+        self.assertIn("Last commit message", page)
+        self.assertIn("Last commit date", page)
+        self.assertIn("Add package and license", page)
+        self.assertIn("Update overview docs", page)
+        self.assertIn("UI author", page)
+        self.assertIn('aria-label="Repository files navigation"', page)
+        self.assertIn('href="#repo-readme">README', page)
+        self.assertIn('href="#repo-license">MIT license', page)
+        self.assertIn("<strong>useful</strong>", page)
+        self.assertIn("3 commits", page)
+        self.assertIn("v1.0", page)
+        self.assertIn("Contributors", page)
+
+    def test_contributors_can_expand_beyond_first_five(self):
+        people = [{"name": f"Contributor {index}", "commits": 10 - index} for index in range(7)]
+        database.db_repository_overview_set(FLAT_OWNER_UI, "project", self.sha,
+            json.dumps({"latest": None, "entries": {}, "commit_count": 49, "contributors": people}))
+        status, page = self.request(self.base)
+        self.assertEqual(status, 200)
+        self.assertIn('class="repo-contributors-more"', page)
+        self.assertIn("Show all 7 contributors", page)
+        expanded = page.split('<details class="repo-contributors-more">', 1)[1].split("</details>", 1)[0]
+        self.assertIn("Contributor 5", expanded)
+        self.assertIn("Contributor 6", expanded)
+        self.assertNotIn("Contributor 0", expanded)
+
+    def test_commits_are_grouped_by_date_with_pagination_metadata(self):
+        commits = [{"hash": str(index) * 40, "author_name": "UI author", "author_email": "ui@example.test",
+                    "date": date, "subject": f"Grouped commit {index}"}
+                   for index, date in ((1, "2026-10-28 13:00:00 +0000"),
+                                       (2, "2026-10-28 10:00:00 +0000"),
+                                       (3, "2026-10-27 12:00:00 +0000"))]
+        with mock.patch("pygithost.application._git_list_commits", new=mock.AsyncMock(return_value=commits)):
+            status, page = self.request(self.base + "/commits?ref=main")
+            self.assertEqual(status, 200)
+            self.assertEqual(page.count('data-date-heading="2026-10-28"'), 1)
+            self.assertEqual(page.count('data-date-heading="2026-10-27"'), 1)
+            self.assertEqual(page.count('data-commit-date="2026-10-28"'), 2)
+            self.assertIn("Commits on Oct 28, 2026", page)
+            self.assertLess(page.index('data-date-heading="2026-10-28"'), page.index('data-date-heading="2026-10-27"'))
+            _, body = self.request(self.base + "/commits?ref=main&partial=1")
+            payload = json.loads(body)
+            self.assertEqual(payload["commits"][0]["date_key"], "2026-10-28")
+            self.assertEqual(payload["commits"][2]["date_key"], "2026-10-27")

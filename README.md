@@ -60,6 +60,29 @@ Run the suite with the project virtual environment:
 
 The integration tests use the real `git-http-backend` and bind a loopback port.
 
+## Repository interface
+
+- The home page searches repository names, owners, and paths with the search box.
+  Search is case-insensitive and works without JavaScript; its URL can be bookmarked.
+- Repository tabs keep **Code**, **Branches**, **Pull requests**, **CI**, and
+  **Artifacts** accessible while browsing files, commits, and pull requests.
+- The **Code** dropdown offers a copyable HTTP(S) clone URL and **Download ZIP**
+  for the branch or commit currently being viewed. ZIPs contain tracked source
+  files, not Git history or CI artifacts; Git archive attributes such as
+  `export-ignore` apply. Branches are resolved to an immutable commit before
+  archiving. Downloads use normal repository access controls, are streamed from
+  temporary storage, and have a 256 MiB compressed-size / 60-second generation
+  limit. Credentials are never embedded in the displayed clone URL.
+- **Branches** separates the default branch from other branches, displays latest
+  commit details, and supports name search, recently-updated/name sorting, and a
+  protected-branch filter. Protection labels reflect the server's configured policy.
+- **New pull request** on a branch prefills the source and default target branch.
+  New branches can start from a branch, tag, or commit, with suggestions for existing
+  branch names.
+- Branch deletion requires write access, excludes default/protected branches,
+  asks for browser confirmation, and rejects stale revisions rather than deleting
+  work pushed since the page was loaded.
+
 ## Continuous integration
 
 Open a repository's **CI → CI settings** page as an administrator. Set a command
@@ -108,6 +131,120 @@ Jobs expose `CI=true` and `PYGITHOST_OWNER`, `PYGITHOST_REPO`,
 
 Branch filters use one case-sensitive glob per line (`main`, `release/*`); blank
 means all branches. PR filters match the **target** branch.
+
+### Versioned JSON pipelines and named steps
+
+Existing single-command CI settings continue to work. To use named sequential
+steps, choose **Named steps** under **What should run?** and enter a JSON array of
+`name`/`run` objects. Only the selected command mode is saved. Settings are grouped
+into pipeline, triggers, runner, protection, and collapsible optional sections.
+**Single command**, **Named steps**, and **JSON in page** are three equal choices
+under **What should run?**, sharing one **Save CI settings** button. Turn off
+Git-based configuration to edit the server pipeline. JSON in page saves without
+creating a repository file or commit. Triggers, runner/image, email and protection
+policies use the same form. Command/steps are replaced; supplied JSON environment,
+artifact and timeout fields override their form fields; omitted fields use the
+form values. The selected editor is remembered after saving. As an
+administrator setting, an inline timeout can raise the server limit. Invalid JSON
+is redisplayed for correction without changing saved settings.
+
+Alternatively, enable **Load .pygithost-ci.json from Git** in
+the repository's server-side CI settings and commit a file such as:
+
+```json
+{
+  "version": 1,
+  "steps": [
+    {
+      "name": "Test",
+      "run": "python -m unittest discover -v"
+    },
+    {
+      "name": "Compile",
+      "run": "python -m compileall -q pygithost"
+    }
+  ],
+  "artifacts": {
+    "paths": ["pygithost/__pycache__/*.pyc"],
+    "when": "always"
+  }
+}
+```
+
+- Each step starts a **separate shell** in the checkout root, with the configured
+  environment. Files persist, but `cd`, `export`, and shell variables do not carry
+  over. Docker steps also start separate containers; only the checkout persists,
+  not container `/tmp` or other container state.
+- Each step has its own status, exit code, duration, and logs. A nonzero exit code
+  stops execution and skips remaining steps. The timeout is a total budget for
+  checkout, PR merge preparation, and all steps—not a new budget per step.
+- `command` and `steps` are mutually exclusive. A file may also contain `env`,
+  `artifacts`, and `timeout_seconds`; version defaults to `1`. Unknown fields are
+  rejected. There are at most 64 steps, with commands up to 8192 characters.
+- Server settings still select **triggers, branch filters, runner/image, email,
+  and protection policies**. A repository timeout cannot exceed the server's
+  configured timeout. Repository `env`, when supplied, replaces the server's
+  ordinary job environment mapping; it cannot override built-in variables.
+- The file is read from the exact recorded commit and snapshotted when queued.
+  **PR checks use the recorded target/base commit's file**, not the PR head's
+  potentially unreviewed pipeline. Pipeline changes in a PR take effect after
+  merging; push/manual runs use the selected commit's file.
+- Opting in requires a regular `.pygithost-ci.json` file, limited to 64 KiB.
+  Missing, malformed, or disallowed configuration creates a failed configuration
+  run; it never silently falls back to the server command. Successful enqueueing
+  snapshots the effective configuration, so reruns use that same configuration.
+
+### Optional merge and branch protections
+
+Both settings live in the repository's **CI settings**, are administrator-only
+when authentication is enabled, and default to **off**:
+
+- **Require successful CI before merging**: the newest qualifying PR check for
+  this PR's exact current source **and** target commit must be successful.
+  Missing, stale, pending, failed, cancelled, interrupted, or timed-out checks
+  block merging. Manual/push runs and checks from another PR do not qualify.
+  Enable PR opened, updated, and reopened triggers so checks are produced.
+  The merge endpoint enforces this independently of the UI; the Git ref update
+  atomically verifies source and target SHAs to reject concurrent branch changes.
+- **Block direct pushes**: rejects HTTP pushes to configured branch patterns,
+  including creations, force-pushes, and deletions. Other branches remain writable;
+  approved PR merges through the server remain allowed. Protected branches cannot
+  be created/deleted through the branch UI either. Patterns are case-sensitive,
+  one per line (for example `main` and `release/*`). Initialize the branch before
+  enabling protection.
+
+These controls are independent: enable both to require a PR and passing CI.
+Repository JSON cannot disable either setting. Push protection adds a temporary
+pre-receive hook without replacing repository hooks on disk; existing hooks still
+run for allowed pushes. Chaining an existing pre-receive hook requires Git 2.36+
+(`git hook run`). Local filesystem access, SSH pushes, and other Git servers are
+outside this HTTP server's enforcement boundary. Host CI is trusted-code-only
+and can access the server filesystem, so it is not a security boundary against
+malicious jobs modifying refs directly.
+
+### Downloadable artifacts
+
+Configure relative file globs in **Artifacts** or the JSON file's `artifacts.paths`.
+`artifacts.when` accepts `always` (default), `success`, or `failure`. Artifacts are
+collected after execution and before checkout cleanup, including after failures
+or timeouts as selected; cancelled runs do not collect artifacts. The run page
+offers one ZIP download. No test output, JUnit XML, or artifact content is parsed.
+The repository's **Artifacts** tab lists available archives across runs, with
+source branches, commit IDs, sizes, expiration times, and direct downloads.
+Downloads also remain available on each CI run page.
+
+- Use file patterns such as `dist/*` or `reports/**/*.xml`; matched directories
+  are not implicitly archived. Missing matches simply produce no download.
+- Regular private files only: symlinks, junctions, hardlinks, `.git` contents,
+  absolute paths, and parent traversal are excluded/rejected.
+- Limits: **20 MiB uncompressed / 1000 files per run**, 32 patterns, and 10,000
+  matched entries. Collection errors/limit violations fail the run explicitly.
+- Archives are stored in SQLite, not publicly served from the static directory.
+  Downloads use the same access controls as CI logs, and are attachments only.
+- Artifacts expire after **7 days**, or earlier when their run is pruned. Expired
+  records are removed at startup and artifact access/collection. SQLite may retain
+  freed database pages for reuse; these are logical retention limits, not an OS
+  filesystem quota.
 
 ### Runs, queues, and recovery
 

@@ -2,11 +2,12 @@
 
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .config import AppConfig
 from .rendering import str_t
@@ -140,6 +141,13 @@ def _db_init() -> None:
         for name in ("config_json", "phase", "reason", "notification"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE ci_runs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+        conn.execute("""CREATE TABLE IF NOT EXISTS ci_steps (
+            run_id INTEGER PRIMARY KEY REFERENCES ci_runs(id) ON DELETE CASCADE,
+            steps_json TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS ci_artifacts (
+            run_id INTEGER PRIMARY KEY REFERENCES ci_runs(id) ON DELETE CASCADE,
+            archive BLOB NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
     finally:
         conn.close()
 
@@ -756,6 +764,75 @@ def db_ci_run_metadata(owner: str, repo: str, run_id: int):
         conn.close()
 
 
+def db_ci_steps_set(run_id, steps_json):
+    conn = _db_connect()
+    try:
+        conn.execute("INSERT INTO ci_steps VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET steps_json=excluded.steps_json", (run_id, steps_json))
+    finally:
+        conn.close()
+
+
+def db_ci_steps_get(run_id):
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT steps_json FROM ci_steps WHERE run_id=?", (run_id,)).fetchone()
+        return row[0] if row else "[]"
+    finally:
+        conn.close()
+
+
+def db_ci_artifact_set(run_id, archive):
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
+        conn.execute("INSERT OR REPLACE INTO ci_artifacts(run_id,archive) VALUES(?,?)", (run_id, archive))
+    finally:
+        conn.close()
+
+
+def db_ci_artifact_get(owner, repo, run_id, *, content=False):
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
+        column = "a.archive" if content else "length(a.archive)"
+        row = conn.execute(f"SELECT {column} FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id WHERE r.owner=? AND r.repo=? AND r.id=?", (owner, repo, run_id)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_ci_artifacts_list(owner, repo, *, before=None, limit=50):
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
+        conditions, params = ["r.owner=?", "r.repo=?"], [owner, repo]
+        if before is not None:
+            conditions.append("r.id<?")
+            params.append(before)
+        params.append(max(1, min(int(limit), 100)))
+        return conn.execute(f"""SELECT r.id,r.branch,r.commit_hash,r.status,r.event,
+            a.created_at,length(a.archive),datetime(a.created_at,'+7 days')
+            FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id
+            WHERE {' AND '.join(conditions)} ORDER BY r.id DESC LIMIT ?""", params).fetchall()
+    finally:
+        conn.close()
+
+
+def db_ci_merge_check(owner, repo, pr_id, base, head):
+    """Only the newest run for this exact PR base/head pair counts."""
+    conn = _db_connect()
+    try:
+        row = conn.execute("""SELECT id,status FROM ci_runs WHERE owner=? AND repo=?
+            AND event IN ('pull_request','pull_request_updated','pull_request_reopened')
+            AND json_extract(payload_json,'$.pr_number')=?
+            AND json_extract(payload_json,'$.base_commit')=?
+            AND json_extract(payload_json,'$.head_commit')=?
+            ORDER BY id DESC LIMIT 1""", (owner, repo, pr_id, base, head)).fetchone()
+        return row
+    finally:
+        conn.close()
+
+
 def db_ci_previous_result(owner: str, repo: str, branch: str, event: str, run_id: int, pr_number=None):
     conn = _db_connect()
     try:
@@ -805,6 +882,14 @@ def db_ci_queued_runs():
 def db_ci_recover_runs():
     conn = _db_connect()
     try:
+        for run_id, steps_json in conn.execute("SELECT s.run_id,s.steps_json FROM ci_steps s JOIN ci_runs r ON r.id=s.run_id WHERE r.status='running'").fetchall():
+            steps = json.loads(steps_json)
+            for step in steps:
+                if step["status"] == "running":
+                    step.update(status="interrupted", finished_at=datetime.now(timezone.utc).isoformat(), return_code=-1)
+                elif step["status"] == "pending":
+                    step["status"] = "skipped"
+            conn.execute("UPDATE ci_steps SET steps_json=? WHERE run_id=?", (json.dumps(steps), run_id))
         conn.execute("UPDATE ci_runs SET status='interrupted', finished_at=datetime('now') WHERE status='running'")
         conn.execute("UPDATE ci_runs SET notification='delivery unknown after restart (not retried)' WHERE notification='sending'")
         for owner, repo in conn.execute("SELECT DISTINCT owner,repo FROM ci_runs").fetchall():

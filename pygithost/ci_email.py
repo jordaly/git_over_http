@@ -6,6 +6,8 @@ import re
 import smtplib
 import ssl
 from email.message import EmailMessage
+from html import escape
+from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
 from . import database
@@ -85,6 +87,59 @@ def validate_recipients(value):
     return list(dict.fromkeys(addresses))
 
 
+def _notification_html(owner, repo, run, url):
+    """Self-contained email markup; interpolate escaped metadata only."""
+    is_test = run[1] == "test"
+    title, color, background = {
+        "success": ("Run passed", "#047857", "#ecfdf5"),
+        "failed": ("Run failed", "#b91c1c", "#fef2f2"),
+        "timed_out": ("Run timed out", "#b45309", "#fffbeb"),
+        "interrupted": ("Run interrupted", "#475569", "#f1f5f9"),
+        "cancelled": ("Run cancelled", "#475569", "#f1f5f9"),
+        "test": ("Email is connected", "#0369a1", "#f0f9ff"),
+    }.get(run[4], ("CI run update", "#475569", "#f1f5f9"))
+    subtitle = "SMTP settings are working. CI notifications are ready to send." if is_test else f"{owner}/{repo} · Run #{run[0]}"
+    rows = []
+    if not is_test:
+        fields = [("Repository", f"{owner}/{repo}"), ("Run", f"#{run[0]}"),
+                  ("Branch", run[2] or "—"), ("Commit", run[3] or "—"),
+                  ("Event", run[1].replace("_", " ")),
+                  ("Exit code", run[7] if run[7] is not None else "—")]
+        if len(run) > 10 and run[9] and run[10]:
+            try:
+                start = datetime.fromisoformat(run[9])
+                end = datetime.fromisoformat(run[10])
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=timezone.utc)
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=timezone.utc)
+                seconds = max(0, int((end - start).total_seconds()))
+                fields.append(("Duration", f"{seconds // 60}m {seconds % 60}s"))
+            except ValueError:
+                pass
+        for label, value in fields:
+            rows.append(f'<tr><th scope="row" align="left" valign="top" style="width:100px;padding:12px 0;border-bottom:1px solid #e2e8f0;color:#64748b;font-size:12px;font-weight:500;">{escape(label)}</th>'
+                        f'<td style="padding:12px 0;border-bottom:1px solid #e2e8f0;color:#0f172a;font-size:13px;line-height:1.6;word-break:break-all;">{escape(str(value))}</td></tr>')
+    action = ""
+    if url and not is_test:
+        safe_url = escape(url, quote=True)
+        action = f'<p style="margin:28px 0 12px;"><a href="{safe_url}" style="display:inline-block;padding:13px 22px;border-radius:8px;background:#0f172a;color:#ffffff;font-size:13px;font-weight:600;text-decoration:none;">View run &rarr;</a></p><p style="font-size:11px;line-height:1.7;word-break:break-all;color:#64748b;">Or open <a href="{safe_url}" style="color:#0369a1;">{safe_url}</a></p>'
+    elif not is_test:
+        action = '<p style="font-size:12px;line-height:1.7;color:#64748b;">Open this repository\'s CI page to view the run. Configure a public server URL in Email settings to include direct links.</p>'
+    details = '<table role="presentation" width="100%" cellspacing="0" cellpadding="0">' + "".join(rows) + "</table>" if rows else '<p style="font-size:14px;line-height:1.8;color:#475569;">This is a test email from pygithost. No action is required.</p>'
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)}</title></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f1f5f9;"><tr><td align="center" style="padding:32px 16px;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:580px;"><tr><td style="padding:0 0 18px;font-size:12px;font-weight:700;letter-spacing:1px;color:#475569;">PYGITHOST <span style="font-weight:400;color:#94a3b8;">/ CONTINUOUS INTEGRATION</span></td></tr>
+<tr><td style="background:#ffffff;border:1px solid #e2e8f0;border-top:4px solid {color};border-radius:12px;padding:28px;">
+<span style="display:inline-block;background:{background};color:{color};padding:6px 10px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.5px;">{escape("SMTP TEST" if is_test else run[4].replace("_", " ").upper())}</span>
+<h1 style="margin:18px 0 8px;font-size:26px;letter-spacing:-.5px;line-height:1.3;color:#0f172a;">{escape(title)}</h1>
+<p style="margin:0 0 24px;color:#64748b;font-size:14px;line-height:1.7;word-break:break-word;">{escape(subtitle)}</p>
+{details}{action}</td></tr>
+<tr><td style="padding:18px 4px;font-size:11px;line-height:1.8;color:#64748b;">Sent by pygithost CI. Notifications contain run metadata only, never commands, logs, or environment values.</td></tr></table>
+</td></tr></table></body></html>'''
+
+
 def send_notification(owner, repo, run, recipients, settings=None):
     """Send a bounded metadata-only message. No commands, environment, or logs."""
     settings = validate_settings(settings if settings is not None else environment_settings())
@@ -106,12 +161,16 @@ def send_notification(owner, repo, run, recipients, settings=None):
     message["Subject"] = subject.replace("\r", " ").replace("\n", " ")
     text = f"Repository: {owner}/{repo}\nRun: #{run[0]}\nStatus: {run[4]}\nEvent: {run[1]}\nBranch: {run[2]}\nCommit: {run[3]}\nExit code: {run[7]}\n"
     base = settings["public_url"].rstrip("/")
+    url = ""
     if base and run[1] != "test":
-        text += f"\n{base}/r/{quote(owner, safe='')}/{quote(repo, safe='')}/ci/runs/{run[0]}\n"
+        url = f"{base}/r/{quote(owner, safe='')}/{quote(repo, safe='')}/ci/runs/{run[0]}"
+        text += f"\n{url}\n"
     if run[1] == "test":
         message.replace_header("Subject", "[CI] SMTP test email")
         text = "This is a test email from pygithost. SMTP settings are working.\n"
     message.set_content(text)
+    message.add_alternative(_notification_html(owner, repo, run, url), subtype="html")
+    message["Auto-Submitted"] = "auto-generated"
     context = tls_context(settings)
     client = smtplib.SMTP_SSL(host, port, timeout=15, context=context) if mode == "ssl" else smtplib.SMTP(host, port, timeout=15)
     with client:

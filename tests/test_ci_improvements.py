@@ -423,8 +423,12 @@ class CIConfigurationAndSMTPTests(unittest.TestCase):
             smtp.return_value.starttls.assert_called_once()
             smtp.return_value.login.assert_called_once_with("ci", "password")
             message = smtp.return_value.send_message.call_args.args[0]
-        self.assertIn("https://git.example.test/prefix/r/owner/repo/ci/runs/9", message.get_content())
-        self.assertNotIn("secret log", message.get_content())
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("https://git.example.test/prefix/r/owner/repo/ci/runs/9", plain)
+        self.assertIn("View run", html)
+        self.assertIn("Run passed", html)
+        self.assertNotIn("secret log", plain + html)
         self.assertNotIn("password", str(message))
 
     def test_smtp_ssl_and_refused_recipients(self):

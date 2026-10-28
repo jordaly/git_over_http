@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import sys
 import signal
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import formatdate
@@ -21,7 +22,9 @@ from urllib.parse import parse_qs, unquote, urlparse, urlencode
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 from .config import AppConfig
 from .context import AppContext
-from .ci import CIManager, default_config as ci_default_config
+from .ci import CIManager, default_config as ci_default_config, protected_branch, pipeline_config
+from .ci_protection import prepare_hooks
+from .ci_documentation import ci_configuration_guide
 from .ci_email import load_settings as load_email_settings, validate_settings as validate_email_settings, validate_recipients, send_notification
 from .database import (
     _db_init,
@@ -47,6 +50,10 @@ from .database import (
     db_prs_for_target,
     db_ci_run_metadata,
     db_ci_config_get,
+    db_ci_steps_get,
+    db_ci_artifact_get,
+    db_ci_artifacts_list,
+    db_ci_merge_check,
     db_email_settings_set,
     db_reset_password,
     db_revoke_session,
@@ -74,6 +81,51 @@ def _ci_elapsed(start, end=None):
         return f"{seconds // 60}m {seconds % 60}s"
     except ValueError:
         return "—"
+
+
+def _ci_tabs(base, active):
+    links = []
+    for key, suffix, label in (("runs", "/ci", "Runs"), ("settings", "/ci/config", "Settings"), ("docs", "/ci/docs", "Documentation")):
+        current = safe_html(' aria-current="page"' if key == active else "")
+        links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
+    return safe_html(html_t(t'<div class="repo-ci-navigation">{_repo_tabs(base, "ci")}<nav class="ci-tabs" aria-label="CI navigation">{join_html(links)}</nav></div>'))
+
+
+def _repo_tabs(base, active):
+    owner, repo = [unquote(part) for part in base.rstrip("/").split("/")[-2:]]
+    links = []
+    for key, suffix, label in (("code", "", "Code"), ("branches", "/branches", "Branches"),
+                              ("pulls", "/pulls", "Pull requests"), ("ci", "/ci", "CI"),
+                              ("artifacts", "/artifacts", "Artifacts")):
+        current = safe_html(' aria-current="page"' if key == active else "")
+        links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
+    return safe_html(html_t(t'<div class="repo-navigation"><header class="repo-header"><div class="repo-eyebrow"><a href="/">Repositories</a></div><h1><a href="{base}">{owner} / <strong>{repo}</strong></a></h1></header><nav class="ci-tabs repo-tabs" aria-label="Repository navigation">{join_html(links)}</nav></div>'))
+
+
+def _repo_code_menu(owner, repo, ref):
+    base = str_t(t"/r/{q(owner)}/{q(repo)}")
+    clone_path = str_t(t"{URL_PREFIX}/{q(repo)}.git") if owner == FLAT_OWNER_UI else str_t(t"{URL_PREFIX}/{q(owner)}/{q(repo)}.git")
+    return safe_html(html_t(t'''<details class="repo-code-menu"><summary>〈〉 Code <span aria-hidden="true">▾</span></summary><div class="repo-code-popover">
+<div class="repo-panel-heading"><strong>Clone repository</strong><span class="repo-clone-protocol">HTTP(S)</span></div><div class="repo-clone-body">
+<label>Clone URL</label><div class="repo-copy-row"><input class="repo-clone-url" data-path="{clone_path}" value="{clone_path}" readonly aria-label="Repository clone URL"><button class="repo-copy-button" type="button">Copy</button></div><p class="muted repo-copy-status" role="status" aria-live="polite">Use Git to clone the full repository and its history.</p><p class="muted">If authentication is enabled, enter your username and password or access token when Git asks. Never share a URL containing credentials.</p></div>
+<a class="repo-zip-link" href="{base}/archive.zip?{urlencode({"ref": ref})}"><strong>↓ Download ZIP</strong><small>Source snapshot of <code>{ref}</code>; no Git history.</small></a></div></details>
+<script>(function() {{
+ const script = document.currentScript; const menu = script.previousElementSibling;
+ const input = menu.querySelector(".repo-clone-url");
+ input.value = window.location.origin + input.dataset.path;
+ menu.querySelector(".repo-clone-protocol").textContent = window.location.protocol === "https:" ? "HTTPS" : "HTTP";
+ input.addEventListener("click", () => input.select());
+ menu.querySelector(".repo-copy-button").addEventListener("click", async function() {{
+   const status = menu.querySelector(".repo-copy-status");
+   try {{
+     if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(input.value);
+     else {{ input.focus(); input.select(); if (!document.execCommand("copy")) throw new Error("copy unavailable"); }}
+     status.textContent = "Clone URL copied.";
+   }} catch (_error) {{ input.focus(); input.select(); status.textContent = "Press Ctrl+C or Command+C to copy the selected URL."; }}
+ }});
+ document.addEventListener("click", event => {{ if (!menu.contains(event.target)) menu.open = false; }});
+ menu.addEventListener("keydown", event => {{ if (event.key === "Escape") {{ menu.open = false; menu.querySelector("summary").focus(); }} }});
+}})();</script>'''))
 
 
 async def _call_in_thread(func, *args, **kwargs):
@@ -578,14 +630,17 @@ async def _git_create_branch(repo_git: str, new_branch: str, from_ref: str) -> t
     existing = await _git_resolve_commit(repo_git, "refs/heads/" + new_branch)
     if existing:
         return False, "Branch already exists."
-    code, _out, err = await _run_git(repo_git, ["update-ref", "refs/heads/" + new_branch, commit])
+    code, _out, err = await _run_git(repo_git, ["update-ref", "refs/heads/" + new_branch, commit, "0" * len(commit)])
     if code != 0:
         return False, err.decode("utf-8", "replace").strip() or "git update-ref failed."
     return True, "Branch created."
 
 
-async def _git_delete_branch(repo_git: str, branch: str) -> tuple[bool, str]:
-    code, _out, err = await _run_git(repo_git, ["update-ref", "-d", "refs/heads/" + branch])
+async def _git_delete_branch(repo_git: str, branch: str, expected_commit: str | None = None) -> tuple[bool, str]:
+    args = ["update-ref", "-d", "refs/heads/" + branch]
+    if expected_commit:
+        args.append(expected_commit)
+    code, _out, err = await _run_git(repo_git, args)
     if code != 0:
         return False, err.decode("utf-8", "replace").strip() or "git update-ref -d failed."
     return True, "Branch deleted."
@@ -670,7 +725,7 @@ async def _git_diff_between(repo_git: str, base: str, head: str, max_bytes: int 
     return out.decode("utf-8", "replace"), False
 
 
-async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str) -> tuple[bool, str, str | None]:
+async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str, *, expected=None) -> tuple[bool, str, str | None]:
     tgt_ref = "refs/heads/" + target_branch
     src_ref = "refs/heads/" + source_branch
 
@@ -680,6 +735,8 @@ async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str) -
         return False, str_t(t"Target branch '{target_branch}' not found."), None
     if not src:
         return False, str_t(t"Source branch '{source_branch}' not found."), None
+    if expected is not None and expected != (tgt, src):
+        return False, "Branches changed while checking CI; refresh and try again.", None
 
     if tgt == src:
         return True, "Already up to date.", tgt
@@ -687,7 +744,12 @@ async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str) -
     if not await _git_is_ancestor(repo_git, tgt, src):
         return False, "Non fast-forward merge required (this server supports ff-only merges).", None
 
-    code, _out, err = await _run_git(repo_git, ["update-ref", tgt_ref, src])
+    # Lock and verify both refs in one transaction, preventing a stale CI decision.
+    process = await asyncio.create_subprocess_exec("git", "--git-dir=" + repo_git, "update-ref", "--stdin",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _out, err = await process.communicate(
+        f"start\nverify {src_ref} {src}\nupdate {tgt_ref} {src} {tgt}\nprepare\ncommit\n".encode())
+    code = process.returncode
     if code != 0:
         return False, err.decode("utf-8", "replace").strip() or "git update-ref failed.", None
     return True, "Merged (fast-forward).", src
@@ -725,52 +787,6 @@ def _html_page(title: str, body_html: str | SafeHTML, *, wide: bool = False) -> 
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
-:root{{
-  color-scheme:light;
-  --bg:#ffffff;
-  --fg:#111827;
-  --muted:#666666;
-  --link:#0f4c81;
-  --border:#eeeeee;
-  --border-strong:#dddddd;
-  --box:#ffffff;
-  --pre-bg:#fafafa;
-  --input-bg:#ffffff;
-  --input-fg:#111827;
-  --button-bg:#111111;
-  --button-fg:#ffffff;
-  --pill-bg:#ffffff;
-  --pill-fg:#444444;
-  --warn-bg:#fff7ed;
-  --warn-border:#fed7aa;
-  --warn-fg:#9a3412;
-  --ok-bg:#ecfdf5;
-  --ok-border:#a7f3d0;
-  --ok-fg:#065f46;
-}}
-html[data-theme="dark"]{{
-  color-scheme:dark;
-  --bg:#0b1220;
-  --fg:#e5e7eb;
-  --muted:#9ca3af;
-  --link:#93c5fd;
-  --border:#1f2937;
-  --border-strong:#374151;
-  --box:#111827;
-  --pre-bg:#030712;
-  --input-bg:#0f172a;
-  --input-fg:#e5e7eb;
-  --button-bg:#e5e7eb;
-  --button-fg:#111827;
-  --pill-bg:#0f172a;
-  --pill-fg:#e5e7eb;
-  --warn-bg:#431407;
-  --warn-border:#9a3412;
-  --warn-fg:#fed7aa;
-  --ok-bg:#052e16;
-  --ok-border:#047857;
-  --ok-fg:#a7f3d0;
-}}
 *{{box-sizing:border-box}}
 body{{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:1200px;background:var(--bg);color:var(--fg)}}
 body.wide-page{{max-width:none}}
@@ -789,14 +805,14 @@ input,select,textarea{{padding:10px;border:1px solid var(--border-strong);border
 textarea{{width:100%;min-height:90px}}
 button{{padding:10px 14px;border:1px solid var(--button-bg);border-radius:10px;background:var(--button-bg);color:var(--button-fg);cursor:pointer}}
 button:hover{{opacity:.92}}
-.danger{{border-color:#7f1d1d;background:#7f1d1d;color:#ffffff}}
+.danger{{border-color:var(--danger-bg);background:var(--danger-bg);color:var(--danger-fg)}}
 .danger:hover{{opacity:.92}}
 .warn{{background:var(--warn-bg);border:1px solid var(--warn-border);color:var(--warn-fg);padding:10px;border-radius:12px}}
 .ok{{background:var(--ok-bg);border:1px solid var(--ok-border);color:var(--ok-fg);padding:10px;border-radius:12px}}
 .theme-toggle{{position:fixed;right:18px;bottom:18px;z-index:9999;border-radius:999px;box-shadow:0 10px 30px rgba(0,0,0,.18)}}
 .tree-icon{{display:inline-flex;width:22px;height:22px;align-items:center;justify-content:center;vertical-align:-6px;color:var(--muted)}}
 .tree-icon svg{{display:block;width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
-.tree-icon.folder{{color:#d97706}}
+.tree-icon.folder{{color:var(--folder-fg)}}
 .tree-icon.file{{color:var(--muted)}}
 .tree-name{{padding-left:2px}}
 @media (max-width:700px){{body{{margin:14px}}.topbar{{align-items:flex-start;flex-direction:column}}.theme-toggle{{right:12px;bottom:12px}}}}
@@ -810,9 +826,12 @@ button:hover{{opacity:.92}}
 }})();
 </script>
 <link rel="stylesheet" href="/static/assets/prismjs/prism-okaidia.min.css" />
+<link rel="stylesheet" href="/static/ui.css" />
+<link rel="stylesheet" href="/static/ci.css" />
+<link rel="stylesheet" href="/static/repository.css" />
 </head>
 <body class="{body_class}">
-<button id="theme-toggle" class="theme-toggle" type="button" title="Toggle dark mode">Dark mode</button>
+<header class="app-header"><a class="app-brand" href="/">pygithost</a><nav aria-label="Workspace navigation"><a href="/">Repositories</a></nav><button id="theme-toggle" class="theme-toggle" type="button" title="Toggle dark mode">Dark mode</button></header>
 
 {body}
 
@@ -1447,15 +1466,15 @@ class GitHTTPHandler:
     # UI: Home / Tokens / Create Repo
     # ========================================================
     async def _ui_home(self, notice: str = "", notice_kind: str = "ok"):
-        repos = _scan_repos(GIT_PROJECT_ROOT)
+        all_repos = sorted(_scan_repos(GIT_PROJECT_ROOT), key=lambda item: (item[0].casefold(), item[1].casefold()))
+        params = parse_qs(urlparse(self.path).query or "")
+        search = (params.get("q") or [""])[0].strip()[:128]
+        repos = [item for item in all_repos if search.casefold() in f"{item[0]}/{item[1]} {item[2]}".casefold()]
 
         rows = []
         for owner, repo, rel in repos:
             rows.append(
-                html_t(t"""<tr>
-<td><a href="/r/{owner}/{repo}">{owner}/{repo}</a></td>
-<td class="muted"><code>{rel}</code></td>
-</tr>""")
+                html_t(t'''<article class="repo-list-item"><div><h2><a href="/r/{q(owner)}/{q(repo)}"><span class="muted">{owner} / </span>{repo}</a></h2><p class="muted"><code>{rel}</code></p></div><nav aria-label="Links for {owner}/{repo}"><a href="/r/{q(owner)}/{q(repo)}">Code</a><a href="/r/{q(owner)}/{q(repo)}/branches">Branches</a><a href="/r/{q(owner)}/{q(repo)}/ci">CI</a><a href="/r/{q(owner)}/{q(repo)}/artifacts">Artifacts</a></nav></article>''')
             )
 
         notice_html = safe_html("")
@@ -1469,32 +1488,26 @@ class GitHTTPHandler:
         elif not REQUIRE_AUTH:
             admin_link = safe_html('<a class="pill" href="/admin/email">Admin: Email</a>')
 
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No repos found.</td><td></td></tr>')
+        rows_html = join_html(rows) if rows else safe_html(html_t(t'<div class="repo-empty"><h2>{"No matching repositories" if search else "No repositories yet"}</h2><p class="muted">{"Try a different name or clear your search." if search else "Create a repository to get started."}</p></div>'))
+        clear = safe_html('<a class="pill" href="/">Clear search</a>') if search else safe_html("")
         body = html_t(
-            t"""<div class="topbar">
-<h1 style="margin:0">Repos</h1>
+            t"""<main class="repo-page"><div class="topbar">
+<div><div class="repo-eyebrow">YOUR WORKSPACE</div><h1>Repositories</h1><p class="muted">Browse your projects and keep your work moving.</p></div>
 <div>{admin_link} <a class="pill" href="/tokens">Tokens</a> <span class="pill">User: <code>{self.remote_user or "?"}</code></span> <a class="pill" href="/logout">Logout</a></div>
 </div>
 {notice_html}
-<div class="box" style="margin-bottom:14px">
-<h2 style="margin:0 0 10px 0;font-size:16px">Create repository</h2>
+<form class="repo-search" method="GET" action="/" role="search"><label for="repo-search">Find a repository</label><div class="row"><input id="repo-search" type="search" name="q" value="{search}" placeholder="Search by repository, owner, or path…" maxlength="128"><button type="submit">Search</button>{clear}</div></form>
+<details class="box repo-create"{safe_html(" open" if not all_repos or notice_kind == "warn" else "")}><summary>Create repository</summary>
 <form method="POST" action="/create-repo">
 <div class="row">
-<div><label>Owner (optional)</label><input name="owner" placeholder="{FLAT_OWNER_UI} for flat layout" /></div>
-<div><label>Repo name</label><input name="repo" placeholder="my-repo" required /></div>
+<div><label for="repo-owner">Owner (optional)</label><input id="repo-owner" name="owner" placeholder="{FLAT_OWNER_UI} for flat layout" /></div>
+<div><label for="repo-name">Repo name</label><input id="repo-name" name="repo" placeholder="my-repo" required /></div>
 <div><button type="submit">Create</button></div>
 </div>
 <p class="muted" style="margin:10px 0 0 0">Create requires <code>write</code> scope.</p>
 </form>
-</div>
-<div class="box" style="margin-bottom:14px">
-<h2 style="margin:0 0 10px 0;font-size:16px">Tokens</h2>
-<p class="muted" style="margin:0">Create, view, expire, and revoke your personal access tokens from the <a href="/tokens">Tokens tab</a>.</p>
-</div>
-<div class="box">
-<p class="muted">GIT_PROJECT_ROOT: <code>{GIT_PROJECT_ROOT}</code></p>
-<table>{rows_html}</table>
-</div>"""
+</details>
+<section class="box repo-list"><div class="repo-panel-heading"><h2>{len(repos)} {"matching repositories" if search else "repositories"}</h2><span class="muted">{len(all_repos)} total</span></div>{rows_html}</section></main>"""
         )
         await _send_html(self.request, 200, _html_page("Repos", safe_html(body)))
 
@@ -1826,39 +1839,14 @@ document.addEventListener("DOMContentLoaded", function() {{
 </div>"""
                 )
             )
-        if owner == FLAT_OWNER_UI:
-            clone_path = str_t(t"{URL_PREFIX}/{q(repo)}.git")
-        else:
-            clone_path = str_t(t"{URL_PREFIX}/{q(owner)}/{q(repo)}.git")
-        clone_variants = [("Clone URL", "")]
-        if REQUIRE_AUTH:
-            clone_variants.extend(
-                [
-                    ("Username and password", "USERNAME:PASSWORD@"),
-                    ("Username and token", "USERNAME:TOKEN@"),
-                    ("Token only", "token:TOKEN_VALUE@"),
-                ]
-            )
-        clone_urls = join_html(
-            [
-                html_t(
-                    t"""<div style="margin:10px 0"><label>{label}</label>
-<pre style="margin:4px 0"><code class="cloneUrl" data-credentials="{credentials}" data-path="{clone_path}"></code></pre></div>"""
-                )
-                for label, credentials in clone_variants
-            ]
-        )
-
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         latest_ci = await _call_in_thread(db_ci_latest_run, owner, repo, default_branch)
         if latest_ci:
             ci_status = latest_ci[1]
-            ci_color = {"success": "#16803c", "failed": "#b42318", "timed_out": "#b42318",
-                        "queued": "#9a6700", "running": "#9a6700", "interrupted": "#667085"}.get(ci_status, "#667085")
             current_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
             if current_commit != latest_ci[4]:
-                ci_status, ci_color = "stale", "#667085"
-            ci_badge = safe_html(html_t(t'<a class="pill" style="border-color:{ci_color};color:{ci_color}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'))
+                ci_status = "stale"
+            ci_badge = safe_html(html_t(t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'))
         else:
             ci_badge = safe_html(html_t(t'<a class="pill" href="{base}/ci">CI: no runs</a>'))
         tree_code, tree_out, _ = await _run_git(repo_git, ["ls-tree", f"{default_branch}:"])
@@ -1892,31 +1880,18 @@ document.addEventListener("DOMContentLoaded", function() {{
         options_html = join_html(options) if options else safe_html("<option>(none)</option>")
 
         body = html_t(
-            t"""<div class="topbar">
-<div><h1 style="margin:0">{owner}/{repo}</h1><div class="muted">Default branch: <code>{default_branch}</code></div></div>
-<div>{ci_badge} <a class="pill" href="/">All repos</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a> <a class="pill" href="{base}/ci">CI</a></div>
-</div>
-<div class="box" style="margin-bottom:14px">
-<div class="row"><div><label>Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div></div>
-<script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
+            t"""{_repo_tabs(base, "code")}<div class="topbar">
+<div><h2>Code</h2><div class="muted">Default branch: <code>{default_branch}</code></div></div>
+<div>{ci_badge}</div>
 </div>
 <div class="box">
-<p><a href="{base}/commits?ref={q(default_branch)}">Commits</a> | <a href="{base}/tree/{q(default_branch)}/">Browse default</a></p>
-<p class="muted" style="margin-top:14px">Clone:</p>
-{clone_urls}
-<script>
-(function() {{
-    document.querySelectorAll(".cloneUrl").forEach(function(element) {{
-        element.textContent = window.location.protocol + "//" +
-            element.dataset.credentials + window.location.host + element.dataset.path;
-    }});
-}})();
-</script>
+<div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch)}</div>
+<script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
 </div>
-<div class="box" style="margin-top:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
+<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
 {readme_html}"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(body)))
+        await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
     async def _ui_branches(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
         owner = unquote(owner)
@@ -1928,7 +1903,22 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._not_found()
 
         default_branch = await _git_default_branch(repo_git)
-        branches = await _git_list_branches(repo_git)
+        params = parse_qs(urlparse(self.path).query or "")
+        search = (params.get("q") or [""])[0].strip()[:128]
+        view = (params.get("view") or ["all"])[0]
+        view = view if view in ("all", "protected") else "all"
+        sort = (params.get("sort") or ["updated"])[0]
+        sort = sort if sort in ("updated", "name") else "updated"
+        code, output, _ = await _run_git(repo_git, ["for-each-ref", "refs/heads",
+            "--sort=" + ("refname" if sort == "name" else "-committerdate"),
+            "--format=%(refname:strip=2)%00%(objectname)%00%(subject)%00%(authorname)%00%(committerdate:iso8601-strict)"])
+        branch_data = []
+        for line in output.decode("utf-8", "replace").splitlines() if code == 0 else []:
+            fields = line.split("\0")
+            if len(fields) == 5:
+                branch_data.append(fields)
+        branches = [fields[0] for fields in branch_data]
+        policy = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html("")
         if notice:
@@ -1936,48 +1926,53 @@ document.addEventListener("DOMContentLoaded", function() {{
             notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
         can_write = _has_write_scope(self)
 
-        rows = []
-        for b in branches:
+        rows, default_rows = [], []
+        for b, sha, subject, author, updated in branch_data:
+            is_protected = protected_branch(policy, b)
+            if search.casefold() not in b.casefold() or (view == "protected" and not is_protected):
+                continue
             browse = str_t(t"{base}/tree/{q(b)}/")
-            if can_write and b != default_branch:
+            if can_write and b != default_branch and not is_protected:
                 del_html = safe_html(
                     html_t(
-                        t"""<form method="POST" action="{base}/branches/delete" style="display:inline">
-<input type="hidden" name="branch" value="{b}"/><button class="danger" type="submit">Delete</button></form>"""
+                        t'''<form method="POST" action="{base}/branches/delete" data-branch="{b}" onsubmit="return confirm('Delete branch ' + this.dataset.branch + '? This cannot be undone from the web interface.');">
+<input type="hidden" name="branch" value="{b}"><input type="hidden" name="expected_commit" value="{sha}"><button class="repo-delete" type="submit" aria-label="Delete branch {b}">Delete</button></form>'''
                     )
                 )
-            elif b == default_branch:
-                del_html = safe_html('<span class="muted">protected</span>')
+            elif b == default_branch or is_protected:
+                del_html = safe_html('<span class="muted repo-lock">Deletion blocked</span>')
             else:
-                del_html = safe_html('<span class="muted">no write scope</span>')
-            default_pill = safe_html(' <span class="pill">default</span>' if b == default_branch else "")
-            rows.append(
-                html_t(
-                    t"""<tr><td><code>{b}</code>{default_pill}</td>
-<td><a class="pill" href="{browse}">Browse</a> <a class="pill" href="{base}/commits?ref={q(b)}">Commits</a></td>
-<td style="text-align:right">{del_html}</td></tr>"""
-                )
-            )
+                del_html = safe_html('<span class="muted repo-lock">Read only</span>')
+            default_pill = safe_html(' <span class="pill repo-default">Default</span>' if b == default_branch else "")
+            protected_pill = safe_html(' <span class="pill">Protected</span>' if is_protected else "")
+            compare_link = safe_html(html_t(t'<a class="pill" href="{base}/pulls?{urlencode({"source": b, "target": default_branch})}#new-pull-request">New pull request</a>')) if b != default_branch else safe_html("")
+            row = html_t(t'''<article class="repo-branch-row"><div class="repo-branch-info"><div class="repo-branch-name"><a href="{browse}"><code>{b}</code></a>{default_pill}{protected_pill}</div>
+<p class="repo-commit-subject"><a href="{base}/commit/{sha}" title="{subject}">{subject or "Untitled commit"}</a></p><p class="muted"><a href="{base}/commit/{sha}"><code>{sha[:8]}</code></a> · {author} · <time datetime="{updated}">{updated.replace("T", " ")}</time></p></div>
+<div class="repo-branch-actions"><a class="pill" href="{base}/commits?ref={q(b)}">Commits</a>{compare_link}{del_html}</div></article>''')
+            (default_rows if b == default_branch else rows).append(row)
 
         if can_write:
             create_box = safe_html(
                 html_t(
-                    t"""<div class="box" style="margin-bottom:14px">
-<h2 style="margin:0 0 10px 0;font-size:16px">Create branch</h2>
+                    t"""<details id="new-branch" class="box repo-create"{safe_html(" open" if notice_kind == "warn" else "")}><summary>New branch</summary>
 <form method="POST" action="{base}/branches/create"><div class="row">
-<div><label>New branch name</label><input name="new_branch" placeholder="feature/x" required/></div>
-<div><label>From (branch/tag/commit)</label><input name="from_ref" value="{default_branch}" required/></div>
-<div><button type="submit">Create</button></div>
-</div></form></div>"""
+<div><label for="branch-name">New branch name</label><input id="branch-name" name="new_branch" placeholder="feature/my-change" required/></div>
+<div><label for="branch-base">Create from branch, tag, or commit</label><input id="branch-base" name="from_ref" list="branch-bases" value="{default_branch}" required/><datalist id="branch-bases">{join_html([html_t(t'<option value="{b}"></option>') for b in branches])}</datalist></div>
+<div><button type="submit">Create branch</button></div>
+</div><p class="muted">Your new branch starts at the selected revision. Protected branch names cannot be created here.</p></form></details>"""
                 )
             )
         else:
             create_box = safe_html('<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope, so branch create/delete is disabled.</div>')
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No branches.</td><td></td><td></td></tr>')
+        rows_html = join_html(rows) if rows else safe_html(html_t(t'<div class="repo-empty"><h2>{"No matching branches" if search or view != "all" else "No other branches yet"}</h2><p class="muted">{"Try a different search or filter." if search or view != "all" else "Create a branch to work on changes without updating the default branch."}</p></div>'))
+        default_html = safe_html(html_t(t'<section class="box repo-list"><div class="repo-panel-heading"><h2>Default branch</h2></div>{join_html(default_rows)}</section>')) if default_rows else safe_html("")
         body = html_t(
-            t"""<div class="topbar"><h1 style="margin:0">Branches</h1>
-<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="/">Home</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
-{notice_html}{create_box}<div class="box"><table>{rows_html}</table></div>"""
+            t"""<main class="repo-page">{_repo_tabs(base, "branches")}<div class="topbar"><div><h2>Branches</h2><p class="muted">Manage development branches and open pull requests.</p></div><span class="pill">{len(branches)} branches</span></div>
+{notice_html}
+<form class="repo-search" method="GET" action="{base}/branches" role="search"><label for="branch-search">Find a branch</label><div class="row"><input id="branch-search" type="search" name="q" value="{search}" placeholder="Search branches…" maxlength="128">
+<select name="view" aria-label="Branch filter"><option value="all"{safe_html(" selected" if view == "all" else "")}>All branches</option><option value="protected"{safe_html(" selected" if view == "protected" else "")}>Protected branches</option></select>
+<select name="sort" aria-label="Branch sort"><option value="updated"{safe_html(" selected" if sort == "updated" else "")}>Recently updated</option><option value="name"{safe_html(" selected" if sort == "name" else "")}>Name</option></select><button type="submit">Find branches</button><a class="pill" href="{base}/branches">Reset</a></div></form>
+{create_box}{default_html}<section class="box repo-list"><div class="repo-panel-heading"><h2>{"Matching branches" if search or view != "all" else "Other branches"}</h2><span class="muted">{len(rows)} shown</span></div>{rows_html}</section></main>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Branches · {owner}/{repo}"), safe_html(body)))
 
@@ -1993,6 +1988,8 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._ui_branches(owner, repo, "Invalid branch name.", "warn")
         if not from_ref:
             return await self._ui_branches(owner, repo, "From ref is required.", "warn")
+        if protected_branch(await self.server.ci_manager.config(owner, repo), new_branch):
+            return await self._ui_branches(owner, repo, "Protected branch creation is blocked; change protection settings first.", "warn")
         ok, msg = await _git_create_branch(_repo_bare_path(owner, repo), new_branch, from_ref)
         return await self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
 
@@ -2005,11 +2002,19 @@ document.addEventListener("DOMContentLoaded", function() {{
         branch = (form.get("branch") or "").strip()
         if not _safe_branch_name(branch):
             return await self._ui_branches(owner, repo, "Invalid branch name.", "warn")
+        if protected_branch(await self.server.ci_manager.config(owner, repo), branch):
+            return await self._ui_branches(owner, repo, "Protected branches cannot be deleted.", "warn")
         repo_git = _repo_bare_path(owner, repo)
         default_branch = await _git_default_branch(repo_git)
         if branch == default_branch:
             return await self._ui_branches(owner, repo, "Default branch is protected and cannot be deleted.", "warn")
-        ok, msg = await _git_delete_branch(repo_git, branch)
+        expected = (form.get("expected_commit") or "").strip()
+        if expected and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", expected):
+            return await self._ui_branches(owner, repo, "Invalid branch revision. Refresh and try again.", "warn")
+        current = await _git_resolve_commit(repo_git, "refs/heads/" + branch)
+        if not current or (expected and expected != current):
+            return await self._ui_branches(owner, repo, "Branch changed or no longer exists. Refresh before deleting it.", "warn")
+        ok, msg = await _git_delete_branch(repo_git, branch, expected_commit=expected or current)
         return await self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
 
     async def _ui_pulls(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
@@ -2045,10 +2050,14 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         default_branch = await _git_default_branch(repo_git)
         branches = await _git_list_branches(repo_git)
-        opt_src = join_html([html_t(t"<option value=\"{b}\">{b}</option>") for b in branches])
+        selected_source = (qs.get("source") or [""])[0]
+        selected_target = (qs.get("target") or [default_branch])[0]
+        if selected_target not in branches:
+            selected_target = default_branch
+        opt_src = join_html([html_t(t'<option value="{b}"{safe_html(" selected" if b == selected_source else "")}>{b}</option>') for b in branches])
         opt_tgt_list = []
         for b in branches:
-            selected = safe_html(" selected") if b == default_branch else safe_html("")
+            selected = safe_html(" selected") if b == selected_target else safe_html("")
             opt_tgt_list.append(html_t(t"<option value=\"{b}\"{selected}>{b}</option>"))
         opt_tgt = join_html(opt_tgt_list)
         can_write = _has_write_scope(self)
@@ -2059,13 +2068,13 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No pull requests.</td><td></td><td></td><td></td></tr>')
         body = html_t(
-            t"""<div class="topbar"><h1 style="margin:0">Pull requests</h1>
+            t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Pull requests</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="/">Home</a></div></div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>
 <a class="pill" href="{base}/pulls?status=open">Open</a> <a class="pill" href="{base}/pulls?status=merged">Merged</a> <a class="pill" href="{base}/pulls?status=closed">Closed</a> <a class="pill" href="{base}/pulls?status=all">All</a>
 </div><div class="muted">Filter: <code>{status}</code></div></div></div>
-<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Open a pull request</h2>
+<div id="new-pull-request" class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Open a pull request</h2>
 <form method="POST" action="{base}/pulls/create">
 <div class="row"><div style="min-width:220px"><label>Source branch</label><select name="source_branch" required>{opt_src}</select></div>
 <div style="min-width:220px"><label>Target branch</label><select name="target_branch" required>{opt_tgt}</select></div></div>
@@ -2074,7 +2083,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div style="margin-top:10px"><button type="submit">Create PR</button></div></form>{warn_merge}</div>
 <div class="box"><table>{rows_html}</table></div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Pull requests · {owner}/{repo}"), safe_html(body)))
+        await _send_html(self.request, 200, _html_page(str_t(t"Pull requests · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
     async def _ui_pulls_create(self, owner: str, repo: str):
         owner = unquote(owner)
@@ -2145,13 +2154,20 @@ document.addEventListener("DOMContentLoaded", function() {{
 
         can_write = _has_write_scope(self)
         merge_box = safe_html("")
+        ci_policy = await self.server.ci_manager.config(owner, repo)
+        check = await _call_in_thread(db_ci_merge_check, owner, repo, pr_id, tgt_commit or "", src_commit or "")
+        ci_passed = bool(check and check[1] == "success" and src_commit and tgt_commit)
+        ci_label = check[1].replace("_", " ") if check else "not run for current commits (missing or outdated)"
+        ci_requirement = "required" if ci_policy["require_ci"] else "informational"
+        ci_panel = safe_html(html_t(t'<div class="box" style="margin-bottom:14px"><h2>CI checks</h2><p>CI is {ci_requirement}: {ci_label}.</p><a href="{base}/ci">View CI runs</a></div>'))
+        merge_disabled = safe_html(' disabled title="Successful CI for the current PR commits is required"' if ci_policy["require_ci"] and not ci_passed else "")
         if status == "open":
             if can_write:
                 merge_box = safe_html(
                     html_t(
                         t"""<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Merge</h2>
 <div class="muted">This server supports <b>fast-forward only</b> merges.</div>
-<form method="POST" action="{base}/pulls/{pr_id}/merge" style="margin-top:10px"><button type="submit">Merge (ff-only)</button></form>
+<form method="POST" action="{base}/pulls/{pr_id}/merge" style="margin-top:10px"><button type="submit"{merge_disabled}>Merge (ff-only)</button></form>
 <form method="POST" action="{base}/pulls/{pr_id}/close" style="margin-top:10px"><button class="danger" type="submit">Close PR</button></form></div>"""
                     )
                 )
@@ -2175,18 +2191,18 @@ document.addEventListener("DOMContentLoaded", function() {{
         src_short = (src_commit or "")[:8]
         tgt_short = (tgt_commit or "")[:8]
         body_html = html_t(
-            t"""<div class="topbar"><div><h1 style="margin:0">PR #{pr_id}: {title}</h1>
+            t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>PR #{pr_id}: {title}</h2>
 <div class="muted"><code>{src_branch}</code> → <code>{tgt_branch}</code> | Created: {created_at}</div></div>
 <div><a class="pill" href="{base}/pulls">All PRs</a> <a class="pill" href="{base}">Repo</a></div></div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><span class="pill">{status}</span>{merge_note}
 <div style="margin-top:10px">{description}</div>
 <div class="muted" style="margin-top:10px">Source: <code>{src_branch}</code> @ <code>{src_short}</code><br>Target: <code>{tgt_branch}</code> @ <code>{tgt_short}</code></div></div>
-{merge_box}
+{ci_panel}{merge_box}
 <div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table></div>
 <div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Diff</h2>{diff_html}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(body_html)))
+        await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>'))))
 
     async def _ui_pull_close(self, owner: str, repo: str, pr_id: int):
         owner = unquote(owner)
@@ -2232,11 +2248,29 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._not_found()
         if status != "open":
             return await self._ui_pull_view(owner, repo, pr_id, "PR is not open.", "warn")
-        ok, msg, new_commit = await _git_ff_merge(_repo_bare_path(owner, repo), tgt_branch, src_branch)
+        # Serialize with HTTP pushes; the Git transaction also verifies both SHAs.
+        lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
+        async with lock:
+            current_pr = await _call_in_thread(db_pr_get, pr_id)
+            if not current_pr or current_pr[8] != "open":
+                return await self._ui_pull_view(owner, repo, pr_id, "PR is no longer open.", "warn")
+            repo_git = _repo_bare_path(owner, repo)
+            tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
+            src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
+            policy = await self.server.ci_manager.config(owner, repo)
+            check = await _call_in_thread(db_ci_merge_check, owner, repo, pr_id, tgt or "", src or "")
+            if policy["require_ci"] and (not tgt or not src or not check or check[1] != "success"):
+                return await self._ui_pull_view(owner, repo, pr_id, "Merge blocked: successful CI is required for the current source and target commits.", "warn")
+            before_refs = await self.server._branch_refs(owner, repo)
+            ok, msg, new_commit = await _git_ff_merge(repo_git, tgt_branch, src_branch, expected=(tgt, src))
+            if ok and new_commit:
+                await _call_in_thread(db_pr_mark_merged, pr_id, "ff-only", new_commit)
+                # A merge changes the target for other open PRs, invalidating
+                # their previous checks just like a push would.
+                await self.server._queue_push_changes(owner, repo, before_refs)
         if not ok:
             return await self._ui_pull_view(owner, repo, pr_id, msg, "warn")
         if new_commit:
-            await asyncio.to_thread(db_pr_mark_merged, pr_id, "ff-only", new_commit)
             await self.server.ci_manager.enqueue(owner, repo, "pull_request_merged", tgt_branch, new_commit,
                 {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch, "base_commit": new_commit})
         return await self._ui_pull_view(owner, repo, pr_id, msg, "ok")
@@ -2344,7 +2378,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows = []
         for run in runs:
-            rows.append(html_t(t'<tr><td><a href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1]}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td>{run[4]}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
+            rows.append(html_t(t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1].replace("_", " ")}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
         empty = "No runs match these filters." if any(filters.values()) else "No CI runs yet."
         runs_html = join_html(rows) if rows else safe_html(html_t(t'<tr><td colspan="8" class="muted">{empty}</td></tr>'))
         filter_options = {
@@ -2368,30 +2402,30 @@ document.addEventListener("DOMContentLoaded", function() {{
             for value, label in branch_values
         ])
         filter_form = safe_html(html_t(t'''<div class="box"><h2>Find runs</h2><form method="GET" action="{base}/ci" class="row">
-<input name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
-<select name="status">{options_html["status"]}</select><select name="event">{options_html["event"]}</select>
-<select name="branch">{branch_options}</select><button type="submit">Filter runs</button>
+<input aria-label="Search runs" name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
+<select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
+<select aria-label="Branch" name="branch">{branch_options}</select><button type="submit">Filter runs</button>
 <a class="pill" href="{base}/ci">Clear filters</a></form></div>'''))
         pagination = safe_html("")
         if len(runs) == 100:
             older_query = urlencode({**{key: value for key, value in filters.items() if value}, "before": runs[-1][0]})
             pagination = safe_html(html_t(t'<a class="pill" href="{base}/ci?{older_query}">Older runs</a>'))
         results_html = safe_html(html_t(t'''<div id="ci-results">
-<div class="box"><h2>CI runs</h2><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table>{pagination}</div></div>'''))
+<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
         config_raw = await _call_in_thread(db_ci_config_get, owner, repo)
         config = json.loads(config_raw) if config_raw else ci_default_config()
-        manual_enabled = bool(config.get("command") and config.get("events", {}).get("manual") and branches and _has_write_scope(self))
+        manual_enabled = bool((config.get("command") or config.get("steps") or config.get("repository_config")) and config.get("events", {}).get("manual") and branches and _has_write_scope(self))
         disabled = safe_html("" if manual_enabled else " disabled")
-        manual_notice = "" if manual_enabled else "Manual runs require write access, a command, the manual trigger, and an existing branch."
+        manual_notice = "" if manual_enabled else "Manual runs require write access, a pipeline, the manual trigger, and an existing branch."
         notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
-        body = html_t(t'''<div class="topbar"><div><h1>CI runs · {owner}/{repo}</h1></div><div><a class="pill" href="{base}/ci/config">CI settings</a> <a class="pill" href="{base}">Repo</a></div></div>{notice_html}
+        body = html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2>CI runs</h2></div><div><a class="pill" href="{base}/ci/config">CI settings</a></div></div>{notice_html}
 <div class="box"><h2>Run manually</h2><p>{manual_notice}</p><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button></form></div>{filter_form}{results_html}
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
-        await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(body)))
+        await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
 
     async def _ui_ci_run_detail(self, owner: str, repo: str, run_id: int, *, partial: bool = False):
         run = await _call_in_thread(db_ci_run_get, owner, repo, run_id)
@@ -2423,8 +2457,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         started_at = run[9] or "—"
         finished_at = run[10] or "—"
         truncated_notice = safe_html('<p class="muted">Output truncated at 1 MiB.</p>') if run[6] else safe_html("")
+        steps = json.loads(await _call_in_thread(db_ci_steps_get, run_id))
+        steps_html = join_html([html_t(t'''<details class="ci-step"><summary><strong>{step["name"]}</strong> · {step["status"]} · {step["duration"]}</summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre>{step["output"] or "No output."}</pre></details>''') for step in steps])
+        artifact_size = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id)
+        artifact_html = safe_html(html_t(t'<h2>Artifacts</h2><p><a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download ZIP ({artifact_size} bytes)</a> · Retained for 7 days, or until this run is pruned.</p>')) if artifact_size else safe_html("")
         result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
-<div class="box"><h1>CI run #{run[0]} · {run[4]}</h1>
+<div class="box"><div class="ci-section-heading"><h1>CI run #{run[0]}</h1><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div>
 <p class="muted">{run[1]} · {run[2]} · <code>{run[3]}</code></p>
 <table><tr><th>Exit code</th><td>{exit_code}</td></tr><tr><th>Created</th><td>{run[8]}</td></tr>
 <tr><th>Started</th><td>{started_at}</td></tr><tr><th>Finished</th><td>{finished_at}</td></tr></table>
@@ -2432,14 +2470,14 @@ document.addEventListener("DOMContentLoaded", function() {{
 <p>{waiting}</p><p>Phase: {meta["phase"] or "queued"} · {meta["reason"]}</p>
 <p>Email: {meta["notification"] or "not sent"}</p>
 <p>Runner: {snapshot.get("runner", "legacy host")} · Base: {payload.get("base_commit", "—")} · Head: {payload.get("head_commit", "—")}</p>
-{actions}{email_action}{command_details}<h2>Output</h2><a href="{base}/ci/runs/{run_id}/log">Download raw log</a>
-<pre id="ci-log" style="white-space:pre-wrap;max-height:70vh;overflow:auto">{output}</pre>
+{actions}{email_action}{command_details}{artifact_html}{steps_html}<h2>Output</h2><a href="{base}/ci/runs/{run_id}/log">Download raw log</a>
+<pre id="ci-log" tabindex="0" aria-label="Run output">{output}</pre>
 {truncated_notice}</div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(result_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
 
-        body = safe_html(html_t(t'''<div class="topbar"><div><h1>CI · {owner}/{repo}</h1></div>
+        body = safe_html(html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2>CI run #{run_id}</h2></div>
 <div><a class="pill" href="{base}/ci">CI settings and runs</a> <a class="pill" href="{base}">Repo</a></div></div>
 {result_html}
 <label><input id="ci-follow" type="checkbox" checked> Follow output</label>
@@ -2454,7 +2492,16 @@ const log = document.getElementById("ci-log"); if (log) log.scrollTop = document
 if (document.getElementById("ci-run-result").dataset.active !== "true") clearInterval(timer);
 }} catch (_error) {{ /* Retry on the next interval. */ }} finally {{ polling = false; }} }}, 3000); }})();</script>'''))
         return await _send_html(self.request, 200,
-            _html_page(str_t(t"CI run #{run[0]} · {owner}/{repo}"), body))
+            _html_page(str_t(t"CI run #{run[0]} · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{body}</main>'))))
+
+    async def _ui_ci_docs(self, owner: str, repo: str):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        body = safe_html(html_t(t'''<main class="ci-page">{_ci_tabs(base, "docs")}<div class="topbar"><h2>CI documentation</h2></div>
+{ci_configuration_guide()}</main>'''))
+        return await _send_html(self.request, 200, _html_page(str_t(t"CI documentation · {owner}/{repo}"), body))
 
     async def _ui_ci_config(self, owner: str, repo: str, notice: str = "", submitted=None, error=False):
         owner, repo = unquote(owner), unquote(repo)
@@ -2465,35 +2512,98 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         config = submitted if submitted is not None else await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         env_text = config.get("env_text", "\n".join(f"{key}={value}" for key, value in config["env"].items()))
+        steps_text = config.get("steps_text", json.dumps(config.get("steps", []), indent=2))
+        pipeline_mode = config.get("pipeline_mode") or ("steps" if config.get("steps") else "command")
+        if "pipeline_text" in config:
+            pipeline_mode = "json"
+        if pipeline_mode not in ("command", "steps", "json"):
+            pipeline_mode = "steps" if config.get("steps") else "command"
+        pipeline_example = {"version": 1, "env": config["env"],
+            "timeout_seconds": config.get("timeout_seconds", 1800),
+            "artifacts": config.get("artifacts", {"paths": [], "when": "always"})}
+        if config.get("steps"):
+            pipeline_example["steps"] = config["steps"]
+        else:
+            pipeline_example["command"] = config["command"] or "python -m unittest discover -v"
+        pipeline_text = config.get("pipeline_text", json.dumps(pipeline_example, indent=2))
+        artifact_paths = "\n".join(config.get("artifacts", {}).get("paths", []))
+        artifact_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("artifacts", {}).get("when", "always") == value else "")}>{value}</option>') for value in ("always", "success", "failure")])
         checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
+        event_labels = {"push": ("Push", "When commits are pushed"),
+            "pr_opened": ("PR opened", "Check new pull requests"),
+            "pr_updated": ("PR updated", "Recheck changes to either branch"),
+            "pr_reopened": ("PR reopened", "Recheck reopened pull requests"),
+            "pr_merged": ("PR merged", "Run after a merge"),
+            "manual": ("Manual", "Allow runs from the Runs tab")}
         event_controls = join_html([
-            html_t(t'<label><input type="checkbox" name="event_{key}"{checks[key]}/> {key.replace("_", " ")}</label>')
-            for key in checks
-        ])
+            html_t(t'<label class="ci-choice"><input type="checkbox" name="event_{key}"{checks[key]}/><span><strong>{event_labels[key][0]}</strong><small>{event_labels[key][1]}</small></span></label>')
+            for key in checks])
         notice_html = safe_html(html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')) if notice else safe_html("")
         runner_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("runner", "host") == value else "")}>{value}</option>') for value in ("host", "docker")])
         email_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("email_mode", "off") == value else "")}>{label}</option>') for value, label in (("off", "Off"), ("failures", "Failures only"), ("all", "All completions"), ("recovery", "Failures and recovery"))])
         shell_name = "cmd.exe" if os.name == "nt" else "/bin/sh"
         smtp = await _call_in_thread(load_email_settings)
         smtp_status = "SMTP host and sender are configured; verify delivery from Email settings." if smtp.get("host") and smtp.get("sender") else "SMTP is not configured: set up Email settings first."
-        body = html_t(t'''<div class="topbar"><div><h1>CI settings · {owner}/{repo}</h1></div>
-<div><a class="pill" href="{base}/ci">CI runs</a> <a class="pill" href="{base}">Repo</a></div></div>{notice_html}
-<div class="box"><p class="warn">Host runner: trusted code only! Jobs have the server OS user's filesystem permissions. Use an unprivileged server account. Docker adds isolation and resource limits; it requires a local Docker daemon and an image with dependencies installed.</p>
-<p class="muted">Host shell: {shell_name}; Docker shell: /bin/sh. Commands use an independent checkout and a restricted environment. Output is capped at 1 MiB. The timeout covers setup and execution (default: 1800 seconds / 30 minutes). Available variables include <code>CI</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, <code>PYGITHOST_EVENT</code>, <code>PYGITHOST_BRANCH</code>, <code>PYGITHOST_COMMIT</code>, and <code>PYGITHOST_PR_NUMBER</code>. Environment values are not a secret store.</p>
-<form method="POST" action="{base}/ci/config"><label>Command</label><textarea name="command" placeholder="python -m pytest" style="min-height:100px">{config["command"]}</textarea>
-<label>Environment variables (KEY=value, one per line)</label><textarea name="env" placeholder="EXAMPLE=value">{env_text}</textarea>
-<label>Runner</label><select name="runner">{runner_options}</select>
-<label>Timeout (seconds)</label><input type="number" name="timeout_seconds" min="1" step="1" required value="{config.get('timeout_seconds', 1800)}">
-<label>Docker image (prefer an immutable digest)</label><input name="image" value="{config.get("image", "python:3.14-slim")}">
-<label><input type="checkbox" name="cancel_superseded"{safe_html(" checked" if config.get("cancel_superseded") else "")}> Cancel superseded runs</label>
-<h2>Email notifications</h2><p>{smtp_status} <a href="/admin/email">Server email settings</a>. Messages contain run metadata, not logs or environment values.</p>
-<label>Recipients (one address per line)</label><textarea name="email_recipients">{config.get("email_recipients", "")}</textarea>
-<label>Send notifications</label><select name="email_mode">{email_options}</select>
-<label>Push branch filters (one glob per line; blank means all)</label><textarea name="push_branches">{config["push_branches"]}</textarea>
-<label>Pull request target branch filters</label><textarea name="pr_branches">{config["pr_branches"]}</textarea>
-<div class="row">{event_controls}</div><button type="submit">Save CI settings</button></form></div>''')
+        source_label = "Repository file" if config.get("repository_config") else "Server settings"
+        trigger_count = sum(bool(value) for value in config["events"].values())
+        body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><div><h2>CI settings</h2><p class="muted">Configure your pipeline, automate checks, and protect what ships.</p></div></div>{notice_html}
+<div class="ci-settings-overview"><span><small>PIPELINE SOURCE</small><strong>{source_label}</strong></span><span><small>AUTOMATION</small><strong>{trigger_count} event triggers enabled</strong></span><a href="{base}/ci/docs"><strong>Configuration guide ↗</strong><small>Examples, options, and troubleshooting</small></a></div>
+<div class="ci-settings-layout"><aside class="ci-settings-sidebar"><nav aria-label="Settings sections"><span class="ci-eyebrow">ON THIS PAGE</span><a href="#ci-pipeline-heading">01 <span>Pipeline</span></a><a href="#ci-triggers-heading">02 <span>Triggers</span></a><a href="#ci-runner-heading">03 <span>Execution</span></a><a href="#ci-protection-heading">04 <span>Protection</span></a><a href="#ci-extras-heading">05 <span>Additional settings</span></a></nav><p>Start simple. Add checks and protections as your workflow grows.</p></aside>
+<form id="ci-settings-form" class="ci-settings-form" method="POST" action="{base}/ci/config">
+<section class="box ci-setting-section" aria-labelledby="ci-pipeline-heading"><h2 id="ci-pipeline-heading"><span class="ci-section-number">1</span> What should run?</h2>
+<label class="ci-choice"><input id="ci-repository-source" type="checkbox" name="repository_config"{safe_html(" checked" if config.get("repository_config") else "")}><span><strong>Load .pygithost-ci.json from Git</strong><small>Keep your pipeline versioned alongside your code.</small></span></label>
+<p id="ci-repository-help" class="muted">When enabled, the repository file replaces command/steps and may override environment, artifacts and timeout. PR checks use the target commit's file. Missing or invalid files fail the run. The fields below are saved server defaults, not an editor for the Git file.</p>
+<div id="ci-server-pipeline"><fieldset class="ci-mode-picker"><legend>Choose how to define your commands</legend>
+<label class="ci-choice"><input type="radio" name="pipeline_mode" value="command"{safe_html(" checked" if pipeline_mode == "command" else "")}><span><span class="ci-mode-symbol" aria-hidden="true">&gt;_</span><strong>Single command</strong><small>The simplest way to get started.</small></span></label>
+<label class="ci-choice"><input type="radio" name="pipeline_mode" value="steps"{safe_html(" checked" if pipeline_mode == "steps" else "")}><span><span class="ci-mode-symbol" aria-hidden="true">01 / 02</span><strong>Named steps</strong><small>Sequential commands with individual results.</small></span></label>
+<label class="ci-choice"><input type="radio" name="pipeline_mode" value="json"{safe_html(" checked" if pipeline_mode == "json" else "")}><span><span class="ci-mode-symbol" aria-hidden="true">{{ }}</span><strong>JSON in page</strong><small>Paste a complete pipeline without a Git commit.</small></span></label></fieldset>
+<div data-pipeline-mode="command"><label for="ci-command">Command</label><textarea id="ci-command" name="command" placeholder="python -m unittest discover -v" spellcheck="false">{config["command"]}</textarea></div>
+<div data-pipeline-mode="steps"><label for="ci-steps">Named steps (JSON array)</label><textarea id="ci-steps" name="steps" rows="8" spellcheck="false" placeholder='[{{"name": "Test", "run": "python -m unittest discover -v"}}]'>{steps_text}</textarea><p class="muted">Each step starts a separate shell in the checkout root. Files persist; shell variables and directory changes do not. A failure skips later steps.</p></div>
+<div data-pipeline-mode="json"><label for="ci-pipeline-json">Pipeline JSON (maximum 64 KiB)</label><textarea id="ci-pipeline-json" name="pipeline_json" rows="18" spellcheck="false">{pipeline_text}</textarea>
+<p class="muted">Use the same format as .pygithost-ci.json. Save CI settings stores this pipeline on the server, without creating a file or commit. This editor shows the saved server pipeline, not the file in Git.</p>
+<p class="muted">JSON replaces command/steps and overrides any environment, timeout, or artifact values supplied below. Omitted optional fields use the form values. Triggers, runner/image, email and protections still use the form.</p></div></div>
+</section>
+<section class="box ci-setting-section" aria-labelledby="ci-triggers-heading"><h2 id="ci-triggers-heading"><span class="ci-section-number">2</span> When should it run?</h2>
+<p class="muted">Choose at least one trigger. Enable Manual to queue runs from the Runs tab.</p><div class="ci-choice-grid">{event_controls}</div>
+<p id="ci-no-triggers" class="warn" hidden>No triggers selected. CI will not queue new runs until you enable an event.</p>
+<details class="ci-optional"{safe_html(" open" if config["push_branches"] or config["pr_branches"] else "")}><summary>Limit which branches trigger runs</summary>
+<div class="ci-fields-grid"><div><label for="ci-push-branches">Push branches</label><textarea id="ci-push-branches" name="push_branches" placeholder="main&#10;release/*">{config["push_branches"]}</textarea></div><div><label for="ci-pr-branches">PR target branches</label><textarea id="ci-pr-branches" name="pr_branches" placeholder="main">{config["pr_branches"]}</textarea></div></div><p class="muted">One case-sensitive glob per line. Leave blank for all branches. PR filters match the target, not the source.</p></details>
+<label class="ci-choice"><input type="checkbox" name="cancel_superseded"{safe_html(" checked" if config.get("cancel_superseded") else "")}><span><strong>Cancel superseded runs</strong><small>Stop older matching runs when newer changes arrive. Manual runs are not superseded.</small></span></label></section>
+<section class="box ci-setting-section" aria-labelledby="ci-runner-heading"><h2 id="ci-runner-heading"><span class="ci-section-number">3</span> Where should it run?</h2>
+<div class="ci-fields-grid"><div><label for="ci-runner">Runner</label><select id="ci-runner" name="runner">{runner_options}</select></div><div><label for="ci-timeout">Total timeout (seconds)</label><input id="ci-timeout" type="number" name="timeout_seconds" min="1" step="1" required value="{config.get('timeout_seconds', 1800)}"><p class="muted">Includes checkout and all steps. 1800 seconds = 30 minutes.</p></div></div>
+<p id="ci-host-warning" class="warn"><strong>Host: trusted code only.</strong> Jobs run as the server's OS user and can access its filesystem. Use an unprivileged account. Shell: {shell_name}.</p>
+<div id="ci-docker-settings"><label for="ci-image">Docker image</label><input id="ci-image" name="image" value="{config.get("image", "python:3.14-slim")}"><p class="muted">Requires a local Docker daemon and a pre-pulled image containing your dependencies and /bin/sh. No network access; pin an immutable image digest for reproducibility.</p></div></section>
+<section class="box ci-setting-section" aria-labelledby="ci-protection-heading"><h2 id="ci-protection-heading"><span class="ci-section-number">4</span> Merge and branch protection <span class="muted">Optional</span></h2>
+<label class="ci-choice"><input id="ci-require-checks" type="checkbox" name="require_ci"{safe_html(" checked" if config.get("require_ci") else "")}><span><strong>Require successful CI before merging</strong><small>Only a passing PR check for the current source and target commits qualifies.</small></span></label>
+<p id="ci-check-trigger-warning" class="warn" hidden>Required checks work best with PR opened, updated and reopened triggers enabled. Missing checks block merging.</p>
+<label class="ci-choice"><input id="ci-block-pushes" type="checkbox" name="block_direct_pushes"{safe_html(" checked" if config.get("block_direct_pushes") else "")}><span><strong>Block direct pushes to protected branches</strong><small>Reject direct pushes, force-pushes, creation and deletion. PR merges remain allowed.</small></span></label>
+<div id="ci-protected-patterns"><label for="ci-protected-branches">Protected branch patterns</label><textarea id="ci-protected-branches" name="protected_branches" placeholder="main&#10;release/*">{config.get("protected_branches", "main")}</textarea><p class="muted">One pattern per line. Create the branch before enabling protection.</p></div>
+<p class="muted">These switches are independent and off by default. Enable both to require PRs and passing CI. Local filesystem/SSH access is outside this HTTP server's control.</p></section>
+<section class="box ci-setting-section" aria-labelledby="ci-extras-heading"><h2 id="ci-extras-heading"><span class="ci-section-number">5</span> Additional settings</h2>
+<details class="ci-optional"{safe_html(" open" if env_text else "")}><summary>Environment variables</summary><label for="ci-env">KEY=value, one per line</label><textarea id="ci-env" name="env" placeholder="PYTHONUNBUFFERED=1" spellcheck="false">{env_text}</textarea><p class="muted">Not a secret store: values are saved in plaintext snapshots and are not redacted from logs. Built-in CI variables cannot be overridden.</p></details>
+<details class="ci-optional"{safe_html(" open" if artifact_paths else "")}><summary>Downloadable artifacts</summary><label for="ci-artifacts">File patterns, relative to checkout</label><textarea id="ci-artifacts" name="artifact_paths" placeholder="dist/*&#10;reports/**/*.xml">{artifact_paths}</textarea><label for="ci-artifact-when">Collect after</label><select id="ci-artifact-when" name="artifact_when">{artifact_options}</select><p class="muted">One pattern per line. ZIP download only; no test-output parsing. Maximum 20 MiB / 1000 files per run. Retained for 7 days or until run deletion.</p></details>
+<details class="ci-optional"{safe_html(" open" if config.get("email_mode", "off") != "off" else "")}><summary>Email notifications</summary><label for="ci-email-mode">Send notifications</label><select id="ci-email-mode" name="email_mode">{email_options}</select><div id="ci-email-settings"><label for="ci-email-recipients">Recipients, one address per line</label><textarea id="ci-email-recipients" name="email_recipients" placeholder="team@example.com">{config.get("email_recipients", "")}</textarea><p class="muted">{smtp_status} <a href="/admin/email">Server email settings</a>. Emails contain metadata, not logs or environment values.</p></div></details></section>
+<div class="ci-save-bar"><span class="muted">Changes apply to new runs.<br>Existing runs keep their configuration snapshot.</span><button type="submit">Save CI settings <span aria-hidden="true">→</span></button></div></form></div>
+<script>(function() {{
+const form = document.getElementById("ci-settings-form");
+function update() {{
+ const repository = form.elements.repository_config.checked;
+ document.getElementById("ci-server-pipeline").hidden = repository;
+ const mode = form.querySelector('input[name="pipeline_mode"]:checked').value;
+ form.querySelectorAll("[data-pipeline-mode]").forEach(node => node.hidden = node.dataset.pipelineMode !== mode);
+ const docker = form.elements.runner.value === "docker";
+ document.getElementById("ci-docker-settings").hidden = !docker;
+ document.getElementById("ci-host-warning").hidden = docker;
+ document.getElementById("ci-protected-patterns").hidden = !form.elements.block_direct_pushes.checked;
+ document.getElementById("ci-email-settings").hidden = form.elements.email_mode.value === "off";
+ const triggers = [...form.querySelectorAll('input[name^="event_"]')];
+ document.getElementById("ci-no-triggers").hidden = triggers.some(input => input.checked);
+ document.getElementById("ci-check-trigger-warning").hidden = !form.elements.require_ci.checked || ["pr_opened", "pr_updated", "pr_reopened"].every(key => form.elements["event_" + key].checked);
+}}
+form.addEventListener("change", update); update();
+}})();</script>''')
         return await _send_html(self.request, 200,
-            _html_page(str_t(t"CI settings · {owner}/{repo}"), safe_html(body)))
+            _html_page(str_t(t"CI settings · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page ci-settings-page">{safe_html(body)}</main>'))))
 
     async def _ui_ci_config_save(self, owner: str, repo: str):
         owner, repo = unquote(owner), unquote(repo)
@@ -2502,10 +2612,32 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
         form = await self._read_form_urlencoded()
+        if form.get("config_mode") == "json":
+            current = await self.server.ci_manager.config(owner, repo)
+            text = form.get("pipeline_json", "")
+            try:
+                if len(text.encode("utf-8")) > 65536:
+                    raise ValueError("Pipeline JSON exceeds 64 KiB.")
+                config = pipeline_config(json.loads(text), current, enforce_timeout=False)
+                config["repository_config"] = False
+                config["pipeline_mode"] = "json"
+                await self.server.ci_manager.save_config(owner, repo, config)
+            except (ValueError, RecursionError) as exc:
+                return await self._ui_ci_config(owner, repo, notice=f"Pipeline JSON: {exc}",
+                    submitted={**current, "pipeline_text": text}, error=True)
+            return await self._ui_ci_config(owner, repo, notice="Pipeline JSON saved on the server. Loading configuration from Git is off.")
         config = {**ci_default_config(), "command": form.get("command", ""), "env_text": form.get("env", ""),
             "runner": form.get("runner", "host"), "image": form.get("image", "python:3.14-slim"),
             "email_mode": form.get("email_mode", "off"), "email_recipients": form.get("email_recipients", ""),
             "cancel_superseded": "cancel_superseded" in form,
+            "repository_config": "repository_config" in form,
+            "require_ci": "require_ci" in form,
+            "block_direct_pushes": "block_direct_pushes" in form,
+            "protected_branches": form.get("protected_branches", "main"),
+            "steps_text": form.get("steps", "[]"),
+            "pipeline_mode": form.get("pipeline_mode", ""),
+            **({"pipeline_text": form.get("pipeline_json", "")} if form.get("pipeline_mode") == "json" else {}),
+            "artifacts": {"paths": [line.strip() for line in form.get("artifact_paths", "").splitlines() if line.strip()], "when": form.get("artifact_when", "always")},
             "timeout_seconds": form.get("timeout_seconds", "1800"),
             "push_branches": form.get("push_branches", ""), "pr_branches": form.get("pr_branches", ""),
             "events": {key: f"event_{key}" in form for key in ci_default_config()["events"]}}
@@ -2520,8 +2652,21 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             env[key.strip()] = value
         config["env"] = env
         try:
+            mode = form.get("pipeline_mode", "")
+            if mode not in ("", "command", "steps", "json"):
+                raise ValueError("Choose single command, named steps, or JSON in page.")
+            config["steps"] = [] if mode in ("command", "json") else json.loads(config["steps_text"] or "[]")
+            if mode == "json" and not config["repository_config"]:
+                text = form.get("pipeline_json", "")
+                if len(text.encode("utf-8")) > 65536:
+                    raise ValueError("Pipeline JSON exceeds 64 KiB.")
+                config = pipeline_config(json.loads(text), config, enforce_timeout=False)
+            if mode == "steps":
+                config["command"] = ""
+                if not config["steps"] and not config["repository_config"]:
+                    raise ValueError("Add at least one named step, or choose Single command.")
             await self.server.ci_manager.save_config(owner, repo, config)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             return await self._ui_ci_config(owner, repo, notice=str(exc), submitted=config, error=True)
         return await self._ui_ci_config(owner, repo, notice="CI settings saved.")
 
@@ -2575,6 +2720,43 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         return await _send_response(self.request, 200, run[5].encode("utf-8"),
             [("Content-Type", "text/plain; charset=utf-8"), ("Content-Disposition", f'attachment; filename="ci-{run_id}.log"'), ("Cache-Control", "no-store")])
 
+    async def _ui_artifacts(self, owner, repo):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        params = parse_qs(urlparse(self.path).query or "")
+        cursor = (params.get("before") or [""])[0]
+        before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
+        artifacts = await _call_in_thread(db_ci_artifacts_list, owner, repo, before=before, limit=51)
+        rows = []
+        for run_id, branch, commit, status, event, created, size, expires in artifacts[:50]:
+            size_label = f"{size / (1024 * 1024):.1f} MiB" if size >= 1024 * 1024 else f"{size / 1024:.1f} KiB"
+            rows.append(html_t(t'''<tr><td><a class="ci-artifact-name" href="{base}/ci/runs/{run_id}/artifacts">ci-{run_id}-artifacts.zip</a><div class="muted">{size_label} · Created {created} UTC</div></td>
+<td><a href="{base}/ci/runs/{run_id}">Run #{run_id}</a> <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span><div class="muted">{branch or "—"} · <code>{commit[:8]}</code> · {event.replace("_", " ")}</div></td>
+<td><span class="muted">Expires {expires} UTC</span></td><td><a class="pill" href="{base}/ci/runs/{run_id}/artifacts" aria-label="Download artifacts from run {run_id}">Download ZIP ↓</a></td></tr>'''))
+        if rows:
+            listing = safe_html(html_t(t'<div class="ci-table-scroll"><table><thead><tr><th scope="col">Archive</th><th scope="col">Source run</th><th scope="col">Retention</th><th scope="col">Download</th></tr></thead><tbody>{join_html(rows)}</tbody></table></div>'))
+        else:
+            listing = safe_html(html_t(t'''<div class="ci-artifacts-empty"><div class="ci-artifact-symbol" aria-hidden="true">↓</div><h2>{"No older artifacts" if before else "No artifacts yet"}</h2><p class="muted">Save build packages, screenshots, or reports from your CI runs.<br>Configure file patterns in CI settings to start collecting downloads.</p><a class="pill" href="{base}/ci/config">Configure artifacts</a> <a class="pill" href="{base}/ci">View CI runs</a></div>'''))
+        pagination = safe_html("")
+        if len(artifacts) > 50:
+            pagination = safe_html(html_t(t'<a class="pill" href="{base}/artifacts?before={artifacts[49][0]}">Older artifacts →</a>'))
+        back = safe_html(html_t(t'<a class="pill" href="{base}/artifacts">Newest artifacts</a>')) if before else safe_html("")
+        body = safe_html(html_t(t'''<main class="ci-page">{_repo_tabs(base, "artifacts")}<div class="topbar"><div><h2>Artifacts</h2><p class="muted">Build outputs from your CI runs, ready to download.</p></div><a class="pill" href="{base}/ci/config">Artifact settings</a></div>
+<section class="box ci-artifacts-panel"><div class="ci-section-heading"><h2>Available downloads</h2><span class="muted">Retained for 7 days or until the run is pruned</span></div>{listing}<div class="row">{back}{pagination}</div></section></main>'''))
+        return await _send_html(self.request, 200, _html_page(str_t(t"Artifacts · {owner}/{repo}"), body))
+
+    async def _ui_ci_artifact(self, owner, repo, run_id):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        archive = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id, content=True)
+        if archive is None:
+            return await self._not_found()
+        return await _send_response(self.request, 200, archive,
+            [("Content-Type", "application/zip"), ("Content-Disposition", f'attachment; filename="ci-{run_id}-artifacts.zip"'), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+
     # ========================================================
     # UI: Commits, Commit, Tree, Blob
     # ========================================================
@@ -2625,7 +2807,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             else safe_html("")
         )
         body = html_t(
-            t"""<div class="topbar"><h1 style="margin:0">Commits</h1>
+            t"""{_repo_tabs(base, "code")}<div class="topbar"><h2>Commits</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
 <div class="box"><p class="muted">ref: <code>{ref}</code></p><table><tbody id="commitRows">{rows_html}</tbody></table>
 <div id="loadMoreStatus" class="muted" style="margin-top:10px">{load_more}</div></div>
@@ -2685,7 +2867,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 }})();
 </script>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Commits · {owner}/{repo}"), safe_html(body)))
+        await _send_html(self.request, 200, _html_page(str_t(t"Commits · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
     async def _ui_commit(self, owner: str, repo: str, commitish: str):
         owner = unquote(owner)
@@ -2721,13 +2903,61 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No file list.</td></tr>')
         patch_html = _prism_diff_patch_html(patch_text, truncated, "Patch")
         body = html_t(
-            t"""<div class="topbar"><div><h1 style="margin:0"><code>{commit[:8]}</code> {meta['subject']}</h1>
+            t"""{_repo_tabs(base, "code")}<div class="topbar"><div><h2><code>{commit[:8]}</code> {meta['subject']}</h2>
 <div class="muted">{meta['author_name']} &lt;{meta['author_email']}&gt; · {meta['date']}</div>{parents_html}</div>
-<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
+<div>{_repo_code_menu(owner, repo, commit)}</div></div>
 <div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
 <div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Patch</h2>{patch_html}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Commit {commit[:8]} · {owner}/{repo}"), safe_html(body)))
+        await _send_html(self.request, 200, _html_page(str_t(t"Commit {commit[:8]} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    async def _ui_archive(self, owner, repo):
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        params = parse_qs(urlparse(self.path).query or "")
+        ref = (params.get("ref") or [""])[0]
+        if not ref or len(ref) > 256 or ref.startswith("-") or any(char in ref for char in "\0\r\n"):
+            return await _send_text(self.request, 400, "Select a valid branch, tag, or commit.\n")
+        bare = _repo_bare_path(owner, repo)
+        commit = await _git_resolve_commit(bare, ref)
+        if not commit:
+            return await self._not_found()
+        name = f"{repo}-{commit[:8]}"
+        process = None
+        # Spool before sending headers: no partial-success response on failure,
+        # and archive size is bounded without loading the ZIP into memory.
+        with tempfile.TemporaryFile() as archive:
+            try:
+                process = await asyncio.create_subprocess_exec("git", "--git-dir=" + bare,
+                    "archive", "--format=zip", "--prefix=" + name + "/", commit,
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                size = 0
+                async with asyncio.timeout(60):
+                    while chunk := await process.stdout.read(65536):
+                        size += len(chunk)
+                        if size > 256 * 1024 * 1024:
+                            return await _send_text(self.request, 413, "Source ZIP exceeds the 256 MiB limit.\n")
+                        archive.write(chunk)
+                    await process.wait()
+                if process.returncode:
+                    return await _send_text(self.request, 500, "Could not create the source archive.\n")
+                archive.seek(0)
+                await _send_response(self.request, 200, headers=[("Content-Type", "application/zip"),
+                    ("Content-Length", str(size)), ("Content-Disposition", f'attachment; filename="{name}.zip"'),
+                    ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")], include_body=False)
+                while chunk := archive.read(65536):
+                    self.request.writer.write(chunk)
+                    await self.request.writer.drain()
+            except asyncio.TimeoutError:
+                return await _send_text(self.request, 503, "Source archive generation timed out. Try again later.\n")
+            except (ConnectionResetError, BrokenPipeError):
+                raise ClientDisconnected()
+            finally:
+                if process is not None and process.returncode is None:
+                    process.kill()
+                    await process.communicate()
 
     async def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
         owner = unquote(owner)
@@ -2774,11 +3004,11 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             up = safe_html(html_t(t"<p><a class=\"pill\" href=\"{parent_href}\">Up one level</a></p>"))
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">Empty.</td></tr>')
         body = html_t(
-            t"""<div class="topbar"><div><h1 style="margin:0">{owner}/{repo}</h1><div class="muted">ref: <code>{ref}</code></div></div>
-<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
+            t"""{_repo_tabs(base, "code")}<div class="topbar"><div><h2>Browse files</h2><div class="muted">ref: <code>{ref}</code></div></div>
+<div>{_repo_code_menu(owner, repo, ref)}</div></div>
 {up}<div class="box"><table>{rows_html}</table></div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(body)))
+        await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
     async def _ui_blob(self, owner: str, repo: str, ref: str, filepath: str):
         owner = unquote(owner)
@@ -2804,9 +3034,9 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             back = str_t(t"{base}/tree/{q(ref)}/{q(folder, safe='/')}/")
         lang = PRISM_LANGUAGE_BY_EXTENSION.get("." + filepath.split(".")[-1], "")
         body = html_t(
-            t"""<p><a class="pill" href="{back}">Back to folder</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></p>
-<h1 style="margin-top:10px"><code>{filepath}</code>
-</h1><div class="box"><pre><code class="language-{lang}">{text}</code></pre>
+            t"""{_repo_tabs(base, "code")}<div class="topbar"><a class="pill" href="{back}">Back to folder</a>{_repo_code_menu(owner, repo, ref)}</div>
+<h2><code>{filepath}</code>
+</h2><div class="box"><pre><code class="language-{lang}">{text}</code></pre>
 <script>
 
     window.Prism = window.Prism || {{}};
@@ -2864,7 +3094,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             200,
             _html_page(
                 str_t(t"{filepath} · {owner}/{repo}"),
-                safe_html(body),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
                 wide=True,
             ),
         )
@@ -3034,6 +3264,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         push_lock = None
         push_lock_acquired = False
         before_refs = {}
+        protection_hooks = None
         connected = True
         is_receive_pack_post = self.command == "POST" and path_info.endswith("/git-receive-pack")
         if is_receive_pack_post:
@@ -3049,6 +3280,19 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
                 await push_lock.acquire()
                 push_lock_acquired = True
                 before_refs = await self.server._branch_refs(*push_identity)
+                policy = await self.server.ci_manager.config(*push_identity)
+                if policy["block_direct_pushes"]:
+                    bare = _repo_bare_path(*push_identity)
+                    _code, hooks_output, _err = await _run_git(bare, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+                    if _code:
+                        return await _send_text(self.request, 500, "Cannot resolve receive hooks; push rejected.\n")
+                    original = hooks_output.decode("utf-8").strip()
+                    patterns = [line.strip() for line in policy["protected_branches"].splitlines() if line.strip()]
+                    protection_hooks, hooks_path = await _call_in_thread(prepare_hooks, original, patterns)
+                    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+                    env[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
+                    env[f"GIT_CONFIG_VALUE_{count}"] = hooks_path
+                    env["GIT_CONFIG_COUNT"] = str(count + 1)
             if TRACE_LOG:
                 _ensure_dir(TRACE_LOG)
                 trace_file = open(TRACE_LOG, "ab", buffering=0)
@@ -3163,6 +3407,8 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
                             await asyncio.shield(finalizer)
                         raise
             finally:
+                if protection_hooks is not None:
+                    protection_hooks.cleanup()
                 try:
                     if body_task is not None and not body_task.done():
                         body_task.cancel()
@@ -3238,6 +3484,15 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", p)
         if m:
             return await self._ui_ci_config(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/artifacts$", p)
+        if m:
+            return await self._ui_artifacts(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/archive\.zip$", p)
+        if m:
+            return await self._ui_archive(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/docs$", p)
+        if m:
+            return await self._ui_ci_docs(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci$", p)
         if m:
             qs = parse_qs(parsed.query or "")
@@ -3251,6 +3506,9 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/runs/(\d+)/log$", p)
         if m:
             return await self._ui_ci_log(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/runs/(\d+)/artifacts$", p)
+        if m:
+            return await self._ui_ci_artifact(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)$", p)
         if m:
             return await self._ui_repo(m.group(1), m.group(2))

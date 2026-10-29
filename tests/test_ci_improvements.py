@@ -93,6 +93,18 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.db_ci_run_get("owner", "repo", row[0])[4], "success")
         self.assertIn("cleanup denied", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
 
+    async def test_cleanup_timeout_reports_limit_and_directory(self):
+        manager = self.manager()
+        row = self.configured_run()
+        manager._capture_process = AsyncMock(return_value=0)
+        directory = str(Path(self.temp.name) / "job")
+        with mock.patch("pygithost.ci.remove_checkout", side_effect=asyncio.TimeoutError()), mock.patch("pygithost.ci.tempfile.mkdtemp", return_value=directory):
+            await manager._execute(row)
+        self.assertEqual(database.db_ci_run_get("owner", "repo", row[0])[4], "success")
+        reason = database.db_ci_run_metadata("owner", "repo", row[0])["reason"]
+        self.assertIn("120 second limit", reason)
+        self.assertIn(directory, reason)
+
     async def test_checkout_and_command_failures_have_different_phases(self):
         manager = self.manager()
         for returns, phase, exit_code in (([128], "checkout", 128), ([0, 0, 0, 7], "command", 7)):

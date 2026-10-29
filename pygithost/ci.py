@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import io
 import zipfile
 from datetime import datetime, timezone
@@ -373,7 +374,19 @@ def remove_checkout(path):
         os.chmod(target, stat.S_IWRITE, follow_symlinks=False)
         func(target)
 
-    shutil.rmtree(path, onexc=writable)
+    # Windows scanners and recently exited processes can briefly retain handles.
+    for attempt in range(6):
+        try:
+            shutil.rmtree(path, onexc=writable)
+            return
+        except FileNotFoundError:
+            if not os.path.lexists(path):
+                return
+            raise
+        except OSError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33, 145) or attempt == 5:
+                raise
+            time.sleep(0.1 * (attempt + 1))
 
 
 class CIManager:
@@ -1149,10 +1162,14 @@ class CIManager:
                     output.extend(f"Artifact collection failed: {exc}\n".encode()[:MAX_OUTPUT - len(output)])
             try:
                 await asyncio.wait_for(
-                    _db_call(remove_checkout, temp_root), timeout=30
+                    _db_call(remove_checkout, temp_root), timeout=120
                 )
             except Exception as exc:
-                cleanup_error = f"Temporary directory cleanup failed: {exc}"
+                detail = ("cleanup exceeded the 120 second limit" if isinstance(exc, asyncio.TimeoutError)
+                          else f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
+                cleanup_error = (f"Temporary directory cleanup failed: {detail}. Directory: {temp_root}. "
+                                 "Check for processes holding files open and server account permissions; "
+                                 "remove this job directory only after its processes have stopped.")
             if cleanup_error:
                 output.extend(
                     (cleanup_error + "\n").encode()[: MAX_OUTPUT - len(output)]

@@ -15,11 +15,27 @@ from pygithost import database
 from pygithost.application import AsyncGitServer, GitHTTPHandler, Headers, FLAT_OWNER_UI
 from pygithost.config import AppConfig
 from pygithost.context import AppContext
-from pygithost.ci import CIManager
+from pygithost.ci import CIManager, remove_checkout
 from pygithost.ci_windows_launcher import _exec_command, _shell_command
 
 
 class WindowsExecutableLookupTests(unittest.TestCase):
+    def test_checkout_cleanup_retries_transient_windows_file_lock(self):
+        error = PermissionError("file is in use")
+        error.winerror = 32
+        with mock.patch("pygithost.ci.os.name", "nt"), mock.patch("pygithost.ci.shutil.rmtree", side_effect=[error, None]) as remove, mock.patch("pygithost.ci.time.sleep") as sleep:
+            remove_checkout("job-directory")
+        self.assertEqual(remove.call_count, 2)
+        sleep.assert_called_once_with(0.1)
+
+    def test_checkout_cleanup_does_not_hide_persistent_errors(self):
+        error = PermissionError("file is in use")
+        error.winerror = 32
+        with mock.patch("pygithost.ci.os.name", "nt"), mock.patch("pygithost.ci.shutil.rmtree", side_effect=error) as remove, mock.patch("pygithost.ci.time.sleep"):
+            with self.assertRaises(PermissionError):
+                remove_checkout("job-directory")
+        self.assertEqual(remove.call_count, 6)
+
     def test_shell_preserves_connection_string_quotes_and_chaining(self):
         command = (
             'sqlpackage /Action:Extract '

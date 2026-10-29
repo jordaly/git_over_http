@@ -484,38 +484,16 @@ class CIManager:
         return validate_config(json.loads(raw)) if raw else default_config()
 
     async def save_config(self, owner, repo, config):
-        content = config.get("deploy_script_content", "")
-        path = None
-        if content:
-            if not isinstance(content, str) or "\0" in content or len(content.encode("utf-8")) > 65536:
-                raise ValueError("Deployment script must be UTF-8 text up to 64 KiB without NUL bytes.")
-            content = content.replace("\r\n", "\n")
-            if os.name != "nt" and not deployment_prefix(config.get("deploy_interpreter", "direct")) and not content.startswith("#!"):
-                raise ValueError("Uploaded deployment scripts require a shebang, for example #!/bin/sh.")
-            digest = hashlib.sha256((owner + "/" + repo + "\0" + content).encode()).hexdigest()
-            path = Path(database.DB_PATH).resolve().parent / "deployment-scripts" / digest
-            config = {**config, "deploy_script": str(path)}
+        if config.get("deploy_script_content"):
+            config = {**config, "deploy_script": ""}
         config = validate_config(config)
-        config.pop("deploy_script_content", None)
-        if path is not None:
-            def store_script():
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                # Publish complete content atomically, including concurrent uploads.
-                descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".upload-")
-                try:
-                    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                        handle.write(content)
-                    os.chmod(temporary, 0o700)
-                    os.replace(temporary, path)
-                finally:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(temporary)
-            await asyncio.to_thread(store_script)
         await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
         return config
 
     async def deployment_script_content(self, owner, repo, config):
-        """Read only a bounded, repository-scoped, content-addressed upload."""
+        """Return database-backed contents, or a verified legacy upload."""
+        if config.get("deploy_script_content"):
+            return config["deploy_script_content"]
         directory = Path(database.DB_PATH).resolve().parent / "deployment-scripts"
         path = Path(config.get("deploy_script", ""))
         if path.parent != directory or not re.fullmatch(r"[0-9a-f]{64}", path.name):
@@ -750,15 +728,25 @@ class CIManager:
     async def _deploy(self, row):
         """Run a trusted external script, never repository-controlled commands."""
         run_id, owner, repo, event, branch, commit, _payload = row
-        if event not in ("push", "pull_request_merged"):
-            return
         run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
         config = await self.config(owner, repo)
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
-        snapshot = json.loads(meta["config"] or "{}")
-        if not run or run[4] != "success" or not config["deploy_enabled"] or not snapshot.get("deploy_enabled"):
+        snapshot = json.loads(meta["config"] or "{}") if meta else {}
+        if not run or run[4] != "success" or not (config["deploy_enabled"] or snapshot.get("deploy_enabled")):
             return
-        if branch != config["deploy_branch"] or any(config[k] != snapshot.get(k, "direct" if k == "deploy_interpreter" else None) for k in ("deploy_branch", "deploy_script", "deploy_timeout", "deploy_interpreter")):
+        async def skip(reason):
+            await _db_call(database.db_ci_run_update, run_id, reason="Deployment skipped: " + reason)
+        if event not in ("push", "pull_request_merged"):
+            await skip("only Push and PR merged runs deploy; manual runs and PR checks do not.")
+            return
+        if not config["deploy_enabled"] or not snapshot.get("deploy_enabled"):
+            await skip("deployment must be enabled both when the run is queued and when it finishes.")
+            return
+        if branch != config["deploy_branch"]:
+            await skip(f"branch {branch!r} does not match deployment branch {config['deploy_branch']!r}.")
+            return
+        if any(config.get(k, "") != snapshot.get(k, "direct" if k == "deploy_interpreter" else "") for k in ("deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter")):
+            await skip("deployment settings changed since this run was queued; push a new commit with the saved settings.")
             return
         output, truncated = bytearray(), [False]
         claimed = False
@@ -766,18 +754,29 @@ class CIManager:
             with tempfile.TemporaryDirectory(prefix="pygithost-deploy-") as home:
                 env = runner_environment(home)
                 bare = str(Path(self.repo_path(owner, repo)).resolve())
-                script = Path(config["deploy_script"]).resolve()
-                if script.is_relative_to(Path(bare)) or not script.is_file():
-                    raise ValueError("Deployment script must exist outside the repository.")
                 rc = await self._capture_process(
                     ["git", "--git-dir", bare, "rev-parse", "--verify", f"refs/heads/{branch}"],
                     shell=False, cwd=None, env=env, output=output, truncated=truncated, timeout=30)
                 if rc or output.decode().strip() != commit:
+                    await skip("the tested commit is no longer the branch tip, or the branch cannot be resolved.")
                     return
                 output.clear()
                 claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
                 if not claimed:
+                    await skip("this repository/commit already has a deployment attempt; see Deployments.")
                     return
+                if config.get("deploy_script_content"):
+                    prefix = deployment_prefix(config["deploy_interpreter"])
+                    runtime = Path(prefix[0]).stem.lower() if prefix else ""
+                    suffix = ".py" if "python" in runtime else ".ps1" if runtime in ("pwsh", "powershell") else ".js" if runtime in ("node", "nodejs") else ".sh"
+                    script = Path(home) / ("deployment" + suffix)
+                    descriptor = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+                    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(snapshot["deploy_script_content"])
+                else:
+                    script = Path(config["deploy_script"]).resolve()
+                    if script.is_relative_to(Path(bare)) or not script.is_file():
+                        raise ValueError("Deployment script must exist outside the repository.")
                 env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
                     PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, CI="true")
                 command = deployment_prefix(config["deploy_interpreter"]) + [str(script), commit]

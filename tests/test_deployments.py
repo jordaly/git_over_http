@@ -75,6 +75,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.capture(tip="b" * 40)
         await self.manager._deploy(row)
         self.assertIsNone(database.db_deployment_get(row[0]))
+        self.assertIn("branch tip", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
 
     async def test_disabling_prevents_pending_deployment(self):
         row = await self.run_record()
@@ -82,6 +83,16 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.capture()
         await self.manager._deploy(row)
         self.manager._capture_process.assert_not_awaited()
+        self.assertIn("enabled", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
+
+    async def test_changed_database_script_is_not_deployed_from_old_run(self):
+        self.config.update(deploy_interpreter="python", deploy_script_content='print("old")\n', deploy_script="")
+        row = await self.run_record()
+        await self.manager.save_config("owner", "repo", {**self.config, "deploy_script_content": 'print("new")\n'})
+        self.capture()
+        await self.manager._deploy(row)
+        self.manager._capture_process.assert_not_awaited()
+        self.assertIn("settings changed", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
 
     async def test_failure_and_timeout_do_not_change_ci_result(self):
         for index, error in enumerate([None, asyncio.TimeoutError()]):
@@ -103,24 +114,15 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         content = "#!/bin/sh\r\nprintf '%s' \"$1\"\r\n"
         saved = await self.manager.save_config("owner", "repo", {
             **self.config, "deploy_script": "", "deploy_script_content": content})
-        path = Path(saved["deploy_script"])
-        self.assertEqual(path.parent.name, "deployment-scripts")
-        self.assertEqual(path.read_text(), content.replace("\r\n", "\n"))
-        self.assertNotIn("deploy_script_content", saved)
-        if os.name == "posix":
-            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
-            process = await asyncio.create_subprocess_exec(str(path), self.commit,
-                stdout=asyncio.subprocess.PIPE)
-            output, _ = await process.communicate()
-            self.assertEqual(output.decode(), self.commit)
+        self.assertEqual(saved["deploy_script"], "")
+        self.assertEqual(saved["deploy_script_content"], content.replace("\r\n", "\n"))
+        self.assertFalse((Path(self.temp.name) / "deployment-scripts").exists())
+        self.assertEqual(json.loads(database.db_ci_config_get("owner", "repo"))["deploy_script_content"], saved["deploy_script_content"])
         again = await self.manager.save_config("owner", "repo", {
             **self.config, "deploy_script_content": content})
-        self.assertEqual(again["deploy_script"], str(path))
+        self.assertEqual(again["deploy_script"], "")
         self.assertEqual(await self.manager.deployment_script_content("owner", "repo", saved), content.replace("\r\n", "\n"))
-        self.assertEqual(await self.manager.deployment_script_content("other", "repo", saved), "")
         self.assertEqual(await self.manager.deployment_script_content("owner", "repo", {"deploy_script": str(self.script)}), "")
-        path.write_text("tampered script")
-        self.assertEqual(await self.manager.deployment_script_content("owner", "repo", saved), "")
 
     async def test_invalid_upload_not_saved(self):
         for content in ["#!/bin/sh\n" + "x" * 65536, "#!/bin/sh\n\0"]:
@@ -134,19 +136,25 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         saved = await self.manager.save_config("owner", "repo", {
             **self.config, "deploy_interpreter": "python", "deploy_script_content": content})
         self.config = saved
-        self.script = Path(saved["deploy_script"])
         row = await self.run_record()
         original = self.manager._capture_process
+        paths = []
         async def capture(command, **kwargs):
             if command[0] == "git":
                 kwargs["output"].extend((self.commit + "\n").encode())
                 return 0
-            self.assertEqual(command, [sys.executable, str(self.script), self.commit])
+            self.assertEqual(command[0], sys.executable)
+            self.assertEqual(command[2], self.commit)
+            path = Path(command[1])
+            paths.append(path)
+            self.assertEqual(path.read_text(), content)
+            self.assertEqual(path.suffix, ".py")
             return await original(command, **kwargs)
         self.manager._capture_process = capture
         await self.manager._deploy(row)
         self.assertEqual(database.db_deployment_get(row[0]),
                          ("success", "deployed " + self.commit + "\n"))
+        self.assertFalse(paths[0].exists())
 
     async def test_direct_upload_still_requires_shebang_on_posix(self):
         if os.name != "nt":
@@ -175,7 +183,8 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(database.db_ci_run_get("owner", "repo", run_id)[4], "success")
             self.assertEqual(database.db_deployment_get(run_id),
                              ("success", "deployed " + self.commit))
-            self.assertTrue(Path(config["deploy_script"]).is_file())
+            self.assertEqual(config["deploy_script"], "")
+            self.assertIn("deploy_script_content", config)
         finally:
             await self.manager.stop()
 

@@ -369,10 +369,10 @@ shebang is needed. Uploading a `.py` file fills this in when blank. It uses
 the Git server's Python interpreter and virtual environment; install dependencies
 there, not just inside the CI image. Other installed runners are supported too,
 for example `node`, `bash -e`, or `pwsh -NoProfile -File`. The script path and commit
-are appended as arguments; no shell expansion is performed. Uploaded scripts are content-addressed
-files in `deployment-scripts` beside the database, with owner-only permissions.
-Keep that directory in server backups; unused script versions are not deleted
-automatically.
+are appended as arguments; no shell expansion is performed. Uploaded/pasted contents
+are stored in SQLite and shown again in settings. A temporary file is created only
+when deployment executes, then removed. Legacy files in `deployment-scripts` remain
+supported; reopen and save their contents to migrate them into the database.
 
 Enable the **Push** and/or **PR merged** CI triggers. After a successful run for
 an actual update to the selected branch, the server checks that its tip still

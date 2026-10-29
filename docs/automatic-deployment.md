@@ -63,7 +63,7 @@ deploy already completed runs; manually queueing a run does not trigger deployme
 | Branch has advanced past the tested commit | Skipped |
 | Deployment was disabled when the run was queued | No deployment |
 | Deployment is disabled before execution | No deployment |
-| Deployment branch, script path, Run with, or timeout changed since queueing | No deployment |
+| Deployment branch, script path/contents, Run with, or timeout changed since queueing | No deployment |
 | This repository/commit already has a deployment attempt | No second attempt |
 
 The corresponding CI event trigger must be enabled, and its branch filters must
@@ -105,9 +105,9 @@ for example `"C:/Program Files/Python/python.exe" -u`.
 
 Pipes, redirects, variable expansion, and command chaining are not evaluated in
 this field. Put multi-command logic in the uploaded script instead. Runners must
-accept the stored script path followed by its arguments. Stored upload filenames
-are content hashes without extensions: extension-dependent tools need a wrapper
-that handles their required filename. Compiled languages need a build/run wrapper.
+accept the temporary script path followed by its arguments. The server uses
+`.py` for Python, `.ps1` for PowerShell, `.js` for Node, and `.sh` otherwise.
+Other extension-dependent tools need a wrapper. Compiled languages need a build/run wrapper.
 Install runtimes and dependencies on the Git server, not only in the CI image.
 
 ```python
@@ -229,13 +229,17 @@ and is executable by the server user.
 - The current uploaded script is displayed in **Deployment script contents** when
   you reopen settings, so you can review and edit it. External server-path files
   are not read into the editor.
-- Nonempty **Deployment script contents** replaces the path field when saved.
+- Nonempty **Deployment script contents** is stored in the SQLite configuration,
+  clears the external path, and is included in new CI configuration snapshots.
 - To use an external path instead, clear the new contents field before saving.
-- Uploading a changed script creates a different content-addressed path. Runs
-  queued with the previous script path will not deploy under the changed settings.
-- Uploaded versions reside in `deployment-scripts` beside the database, with
-  owner-only file permissions. Back up that directory together with the database.
-  Unused script versions are not automatically removed.
+- No script file is created when saving. After an eligible CI run succeeds, its
+  snapshotted contents are written to an owner-only temporary file, executed, and
+  cleaned up with the deployment directory afterward.
+- Changing script contents prevents older queued configurations from deploying.
+  Back up the database to preserve saved contents and run snapshots.
+- Legacy uploads in `deployment-scripts` remain readable for compatibility.
+  Reopen settings and save their loaded contents to migrate them into the database.
+  Legacy files are not automatically deleted; keep them while older runs need them.
 
 ## 6. Results, failures, and recovery
 
@@ -286,7 +290,7 @@ Use a service supervisor to clean up server subprocesses after shutdown/crashes.
 | Symptom | Check |
 | --- | --- |
 | No CI run | Pipeline configured, event enabled, branch filter matches |
-| CI passed, no Deployment section | Actual event, exact branch, queue-time settings, current tip, previous attempt |
+| CI passed, no Deployment section | Read the “Deployment skipped” reason on the CI run, then check event, branch, queue-time settings, current tip, previous attempt |
 | Script cannot start | Absolute path, executable bit, shebang, interpreter installed on Git server |
 | Command missing | Tool installed on Git server, not only in the CI Docker image |
 | SSH fails | Service-user permissions, explicit key path, verified known-hosts entry, target account, firewall |

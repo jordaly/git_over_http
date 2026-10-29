@@ -304,8 +304,8 @@ class RepositoryUITests(unittest.TestCase):
             self.assertIn("CI settings saved", page, mode)
             saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
             self.assertTrue(saved["deploy_enabled"])
-            self.assertEqual(Path(saved["deploy_script"]).read_text(), content)
-            self.assertNotIn("deploy_script_content", saved)
+            self.assertEqual(saved["deploy_script"], "")
+            self.assertEqual(saved["deploy_script_content"], content)
             _, reopened = self.request(self.base + "/ci/config")
             editor = reopened.split('id="deploy-script-content"', 1)[1].split("</textarea>", 1)[0]
             self.assertIn('print(&quot;deploying&quot;, sys.argv[1])', editor)

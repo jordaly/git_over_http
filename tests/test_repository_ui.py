@@ -166,7 +166,7 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn("person-00", table)
         self.assertIn('value="0">person-00</option>', page)  # Reset form still covers all users.
 
-    def test_root_tree_and_commit_files_are_paginated_with_metadata(self):
+    def test_root_and_tree_show_all_files_while_commit_files_remain_paginated(self):
         (self.source / "src").mkdir()
         for index in range(30):
             (self.source / f"file-{index:02}.txt").write_text("root")
@@ -183,12 +183,13 @@ class RepositoryUITests(unittest.TestCase):
             _, second = self.request(self.base + suffix + "?page=2")
             table = first.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
             self.assertIn(first_name, table)
-            self.assertNotIn(last_name, table)
+            self.assertIn(last_name, table)
+            self.assertNotIn('aria-label="Pagination"', first)
             table = second.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
             self.assertIn(last_name, table)
-            self.assertNotIn(first_name, table)
+            self.assertIn(first_name, table)
             self.assertIn("Many files", table)
-            self.assertIn('rel="prev"', second)
+            self.assertNotIn('aria-label="Pagination"', second)
         _, first = self.request(self.base + "/commit/" + sha)
         _, second = self.request(self.base + "/commit/" + sha + "?page=2")
         self.assertIn('rel="next"', first)
@@ -573,7 +574,7 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_contributors_can_expand_beyond_first_five(self):
         people = [{"name": f"Contributor {index}", "commits": 10 - index} for index in range(7)]
-        database.db_repository_overview_set(FLAT_OWNER_UI, "project", self.sha + ":page=1",
+        database.db_repository_overview_set(FLAT_OWNER_UI, "project", self.sha,
             json.dumps({"latest": None, "entries": {}, "commit_count": 49, "contributors": people}))
         status, page = self.request(self.base)
         self.assertEqual(status, 200)

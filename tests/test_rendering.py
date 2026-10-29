@@ -18,16 +18,17 @@ class PageLayoutTests(unittest.TestCase):
         self.assertIn("q=a%26b&amp;page=1", last)
         self.assertIn('class="pagination-ellipsis"', last)
 
-    def test_pagination_includes_first_last_totals_and_forms(self):
+    def test_pagination_includes_first_last_totals_without_extra_forms(self):
         markup = str(_pagination("/items", {"q": "needle"}, 5, True, total=95, per_page=10))
         self.assertIn('aria-label="Go to first page"', markup)
         self.assertIn('aria-label="Go to last page"', markup)
         self.assertIn("page=10&amp;per_page=10", markup)
         self.assertIn("Showing 41–50 of 95", markup)
         self.assertIn("Page 5 of 10", markup)
-        self.assertIn('name="per_page"', markup)
-        self.assertIn('name="page" type="number" min="1" max="10"', markup)
-        self.assertIn('name="q" value="needle"', markup)
+        self.assertIn("q=needle&amp;page=10", markup)
+        self.assertNotIn("<form", markup)
+        self.assertNotIn("Rows per page", markup)
+        self.assertNotIn("Go to page <input", markup)
 
     def test_wide_page_uses_full_width_body_class(self):
         page = _html_page("Source", "content", wide=True).decode("utf-8")

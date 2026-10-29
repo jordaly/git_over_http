@@ -121,13 +121,7 @@ td { padding: 12px; font-size: 13px; }
   font-variant-numeric: tabular-nums;
 }
 .pagination .pagination-summary { margin: 0; color: var(--muted); font-size: 12px; text-align: center; }
-.pagination-links, .pagination-options { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; }
-.pagination-options { gap: 12px 24px; }
-.pagination .pagination-options form { display: flex; align-items: center; gap: 8px; margin: 0; }
-.pagination .pagination-options form > label { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 12px; font-weight: 400; }
-.pagination .pagination-options :is(input, select) { width: auto; min-height: 34px; padding: 6px 8px; font-size: 12px; }
-.pagination .pagination-options input[type="number"] { width: 76px; }
-.pagination .pagination-options form > button { margin: 0; padding: 7px 10px; font-size: 12px; min-height: 34px; }
+.pagination-links { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; }
 .pagination-control, .pagination-number, .pagination-current {
   display: inline-flex;
   align-items: center;

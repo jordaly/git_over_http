@@ -68,8 +68,6 @@ These lists default to **25 entries per page**:
   selector continues to include all users, not just the current page.
 - **Pull requests:** pagination preserves the selected open/closed/merged/all filter.
 - **Pull request → Commits:** 25 commits per page, without the former 200-commit cap.
-- **Code** and **folder browsing:** folders first, then files, with last-commit
-  metadata for the visible page. Each directory starts its own pagination.
 - **Commit → Files:** the changed-file list is paginated; the patch remains a
   separate, bounded view of the commit.
 - **Branches:** filters and sorting survive page changes; the default branch
@@ -81,21 +79,20 @@ are preserved. Commit-history page controls appear above and below the table,
 near the Repo, Branches, and Pull requests navigation. Those navigation links
 open their own separately paginated lists, starting on their first page.
 Fixed-size documentation/reference tables are not paginated.
+Repository Code pages and folder explorers are also not paginated: they show the
+full directory listing, folders first, with last-commit information.
 
 Each list uses the same pagination controls:
 
 - **First / Last:** jump directly to the beginning or end of the list.
 - **Previous / Next:** move one page at a time.
 - **Numbered pages:** select a nearby page; ellipses mark omitted page ranges.
-- **Rows per page:** choose 10, 25, 50, or 100 and click **Apply**. This starts at
-  page 1 and preserves the current filters.
-- **Go to page:** enter a page number and click **Go**.
 - **Result summary:** shows the displayed range, total matches, and current/total pages.
 
 Unavailable controls remain visible but disabled at list boundaries. Out-of-range
 page requests are clamped to the final page. Page size, filters, sorting, revision,
-and path are preserved in navigation links. Commit history defaults to 50 entries
-and supports the same size choices; its Load more button uses the selected size.
+and path are preserved in navigation links. Commit history defaults to 50 entries;
+its Load more button remains available. There are no page-size or jump-to-page forms.
 If a Git count cannot be obtained, commit lists omit the unknown total and Last
 control rather than guessing where the list ends.
 

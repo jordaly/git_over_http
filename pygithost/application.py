@@ -152,13 +152,8 @@ def _pagination(base, params, page, has_next, *, total=None, per_page=25):
     summary = f"{total:,} results · Page {page:,} of {pages:,}" if total is not None else f"Page {page:,}"
     if total:
         summary = f"Showing {(page - 1) * per_page + 1:,}–{min(page * per_page, total):,} of {total:,} · Page {page:,} of {pages:,}"
-    hidden = join_html([html_t(t'<input type="hidden" name="{key}" value="{value}">') for key, value in params.items()])
-    options = join_html([html_t(t'<option value="{size}"{safe_html(" selected" if size == per_page else "")}>{size}</option>') for size in (10, 25, 50, 100)])
-    maximum = safe_html(html_t(t' max="{pages}"')) if pages is not None else safe_html("")
     return safe_html(html_t(t'''<nav class="pagination" aria-label="Pagination">
-<p class="pagination-summary" role="status">{summary}</p><div class="pagination-links">{join_html(links)}</div>
-<div class="pagination-options"><form method="GET" action="{base}" class="pagination-size">{hidden}<label>Rows per page <select name="per_page">{options}</select></label><button type="submit">Apply</button></form>
-<form method="GET" action="{base}" class="pagination-jump">{hidden}<input type="hidden" name="per_page" value="{per_page}"><label>Go to page <input name="page" type="number" min="1"{maximum} value="{page}" required></label><button type="submit">Go</button></form></div></nav>'''))
+<p class="pagination-summary" role="status">{summary}</p><div class="pagination-links">{join_html(links)}</div></nav>'''))
 
 
 def _paginate_items(items, url, base=None):
@@ -1999,8 +1994,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 kind = parts[1] if len(parts) >= 2 else "blob"
                 root_entries.append((kind, name))
         root_entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
-        root_entries, files_pagination, files_page = _paginate_items(root_entries, self.path)
-        overview = await repository_overview(owner, repo, repo_git, default_commit, root_entries, page=files_page, page_size=_page_size(parse_qs(urlparse(self.path).query or "")))
+        overview = await repository_overview(owner, repo, repo_git, default_commit, root_entries)
         latest = overview["latest"]
         latest_html = safe_html("")
         if latest:
@@ -2058,7 +2052,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch)}</div>
 <script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
 </div>
-<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div>{files_pagination}</div>
+<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div></div>
 {document_nav}{readme_html}{license_html}</div><aside class="repo-sidebar">{about_html}{language_html}</aside></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
@@ -3326,8 +3320,7 @@ form.addEventListener("change", update); update();
         # Show folders first, then files. Keep alphabetical order inside each group.
         entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
 
-        entries, pagination, page = _paginate_items(entries, self.path)
-        overview = await repository_overview(owner, repo, repo_git, commit, entries, subpath=subpath, page=page, page_size=_page_size(parse_qs(urlparse(self.path).query or "")))
+        overview = await repository_overview(owner, repo, repo_git, commit, entries, subpath=subpath)
         rows = []
         for kind, name in entries:
             if kind == "tree":
@@ -3351,7 +3344,7 @@ form.addEventListener("change", update); update();
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{_repo_breadcrumbs(owner, repo, ref, subpath)}<p class="muted">ref: <code>{ref}</code></p></div>
 <div>{_repo_code_menu(owner, repo, ref)}</div></div>
-{up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div>{pagination}</div>"""
+{up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 

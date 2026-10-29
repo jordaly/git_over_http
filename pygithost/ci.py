@@ -139,6 +139,15 @@ def validate_config(raw):
     script = raw.get("deploy_script", "")
     interpreter = raw.get("deploy_interpreter", "direct")
     deployment_prefix(interpreter)
+    content = raw.get("deploy_script_content", "")
+    if not isinstance(content, str) or "\0" in content or len(content.encode("utf-8")) > 65536:
+        raise ValueError("Deployment script must be UTF-8 text up to 64 KiB without NUL bytes.")
+    if content:
+        content = content.replace("\r\n", "\n")
+        if os.name != "nt" and not deployment_prefix(interpreter) and not content.startswith("#!"):
+            raise ValueError("Uploaded deployment scripts require a shebang, for example #!/bin/sh.")
+        # Pipeline-form validation must carry unsaved contents through to save_config.
+        defaults["deploy_script_content"] = content
     branch = raw.get("deploy_branch", "main")
     if not isinstance(script, str) or "\0" in script or len(script) > 4096 or (script and not os.path.isabs(script)):
         raise ValueError("Deployment script must be an absolute path outside the repository.")
@@ -149,8 +158,8 @@ def validate_config(raw):
         deploy_timeout = int(deploy_timeout)
     if type(deploy_timeout) is not int or not 1 <= deploy_timeout <= 86400:
         raise ValueError("Deployment timeout must be 1–86400 seconds.")
-    if raw.get("deploy_enabled", False) and not script:
-        raise ValueError("Automatic deployment requires a script path.")
+    if raw.get("deploy_enabled", False) and not script and not content:
+        raise ValueError("Automatic deployment requires a script path or new script contents.")
     defaults.update(deploy_enabled=raw.get("deploy_enabled", False), deploy_branch=branch,
                     deploy_script=script, deploy_timeout=deploy_timeout, deploy_interpreter=interpreter)
     timeout = raw.get("timeout_seconds", JOB_TIMEOUT)
@@ -487,6 +496,7 @@ class CIManager:
             path = Path(database.DB_PATH).resolve().parent / "deployment-scripts" / digest
             config = {**config, "deploy_script": str(path)}
         config = validate_config(config)
+        config.pop("deploy_script_content", None)
         if path is not None:
             def store_script():
                 path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

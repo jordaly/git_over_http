@@ -289,6 +289,24 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("Retention changes apply to existing data immediately.", page)
         self.assertIn('window.confirm("These retention limits may permanently delete', page)
 
+    def test_pasted_deployment_script_with_blank_path_saves_in_json_mode(self):
+        content = 'import sys\nprint("deploying", sys.argv[1])\n'
+        for mode in ("json", "command", "steps"):
+            status, page = self.request(self.base + "/ci/config", {
+                "pipeline_mode": mode,
+                "pipeline_json": json.dumps({"version": 1, "command": "echo tests"}),
+                "command": "echo tests" if mode == "command" else "",
+                "steps": json.dumps([{"name": "Test", "run": "echo tests"}]),
+                "deploy_enabled": "on", "deploy_script": "",
+                "deploy_interpreter": "python", "deploy_script_content": content,
+            })
+            self.assertEqual(status, 200)
+            self.assertIn("CI settings saved", page, mode)
+            saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
+            self.assertTrue(saved["deploy_enabled"])
+            self.assertEqual(Path(saved["deploy_script"]).read_text(), content)
+            self.assertNotIn("deploy_script_content", saved)
+
     def test_branch_to_pr_prefills_source_and_target(self):
         status, page = self.request(self.base + "/pulls?source=feature%2Fapi&target=main")
         self.assertEqual(status, 200)

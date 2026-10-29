@@ -1185,6 +1185,7 @@ class CIManager:
             return_code=rc,
             finished_at=datetime.now(timezone.utc).isoformat(),
             phase=phase,
+            warnings=cleanup_error or "",
             reason=("Cancelled by user or superseded." if cancelled and run_id in self.cancelled else
                     f"Interrupted during {phase}." if cancelled else
                     f"Timed out during {phase}." if status == "timed_out" else

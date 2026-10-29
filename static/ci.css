@@ -1,4 +1,7 @@
 /* CI layouts and components; shared typography/controls live in ui.css. */
+.ci-warning-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border: 1px solid var(--warn-border); border-radius: 6px; color: var(--warn-fg); background: var(--warn-bg); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.ci-warning-badge:hover { color: var(--warn-fg); text-decoration: underline; }
+.ci-warning-details { white-space: pre-wrap; margin: 6px 0 0; }
 .ci-page { display: grid; gap: 20px; padding-bottom: 40px; min-width: 0; }
 .ci-page .topbar { margin-bottom: 0; }
 .repo-navigation { min-width: 0; width: 100%; max-width: 1200px; margin-inline: auto; }

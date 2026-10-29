@@ -1590,7 +1590,7 @@ class GitHTTPHandler:
     # UI: Home / Tokens / Create Repo
     # ========================================================
     async def _ui_home(self, notice: str = "", notice_kind: str = "ok"):
-        all_repos = sorted(_scan_repos(GIT_PROJECT_ROOT), key=lambda item: (item[0].casefold(), item[1].casefold()))
+        all_repos = await _call_in_thread(lambda: sorted(_scan_repos(GIT_PROJECT_ROOT), key=lambda item: (item[0].casefold(), item[1].casefold())))
         params = parse_qs(urlparse(self.path).query or "")
         search = (params.get("q") or [""])[0].strip()[:128]
         repos = [item for item in all_repos if search.casefold() in f"{item[0]}/{item[1]} {item[2]}".casefold()]
@@ -1945,12 +1945,34 @@ class GitHTTPHandler:
         if not os.path.isdir(repo_git):
             return await self._not_found()
 
-        default_branch = await _git_default_branch(repo_git)
-        branches = await _git_list_branches(repo_git)
+        default_branch, branches = await asyncio.gather(
+            _git_default_branch(repo_git), _git_list_branches(repo_git))
         default_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
-        languages = await repository_languages(owner, repo, repo_git, default_commit)
+
+        async def load_files():
+            code, output, _ = await _run_git(repo_git, ["ls-tree", "-z", f"{default_commit or default_branch}:"])
+            entries = []
+            if code == 0:
+                for line in output.decode("utf-8", "replace").split("\0"):
+                    if "\t" not in line:
+                        continue
+                    metadata, name = line.split("\t", 1)
+                    parts = metadata.split()
+                    entries.append((parts[1] if len(parts) >= 2 else "blob", name))
+            entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
+            return entries, await repository_overview(owner, repo, repo_git, default_commit, entries)
+
+        languages, readme, latest_ci, tags_result, files = await asyncio.gather(
+            repository_languages(owner, repo, repo_git, default_commit),
+            _run_git(repo_git, ["show", f"{default_commit or default_branch}:README.md"]),
+            _call_in_thread(db_ci_latest_run, owner, repo, default_branch),
+            _run_git(repo_git, ["for-each-ref", "refs/tags", "--sort=-creatordate", "--format=%(refname:short)"]),
+            load_files(),
+        )
+        root_entries, overview = files
+        readme_code, readme_out, _ = readme
+        tag_code, tag_output, _ = tags_result
         language_html = _language_panel(languages, default_branch)
-        readme_code, readme_out, _ = await _run_git(repo_git, ["show", f"{default_commit or default_branch}:README.md"])
         readme_text = ""
         readme_html = safe_html("")
         if readme_code == 0:
@@ -1974,7 +1996,6 @@ document.addEventListener("DOMContentLoaded", function() {{
                 )
             )
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        latest_ci = await _call_in_thread(db_ci_latest_run, owner, repo, default_branch)
         if latest_ci:
             ci_status = latest_ci[1]
             current_commit = default_commit
@@ -1983,18 +2004,6 @@ document.addEventListener("DOMContentLoaded", function() {{
             ci_badge = safe_html(html_t(t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'))
         else:
             ci_badge = safe_html(html_t(t'<a class="pill" href="{base}/ci">CI: no runs</a>'))
-        tree_code, tree_out, _ = await _run_git(repo_git, ["ls-tree", "-z", f"{default_commit or default_branch}:"])
-        root_entries: list[tuple[str, str]] = []
-        if tree_code == 0:
-            for line in tree_out.decode("utf-8", "replace").split("\0"):
-                if "\t" not in line:
-                    continue
-                metadata, name = line.split("\t", 1)
-                parts = metadata.split()
-                kind = parts[1] if len(parts) >= 2 else "blob"
-                root_entries.append((kind, name))
-        root_entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
-        overview = await repository_overview(owner, repo, repo_git, default_commit, root_entries)
         latest = overview["latest"]
         latest_html = safe_html("")
         if latest:
@@ -2013,7 +2022,6 @@ document.addEventListener("DOMContentLoaded", function() {{
             changed_at = safe_html(html_t(t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>')) if change else safe_html("—")
             file_rows.append(html_t(t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'))
         files_html = join_html(file_rows) if file_rows else safe_html('<tr><td colspan="3" class="muted">No files on the default branch.</td></tr>')
-        tag_code, tag_output, _ = await _run_git(repo_git, ["for-each-ref", "refs/tags", "--sort=-creatordate", "--format=%(refname:short)"])
         tags = tag_output.decode("utf-8", "replace").splitlines() if tag_code == 0 else []
         tags_html = join_html([html_t(t'<li><a href="{base}/tree/{q(tag)}/">{tag}</a><a href="{base}/archive.zip?{urlencode({"ref": tag})}" aria-label="Download source for tag {tag}">ZIP ↓</a></li>') for tag in tags[:5]]) if tags else safe_html('<li class="muted">No tags yet.</li>')
         contributors = overview["contributors"]
@@ -2571,7 +2579,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         query_params = parse_qs(urlparse(getattr(self, "path", "")).query or "")
         filters = {
             key: (query_params.get(key) or [""])[0].strip()
-            for key in ("status", "event", "branch", "q")
+            for key in ("status", "event", "branch", "q", "warnings")
         }
         allowed_statuses = {"queued", "running", "success", "failed", "timed_out", "interrupted", "cancelled"}
         allowed_events = {"push", "pull_request", "pull_request_updated", "pull_request_reopened", "pull_request_merged", "manual"}
@@ -2579,18 +2587,21 @@ document.addEventListener("DOMContentLoaded", function() {{
             filters["status"] = ""
         if filters["event"] not in allowed_events:
             filters["event"] = ""
+        if filters["warnings"] not in ("yes", "no"):
+            filters["warnings"] = ""
         filters["q"] = filters["q"][:128]
         cursor = (query_params.get("before") or [""])[0]
         before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
         from .database import db_ci_runs_count
         size = _page_size(query_params)
-        total = await _call_in_thread(db_ci_runs_count, owner, repo, status=filters["status"], event=filters["event"], branch=filters["branch"], query=filters["q"], before=before)
+        total = await _call_in_thread(db_ci_runs_count, owner, repo, status=filters["status"], event=filters["event"], branch=filters["branch"], query=filters["q"], before=before, warnings=filters["warnings"])
         page = _clamp_page(_page_number(query_params), total, size)
         runs = await _call_in_thread(
             db_ci_runs_list, owner, repo, size,
             status=filters["status"], event=filters["event"],
             branch=filters["branch"], query=filters["q"],
             summary=True,
+            warnings=filters["warnings"], include_warnings=True,
             before=before,
             offset=(page - 1) * size,
         )
@@ -2599,10 +2610,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows = []
         for run in runs:
-            rows.append(html_t(t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1].replace("_", " ")}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
+            warning = safe_html(html_t(t'<a class="ci-warning-badge" href="{base}/ci/runs/{run[0]}#ci-run-warnings" title="{run[11]}"><span aria-hidden="true">⚠</span> Warning</a>')) if run[11] else safe_html('<span class="muted">—</span>')
+            rows.append(html_t(t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1].replace("_", " ")}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></td><td>{warning}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
         empty = "No runs match these filters." if any(filters.values()) else "No CI runs yet."
-        runs_html = join_html(rows) if rows else safe_html(html_t(t'<tr><td colspan="8" class="muted">{empty}</td></tr>'))
+        runs_html = join_html(rows) if rows else safe_html(html_t(t'<tr><td colspan="9" class="muted">{empty}</td></tr>'))
         filter_options = {
+            "warnings": [("", "All warnings"), ("yes", "With warnings"), ("no", "Without warnings")],
             "status": [("", "All statuses"), ("queued", "Queued"), ("running", "Running"),
                 ("success", "Success"), ("failed", "Failed"), ("timed_out", "Timed out"), ("interrupted", "Interrupted"), ("cancelled", "Cancelled")],
             "event": [("", "All events"), ("push", "Push"), ("pull_request", "PR opened"),
@@ -2626,11 +2639,12 @@ document.addEventListener("DOMContentLoaded", function() {{
 <input type="hidden" name="per_page" value="{size}">
 <input aria-label="Search runs" name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
 <select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
+<select aria-label="Warnings" name="warnings">{options_html["warnings"]}</select>
 <select aria-label="Branch" name="branch">{branch_options}</select><button type="submit">Filter runs</button>
 <a class="pill" href="{base}/ci">Clear filters</a></form></div>'''))
         pagination = _pagination(base + "/ci", {**{key: value for key, value in filters.items() if value}, **({"before": before} if before is not None else {})}, page, has_next, total=total, per_page=size)
         results_html = safe_html(html_t(t'''<div id="ci-results">
-<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>'''))
+<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Warnings</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>'''))
         if partial:
             return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
@@ -2689,10 +2703,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         active = active or bool(deployment_email and deployment_email[6] in ("queued", "sending"))
         active = active or bool(run[4] == "success" and run_id in self.server.ci_manager.active)
         artifact_html = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>')) if artifact_size else safe_html("")
-        reason_html = safe_html(html_t(t'<p class="warn" role="status">{waiting or meta["reason"]}</p>')) if waiting or meta["reason"] else safe_html("")
+        reason = waiting or meta["reason"]
+        reason_html = safe_html(html_t(t'<p class="warn" role="status">{reason}</p>')) if reason and reason != meta["warnings"] else safe_html("")
+        warning_html = safe_html(html_t(t'<div id="ci-run-warnings" class="warn" role="status"><strong>Run warnings</strong><p class="ci-warning-details">{meta["warnings"]}</p></div>')) if meta["warnings"] else safe_html("")
         result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
 <section class="box ci-run-overview" aria-label="Run summary"><div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
-{reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
+{warning_html}{reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
 <details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
 <pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details>{deployment_html}</div>'''))

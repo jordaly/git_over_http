@@ -64,6 +64,10 @@ The integration tests use the real `git-http-backend` and bind a loopback port.
 
 - The home page searches repository names, owners, and paths with the search box.
   Search is case-insensitive and works without JavaScript; its URL can be bookmarked.
+  Filesystem discovery runs off the request loop so a slow disk scan does not
+  block other requests. Repository overviews load independent Git metadata,
+  README, language estimates, and CI status concurrently; commit-keyed metadata
+  caches remain in use, while branch/tag and CI status reads stay live.
 - Repository tabs keep **Code**, **Branches**, **Pull requests**, **CI**, and
   **Artifacts** accessible while browsing files, commits, and pull requests.
 - The Code overview shows the latest commit's author, message, short SHA, and
@@ -312,6 +316,14 @@ follow/copy/download controls, queue wait, duration, phase, failure reason, and
 email status. Commands plus checkout/merge have a shared 30-minute timeout.
 Cleanup has a separate bounded timeout; cleanup warnings do not overwrite a
 successful command result.
+
+Runs with recorded cleanup or metadata-save warnings show a **Warning** badge in
+the CI Runs table. Click it to view the warning on the run detail page. Under
+**Find runs**, choose **With warnings** or **Without warnings**; this combines with
+status, event, branch, and search filters and is preserved during pagination and
+live refresh. Warnings are separate from success/failure and deployment skip
+reasons. Arbitrary warning text printed by your commands is not automatically
+classified. Existing cleanup warnings in stored run reasons are migrated.
 
 Only one job per repository runs at once. Server environment settings:
 

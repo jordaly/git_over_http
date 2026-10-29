@@ -157,9 +157,15 @@ def _db_init() -> None:
             overview_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY(owner,repo,commit_hash))""")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(ci_runs)")}
-        for name in ("config_json", "phase", "reason", "notification"):
+        for name in ("config_json", "phase", "reason", "notification", "warnings"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE ci_runs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+                if name == "warnings":
+                    conn.execute("""UPDATE ci_runs SET warnings=reason WHERE
+                        reason LIKE 'Temporary directory cleanup failed:%' OR
+                        reason LIKE 'Container cleanup failed:%' OR
+                        reason LIKE 'Container cleanup failed;%' OR
+                        reason LIKE 'Step metadata could not be saved:%'""")
         conn.execute("""CREATE TABLE IF NOT EXISTS ci_steps (
             run_id INTEGER PRIMARY KEY REFERENCES ci_runs(id) ON DELETE CASCADE,
             steps_json TEXT NOT NULL)""")
@@ -852,7 +858,7 @@ def db_ci_run_create(owner: str, repo: str, event: str, branch: str, commit_hash
 
 
 def db_ci_run_update(run_id: int, **values) -> None:
-    allowed = {"status", "output", "truncated", "return_code", "started_at", "finished_at", "phase", "reason", "notification"}
+    allowed = {"status", "output", "truncated", "return_code", "started_at", "finished_at", "phase", "reason", "notification", "warnings"}
     values = {key: val for key, val in values.items() if key in allowed}
     if not values:
         return
@@ -868,10 +874,12 @@ def db_ci_run_update(run_id: int, **values) -> None:
         conn.close()
 
 
-def db_ci_runs_count(owner, repo, *, status="", event="", branch="", query="", before=None):
+def db_ci_runs_count(owner, repo, *, status="", event="", branch="", query="", before=None, warnings=""):
     conn = _db_connect()
     try:
         conditions, params = ["owner=?", "repo=?"], [owner, repo]
+        if warnings in ("yes", "no"):
+            conditions.append("warnings!=''" if warnings == "yes" else "warnings=''")
         if before is not None:
             conditions.append("id<?")
             params.append(before)
@@ -901,11 +909,15 @@ def db_ci_runs_list(
     summary: bool = False,
     before: int | None = None,
     offset: int = 0,
+    warnings: str = "",
+    include_warnings: bool = False,
 ):
     conn = _db_connect()
     try:
         conditions = ["owner=?", "repo=?"]
         params = [owner, repo]
+        if warnings in ("yes", "no"):
+            conditions.append("warnings!=''" if warnings == "yes" else "warnings=''")
         if before is not None:
             conditions.append("id<?")
             params.append(before)
@@ -926,7 +938,7 @@ def db_ci_runs_list(
         params.append(max(0, int(offset)))
         output_column = "''" if summary else "output"
         return conn.execute(
-            f"SELECT id,event,branch,commit_hash,status,{output_column},truncated,return_code,created_at,started_at,finished_at "
+            f"SELECT id,event,branch,commit_hash,status,{output_column},truncated,return_code,created_at,started_at,finished_at{',warnings' if include_warnings else ''} "
             f"FROM ci_runs WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -945,8 +957,8 @@ def db_ci_run_get(owner: str, repo: str, run_id: int):
 def db_ci_run_metadata(owner: str, repo: str, run_id: int):
     conn = _db_connect()
     try:
-        row = conn.execute("SELECT payload_json,config_json,phase,reason,notification FROM ci_runs WHERE owner=? AND repo=? AND id=?", (owner, repo, run_id)).fetchone()
-        return dict(zip(("payload", "config", "phase", "reason", "notification"), row)) if row else None
+        row = conn.execute("SELECT payload_json,config_json,phase,reason,notification,warnings FROM ci_runs WHERE owner=? AND repo=? AND id=?", (owner, repo, run_id)).fetchone()
+        return dict(zip(("payload", "config", "phase", "reason", "notification", "warnings"), row)) if row else None
     finally:
         conn.close()
 

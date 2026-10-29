@@ -92,6 +92,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
                 await manager._execute(row)
         self.assertEqual(database.db_ci_run_get("owner", "repo", row[0])[4], "success")
         self.assertIn("cleanup denied", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
+        self.assertIn("cleanup denied", database.db_ci_run_metadata("owner", "repo", row[0])["warnings"])
 
     async def test_cleanup_timeout_reports_limit_and_directory(self):
         manager = self.manager()

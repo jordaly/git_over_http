@@ -60,6 +60,7 @@ def ci_configuration_guide():
 <li>Docker steps start separate containers. Only files in the checkout persist between containers; container <code>/tmp</code> and other container state do not.</li>
 <li>A nonzero exit code fails the step and skips later steps. Test output and JUnit reports are not parsed.</li>
 <li>Each step has its own status, exit code, duration, and output. Combined run output is limited to 1 MiB; the run page provides a raw-log download.</li></ul>
+<p><b>Run warnings:</b> cleanup and step-metadata-save issues show a separate Warning badge in the Runs table, even when tests pass. Click the badge for details. In Find runs, select With warnings or Without warnings; the selection combines with other filters and survives pagination/live refresh. Warnings remain visible independently of deployment skip reasons. The server does not classify arbitrary command output as warnings.</p>
 </details>
 
 <details><summary>Jinja-style environment placeholders</summary>

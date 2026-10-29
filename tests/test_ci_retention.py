@@ -90,3 +90,28 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(database.db_ci_runs_count("owner", "repo", query="a" * 40), 6)
         self.assertEqual(database.db_ci_runs_count("owner", "repo", query="%"), 0)
         self.assertEqual(database.db_ci_runs_count("owner", "repo", before=ids[2]), 2)
+
+    def test_warning_filters_and_counts_are_independent_of_result(self):
+        self.config(run_retention_count=0)
+        warning = self.create_run(artifacts=False)
+        clean = self.create_run(artifacts=False)
+        database.db_ci_run_update(warning, warnings="Temporary directory cleanup failed: locked")
+        database.db_ci_run_update(warning, reason="Deployment skipped: manual run")
+        self.assertEqual(database.db_ci_runs_count("owner", "repo", status="success", warnings="yes"), 1)
+        self.assertEqual(database.db_ci_runs_count("owner", "repo", warnings="no"), 1)
+        rows = database.db_ci_runs_list("owner", "repo", warnings="yes", summary=True, include_warnings=True)
+        self.assertEqual([row[0] for row in rows], [warning])
+        self.assertIn("locked", rows[0][11])
+        self.assertEqual([row[0] for row in database.db_ci_runs_list("owner", "repo", warnings="no")], [clean])
+        self.assertIn("locked", database.db_ci_run_metadata("owner", "repo", warning)["warnings"])
+
+    def test_existing_cleanup_reasons_migrate_to_warning_field(self):
+        run_id = self.create_run(artifacts=False)
+        database.db_ci_run_update(run_id, reason="Temporary directory cleanup failed: old warning")
+        conn = database._db_connect()
+        try:
+            conn.execute("ALTER TABLE ci_runs DROP COLUMN warnings")
+        finally:
+            conn.close()
+        database._db_init()
+        self.assertIn("old warning", database.db_ci_run_metadata("owner", "repo", run_id)["warnings"])

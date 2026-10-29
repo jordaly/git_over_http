@@ -62,6 +62,9 @@ These lists default to **25 entries per page**:
 
 - **Home → Repositories:** sorted by owner and repository name; search is preserved.
 - **CI → Runs:** newest run first; status, event, branch, and text filters are preserved.
+  The Warnings filter supports all runs, only runs with warnings, or only runs
+  without warnings. Click a Warning badge to inspect the recorded issue. Warnings
+  do not change a successful run into a failure.
 - **CI → Deployments:** newest attempt first, independent of retained CI history.
 - **Artifacts:** newest run's archive first; age/count policies still apply.
 - **Tokens** and **Admin → Users:** paginated management tables. The password-reset

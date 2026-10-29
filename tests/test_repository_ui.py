@@ -1,3 +1,4 @@
+import asyncio
 import http.client
 import io
 import json
@@ -10,7 +11,7 @@ import zipfile
 from unittest import mock
 from urllib.parse import urlencode
 
-from pygithost import database
+from pygithost import application, database
 from pygithost.application import FLAT_OWNER_UI
 from tests.test_server import ServerRunner, _which_git_backend
 
@@ -80,6 +81,35 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("No matching repositories", page)
         _, page = self.request("/?" + urlencode({"q": '\"><script>alert(1)</script>'}))
         self.assertNotIn("<script>alert(1)</script>", page)
+
+    def test_home_filesystem_scan_does_not_block_the_request_loop(self):
+        def scan(_root):
+            with self.assertRaises(RuntimeError):
+                asyncio.get_running_loop()
+            return [(FLAT_OWNER_UI, "project", "project.git")]
+        with mock.patch("pygithost.application._scan_repos", side_effect=scan):
+            status, page = self.request("/")
+        self.assertEqual(status, 200)
+        self.assertIn(self.base, page)
+
+    def test_repository_page_reads_independent_metadata_concurrently(self):
+        original = application._run_git
+        active, peak = 0, 0
+        async def tracked(*args, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.01)
+                return await original(*args, **kwargs)
+            finally:
+                active -= 1
+        with mock.patch("pygithost.application._run_git", side_effect=tracked):
+            status, page = self.request(self.base)
+        self.assertEqual(status, 200)
+        self.assertIn("README.md", page)
+        self.assertIn("Last commit message", page)
+        self.assertGreaterEqual(peak, 3)
 
     def test_branches_show_metadata_filters_and_safe_actions(self):
         status, page = self.request(self.base + "/branches")
@@ -274,6 +304,32 @@ class RepositoryUITests(unittest.TestCase):
             self.assertNotIn('rel="next"', second)
         _, page = self.request(self.base + "/ci?status=success&page=2")
         self.assertIn("status=success&amp;page=1", page)
+
+    def test_run_warning_badges_filters_pagination_and_details(self):
+        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
+        warning_ids = []
+        for _ in range(28):
+            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}")
+            database.db_ci_run_update(run_id, status="success", warnings="Cleanup failed: <script>unsafe</script>", reason="Deployment skipped: example")
+            warning_ids.append(run_id)
+        clean = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}")
+        database.db_ci_run_update(clean, status="success")
+        _, first = self.request(self.base + "/ci?warnings=yes&status=success")
+        self.assertIn('class="ci-warning-badge"', first)
+        self.assertIn("warnings=yes", first)
+        self.assertIn("of 28", first)
+        self.assertNotIn(f'class="ci-run-link" href="{self.base}/ci/runs/{clean}"', first)
+        _, second = self.request(self.base + "/ci?warnings=yes&status=success&page=2&partial=1")
+        self.assertIn("Page 2", second)
+        self.assertIn("warnings=yes", second)
+        _, without = self.request(self.base + "/ci?warnings=no")
+        self.assertNotIn('class="ci-warning-badge"', without)
+        self.assertIn(f'class="ci-run-link" href="{self.base}/ci/runs/{clean}"', without)
+        _, detail = self.request(self.base + f"/ci/runs/{warning_ids[0]}")
+        self.assertIn('id="ci-run-warnings"', detail)
+        self.assertIn("Deployment skipped: example", detail)
+        self.assertIn("&lt;script&gt;unsafe&lt;/script&gt;", detail)
+        self.assertNotIn("<script>unsafe</script>", detail)
 
     def test_retention_settings_are_saved_from_website(self):
         status, page = self.request(self.base + "/ci/config", {

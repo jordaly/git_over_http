@@ -26,7 +26,7 @@ def ci_configuration_guide():
     return safe_html(html_t(t'''<section id="ci-configuration-guide" class="box ci-guide" aria-labelledby="ci-guide-heading">
 <h2 id="ci-guide-heading">CI configuration guide</h2>
 <p>On the <b>Settings</b> tab, choose <b>Single command</b>, <b>Named steps</b>, or <b>JSON in page</b> and use the same <b>Save CI settings</b> button. You can also enable a versioned <code>.pygithost-ci.json</code> file. Everything uses standard JSON: double-quoted strings, no comments, and no trailing commas.</p>
-<nav class="row" aria-label="CI guide sections"><a href="#ci-guide-start">Quick start</a><a href="#ci-guide-json">JSON reference</a><a href="#ci-guide-settings">Server settings</a><a href="#ci-guide-deployment">Deployment</a><a href="#ci-guide-variables">Variables</a></nav>
+<nav class="row" aria-label="CI guide sections"><a href="#ci-guide-start">Quick start</a><a href="#ci-guide-json">JSON reference</a><a href="#ci-guide-settings">Server settings</a><a href="#ci-guide-retention">Retention</a><a href="#ci-guide-deployment">Deployment</a><a href="#ci-guide-variables">Variables</a></nav>
 
 <details id="ci-guide-start" open><summary>Quick start: configure a pipeline</summary>
 <ol><li>Choose a runner and ensure the required tools are installed. Host runs use the server machine; Docker runs use an image already available locally.</li>
@@ -79,7 +79,20 @@ def ci_configuration_guide():
 <li>Files are collected before checkout cleanup and offered as one ZIP on the run page. Content is not interpreted, including test reports.</li>
 <li>Limits: 32 patterns, 256 characters per pattern, 1000 files, 10,000 matched entries, and 20 MiB total uncompressed content per run. Collection errors or limit violations fail the run.</li>
 <li>Absolute paths, parent traversal, and <code>.git</code> paths are rejected/excluded. Symlinks, junctions, and hardlinks are not collected.</li>
-<li>Downloads use the same access controls as CI logs. Archives expire after 7 days, or earlier when the run is pruned.</li></ul>
+<li>Downloads use the same access controls as CI logs. Retention defaults to 7 days and can be changed in <b>Additional settings → Artifact and run retention</b>. Retained archives protect their run records from pruning.</li></ul>
+</details>
+
+<details id="ci-guide-retention" open><summary>Artifact expiration, storage limits, and pagination</summary>
+<p>Administrators configure these repository-level policies under <b>Settings → Additional settings → Artifact and run retention</b>. They cannot be set in repository pipeline JSON. These are current storage policies, not frozen per-run settings.</p>
+<div class="ci-table-scroll"><table><thead><tr><th>Setting</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>Artifact expiration (days)</td><td>7</td><td>Whole days from archive creation; 0 means never expire by age. Maximum 36500.</td></tr>
+<tr><td>Maximum artifact bundles</td><td>0</td><td>One bundle is one run's ZIP, not one file. Keep the newest N runs' bundles; 0 means unlimited. Maximum 1000000.</td></tr>
+<tr><td>Completed CI runs to retain</td><td>100, or server default</td><td>Keep the newest N completed runs; 0 means unlimited. Maximum 1000000. Runs with retained artifacts, active runs, and pending notifications are protected.</td></tr>
+</tbody></table></div>
+<p><b>Examples:</b> 30 days and 50 bundles keeps at most the newest 50 bundles, none older than 30 days. To retain artifacts forever, set <b>both</b> artifact values to 0. To retain run history forever too, set completed-run retention to 0. Protected artifact-bearing runs can make the run total exceed its limit.</p>
+<p class="warn">Saving applies to existing archives and completed runs immediately. Reducing limits can permanently delete data; increasing them cannot restore it. Unlimited retention can fill the server disk. SQLite may reuse freed pages without shrinking the database file.</p>
+<p>Expiration cleanup runs at startup, artifact access/collection, and run/configuration pruning; it is not an exact-time background timer. Expiration dates on the Artifacts page reflect the current age policy, while count limits may remove a bundle earlier. With age expiration disabled, the page shows <b>Never expires</b>; a nonzero count limit can still remove it.</p>
+<p>The repository home list, <b>CI → Runs</b>, and <b>CI → Deployments</b> show 25 entries per page with <b>Previous</b>, <b>Next</b>, and the current page number. Repository search and run filters survive page changes; submitting a new search/filter starts at page 1. Running jobs and newly created entries may shift page contents on refresh. Skipped deployments do not create history entries. Deployment history is not deleted by CI run retention.</p>
 </details>
 
 <details id="ci-guide-settings"><summary>Server-controlled settings and triggers</summary>

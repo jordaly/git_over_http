@@ -101,6 +101,23 @@ def _relative_time(value):
     return "just now"
 
 
+def _page_number(params):
+    value = (params.get("page") or ["1"])[0]
+    return max(1, min(1000000, int(value))) if value.isascii() and value.isdecimal() and len(value) <= 7 else 1
+
+
+def _pagination(base, params, page, has_next):
+    links = []
+    if page > 1:
+        previous = base + "?" + urlencode({**params, "page": page - 1})
+        links.append(html_t(t'<a class="pill" rel="prev" href="{previous}">← Previous</a>'))
+    links.append(html_t(t'<span class="muted">Page {page}</span>'))
+    if has_next:
+        following = base + "?" + urlencode({**params, "page": page + 1})
+        links.append(html_t(t'<a class="pill" rel="next" href="{following}">Next →</a>'))
+    return safe_html(html_t(t'<nav class="row" aria-label="Pagination">{join_html(links)}</nav>'))
+
+
 def _ci_tabs(base, active):
     links = []
     for key, suffix, label in (("runs", "/ci", "Runs"), ("deployments", "/ci/deployments", "Deployments"), ("settings", "/ci/config", "Settings"), ("docs", "/ci/docs", "Documentation")):
@@ -1525,6 +1542,10 @@ class GitHTTPHandler:
         params = parse_qs(urlparse(self.path).query or "")
         search = (params.get("q") or [""])[0].strip()[:128]
         repos = [item for item in all_repos if search.casefold() in f"{item[0]}/{item[1]} {item[2]}".casefold()]
+        total = len(repos)
+        page = min(_page_number(params), max(1, (total + 24) // 25))
+        repos = repos[(page - 1) * 25:page * 25]
+        pagination = _pagination("/", {"q": search} if search else {}, page, page * 25 < total)
 
         rows = []
         for owner, repo, rel in repos:
@@ -1562,7 +1583,7 @@ class GitHTTPHandler:
 <p class="muted" style="margin:10px 0 0 0">Create requires <code>write</code> scope.</p>
 </form>
 </details>
-<section class="box repo-list"><div class="repo-panel-heading"><h2>{len(repos)} {"matching repositories" if search else "repositories"}</h2><span class="muted">{len(all_repos)} total</span></div>{rows_html}</section></main>"""
+<section class="box repo-list"><div class="repo-panel-heading"><h2>{total} {"matching repositories" if search else "repositories"}</h2><span class="muted">{len(all_repos)} total</span></div>{rows_html}{pagination}</section></main>"""
         )
         await _send_html(self.request, 200, _html_page("Repos", safe_html(body)))
 
@@ -2451,7 +2472,8 @@ document.addEventListener("DOMContentLoaded", function() {{
             params = parse_qs(urlparse(self.path).query or "")
             value = (params.get("before") or [""])[0]
             before = int(value) if value.isascii() and value.isdecimal() and len(value) < 19 else 0
-            rows = await _call_in_thread(db_deployments_list, owner, repo, before, 26)
+            page = _page_number(params)
+            rows = await _call_in_thread(db_deployments_list, owner, repo, before, 26, (page - 1) * 25)
         entries = []
         for row in rows[:25]:
             identity, run_id, commit, status, started, finished, notification, raw, retained = row[:9]
@@ -2463,7 +2485,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <p>Branch: <code>{branch}</code> · Commit: <a href="{base}/commit/{q(commit)}"><code>{commit}</code></a></p>
 <p class="muted">Started: {started} · Finished: {finished or "—"} · Duration: {_ci_elapsed(started, finished)} · Email: {notification or "not queued"}</p>{run_link}{logs}</section>'''))
         listing = join_html(entries) if entries else safe_html('<section class="box"><h2>No deployments yet</h2><p>Deployment attempts appear here after matching CI succeeds. Skipped deployments are not recorded.</p></section>')
-        older = safe_html(html_t(t'<a class="pill" href="{base}/ci/deployments?before={rows[24][0]}">Older deployments →</a>')) if deployment_id is None and len(rows) > 25 else safe_html("")
+        older = _pagination(base + "/ci/deployments", {"before": before} if before else {}, page, len(rows) > 25) if deployment_id is None else safe_html("")
         body = html_t(t'''{_ci_tabs(base, "deployments")}<div class="topbar"><h2>Deployment history</h2><a class="pill" href="{base}/ci/deployments">Latest deployments</a></div>
 <p class="muted">Deployment results are separate from CI results. Open a deployment for output. Refresh to update running attempts and email delivery.</p>
 <p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs#ci-guide-deployment">Deployment documentation</a></p>{listing}{older}''')
@@ -2489,13 +2511,17 @@ document.addEventListener("DOMContentLoaded", function() {{
         filters["q"] = filters["q"][:128]
         cursor = (query_params.get("before") or [""])[0]
         before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
+        page = _page_number(query_params)
         runs = await _call_in_thread(
-            db_ci_runs_list, owner, repo, 100,
+            db_ci_runs_list, owner, repo, 26,
             status=filters["status"], event=filters["event"],
             branch=filters["branch"], query=filters["q"],
             summary=True,
             before=before,
+            offset=(page - 1) * 25,
         )
+        has_next = len(runs) > 25
+        runs = runs[:25]
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows = []
@@ -2528,10 +2554,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
 <select aria-label="Branch" name="branch">{branch_options}</select><button type="submit">Filter runs</button>
 <a class="pill" href="{base}/ci">Clear filters</a></form></div>'''))
-        pagination = safe_html("")
-        if len(runs) == 100:
-            older_query = urlencode({**{key: value for key, value in filters.items() if value}, "before": runs[-1][0]})
-            pagination = safe_html(html_t(t'<a class="pill" href="{base}/ci?{older_query}">Older runs</a>'))
+        pagination = _pagination(base + "/ci", {**{key: value for key, value in filters.items() if value}, **({"before": before} if before is not None else {})}, page, has_next)
         results_html = safe_html(html_t(t'''<div id="ci-results">
 <div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>'''))
         if partial:
@@ -2722,7 +2745,13 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 <p class="muted">These switches are independent and off by default. Enable both to require PRs and passing CI. Local filesystem/SSH access is outside this HTTP server's control.</p></section>
 <section class="box ci-setting-section" aria-labelledby="ci-extras-heading"><h2 id="ci-extras-heading"><span class="ci-section-number">5</span> Additional settings</h2>
 <details class="ci-optional"{safe_html(" open" if env_text else "")}><summary>Environment variables</summary><label for="ci-env">KEY=value, one per line</label><textarea id="ci-env" name="env" placeholder="PYTHONUNBUFFERED=1" spellcheck="false">{env_text}</textarea><p class="muted">Not a secret store: values are saved in plaintext snapshots and are not redacted from logs. Built-in CI variables cannot be overridden.</p></details>
-<details class="ci-optional"{safe_html(" open" if artifact_paths else "")}><summary>Downloadable artifacts</summary><label for="ci-artifacts">File patterns, relative to checkout</label><textarea id="ci-artifacts" name="artifact_paths" placeholder="dist/*&#10;reports/**/*.xml">{artifact_paths}</textarea><label for="ci-artifact-when">Collect after</label><select id="ci-artifact-when" name="artifact_when">{artifact_options}</select><p class="muted">One pattern per line. ZIP download only; no test-output parsing. Maximum 20 MiB / 1000 files per run. Retained for 7 days or until run deletion.</p></details>
+<details class="ci-optional"{safe_html(" open" if artifact_paths else "")}><summary>Downloadable artifacts</summary><label for="ci-artifacts">File patterns, relative to checkout</label><textarea id="ci-artifacts" name="artifact_paths" placeholder="dist/*&#10;reports/**/*.xml">{artifact_paths}</textarea><label for="ci-artifact-when">Collect after</label><select id="ci-artifact-when" name="artifact_when">{artifact_options}</select><p class="muted">One pattern per line. ZIP download only; no test-output parsing. Maximum 20 MiB / 1000 files per run. Retention is configured below.</p></details>
+<details class="ci-optional"><summary>Artifact and run retention</summary>
+<label for="artifact-retention-days">Artifact expiration (days; 0 = never expire)</label><input id="artifact-retention-days" type="number" name="artifact_retention_days" min="0" max="36500" required value="{config.get('artifact_retention_days', 7)}">
+<label for="artifact-retention-count">Maximum artifact bundles (0 = unlimited)</label><input id="artifact-retention-count" type="number" name="artifact_retention_count" min="0" max="1000000" required value="{config.get('artifact_retention_count', 0)}">
+<label for="run-retention-count">Completed CI runs to retain (0 = unlimited)</label><input id="run-retention-count" type="number" name="run_retention_count" min="0" max="1000000" required value="{config.get('run_retention_count', ci_default_config()['run_retention_count'])}">
+<p class="muted">One artifact bundle is one run's ZIP, not an individual file. Expiration and count limits both apply; set both artifact limits to 0 to keep artifacts forever. Oldest bundles (by run ID) are removed first. Runs with retained artifacts, active runs, and pending notifications are protected, so the run limit may be exceeded.</p>
+<p class="warn">Saving applies retention to existing data immediately. Lower limits can permanently delete old artifacts and completed runs; increasing limits cannot restore them. Unlimited retention can fill server storage.</p></details>
 <details class="ci-optional"{safe_html(" open" if config.get("email_mode", "off") != "off" else "")}><summary>Email notifications</summary><label for="ci-email-mode">Send notifications</label><select id="ci-email-mode" name="email_mode">{email_options}</select><div id="ci-email-settings"><label for="ci-email-recipients">Recipients, one address per line</label><textarea id="ci-email-recipients" name="email_recipients" placeholder="team@example.com">{config.get("email_recipients", "")}</textarea><p class="muted">{smtp_status} <a href="/admin/email">Server email settings</a>. Emails contain metadata, not logs or environment values.</p></div></details></section>
 <section class="box ci-setting-section"><h2>Automatic deployment</h2>
 <p class="muted"><a href="{base}/ci/docs#ci-guide-deployment">Deployment setup, script examples, security, and troubleshooting</a></p>
@@ -2738,9 +2767,12 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 <label>Deployment timeout (seconds)</label><input type="number" name="deploy_timeout" min="1" max="86400" value="{config.get('deploy_timeout', 600)}">
 <p class="warn">Trusted script runs on the Git server as its OS user, outside Docker, with network access. Keep it outside repositories and protect it from job writes. No secret redaction. Credentials belong in protected server files, not CI settings.</p>
 <p class="muted">Enable Push and/or PR merged triggers above. Only successful updates of this branch deploy, and only while the tested commit is still its tip. PR checks and manual runs do not deploy. The script receives the exact commit as its first argument and PYGITHOST_COMMIT. One attempt per commit; no automatic retries or rollback.</p></section>
-<div class="ci-save-bar"><span class="muted">Changes apply to new runs.<br>Disabling deployment also prevents pending deployments.</span><button type="submit">Save CI settings <span aria-hidden="true">→</span></button></div></form></div>
+<p class="warn" role="note"><strong>Retention changes can permanently delete data.</strong> Saving lower artifact expiration, artifact count, or completed-run limits applies to existing data immediately. Deleted artifacts and runs cannot be restored by increasing the limits. A value of 0 disables that limit; unlimited retention can fill the server disk.</p>
+<div class="ci-save-bar"><span class="muted">Pipeline changes apply to new runs.<br>Retention changes apply to existing data immediately.<br>Disabling deployment also prevents pending deployments.</span><button type="submit">Save CI settings <span aria-hidden="true">→</span></button></div></form></div>
 <script>(function() {{
 const form = document.getElementById("ci-settings-form");
+const retentionNames = ["artifact_retention_days", "artifact_retention_count", "run_retention_count"];
+const originalRetention = Object.fromEntries(retentionNames.map(name => [name, Number(form.elements[name].value)]));
 const upload = document.getElementById("deploy-script-upload");
 let readingScript = false;
 upload.addEventListener("change", async () => {{
@@ -2755,7 +2787,14 @@ upload.addEventListener("change", async () => {{
  }} catch (_) {{ status.textContent = "Could not read script as UTF-8."; }}
  finally {{ readingScript = false; }}
 }});
-form.addEventListener("submit", event => {{ if (readingScript) {{ event.preventDefault(); }} }});
+form.addEventListener("submit", event => {{
+ if (readingScript) {{ event.preventDefault(); return; }}
+ const stricter = retentionNames.some(name => {{
+  const value = Number(form.elements[name].value), previous = originalRetention[name];
+  return Number.isFinite(value) && value > 0 && (previous === 0 || value < previous);
+ }});
+ if (stricter && !window.confirm("These retention limits may permanently delete existing CI artifacts and completed runs immediately. Increasing limits later cannot restore deleted data. Save changes?")) event.preventDefault();
+}});
 function update() {{
  const repository = form.elements.repository_config.checked;
  document.getElementById("ci-server-pipeline").hidden = repository;
@@ -2815,6 +2854,9 @@ form.addEventListener("change", update); update();
             **({"pipeline_text": form.get("pipeline_json", "")} if form.get("pipeline_mode") == "json" else {}),
             "artifacts": {"paths": [line.strip() for line in form.get("artifact_paths", "").splitlines() if line.strip()], "when": form.get("artifact_when", "always")},
             "timeout_seconds": form.get("timeout_seconds", "1800"),
+            "artifact_retention_days": form.get("artifact_retention_days", "7"),
+            "artifact_retention_count": form.get("artifact_retention_count", "0"),
+            "run_retention_count": form.get("run_retention_count", str(ci_default_config()["run_retention_count"])),
             "push_branches": form.get("push_branches", ""), "pr_branches": form.get("pr_branches", ""),
             "events": {key: f"event_{key}" in form for key in ci_default_config()["events"]}}
         env = {}
@@ -2910,7 +2952,7 @@ form.addEventListener("change", update); update();
             size_label = f"{size / (1024 * 1024):.1f} MiB" if size >= 1024 * 1024 else f"{size / 1024:.1f} KiB"
             rows.append(html_t(t'''<tr><td><a class="ci-artifact-name" href="{base}/ci/runs/{run_id}/artifacts">ci-{run_id}-artifacts.zip</a><div class="muted">{size_label} · Created {created} UTC</div></td>
 <td><a href="{base}/ci/runs/{run_id}">Run #{run_id}</a> <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span><div class="muted">{branch or "—"} · <code>{commit[:8]}</code> · {event.replace("_", " ")}</div></td>
-<td><span class="muted">Expires {expires} UTC</span></td><td><a class="pill" href="{base}/ci/runs/{run_id}/artifacts" aria-label="Download artifacts from run {run_id}">Download ZIP ↓</a></td></tr>'''))
+<td><span class="muted">{("Expires " + expires + " UTC") if expires else "Never expires"}</span></td><td><a class="pill" href="{base}/ci/runs/{run_id}/artifacts" aria-label="Download artifacts from run {run_id}">Download ZIP ↓</a></td></tr>'''))
         if rows:
             listing = safe_html(html_t(t'<div class="ci-table-scroll"><table><thead><tr><th scope="col">Archive</th><th scope="col">Source run</th><th scope="col">Retention</th><th scope="col">Download</th></tr></thead><tbody>{join_html(rows)}</tbody></table></div>'))
         else:
@@ -2920,7 +2962,7 @@ form.addEventListener("change", update); update();
             pagination = safe_html(html_t(t'<a class="pill" href="{base}/artifacts?before={artifacts[49][0]}">Older artifacts →</a>'))
         back = safe_html(html_t(t'<a class="pill" href="{base}/artifacts">Newest artifacts</a>')) if before else safe_html("")
         body = safe_html(html_t(t'''<main class="ci-page">{_repo_tabs(base, "artifacts")}<div class="topbar"><div><h2>Artifacts</h2><p class="muted">Build outputs from your CI runs, ready to download.</p></div><a class="pill" href="{base}/ci/config">Artifact settings</a></div>
-<section class="box ci-artifacts-panel"><div class="ci-section-heading"><h2>Available downloads</h2><span class="muted">Retained for 7 days or until the run is pruned</span></div>{listing}<div class="row">{back}{pagination}</div></section></main>'''))
+<section class="box ci-artifacts-panel"><div class="ci-section-heading"><h2>Available downloads</h2><span class="muted">Retention configured in CI settings; count limits also apply</span></div>{listing}<div class="row">{back}{pagination}</div></section></main>'''))
         return await _send_html(self.request, 200, _html_page(str_t(t"Artifacts · {owner}/{repo}"), body))
 
     async def _ui_ci_artifact(self, owner, repo, run_id):

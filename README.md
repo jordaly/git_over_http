@@ -284,8 +284,18 @@ Downloads also remain available on each CI run page.
   matched entries. Collection errors/limit violations fail the run explicitly.
 - Archives are stored in SQLite, not publicly served from the static directory.
   Downloads use the same access controls as CI logs, and are attachments only.
-- Artifacts expire after **7 days**, or earlier when their run is pruned. Expired
-  records are removed at startup and artifact access/collection. SQLite may retain
+- Configure **CI → Settings → Additional settings → Artifact and run retention**:
+  artifact expiration defaults to **7 days**, maximum bundles defaults to **0
+  (unlimited)**, and completed-run retention defaults to **100** (or the server
+  environment default). Each field accepts **0** to disable that limit. Set both
+  artifact limits to 0 to keep archives forever. A bundle is one run's ZIP.
+- Both artifact limits apply; the oldest bundles by run ID are removed when the
+  count limit is exceeded. Retained artifacts protect their parent run from
+  pruning, so retained run counts can exceed the configured run limit. Active runs
+  and runs with pending CI notifications are also protected.
+- Saving retention settings applies them to existing data immediately and can
+  permanently delete it. Expiration is checked at startup, artifact operations,
+  and run/configuration pruning—not by an exact-time deletion timer. SQLite may retain
   freed database pages for reuse; these are logical retention limits, not an OS
   filesystem quota.
 
@@ -309,13 +319,19 @@ Only one job per repository runs at once. Server environment settings:
 | --- | --- | --- |
 | `PYGITHOST_CI_CONCURRENCY` | `2` | Global simultaneous jobs |
 | `PYGITHOST_CI_QUEUE_LIMIT` | `100` | Global waiting jobs, excluding running jobs |
-| `PYGITHOST_CI_RETENTION` | `100` | Completed runs retained per repository (1–10000) |
+| `PYGITHOST_CI_RETENTION` | `100` | Default completed-run limit for repositories without an override (0–10000; 0 = unlimited) |
 
 A full queue produces a failed run with a queue-specific reason instead of
 silently dropping the event. Optionally cancel superseded runs for the same
 event/branch/PR. Cancelled and interrupted runs do not send email. Filters and
-cursor pagination let you browse retained history; the repository badge shows
+Previous/Next pagination lets you browse retained history; the repository badge shows
 the default branch and marks results stale when its commit changes.
+
+The home repository list, CI Runs, and Deployments use **25 items per page** with
+Previous/Next controls and a page number. Repository search and CI run filters
+are preserved across pages. Searches start on page 1. Pagination is a live view:
+new entries or retention cleanup can shift entries between pages on refresh.
+See [Retention and pagination](docs/ci-retention.md) for examples and limits.
 
 The scheduler takes an OS lock beside the SQLite database; do not run multiple
 servers against the same database. Waiting jobs survive shutdown, running jobs

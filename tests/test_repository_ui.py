@@ -101,6 +101,56 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn('action="' + self.base + '/branches/delete"', page)
         self.assertNotIn('action="' + self.base + '/branches/create"', page)
 
+    def test_home_pagination_preserves_search(self):
+        repos = [("owner", f"app-{index:02}", f"app-{index:02}.git") for index in range(30)]
+        with mock.patch("pygithost.application._scan_repos", return_value=repos):
+            status, first = self.request("/?q=app")
+            self.assertEqual(status, 200)
+            self.assertIn("Page 1", first)
+            self.assertIn('rel="next"', first)
+            self.assertNotIn('href="/r/owner/app-25"', first)
+            _, second = self.request("/?q=app&page=2")
+            self.assertIn("Page 2", second)
+            self.assertIn('href="/r/owner/app-25"', second)
+            self.assertIn('href="/?q=app&amp;page=1"', second)
+            self.assertNotIn('rel="next"', second)
+
+    def test_run_and_deployment_pagination(self):
+        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
+        ids = []
+        for index in range(28):
+            commit = f"{index:040x}"
+            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", commit, "{}")
+            database.db_ci_run_update(run_id, status="success")
+            database.db_deployment_claim(run_id, FLAT_OWNER_UI, "project", commit)
+            database.db_deployment_finish(run_id, "success", "done")
+            ids.append(run_id)
+        for suffix in ("/ci?status=success", "/ci/deployments?"):
+            status, first = self.request(self.base + suffix)
+            self.assertEqual(status, 200)
+            self.assertIn("Page 1", first)
+            self.assertIn('rel="next"', first)
+            _, second = self.request(self.base + suffix + "&page=2")
+            self.assertIn("Page 2", second)
+            self.assertIn('rel="prev"', second)
+            self.assertNotIn('rel="next"', second)
+        _, page = self.request(self.base + "/ci?status=success&page=2")
+        self.assertIn("status=success&amp;page=1", page)
+
+    def test_retention_settings_are_saved_from_website(self):
+        status, page = self.request(self.base + "/ci/config", {
+            "command": "echo test", "artifact_retention_days": "0",
+            "artifact_retention_count": "12", "run_retention_count": "0"})
+        self.assertEqual(status, 200)
+        self.assertIn("CI settings saved", page)
+        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
+        self.assertEqual(saved["artifact_retention_days"], 0)
+        self.assertEqual(saved["artifact_retention_count"], 12)
+        self.assertEqual(saved["run_retention_count"], 0)
+        self.assertIn('<p class="warn" role="note"><strong>Retention changes can permanently delete data.', page)
+        self.assertIn("Retention changes apply to existing data immediately.", page)
+        self.assertIn('window.confirm("These retention limits may permanently delete', page)
+
     def test_branch_to_pr_prefills_source_and_target(self):
         status, page = self.request(self.base + "/pulls?source=feature%2Fapi&target=main")
         self.assertEqual(status, 200)

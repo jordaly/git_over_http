@@ -166,7 +166,7 @@ def _db_init() -> None:
         conn.execute("""CREATE TABLE IF NOT EXISTS ci_artifacts (
             run_id INTEGER PRIMARY KEY REFERENCES ci_runs(id) ON DELETE CASCADE,
             archive BLOB NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
-        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
+        _db_ci_cleanup_artifacts(conn)
     finally:
         conn.close()
 
@@ -744,14 +744,14 @@ def db_deployment_email_record(run_id):
         conn.close()
 
 
-def db_deployments_list(owner, repo, before=0, limit=25):
+def db_deployments_list(owner, repo, before=0, limit=25, offset=0):
     conn = _db_connect()
     try:
         return conn.execute("""SELECT d.id,d.run_id,d.commit_hash,d.status,d.started_at,
             d.finished_at,d.notification,d.config_json,r.id
             FROM ci_deployments d LEFT JOIN ci_runs r ON r.id=d.run_id
             WHERE d.owner=? AND d.repo=? AND (?=0 OR d.id<?)
-            ORDER BY d.id DESC LIMIT ?""", (owner, repo, before, before, limit)).fetchall()
+            ORDER BY d.id DESC LIMIT ? OFFSET ?""", (owner, repo, before, before, limit, max(0, offset))).fetchall()
     finally:
         conn.close()
 
@@ -827,6 +827,8 @@ def db_ci_config_set(owner: str, repo: str, config_json: str) -> None:
         conn.execute("""INSERT INTO ci_configs(owner,repo,config_json) VALUES(?,?,?)
             ON CONFLICT(owner,repo) DO UPDATE SET config_json=excluded.config_json, updated_at=datetime('now')""",
             (owner, repo, config_json))
+        _db_ci_cleanup_artifacts(conn, owner, repo)
+        _db_ci_prune_completed(conn, owner, repo)
     finally:
         conn.close()
 
@@ -869,6 +871,7 @@ def db_ci_runs_list(
     query: str = "",
     summary: bool = False,
     before: int | None = None,
+    offset: int = 0,
 ):
     conn = _db_connect()
     try:
@@ -891,10 +894,11 @@ def db_ci_runs_list(
             )
             params.extend((pattern, pattern, pattern))
         params.append(max(1, min(int(limit), 500)))
+        params.append(max(0, int(offset)))
         output_column = "''" if summary else "output"
         return conn.execute(
             f"SELECT id,event,branch,commit_hash,status,{output_column},truncated,return_code,created_at,started_at,finished_at "
-            f"FROM ci_runs WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ?",
+            f"FROM ci_runs WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
     finally:
@@ -935,11 +939,35 @@ def db_ci_steps_get(run_id):
         conn.close()
 
 
+def _db_ci_retention(conn, owner, repo):
+    row = conn.execute("SELECT config_json FROM ci_configs WHERE owner=? AND repo=?", (owner, repo)).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+def _db_ci_cleanup_artifacts(conn, owner=None, repo=None):
+    conditions, params = (" WHERE r.owner=? AND r.repo=?", (owner, repo)) if owner is not None else ("", ())
+    repositories = conn.execute("SELECT DISTINCT r.owner,r.repo FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id" + conditions, params).fetchall()
+    for artifact_owner, artifact_repo in repositories:
+        config = _db_ci_retention(conn, artifact_owner, artifact_repo)
+        days = config.get("artifact_retention_days", 7)
+        count = config.get("artifact_retention_count", 0)
+        if days:
+            conn.execute("""DELETE FROM ci_artifacts WHERE run_id IN
+                (SELECT id FROM ci_runs WHERE owner=? AND repo=?)
+                AND created_at <= datetime('now', ?)""", (artifact_owner, artifact_repo, f"-{days} days"))
+        if count:
+            conn.execute("""DELETE FROM ci_artifacts WHERE run_id IN
+                (SELECT id FROM ci_runs WHERE owner=? AND repo=?) AND run_id NOT IN
+                (SELECT a.run_id FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id
+                 WHERE r.owner=? AND r.repo=? ORDER BY a.run_id DESC LIMIT ?)""",
+                (artifact_owner, artifact_repo, artifact_owner, artifact_repo, count))
+
+
 def db_ci_artifact_set(run_id, archive):
     conn = _db_connect()
     try:
-        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
         conn.execute("INSERT OR REPLACE INTO ci_artifacts(run_id,archive) VALUES(?,?)", (run_id, archive))
+        _db_ci_cleanup_artifacts(conn)
     finally:
         conn.close()
 
@@ -947,7 +975,7 @@ def db_ci_artifact_set(run_id, archive):
 def db_ci_artifact_get(owner, repo, run_id, *, content=False):
     conn = _db_connect()
     try:
-        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
+        _db_ci_cleanup_artifacts(conn, owner, repo)
         column = "a.archive" if content else "length(a.archive)"
         row = conn.execute(f"SELECT {column} FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id WHERE r.owner=? AND r.repo=? AND r.id=?", (owner, repo, run_id)).fetchone()
         return row[0] if row else None
@@ -958,16 +986,17 @@ def db_ci_artifact_get(owner, repo, run_id, *, content=False):
 def db_ci_artifacts_list(owner, repo, *, before=None, limit=50):
     conn = _db_connect()
     try:
-        conn.execute("DELETE FROM ci_artifacts WHERE created_at <= datetime('now','-7 days')")
+        _db_ci_cleanup_artifacts(conn, owner, repo)
+        days = _db_ci_retention(conn, owner, repo).get("artifact_retention_days", 7)
         conditions, params = ["r.owner=?", "r.repo=?"], [owner, repo]
         if before is not None:
             conditions.append("r.id<?")
             params.append(before)
         params.append(max(1, min(int(limit), 100)))
         return conn.execute(f"""SELECT r.id,r.branch,r.commit_hash,r.status,r.event,
-            a.created_at,length(a.archive),datetime(a.created_at,'+7 days')
+            a.created_at,length(a.archive),{'datetime(a.created_at, ?)' if days else 'NULL'}
             FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id
-            WHERE {' AND '.join(conditions)} ORDER BY r.id DESC LIMIT ?""", params).fetchall()
+            WHERE {' AND '.join(conditions)} ORDER BY r.id DESC LIMIT ?""", ([f"+{days} days"] if days else []) + params).fetchall()
     finally:
         conn.close()
 
@@ -1053,10 +1082,15 @@ def db_ci_recover_runs():
 
 
 def _db_ci_prune_completed(conn, owner: str, repo: str) -> None:
-    retention = max(1, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100"))))
+    config = _db_ci_retention(conn, owner, repo)
+    retention = config.get("run_retention_count", max(0, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100")))))
+    _db_ci_cleanup_artifacts(conn, owner, repo)
+    if not retention:
+        return
     conn.execute("""DELETE FROM ci_runs AS old
         WHERE old.owner=? AND old.repo=? AND old.status NOT IN ('queued','running')
           AND old.notification NOT IN ('queued','sending')
+          AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.run_id=old.id)
           AND old.id NOT IN (SELECT newer.id FROM ci_runs AS newer
             WHERE newer.owner=? AND newer.repo=? AND newer.status NOT IN ('queued','running')
             ORDER BY newer.id DESC LIMIT ?)""", (owner, repo, owner, repo, retention))

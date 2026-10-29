@@ -102,6 +102,9 @@ def default_config():
         "protected_branches": "main",
         "steps": [],
         "artifacts": {"paths": [], "when": "always"},
+        "artifact_retention_days": 7,
+        "artifact_retention_count": 0,
+        "run_retention_count": max(0, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100")))),
     }
 
 
@@ -124,6 +127,13 @@ def validate_config(raw):
         if not isinstance(value, str) or "\0" in value or len(value) > 8192:
             raise ValueError(f"Invalid value for {key}.")
     defaults = default_config()
+    for key, maximum in (("artifact_retention_days", 36500), ("artifact_retention_count", 1000000), ("run_retention_count", 1000000)):
+        value = raw.get(key, defaults[key])
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            value = int(value)
+        if type(value) is not int or not 0 <= value <= maximum:
+            raise ValueError(f"{key} must be a whole number from 0 to {maximum}; 0 means unlimited.")
+        defaults[key] = value
     if type(raw.get("deploy_enabled", False)) is not bool:
         raise ValueError("Deployment enabled must be true or false.")
     script = raw.get("deploy_script", "")

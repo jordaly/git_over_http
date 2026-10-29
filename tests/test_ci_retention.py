@@ -110,6 +110,7 @@ class RetentionTests(unittest.TestCase):
         database.db_ci_run_update(run_id, reason="Temporary directory cleanup failed: old warning")
         conn = database._db_connect()
         try:
+            conn.execute("DROP INDEX IF EXISTS idx_ci_runs_warnings")
             conn.execute("ALTER TABLE ci_runs DROP COLUMN warnings")
         finally:
             conn.close()

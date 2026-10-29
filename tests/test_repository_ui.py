@@ -82,6 +82,36 @@ class RepositoryUITests(unittest.TestCase):
         _, page = self.request("/?" + urlencode({"q": '\"><script>alert(1)</script>'}))
         self.assertNotIn("<script>alert(1)</script>", page)
 
+    def test_server_display_name_is_editable_persistent_and_escaped(self):
+        _, home = self.request("/")
+        self.assertIn('href="/admin/settings"', home)
+        status, page = self.request("/admin/settings", {"display_name": "Team <Git>"})
+        self.assertEqual(status, 200)
+        self.assertIn("Settings saved", page)
+        self.assertIn('class="app-brand" href="/">Team &lt;Git&gt;</a>', page)
+        self.assertEqual(database.db_display_name_get(), "Team <Git>")
+        _, repo = self.request(self.base)
+        self.assertIn('class="app-brand" href="/">Team &lt;Git&gt;</a>', repo)
+        _, settings = self.request("/admin/settings")
+        self.assertIn('value="Team &lt;Git&gt;"', settings)
+        self.request("/admin/settings", {"display_name": ""})
+        _, home = self.request("/")
+        self.assertIn('class="app-brand" href="/">pygithost</a>', home)
+
+    def test_display_name_rejects_invalid_input(self):
+        for value in ("x" * 81, "bad\nname", "bad\0name"):
+            status, page = self.request("/admin/settings", {"display_name": value})
+            self.assertEqual(status, 200)
+            self.assertIn("without control characters", page)
+            self.assertEqual(database.db_display_name_get(), "pygithost")
+
+    def test_display_name_settings_require_admin(self):
+        with mock.patch("pygithost.application.REQUIRE_AUTH", True), mock.patch("pygithost.application.GitHTTPHandler._require_session_auth", new=mock.AsyncMock(return_value=True)), mock.patch("pygithost.application._require_admin", return_value=False):
+            for fields in (None, {"display_name": "unauthorized"}):
+                status, _ = self.request("/admin/settings", fields)
+                self.assertEqual(status, 403)
+        self.assertEqual(database.db_display_name_get(), "pygithost")
+
     def test_home_filesystem_scan_does_not_block_the_request_loop(self):
         def scan(_root):
             with self.assertRaises(RuntimeError):

@@ -76,6 +76,8 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         run_id = database.db_ci_run_create("owner", "repo", "manual", "main", "a" * 40, "{}")
         with sqlite3.connect(database.DB_PATH) as connection:
             for column in ("config_json", "phase", "reason", "notification"):
+                if column == "notification":
+                    connection.execute("DROP INDEX IF EXISTS idx_ci_runs_pending_email")
                 connection.execute(f"ALTER TABLE ci_runs DROP COLUMN {column}")
         database._db_init()
         database._db_init()

@@ -172,6 +172,23 @@ def _db_init() -> None:
         conn.execute("""CREATE TABLE IF NOT EXISTS ci_artifacts (
             run_id INTEGER PRIMARY KEY REFERENCES ci_runs(id) ON DELETE CASCADE,
             archive BLOB NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+        # Match live filters and newest-first history queries. Create these only
+        # after column migrations so existing installations can upgrade safely.
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_ci_runs_repo_branch ON ci_runs(owner,repo,branch,id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ci_runs_repo_result ON ci_runs(owner,repo,status,id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ci_runs_repo_event ON ci_runs(owner,repo,event,id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ci_runs_warnings ON ci_runs(owner,repo,id DESC) WHERE warnings!=''",
+            "CREATE INDEX IF NOT EXISTS idx_ci_runs_pending_email ON ci_runs(id) WHERE notification='queued'",
+            "CREATE INDEX IF NOT EXISTS idx_deployments_repo_history ON ci_deployments(owner,repo,id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_deployments_run ON ci_deployments(run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_deployments_pending_email ON ci_deployments(run_id) WHERE notification='queued'",
+            "CREATE INDEX IF NOT EXISTS idx_pr_repo_history ON pull_requests(owner,repo,id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_pr_open_source ON pull_requests(owner,repo,source_branch) WHERE status='open'",
+            "CREATE INDEX IF NOT EXISTS idx_pr_open_target ON pull_requests(owner,repo,target_branch) WHERE status='open'",
+            "CREATE INDEX IF NOT EXISTS idx_users_name_order ON users(username COLLATE NOCASE)",
+        ):
+            conn.execute(statement)
         _db_ci_cleanup_artifacts(conn)
     finally:
         conn.close()
@@ -814,6 +831,23 @@ def db_email_settings_get():
     try:
         row = conn.execute("SELECT value FROM server_settings WHERE key='smtp'").fetchone()
         return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_display_name_get():
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT value FROM server_settings WHERE key='display_name'").fetchone()
+        return row[0] if row else "pygithost"
+    finally:
+        conn.close()
+
+
+def db_display_name_set(value):
+    conn = _db_connect()
+    try:
+        conn.execute("INSERT INTO server_settings(key,value) VALUES('display_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (value,))
     finally:
         conn.close()
 

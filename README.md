@@ -62,12 +62,24 @@ The integration tests use the real `git-http-backend` and bind a loopback port.
 
 ## Repository interface
 
+Administrators can customize the name in the top-left header under
+**Home → Admin: Settings → Appearance → Display name**. It is stored in the
+database, applies to all pages immediately, and survives restart. Leave it blank
+to restore `pygithost`. The limit is 80 characters; repository URLs and email
+sender settings are unchanged. With authentication disabled, the IP allowlist
+protects access to these settings, as with other administration pages.
+
 - The home page searches repository names, owners, and paths with the search box.
   Search is case-insensitive and works without JavaScript; its URL can be bookmarked.
   Filesystem discovery runs off the request loop so a slow disk scan does not
   block other requests. Repository overviews load independent Git metadata,
   README, language estimates, and CI status concurrently; commit-keyed metadata
   caches remain in use, while branch/tag and CI status reads stay live.
+  Database startup automatically adds indexes for CI branch/status/event and
+  warning filters, deployment/PR history, pending notifications, open-PR branch
+  lookups, and user-name ordering. Existing primary-key indexes already cover
+  settings and artifact/run lookups; no manual index setup is needed. The first
+  startup after upgrading a large database can take longer while indexes build.
 - Repository tabs keep **Code**, **Branches**, **Pull requests**, **CI**, and
   **Artifacts** accessible while browsing files, commits, and pull requests.
 - The Code overview shows the latest commit's author, message, short SHA, and

@@ -3,6 +3,7 @@ import asyncio
 import json
 import base64
 import contextlib
+from contextvars import ContextVar
 import ipaddress
 import mimetypes
 import os
@@ -67,6 +68,9 @@ from .database import (
     db_verify_token,
     db_verify_token_any_user,
 )
+
+
+_display_name = ContextVar("display_name", default="pygithost")
 
 
 def _thread_call(func, *args, **kwargs):
@@ -955,7 +959,7 @@ button:hover{{opacity:.92}}
 <link rel="stylesheet" href="/static/repository.css" />
 </head>
 <body class="{body_class}">
-<header class="app-header"><a class="app-brand" href="/">pygithost</a><nav aria-label="Workspace navigation"><a href="/">Repositories</a></nav><button id="theme-toggle" class="theme-toggle" type="button" title="Toggle dark mode">Dark mode</button></header>
+<header class="app-header"><a class="app-brand" href="/">{_display_name.get()}</a><nav aria-label="Workspace navigation"><a href="/">Repositories</a></nav><button id="theme-toggle" class="theme-toggle" type="button" title="Toggle dark mode">Dark mode</button></header>
 
 {body}
 
@@ -1613,9 +1617,9 @@ class GitHTTPHandler:
 
         admin_link = safe_html("")
         if _require_admin(self):
-            admin_link = safe_html('<a class="pill" href="/admin/users">Admin: Users</a> <a class="pill" href="/admin/email">Admin: Email</a>')
+            admin_link = safe_html('<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/users">Admin: Users</a> <a class="pill" href="/admin/email">Admin: Email</a>')
         elif not REQUIRE_AUTH:
-            admin_link = safe_html('<a class="pill" href="/admin/email">Admin: Email</a>')
+            admin_link = safe_html('<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/email">Admin: Email</a>')
 
         rows_html = join_html(rows) if rows else safe_html(html_t(t'<div class="repo-empty"><h2>{"No matching repositories" if search else "No repositories yet"}</h2><p class="muted">{"Try a different name or clear your search." if search else "Create a repository to get started."}</p></div>'))
         clear = safe_html('<a class="pill" href="/">Clear search</a>') if search else safe_html("")
@@ -1806,6 +1810,26 @@ class GitHTTPHandler:
     # ========================================================
     # UI: Admin Users
     # ========================================================
+    async def _ui_admin_settings(self, *, save=False):
+        from .database import db_display_name_set
+        if REQUIRE_AUTH and not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
+        notice = safe_html("")
+        value = await self.server.display_name()
+        if save:
+            form = await self._read_form_urlencoded()
+            value = form.get("display_name", "").strip() or "pygithost"
+            if len(value) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+                notice = safe_html('<p class="warn" role="alert">Display name must be at most 80 characters without control characters.</p>')
+            else:
+                await _call_in_thread(db_display_name_set, value)
+                self.server._display_name = value
+                _display_name.set(value)
+                notice = safe_html('<p class="ok" role="status">Settings saved.</p>')
+        body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><a class="pill" href="/">Home</a></div>{notice}
+<section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form></section></main>''')
+        return await _send_html(self.request, 200, _html_page("Server settings", safe_html(body)))
+
     async def _ui_admin_users(self, notice: str = "", notice_kind: str = "ok"):
         if not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin only.\n")
@@ -3915,6 +3939,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_admin_users()
         if p == "/admin/email":
             return await self._ui_admin_email()
+        if p == "/admin/settings":
+            return await self._ui_admin_settings()
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", p)
         if m:
             return await self._ui_ci_config(m.group(1), m.group(2))
@@ -4006,6 +4032,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_admin_users_create()
         if parsed.path == "/admin/email":
             return await self._ui_admin_email_save()
+        if parsed.path == "/admin/settings":
+            return await self._ui_admin_settings(save=True)
         if parsed.path == "/admin/email/test":
             return await self._ui_admin_email_save(test=True)
         if parsed.path == "/admin/users/reset":
@@ -4055,6 +4083,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         return await _send_text(self.request, 400, "HEAD is only implemented for static files.\n")
 
     async def dispatch(self):
+        path = urlparse(self.path).path
+        if not _is_static_request_path(path) and not path.startswith(URL_PREFIX + "/"):
+            _display_name.set(await self.server.display_name())
         if self.command == "GET":
             return await self.do_GET()
         if self.command == "POST":
@@ -4073,6 +4104,16 @@ class AsyncGitServer:
         self.push_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.push_requests: set[asyncio.Task] = set()
         self.push_finalizers: set[asyncio.Task] = set()
+        self._display_name = None
+        self._display_name_lock = asyncio.Lock()
+
+    async def display_name(self):
+        from .database import db_display_name_get
+        if self._display_name is None:
+            async with self._display_name_lock:
+                if self._display_name is None:
+                    self._display_name = await _call_in_thread(db_display_name_get)
+        return self._display_name
 
     async def _branch_refs(self, owner: str, repo: str) -> dict[str, str] | None:
         code, out, _ = await _run_git(_repo_bare_path(owner, repo), ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])

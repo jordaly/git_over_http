@@ -514,6 +514,28 @@ class CIManager:
         await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
         return config
 
+    async def deployment_script_content(self, owner, repo, config):
+        """Read only a bounded, repository-scoped, content-addressed upload."""
+        directory = Path(database.DB_PATH).resolve().parent / "deployment-scripts"
+        path = Path(config.get("deploy_script", ""))
+        if path.parent != directory or not re.fullmatch(r"[0-9a-f]{64}", path.name):
+            return ""
+
+        def read_script():
+            try:
+                if path.is_symlink() or not path.is_file():
+                    return ""
+                with path.open("rb") as handle:
+                    data = handle.read(65537)
+                if len(data) > 65536:
+                    return ""
+                content = data.decode("utf-8")
+                expected = hashlib.sha256((owner + "/" + repo + "\0" + content).encode()).hexdigest()
+                return content if expected == path.name else ""
+            except (OSError, UnicodeError):
+                return ""
+        return await asyncio.to_thread(read_script)
+
     async def repository_pipeline(self, owner, repo, commit, config):
         """Read a bounded blob at an immutable SHA, never from the working tree."""
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):

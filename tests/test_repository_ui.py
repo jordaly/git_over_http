@@ -306,6 +306,9 @@ class RepositoryUITests(unittest.TestCase):
             self.assertTrue(saved["deploy_enabled"])
             self.assertEqual(Path(saved["deploy_script"]).read_text(), content)
             self.assertNotIn("deploy_script_content", saved)
+            _, reopened = self.request(self.base + "/ci/config")
+            editor = reopened.split('id="deploy-script-content"', 1)[1].split("</textarea>", 1)[0]
+            self.assertIn('print(&quot;deploying&quot;, sys.argv[1])', editor)
 
     def test_branch_to_pr_prefills_source_and_target(self):
         status, page = self.request(self.base + "/pulls?source=feature%2Fapi&target=main")

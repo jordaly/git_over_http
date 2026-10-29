@@ -116,6 +116,11 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         again = await self.manager.save_config("owner", "repo", {
             **self.config, "deploy_script_content": content})
         self.assertEqual(again["deploy_script"], str(path))
+        self.assertEqual(await self.manager.deployment_script_content("owner", "repo", saved), content.replace("\r\n", "\n"))
+        self.assertEqual(await self.manager.deployment_script_content("other", "repo", saved), "")
+        self.assertEqual(await self.manager.deployment_script_content("owner", "repo", {"deploy_script": str(self.script)}), "")
+        path.write_text("tampered script")
+        self.assertEqual(await self.manager.deployment_script_content("owner", "repo", saved), "")
 
     async def test_invalid_upload_not_saved(self):
         for content in ["#!/bin/sh\n" + "x" * 65536, "#!/bin/sh\n\0"]:

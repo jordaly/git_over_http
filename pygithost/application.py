@@ -2748,6 +2748,9 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
         config = submitted if submitted is not None else await self.server.ci_manager.config(owner, repo)
+        if submitted is None:
+            content = await self.server.ci_manager.deployment_script_content(owner, repo, config)
+            config = {**config, "deploy_script_content": content}
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         env_text = config.get("env_text", "\n".join(f"{key}={value}" for key, value in config["env"].items()))
         steps_text = config.get("steps_text", json.dumps(config.get("steps", []), indent=2))
@@ -2837,7 +2840,8 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 <p class="muted">The server runs: runner + uploaded script path + commit SHA. Leave blank to run the file directly. Any installed interpreter is supported; no shell expansion, pipes, or command chaining. Quote executable paths containing spaces; on Windows use forward slashes in paths, for example &quot;C:/Program Files/Python/python.exe&quot;. The exact value python uses the server's Python interpreter.</p>
 <label for="deploy-script-upload">Or upload a deployment script (UTF-8, maximum 64 KiB)</label><input id="deploy-script-upload" type="file">
 <p id="deploy-upload-status" class="muted">Uploaded scripts are stored privately on the server. Set Run with to an interpreter to avoid needing a shebang. Direct scripts on Ubuntu require a shebang such as #!/bin/sh. Save CI settings to apply.</p>
-<label for="deploy-script-content">New script contents (optional; replaces the path above when saved)</label><textarea id="deploy-script-content" name="deploy_script_content" spellcheck="false">{config.get('deploy_script_content', '')}</textarea>
+<label for="deploy-script-content">Deployment script contents (uploaded scripts shown here)</label><textarea id="deploy-script-content" name="deploy_script_content" spellcheck="false">{config.get('deploy_script_content', '')}</textarea>
+<p class="muted">The current uploaded script is loaded here for review and editing. Saving nonempty contents stores that version and updates the path above. To use an external script path instead, clear this field first. External server files are not loaded into this editor.</p>
 <label>Deployment timeout (seconds)</label><input type="number" name="deploy_timeout" min="1" max="86400" value="{config.get('deploy_timeout', 600)}">
 <p class="warn">Trusted script runs on the Git server as its OS user, outside Docker, with network access. Keep it outside repositories and protect it from job writes. No secret redaction. Credentials belong in protected server files, not CI settings.</p>
 <p class="muted">Enable Push and/or PR merged triggers above. Only successful updates of this branch deploy, and only while the tested commit is still its tip. PR checks and manual runs do not deploy. The script receives the exact commit as its first argument and PYGITHOST_COMMIT. One attempt per commit; no automatic retries or rollback.</p></section>

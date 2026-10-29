@@ -30,7 +30,7 @@ before giving deployment access to a production server.
    `main`. A successful PR check before merging is not a deployment trigger.
 3. Under **Automatic deployment**, enable **Deploy after successful branch CI**.
 4. Set **Deployment branch** to `main` and leave the timeout at `600` seconds.
-5. Paste this into **New script contents**, or save it as `deploy.sh` and select
+5. Paste this into **Deployment script contents**, or save it as `deploy.sh` and select
    it with the file picker:
 
    ```sh
@@ -226,7 +226,10 @@ and is executable by the server user.
 - Uploads accept UTF-8 text, no NUL bytes, up to 64 KiB. CRLF becomes LF.
   An explicit runner does not require a shebang; direct scripts on Ubuntu do.
 - The file picker loads an editable preview. **Save CI settings** stores it.
-- Nonempty **New script contents** replaces the path field when saved.
+- The current uploaded script is displayed in **Deployment script contents** when
+  you reopen settings, so you can review and edit it. External server-path files
+  are not read into the editor.
+- Nonempty **Deployment script contents** replaces the path field when saved.
 - To use an external path instead, clear the new contents field before saving.
 - Uploading a changed script creates a different content-addressed path. Runs
   queued with the previous script path will not deploy under the changed settings.

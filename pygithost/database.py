@@ -136,6 +136,13 @@ def _db_init() -> None:
             started_at TEXT, finished_at TEXT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_repo ON ci_runs(owner, repo, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_status ON ci_runs(status, id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS ci_deployments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running', output TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
+            UNIQUE(owner, repo, commit_hash))""")
         conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("""CREATE TABLE IF NOT EXISTS repository_languages (
             owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
@@ -683,6 +690,42 @@ def db_ci_config_get(owner: str, repo: str):
     try:
         row = conn.execute("SELECT config_json FROM ci_configs WHERE owner=? AND repo=?", (owner, repo)).fetchone()
         return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_deployment_claim(run_id, owner, repo, commit):
+    conn = _db_connect()
+    try:
+        cursor = conn.execute("""INSERT OR IGNORE INTO ci_deployments
+            (run_id,owner,repo,commit_hash) VALUES(?,?,?,?)""", (run_id, owner, repo, commit))
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def db_deployment_finish(run_id, status, output):
+    conn = _db_connect()
+    try:
+        conn.execute("""UPDATE ci_deployments SET status=?, output=?,
+            finished_at=datetime('now') WHERE run_id=?""", (status, output, run_id))
+    finally:
+        conn.close()
+
+
+def db_deployment_get(run_id):
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT status,output FROM ci_deployments WHERE run_id=?", (run_id,)).fetchone()
+    finally:
+        conn.close()
+
+
+def db_deployment_recover():
+    conn = _db_connect()
+    try:
+        conn.execute("""UPDATE ci_deployments SET status='interrupted',
+            finished_at=datetime('now') WHERE status='running'""")
     finally:
         conn.close()
 

@@ -331,6 +331,54 @@ For a proposed distributed execution model, see
 [Remote CI runners](docs/remote-ci-runners.md). This is a design document, not an
 available feature.
 
+### Automatic deployment
+
+Administrators can enable **Automatic deployment** in a repository's **CI settings**.
+Choose one branch (default `main`), a deployment timeout, and either an absolute
+server-side script path or **upload a script directly in the website**. The file
+picker loads the script into an editable text field; **Save CI settings** stores
+it on the server. Uploads must be UTF-8 text, at most 64 KiB, and on Ubuntu must
+start with a shebang such as `#!/bin/sh`. Uploaded scripts are content-addressed
+files in `deployment-scripts` beside the database, with owner-only permissions.
+Keep that directory in server backups; unused script versions are not deleted
+automatically.
+
+Enable the **Push** and/or **PR merged** CI triggers. After a successful run for
+an actual update to the selected branch, the server checks that its tip still
+matches the tested commit and runs the script. PR checks and manually queued
+runs never deploy. The repository's runner slot remains occupied until deployment
+finishes, so deployments cannot overlap within a repository. Disabling deployment
+or changing its settings prevents older queued configurations from deploying.
+
+The exact tested commit is passed as the first argument and `PYGITHOST_COMMIT`;
+`PYGITHOST_OWNER`, `PYGITHOST_REPO`, and `PYGITHOST_BRANCH` are also available.
+The script must deploy that commit, not fetch and deploy the latest branch tip.
+It runs in a temporary directory, not the CI checkout, and must fetch source or
+retrieve the desired build itself. It does not automatically receive CI artifacts.
+
+```sh
+#!/bin/sh
+set -eu
+commit="$1"
+# Invoke your trusted deployment tool with this exact commit.
+/opt/my-app/release "$commit"
+```
+
+**Deployment scripts are trusted host code**, even when CI uses Docker. They run
+as the Git server's OS user with network access. Protect scripts from modification
+by repository jobs. Store SSH keys and other credentials in protected server
+files, not CI environment settings or script contents. The execution environment
+does not inherit arbitrary server variables; scripts should use explicit
+credential paths. Logs are not secret-redacted.
+
+Deployment status and bounded logs appear separately on the CI run page after
+execution finishes; deployment failure does not turn passing tests into failing
+tests. Each repository/commit gets at most one deployment attempt, including
+failed attempts. Attempt records survive CI history pruning. There is no automatic
+retry or rollback. Server restarts mark unfinished deployments interrupted rather
+than replaying them; operators must verify the target's actual state. As with CI,
+use a service supervisor to terminate subprocesses after shutdown or crashes.
+
 ### Email notifications
 
 Open **Admin: Email** from the repository list (or `/admin/email`) to configure the

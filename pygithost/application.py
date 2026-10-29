@@ -2551,6 +2551,11 @@ document.addEventListener("DOMContentLoaded", function() {{
         steps_html = join_html([html_t(t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><strong>{step["name"]}</strong><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>''') for index, step in enumerate(steps)])
         steps_section = safe_html(html_t(t'<section class="box ci-run-steps"><div class="ci-section-heading"><h2>Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>')) if steps else safe_html("")
         artifact_size = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id)
+        from .database import db_deployment_get
+        deployment = await _call_in_thread(db_deployment_get, run_id)
+        deployment_html = safe_html(html_t(t'<section class="box"><h2>Deployment: {deployment[0]}</h2><pre>{deployment[1] or "No output yet. Logs are available when deployment finishes."}</pre></section>')) if deployment else safe_html("")
+        active = active or bool(deployment and deployment[0] == "running")
+        active = active or bool(run[4] == "success" and run_id in self.server.ci_manager.active)
         artifact_html = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>')) if artifact_size else safe_html("")
         reason_html = safe_html(html_t(t'<p class="warn" role="status">{waiting or meta["reason"]}</p>')) if waiting or meta["reason"] else safe_html("")
         result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
@@ -2558,7 +2563,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 {reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
 <details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
-<pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details></div>'''))
+<pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details>{deployment_html}</div>'''))
         if partial:
             return await _send_response(self.request, 200, str(result_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
@@ -2684,9 +2689,33 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 <details class="ci-optional"{safe_html(" open" if env_text else "")}><summary>Environment variables</summary><label for="ci-env">KEY=value, one per line</label><textarea id="ci-env" name="env" placeholder="PYTHONUNBUFFERED=1" spellcheck="false">{env_text}</textarea><p class="muted">Not a secret store: values are saved in plaintext snapshots and are not redacted from logs. Built-in CI variables cannot be overridden.</p></details>
 <details class="ci-optional"{safe_html(" open" if artifact_paths else "")}><summary>Downloadable artifacts</summary><label for="ci-artifacts">File patterns, relative to checkout</label><textarea id="ci-artifacts" name="artifact_paths" placeholder="dist/*&#10;reports/**/*.xml">{artifact_paths}</textarea><label for="ci-artifact-when">Collect after</label><select id="ci-artifact-when" name="artifact_when">{artifact_options}</select><p class="muted">One pattern per line. ZIP download only; no test-output parsing. Maximum 20 MiB / 1000 files per run. Retained for 7 days or until run deletion.</p></details>
 <details class="ci-optional"{safe_html(" open" if config.get("email_mode", "off") != "off" else "")}><summary>Email notifications</summary><label for="ci-email-mode">Send notifications</label><select id="ci-email-mode" name="email_mode">{email_options}</select><div id="ci-email-settings"><label for="ci-email-recipients">Recipients, one address per line</label><textarea id="ci-email-recipients" name="email_recipients" placeholder="team@example.com">{config.get("email_recipients", "")}</textarea><p class="muted">{smtp_status} <a href="/admin/email">Server email settings</a>. Emails contain metadata, not logs or environment values.</p></div></details></section>
-<div class="ci-save-bar"><span class="muted">Changes apply to new runs.<br>Existing runs keep their configuration snapshot.</span><button type="submit">Save CI settings <span aria-hidden="true">→</span></button></div></form></div>
+<section class="box ci-setting-section"><h2>Automatic deployment</h2>
+<label><input type="checkbox" name="deploy_enabled"{safe_html(" checked" if config.get("deploy_enabled") else "")}> Deploy after successful branch CI</label>
+<label>Deployment branch</label><input name="deploy_branch" value="{config.get('deploy_branch', 'main')}">
+<label>Absolute deployment script path</label><input name="deploy_script" value="{config.get('deploy_script', '')}" placeholder="/opt/deploy/my-app.sh">
+<label for="deploy-script-upload">Or upload a deployment script (UTF-8, maximum 64 KiB)</label><input id="deploy-script-upload" type="file" accept=".sh,.py,.bash,.txt">
+<p id="deploy-upload-status" class="muted">Uploaded scripts are stored privately on the server. On Ubuntu, include a shebang such as #!/bin/sh. Save CI settings to apply.</p>
+<label for="deploy-script-content">New script contents (optional; replaces the path above when saved)</label><textarea id="deploy-script-content" name="deploy_script_content" spellcheck="false">{config.get('deploy_script_content', '')}</textarea>
+<label>Deployment timeout (seconds)</label><input type="number" name="deploy_timeout" min="1" max="86400" value="{config.get('deploy_timeout', 600)}">
+<p class="warn">Trusted script runs on the Git server as its OS user, outside Docker, with network access. Keep it outside repositories and protect it from job writes. No secret redaction. Credentials belong in protected server files, not CI settings.</p>
+<p class="muted">Enable Push and/or PR merged triggers above. Only successful updates of this branch deploy, and only while the tested commit is still its tip. PR checks and manual runs do not deploy. The script receives the exact commit as its first argument and PYGITHOST_COMMIT. One attempt per commit; no automatic retries or rollback.</p></section>
+<div class="ci-save-bar"><span class="muted">Changes apply to new runs.<br>Disabling deployment also prevents pending deployments.</span><button type="submit">Save CI settings <span aria-hidden="true">→</span></button></div></form></div>
 <script>(function() {{
 const form = document.getElementById("ci-settings-form");
+const upload = document.getElementById("deploy-script-upload");
+let readingScript = false;
+upload.addEventListener("change", async () => {{
+ const file = upload.files[0]; if (!file) return;
+ const status = document.getElementById("deploy-upload-status");
+ if (file.size > 65536) {{ status.textContent = "Script exceeds 64 KiB."; upload.value = ""; return; }}
+ readingScript = true;
+ try {{ const content = new TextDecoder("utf-8", {{fatal:true}}).decode(await file.arrayBuffer());
+ document.getElementById("deploy-script-content").value = content;
+ status.textContent = "Script loaded. Save CI settings to store it on the server.";
+ }} catch (_) {{ status.textContent = "Could not read script as UTF-8."; }}
+ finally {{ readingScript = false; }}
+}});
+form.addEventListener("submit", event => {{ if (readingScript) {{ event.preventDefault(); }} }});
 function update() {{
  const repository = form.elements.repository_config.checked;
  document.getElementById("ci-server-pipeline").hidden = repository;
@@ -2731,6 +2760,11 @@ form.addEventListener("change", update); update();
             "runner": form.get("runner", "host"), "image": form.get("image", "python:3.14-slim"),
             "email_mode": form.get("email_mode", "off"), "email_recipients": form.get("email_recipients", ""),
             "cancel_superseded": "cancel_superseded" in form,
+            "deploy_enabled": "deploy_enabled" in form,
+            "deploy_branch": form.get("deploy_branch", "main"),
+            "deploy_script": form.get("deploy_script", ""),
+            "deploy_script_content": form.get("deploy_script_content", ""),
+            "deploy_timeout": form.get("deploy_timeout", "600"),
             "repository_config": "repository_config" in form,
             "require_ci": "require_ci" in form,
             "block_direct_pushes": "block_direct_pushes" in form,

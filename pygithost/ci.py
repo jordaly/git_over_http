@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,10 @@ async def _db_call(func, *args, **kwargs):
 def default_config():
     return {
         "command": "",
+        "deploy_enabled": False,
+        "deploy_branch": "main",
+        "deploy_script": "",
+        "deploy_timeout": 600,
         "timeout_seconds": JOB_TIMEOUT,
         "env": {},
         "events": {
@@ -99,6 +104,23 @@ def validate_config(raw):
         if not isinstance(value, str) or "\0" in value or len(value) > 8192:
             raise ValueError(f"Invalid value for {key}.")
     defaults = default_config()
+    if type(raw.get("deploy_enabled", False)) is not bool:
+        raise ValueError("Deployment enabled must be true or false.")
+    script = raw.get("deploy_script", "")
+    branch = raw.get("deploy_branch", "main")
+    if not isinstance(script, str) or "\0" in script or len(script) > 4096 or (script and not os.path.isabs(script)):
+        raise ValueError("Deployment script must be an absolute path outside the repository.")
+    if not isinstance(branch, str) or not branch or len(branch) > 255 or re.search(r"[\s~^:?*\[\\\x00-\x1f]", branch) or ".." in branch or "@{" in branch or branch.startswith(("-", "/")) or branch.endswith(("/", ".", ".lock")):
+        raise ValueError("Enter a single valid deployment branch name.")
+    deploy_timeout = raw.get("deploy_timeout", 600)
+    if isinstance(deploy_timeout, str) and deploy_timeout.isascii() and deploy_timeout.isdecimal():
+        deploy_timeout = int(deploy_timeout)
+    if type(deploy_timeout) is not int or not 1 <= deploy_timeout <= 86400:
+        raise ValueError("Deployment timeout must be 1–86400 seconds.")
+    if raw.get("deploy_enabled", False) and not script:
+        raise ValueError("Automatic deployment requires a script path.")
+    defaults.update(deploy_enabled=raw.get("deploy_enabled", False), deploy_branch=branch,
+                    deploy_script=script, deploy_timeout=deploy_timeout)
     timeout = raw.get("timeout_seconds", JOB_TIMEOUT)
     if isinstance(timeout, str) and timeout.isascii() and timeout.isdecimal():
         timeout = int(timeout)
@@ -338,6 +360,7 @@ class CIManager:
             self._acquire_runner_lock()
             try:
                 await _db_call(database.db_ci_recover_runs)
+                await _db_call(database.db_deployment_recover)
                 rows = await _db_call(database.db_ci_queued_runs)
                 notifications = await _db_call(database.db_ci_pending_notifications)
             except BaseException:
@@ -416,7 +439,32 @@ class CIManager:
         return validate_config(json.loads(raw)) if raw else default_config()
 
     async def save_config(self, owner, repo, config):
+        content = config.get("deploy_script_content", "")
+        path = None
+        if content:
+            if not isinstance(content, str) or "\0" in content or len(content.encode("utf-8")) > 65536:
+                raise ValueError("Deployment script must be UTF-8 text up to 64 KiB without NUL bytes.")
+            content = content.replace("\r\n", "\n")
+            if os.name != "nt" and not content.startswith("#!"):
+                raise ValueError("Uploaded deployment scripts require a shebang, for example #!/bin/sh.")
+            digest = hashlib.sha256((owner + "/" + repo + "\0" + content).encode()).hexdigest()
+            path = Path(database.DB_PATH).resolve().parent / "deployment-scripts" / digest
+            config = {**config, "deploy_script": str(path)}
         config = validate_config(config)
+        if path is not None:
+            def store_script():
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                # Publish complete content atomically, including concurrent uploads.
+                descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".upload-")
+                try:
+                    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(content)
+                    os.chmod(temporary, 0o700)
+                    os.replace(temporary, path)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(temporary)
+            await asyncio.to_thread(store_script)
         await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
         return config
 
@@ -553,11 +601,13 @@ class CIManager:
             return False
         self.cancelled.add(run_id)
         if active:
+            completed = await _db_call(database.db_ci_run_get, owner, repo, run_id)
             active[1].cancel()
             await asyncio.gather(active[1], return_exceptions=True)
             # A task cancelled before its first instruction never enters its finally block.
             self.active.pop(run_id, None)
-            await _db_call(database.db_ci_run_update, run_id, status="cancelled", reason="Cancelled by user or superseded.", finished_at=datetime.now(timezone.utc).isoformat())
+            if not completed or completed[4] != "success":
+                await _db_call(database.db_ci_run_update, run_id, status="cancelled", reason="Cancelled by user or superseded.", finished_at=datetime.now(timezone.utc).isoformat())
         else:
             self.pending.pop(run_id, None)
             await _db_call(database.db_ci_run_update, run_id, status="cancelled", reason="Cancelled by user or superseded.", finished_at=datetime.now(timezone.utc).isoformat())
@@ -593,17 +643,24 @@ class CIManager:
                     logging.getLogger(__name__).exception("CI queue reconciliation failed")
 
     async def _run_one(self, row):
+        ci_finished = False
         try:
             await self._execute(row)
+            ci_finished = True
+            await self._deploy(row)
         except asyncio.CancelledError:
-            await _db_call(
-                database.db_ci_run_update,
-                row[0],
-                status="cancelled" if row[0] in self.cancelled else "interrupted",
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
+            if not ci_finished:
+                await _db_call(
+                    database.db_ci_run_update,
+                    row[0],
+                    status="cancelled" if row[0] in self.cancelled else "interrupted",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
             raise
         except Exception as exc:
+            if ci_finished:
+                logging.getLogger(__name__).exception("Deployment processing failed for run #%s", row[0])
+                return
             await _db_call(
                 database.db_ci_run_update,
                 row[0],
@@ -621,6 +678,55 @@ class CIManager:
         task = asyncio.create_task(self._notify(row))
         self.notification_tasks.add(task)
         task.add_done_callback(self.notification_tasks.discard)
+
+    async def _deploy(self, row):
+        """Run a trusted external script, never repository-controlled commands."""
+        run_id, owner, repo, event, branch, commit, _payload = row
+        if event not in ("push", "pull_request_merged"):
+            return
+        run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
+        config = await self.config(owner, repo)
+        meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
+        snapshot = json.loads(meta["config"] or "{}")
+        if not run or run[4] != "success" or not config["deploy_enabled"] or not snapshot.get("deploy_enabled"):
+            return
+        if branch != config["deploy_branch"] or any(config[k] != snapshot.get(k) for k in ("deploy_branch", "deploy_script", "deploy_timeout")):
+            return
+        output, truncated = bytearray(), [False]
+        claimed = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="pygithost-deploy-") as home:
+                env = runner_environment(home)
+                bare = str(Path(self.repo_path(owner, repo)).resolve())
+                script = Path(config["deploy_script"]).resolve()
+                if script.is_relative_to(Path(bare)) or not script.is_file():
+                    raise ValueError("Deployment script must exist outside the repository.")
+                rc = await self._capture_process(
+                    ["git", "--git-dir", bare, "rev-parse", "--verify", f"refs/heads/{branch}"],
+                    shell=False, cwd=None, env=env, output=output, truncated=truncated, timeout=30)
+                if rc or output.decode().strip() != commit:
+                    return
+                output.clear()
+                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit)
+                if not claimed:
+                    return
+                env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
+                    PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, CI="true")
+                rc = await self._capture_process([str(script), commit], shell=False,
+                    cwd=home, env=env, output=output, truncated=truncated,
+                    timeout=config["deploy_timeout"])
+                status = "success" if rc == 0 else "failed"
+        except asyncio.CancelledError:
+            if claimed:
+                await _db_call(database.db_deployment_finish, run_id, "interrupted", output.decode("utf-8", "replace"))
+            raise
+        except Exception as exc:
+            status = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed"
+            output.extend((f"\nDeployment error: {exc}\n").encode()[:MAX_OUTPUT - len(output)])
+            if not claimed:
+                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit)
+        if claimed:
+            await _db_call(database.db_deployment_finish, run_id, status, output.decode("utf-8", "replace"))
 
     async def _notify(self, row):
         async with self.notification_slots:

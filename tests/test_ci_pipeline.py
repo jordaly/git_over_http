@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 
 from pygithost import database
 from pygithost.application import _git_ff_merge
-from pygithost.ci import CIManager, collect_artifacts, default_config, protected_branch, validate_config
+from pygithost.ci import CIManager, collect_artifacts, default_config, protected_branch, validate_config, render_command
 from pygithost.ci_protection import check_updates, prepare_hooks
 from pygithost.ci_documentation import EXAMPLE_PIPELINE, ci_configuration_guide
 from tests.test_server import ServerRunner, _which_git_backend
@@ -88,6 +88,33 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                      "PYGITHOST_WORKTREE", "no trailing commas"):
             self.assertIn(text, guide)
         self.assertIn('id="ci-configuration-guide"', guide)
+
+    def test_jinja_style_environment_references_are_literal_single_pass(self):
+        env = {"NAME": "value with spaces", "OTHER": "{{ env.NAME }}", "EMPTY": ""}
+        self.assertEqual(render_command('echo "{{ env.NAME }}" {{env.EMPTY}}', env), 'echo "value with spaces" ')
+        self.assertEqual(render_command("{{ env.OTHER }}", env), "{{ env.NAME }}")
+        self.assertEqual(render_command("echo unchanged", env), "echo unchanged")
+        self.assertEqual(render_command("{{ not_a_ci_template }}", env), "{{ not_a_ci_template }}")
+        for template in ("{{ env.MISSING }}", "{{ env.NAME | upper }}", "{{ env['NAME'] }}", "{{ env.NAME"):
+            with self.subTest(template=template), self.assertRaises(ValueError):
+                render_command(template, env)
+
+    async def test_environment_templates_execute_without_expanding_saved_snapshot(self):
+        _source, bare, commit = self.repository()
+        manager = self.manager(bare)
+        config = {"env": {"GREETING": "template-value"}, "steps": [
+            {"name": "Template", "run": "echo {{ env.GREETING }} {{ env.PYGITHOST_BRANCH }}"}]}
+        run = await self.execute(manager, commit, config)
+        self.assertEqual(run[4], "success")
+        self.assertIn("template-value main", run[5])
+        snapshot = database.db_ci_run_metadata("owner", "repo", run[0])["config"]
+        self.assertIn("{{ env.GREETING }}", snapshot)
+        config = {"steps": [{"name": "Missing", "run": "echo {{ env.NOT_CONFIGURED }}"},
+                            {"name": "Skipped", "run": "echo should-not-execute"}]}
+        run = await self.execute(manager, commit, config)
+        self.assertEqual(run[4], "failed")
+        self.assertIn("Undefined CI environment variable: NOT_CONFIGURED", run[5])
+        self.assertEqual([step["status"] for step in json.loads(database.db_ci_steps_get(run[0]))], ["failed", "skipped"])
 
     @unittest.skipUnless(os.name == "posix", "POSIX shell syntax")
     async def test_steps_use_fresh_shells_share_files_and_stop_on_failure(self):

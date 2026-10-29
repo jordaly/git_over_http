@@ -62,6 +62,16 @@ def ci_configuration_guide():
 <li>Each step has its own status, exit code, duration, and output. Combined run output is limited to 1 MiB; the run page provides a raw-log download.</li></ul>
 </details>
 
+<details><summary>Jinja-style environment placeholders</summary>
+<p>Use <code>{{{{ env.NAME }}}}</code> in a command or step's <code>run</code> string to insert a configured environment value. The same syntax works on Windows, Linux, and Docker, without installing Jinja.</p>
+<pre>{{
+  "command": "my-tool --password \\"{{{{ env.DB_PASSWORD }}}}\\""
+}}</pre>
+<p>Set <code>DB_PASSWORD</code> in the CI settings environment field. Omit JSON <code>env</code> to inherit that mapping; supplying JSON <code>env</code> replaces it. Built-in variables such as <code>{{{{ env.PYGITHOST_BRANCH }}}}</code> are also available.</p>
+<p>Substitution happens once, just before each command executes. Undefined variables fail the run/step without executing that command. Loops, filters, function calls, and other Jinja expressions are not supported. References inside inserted values are not expanded recursively.</p>
+<p class="warn">Values are inserted as literal command text, not automatically shell-escaped. Quote them for the selected shell; special characters may change how a command executes. Environment values remain plaintext in configuration snapshots and output is not redacted. Avoid printing credentials. Prefer tools that read sensitive values directly from the environment where possible.</p>
+</details>
+
 <details><summary>Artifacts: downloadable files</summary>
 <p>In the form, enter one file pattern per line. In JSON, use <code>"artifacts": {{"paths": ["dist/*", "reports/**/*.xml"], "when": "always"}}</code>.</p>
 <ul><li>Paths are relative to the checkout. Use forward slashes. Matched directories are not implicitly archived; choose file patterns. No matches means no download.</li>

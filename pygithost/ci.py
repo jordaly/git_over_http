@@ -195,6 +195,26 @@ def pipeline_config(raw, config, *, enforce_timeout=True):
     return merged
 
 
+def render_command(command, env):
+    """Single-pass {{ env.NAME }} substitution, without expression evaluation."""
+    reference = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+    def replace(match):
+        name = match.group(1)
+        if name not in env:
+            raise ValueError(f"Undefined CI environment variable: {name}")
+        return env[name]
+
+    # Validate the original template before insertion, so values containing
+    # template-like text are always treated literally and never expanded again.
+    for expression in re.finditer(r"\{\{\s*env\b.*?\}\}", command, re.DOTALL):
+        if not reference.fullmatch(expression.group()):
+            raise ValueError("CI templates support only {{ env.NAME }} references; expressions and filters are not supported.")
+    if re.search(r"\{\{\s*env\b", reference.sub("", command)):
+        raise ValueError("Invalid CI environment placeholder; use {{ env.NAME }}.")
+    return reference.sub(replace, command)
+
+
 def protected_branch(config, branch):
     return config.get("block_direct_pushes", False) and any(
         fnmatch.fnmatchcase(branch, pattern.strip())
@@ -851,7 +871,8 @@ class CIManager:
                         phase = f"step {index + 1}: {step['name']}"
                         current_step.update(status="running", started_at=datetime.now(timezone.utc).isoformat())
                         await save_steps()
-                    command, shell = step["run"], True
+                    command, shell = render_command(step["run"],
+                        {key: value for key, value in env.items() if key in BUILTINS or key in config["env"]}), True
                     if config["runner"] == "docker":
                         container = f"pygithost-ci-{os.getpid()}-{run_id}-{index}"
                         command, shell = docker_command(container, worktree, env_file, {**config, "command": command}), False

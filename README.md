@@ -160,6 +160,18 @@ Jobs expose `CI=true` and `PYGITHOST_OWNER`, `PYGITHOST_REPO`,
 `PYGITHOST_BASE_BRANCH`, `PYGITHOST_HEAD_BRANCH`, `PYGITHOST_BASE_COMMIT`, and
 `PYGITHOST_WORKTREE`. Built-in variable names cannot be overridden.
 
+Commands and step `run` strings also support dependency-free Jinja-style
+placeholders: `{{ env.NAME }}`. For example, configure `DB_PASSWORD=value` in CI
+settings and use `"command": "my-tool --password \"{{ env.DB_PASSWORD }}\""`
+in pipeline JSON. Omit JSON `env` to inherit the server mapping; JSON `env`, when
+provided, replaces it. Configured and built-in CI variables are available.
+Substitution occurs once immediately before command execution; missing variables
+fail the command's run/step. No Jinja filters, loops, function calls, or expression
+evaluation are supported. Inserted values are not recursively expanded or
+automatically shell-escaped: quote appropriately for the runner shell. This is
+not secret management; environment values remain in plaintext snapshots and logs
+are not redacted. Prefer tools reading sensitive values directly from their environment.
+
 Branch filters use one case-sensitive glob per line (`main`, `release/*`); blank
 means all branches. PR filters match the **target** branch.
 
@@ -314,6 +326,10 @@ operator cleanup. Use a service supervisor that terminates the entire service
 process tree/cgroup (for example systemd's `KillMode=control-group`), not just the
 server's process group: CI subprocesses use separate sessions. Docker containers
 need separate cleanup after a crash. This is not a distributed worker system.
+
+For a proposed distributed execution model, see
+[Remote CI runners](docs/remote-ci-runners.md). This is a design document, not an
+available feature.
 
 ### Email notifications
 

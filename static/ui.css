@@ -107,6 +107,60 @@ td { padding: 12px; font-size: 13px; }
 .ok, .warn { border-radius: 8px; font-size: 13px; line-height: 1.65; padding: 12px 14px; }
 :is(a, button, input, select, textarea, summary):focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
 [hidden] { display: none !important; }
+
+/* Shared pagination: stable controls, visible boundaries, and no guessed totals. */
+.pagination {
+  display: grid;
+  width: 100%;
+  gap: 14px;
+  padding-top: 18px;
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+.pagination .pagination-summary { margin: 0; color: var(--muted); font-size: 12px; text-align: center; }
+.pagination-links, .pagination-options { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; }
+.pagination-options { gap: 12px 24px; }
+.pagination .pagination-options form { display: flex; align-items: center; gap: 8px; margin: 0; }
+.pagination .pagination-options form > label { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 12px; font-weight: 400; }
+.pagination .pagination-options :is(input, select) { width: auto; min-height: 34px; padding: 6px 8px; font-size: 12px; }
+.pagination .pagination-options input[type="number"] { width: 76px; }
+.pagination .pagination-options form > button { margin: 0; padding: 7px 10px; font-size: 12px; min-height: 34px; }
+.pagination-control, .pagination-number, .pagination-current {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 8px 12px;
+  white-space: nowrap;
+  font-weight: 600;
+  text-decoration: none;
+}
+.pagination-control { color: var(--fg); background: var(--box); }
+.pagination-number { min-width: 38px; color: var(--fg); background: var(--box); }
+.pagination :is(a.pagination-control, a.pagination-number):hover {
+  color: var(--link);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  text-decoration: none;
+}
+.pagination-current { color: var(--link); background: var(--accent-bg); border-color: var(--accent-border); }
+.pagination-control.is-disabled { color: var(--muted); background: var(--pre-bg); border-color: var(--border); opacity: .65; cursor: default; }
+.pagination-ellipsis { color: var(--muted); padding: 0 2px; }
+.topbar:has(> .pagination) { flex-wrap: wrap; }
+.topbar > .pagination { margin: 0; padding: 0; border: 0; flex: 1 1 100%; }
+@media (max-width: 480px) {
+  .pagination { gap: 6px; }
+  .pagination-control { padding-inline: 8px; font-size: 12px; }
+  .pagination-current { padding-inline: 10px; }
+  .pagination-number, .pagination-ellipsis { display: none; }
+  .topbar > .pagination { width: 100%; }
+}
 @media (max-width: 700px) {
   body { width: calc(100% - 28px); margin: 0 auto; }
   .app-header { gap: 16px; margin-bottom: 20px; }

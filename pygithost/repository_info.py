@@ -6,10 +6,14 @@ import json
 from . import database
 
 
-async def repository_overview(owner, repo, bare, commit, entries, subpath=""):
+async def repository_overview(owner, repo, bare, commit, entries, subpath="", page=None, page_size=25):
     if not commit:
         return {"latest": None, "entries": {}, "commit_count": 0, "contributors": []}
     cache_key = commit + ":" + subpath if subpath else commit
+    if page is not None:
+        cache_key += f":page={page}"
+        if page_size != 25:
+            cache_key += f":size={page_size}"
     cached = await asyncio.to_thread(database.db_repository_overview_get, owner, repo, cache_key)
     if cached is not None:
         return json.loads(cached)

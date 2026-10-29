@@ -106,16 +106,68 @@ def _page_number(params):
     return max(1, min(1000000, int(value))) if value.isascii() and value.isdecimal() and len(value) <= 7 else 1
 
 
-def _pagination(base, params, page, has_next):
+def _page_size(params, default=25):
+    value = (params.get("per_page") or [str(default)])[0]
+    return int(value) if value in ("10", "25", "50", "100") else default
+
+
+def _clamp_page(page, total, size):
+    return min(page, max(1, (total + size - 1) // size))
+
+
+def _pagination(base, params, page, has_next, *, total=None, per_page=25):
+    if total is not None:
+        page = _clamp_page(page, total, per_page)
+        has_next = page * per_page < total
+    params = {key: value for key, value in params.items() if key not in ("page", "partial", "skip", "per_page")}
+    pages = max(1, (total + per_page - 1) // per_page) if total is not None else None
     links = []
-    if page > 1:
-        previous = base + "?" + urlencode({**params, "page": page - 1})
-        links.append(html_t(t'<a class="pill" rel="prev" href="{previous}">← Previous</a>'))
-    links.append(html_t(t'<span class="muted">Page {page}</span>'))
-    if has_next:
-        following = base + "?" + urlencode({**params, "page": page + 1})
-        links.append(html_t(t'<a class="pill" rel="next" href="{following}">Next →</a>'))
-    return safe_html(html_t(t'<nav class="row" aria-label="Pagination">{join_html(links)}</nav>'))
+
+    def control(label, destination, enabled, *, rel="", aria="", numbered=False):
+        cls = "pagination-number" if numbered else "pagination-control"
+        if enabled:
+            href = base + "?" + urlencode({**params, "page": destination, "per_page": per_page})
+            relationship = safe_html(html_t(t' rel="{rel}"')) if rel else safe_html("")
+            return html_t(t'<a class="{cls}"{relationship} href="{href}" aria-label="{aria or label}">{label}</a>')
+        return html_t(t'<span class="{cls} is-disabled" aria-disabled="true">{label}</span>')
+
+    links.append(control("« First", 1, page > 1, aria="Go to first page"))
+    links.append(control("← Previous", page - 1, page > 1, rel="prev"))
+    numbers = {1, page, *range(max(1, page - 1), page + 2 if has_next else page + 1)}
+    if pages is not None:
+        numbers.add(pages)
+        numbers = {number for number in numbers if number <= pages}
+    previous = 0
+    for number in sorted(numbers):
+        if previous and number - previous > 1:
+            links.append(safe_html('<span class="pagination-ellipsis" aria-hidden="true">…</span>'))
+        if number == page:
+            links.append(html_t(t'<span class="pagination-current" aria-current="page">Page {page}</span>'))
+        else:
+            links.append(control(str(number), number, True, aria=f"Go to page {number}", numbered=True))
+        previous = number
+    links.append(control("Next →", page + 1, has_next, rel="next"))
+    if pages is not None:
+        links.append(control("Last »", pages, page < pages, aria="Go to last page"))
+    summary = f"{total:,} results · Page {page:,} of {pages:,}" if total is not None else f"Page {page:,}"
+    if total:
+        summary = f"Showing {(page - 1) * per_page + 1:,}–{min(page * per_page, total):,} of {total:,} · Page {page:,} of {pages:,}"
+    hidden = join_html([html_t(t'<input type="hidden" name="{key}" value="{value}">') for key, value in params.items()])
+    options = join_html([html_t(t'<option value="{size}"{safe_html(" selected" if size == per_page else "")}>{size}</option>') for size in (10, 25, 50, 100)])
+    maximum = safe_html(html_t(t' max="{pages}"')) if pages is not None else safe_html("")
+    return safe_html(html_t(t'''<nav class="pagination" aria-label="Pagination">
+<p class="pagination-summary" role="status">{summary}</p><div class="pagination-links">{join_html(links)}</div>
+<div class="pagination-options"><form method="GET" action="{base}" class="pagination-size">{hidden}<label>Rows per page <select name="per_page">{options}</select></label><button type="submit">Apply</button></form>
+<form method="GET" action="{base}" class="pagination-jump">{hidden}<input type="hidden" name="per_page" value="{per_page}"><label>Go to page <input name="page" type="number" min="1"{maximum} value="{page}" required></label><button type="submit">Go</button></form></div></nav>'''))
+
+
+def _paginate_items(items, url, base=None):
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query or "")
+    size = _page_size(params)
+    page = _clamp_page(_page_number(params), len(items), size)
+    query = {key: values[0] for key, values in params.items() if key not in ("page", "partial")}
+    return items[(page - 1) * size:page * size], _pagination(base or parsed.path, query, page, page * size < len(items), total=len(items), per_page=size), page
 
 
 def _ci_tabs(base, active):
@@ -761,6 +813,11 @@ async def _git_commit_patch(repo_git: str, commit: str, max_bytes: int = 600_000
 async def _git_is_ancestor(repo_git: str, maybe_ancestor: str, maybe_descendant: str) -> bool:
     code, _out, _err = await _run_git(repo_git, ["merge-base", "--is-ancestor", maybe_ancestor, maybe_descendant])
     return code == 0
+
+
+async def _git_commit_count(repo_git, revision, path=""):
+    code, output, _ = await _run_git(repo_git, ["--literal-pathspecs", "rev-list", "--count", revision] + (["--", path] if path else []))
+    return int(output.strip()) if code == 0 and output.strip().isdigit() else None
 
 
 async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100, skip: int = 0, path: str = "") -> list[dict[str, str]]:
@@ -1543,9 +1600,10 @@ class GitHTTPHandler:
         search = (params.get("q") or [""])[0].strip()[:128]
         repos = [item for item in all_repos if search.casefold() in f"{item[0]}/{item[1]} {item[2]}".casefold()]
         total = len(repos)
-        page = min(_page_number(params), max(1, (total + 24) // 25))
-        repos = repos[(page - 1) * 25:page * 25]
-        pagination = _pagination("/", {"q": search} if search else {}, page, page * 25 < total)
+        size = _page_size(params)
+        page = _clamp_page(_page_number(params), total, size)
+        repos = repos[(page - 1) * size:page * size]
+        pagination = _pagination("/", {"q": search} if search else {}, page, page * size < total, total=total, per_page=size)
 
         rows = []
         for owner, repo, rel in repos:
@@ -1572,7 +1630,7 @@ class GitHTTPHandler:
 <div>{admin_link} <a class="pill" href="/tokens">Tokens</a> <span class="pill">User: <code>{self.remote_user or "?"}</code></span> <a class="pill" href="/logout">Logout</a></div>
 </div>
 {notice_html}
-<form class="repo-search" method="GET" action="/" role="search"><label for="repo-search">Find a repository</label><div class="row"><input id="repo-search" type="search" name="q" value="{search}" placeholder="Search by repository, owner, or path…" maxlength="128"><button type="submit">Search</button>{clear}</div></form>
+<form class="repo-search" method="GET" action="/" role="search"><input type="hidden" name="per_page" value="{size}"><label for="repo-search">Find a repository</label><div class="row"><input id="repo-search" type="search" name="q" value="{search}" placeholder="Search by repository, owner, or path…" maxlength="128"><button type="submit">Search</button>{clear}</div></form>
 <details class="box repo-create"{safe_html(" open" if not all_repos or notice_kind == "warn" else "")}><summary>Create repository</summary>
 <form method="POST" action="/create-repo">
 <div class="row">
@@ -1590,6 +1648,7 @@ class GitHTTPHandler:
     async def _ui_tokens(self, notice: str = "", notice_kind: str = "ok", new_token: str = ""):
         user_id = int(self.remote_user_id or 0)
         tokens = await asyncio.to_thread(db_list_tokens_for_user, user_id)
+        tokens, pagination, _page = _paginate_items(tokens, self.path, "/tokens")
 
         notice_html = safe_html("")
         if notice:
@@ -1673,6 +1732,7 @@ class GitHTTPHandler:
 <tr><td><b>Name</b></td><td><b>Scopes</b></td><td><b>Expires</b></td><td><b>Status</b></td><td></td></tr>
 {rows_html}
 </table>
+{pagination}
 </div>"""
         )
         await _send_html(self.request, 200, _html_page("Tokens", safe_html(body)))
@@ -1761,8 +1821,9 @@ class GitHTTPHandler:
             notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
 
         users = await asyncio.to_thread(db_list_users)
+        all_users = users
+        users, pagination, _page = _paginate_items(users, self.path, "/admin/users")
         rows = []
-        options = []
         for uid, uname, is_admin, is_active, created_at in users:
             pill_admin = safe_html('<span class="pill">admin</span>' if is_admin else '<span class="pill muted">user</span>')
             pill_active = safe_html('<span class="pill">active</span>' if is_active else '<span class="pill muted">disabled</span>')
@@ -1786,10 +1847,8 @@ class GitHTTPHandler:
 </tr>"""
                 )
             )
-            options.append(html_t(t"<option value=\"{uid}\">{uname}</option>"))
-
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No users.</td></tr>')
-        options_html = join_html(options)
+        options_html = join_html([html_t(t'<option value="{uid}">{uname}</option>') for uid, uname, *_rest in all_users])
 
         body = html_t(
             t"""<div class="topbar"><h1 style="margin:0">Admin · Users</h1><div><a class="pill" href="/">Home</a></div></div>
@@ -1815,7 +1874,7 @@ class GitHTTPHandler:
 </div>
 </form>
 </div>
-<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">All users</h2><table>{rows_html}</table></div>"""
+<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">All users</h2><table>{rows_html}</table>{pagination}</div>"""
         )
         await _send_html(self.request, 200, _html_page("Admin · Users", safe_html(body)))
 
@@ -1940,7 +1999,8 @@ document.addEventListener("DOMContentLoaded", function() {{
                 kind = parts[1] if len(parts) >= 2 else "blob"
                 root_entries.append((kind, name))
         root_entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
-        overview = await repository_overview(owner, repo, repo_git, default_commit, root_entries)
+        root_entries, files_pagination, files_page = _paginate_items(root_entries, self.path)
+        overview = await repository_overview(owner, repo, repo_git, default_commit, root_entries, page=files_page, page_size=_page_size(parse_qs(urlparse(self.path).query or "")))
         latest = overview["latest"]
         latest_html = safe_html("")
         if latest:
@@ -1998,7 +2058,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch)}</div>
 <script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
 </div>
-<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div></div>
+<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div>{files_pagination}</div>
 {document_nav}{readme_html}{license_html}</div><aside class="repo-sidebar">{about_html}{language_html}</aside></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
@@ -2074,15 +2134,16 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         else:
             create_box = safe_html('<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope, so branch create/delete is disabled.</div>')
+        rows, pagination, _page = _paginate_items(rows, self.path, base + "/branches")
         rows_html = join_html(rows) if rows else safe_html(html_t(t'<div class="repo-empty"><h2>{"No matching branches" if search or view != "all" else "No other branches yet"}</h2><p class="muted">{"Try a different search or filter." if search or view != "all" else "Create a branch to work on changes without updating the default branch."}</p></div>'))
         default_html = safe_html(html_t(t'<section class="box repo-list"><div class="repo-panel-heading"><h2>Default branch</h2></div>{join_html(default_rows)}</section>')) if default_rows else safe_html("")
         body = html_t(
             t"""<main class="repo-page">{_repo_tabs(base, "branches")}<div class="topbar"><div><h2>Branches</h2><p class="muted">Manage development branches and open pull requests.</p></div><span class="pill">{len(branches)} branches</span></div>
 {notice_html}
-<form class="repo-search" method="GET" action="{base}/branches" role="search"><label for="branch-search">Find a branch</label><div class="row"><input id="branch-search" type="search" name="q" value="{search}" placeholder="Search branches…" maxlength="128">
+<form class="repo-search" method="GET" action="{base}/branches" role="search"><input type="hidden" name="per_page" value="{_page_size(params)}"><label for="branch-search">Find a branch</label><div class="row"><input id="branch-search" type="search" name="q" value="{search}" placeholder="Search branches…" maxlength="128">
 <select name="view" aria-label="Branch filter"><option value="all"{safe_html(" selected" if view == "all" else "")}>All branches</option><option value="protected"{safe_html(" selected" if view == "protected" else "")}>Protected branches</option></select>
 <select name="sort" aria-label="Branch sort"><option value="updated"{safe_html(" selected" if sort == "updated" else "")}>Recently updated</option><option value="name"{safe_html(" selected" if sort == "name" else "")}>Name</option></select><button type="submit">Find branches</button><a class="pill" href="{base}/branches">Reset</a></div></form>
-{create_box}{default_html}<section class="box repo-list"><div class="repo-panel-heading"><h2>{"Matching branches" if search or view != "all" else "Other branches"}</h2><span class="muted">{len(rows)} shown</span></div>{rows_html}</section></main>"""
+{create_box}{default_html}<section class="box repo-list"><div class="repo-panel-heading"><h2>{"Matching branches" if search or view != "all" else "Other branches"}</h2><span class="muted">{len(rows)} shown</span></div>{rows_html}{pagination}</section></main>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Branches · {owner}/{repo}"), safe_html(body)))
 
@@ -2141,7 +2202,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         status = (qs.get("status") or ["open"])[0].strip().lower()
         if status not in ("open", "closed", "merged", "all"):
             status = "open"
-        rows_db = await asyncio.to_thread(db_pr_list, owner, repo, None if status == "all" else status)
+        from .database import db_pr_count
+        size = _page_size(qs)
+        total = await _call_in_thread(db_pr_count, owner, repo, None if status == "all" else status)
+        page = _clamp_page(_page_number(qs), total, size)
+        rows_db = await asyncio.to_thread(db_pr_list, owner, repo, None if status == "all" else status, limit=size, offset=(page - 1) * size)
+        pagination = _pagination(str_t(t"/r/{q(owner)}/{q(repo)}/pulls"), {key: values[0] for key, values in qs.items() if key != "page"}, page, page * size < total, total=total, per_page=size)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html("")
         if notice:
@@ -2191,7 +2257,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="row" style="margin-top:10px"><div style="flex:1;min-width:260px"><label>Title</label><input name="title" placeholder="Add feature X" required style="width:100%"/></div></div>
 <div style="margin-top:10px"><label>Description</label><textarea name="body" placeholder="What does this change?"></textarea></div>
 <div style="margin-top:10px"><button type="submit">Create PR</button></div></form>{warn_merge}</div>
-<div class="box"><table>{rows_html}</table></div>"""
+<div class="box"><table>{rows_html}</table>{pagination}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Pull requests · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
@@ -2242,8 +2308,17 @@ document.addEventListener("DOMContentLoaded", function() {{
         src_commit = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
         tgt_commit = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
         commits = []
+        params = parse_qs(urlparse(self.path).query or "")
+        page = _page_number(params)
+        size = _page_size(params)
+        total = 0
         if src_commit and tgt_commit and src_commit != tgt_commit:
-            commits = await _git_list_commits(repo_git, tgt_commit + ".." + src_commit, limit=200)
+            total = await _git_commit_count(repo_git, tgt_commit + ".." + src_commit)
+            if total is not None:
+                page = _clamp_page(page, total, size)
+            commits = await _git_list_commits(repo_git, tgt_commit + ".." + src_commit, limit=size + 1, skip=(page - 1) * size)
+        commits_pagination = _pagination(base + f"/pulls/{pr_id}", {}, page, len(commits) > size, total=total, per_page=size)
+        commits = commits[:size]
         if src_commit and tgt_commit and src_commit != tgt_commit:
             diff_text, diff_trunc = await _git_diff_between(repo_git, tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES)
         elif src_commit and tgt_commit and src_commit == tgt_commit:
@@ -2309,7 +2384,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div style="margin-top:10px">{description}</div>
 <div class="muted" style="margin-top:10px">Source: <code>{src_branch}</code> @ <code>{src_short}</code><br>Target: <code>{tgt_branch}</code> @ <code>{tgt_short}</code></div></div>
 {ci_panel}{merge_box}
-<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table></div>
+<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table>{commits_pagination}</div>
 <div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Diff</h2>{diff_html}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>'))))
@@ -2458,7 +2533,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         return await self._ui_admin_email(notice="Email settings saved.")
 
     async def _ui_deployments(self, owner, repo, deployment_id=None):
-        from .database import db_deployments_list, db_deployment_detail
+        from .database import db_deployments_list, db_deployment_detail, db_deployments_count
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
@@ -2472,10 +2547,12 @@ document.addEventListener("DOMContentLoaded", function() {{
             params = parse_qs(urlparse(self.path).query or "")
             value = (params.get("before") or [""])[0]
             before = int(value) if value.isascii() and value.isdecimal() and len(value) < 19 else 0
-            page = _page_number(params)
-            rows = await _call_in_thread(db_deployments_list, owner, repo, before, 26, (page - 1) * 25)
+            size = _page_size(params)
+            total = await _call_in_thread(db_deployments_count, owner, repo, before)
+            page = _clamp_page(_page_number(params), total, size)
+            rows = await _call_in_thread(db_deployments_list, owner, repo, before, size, (page - 1) * size)
         entries = []
-        for row in rows[:25]:
+        for row in rows:
             identity, run_id, commit, status, started, finished, notification, raw, retained = row[:9]
             config = json.loads(raw or "{}")
             branch = config.get("deploy_branch", "—")
@@ -2485,7 +2562,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <p>Branch: <code>{branch}</code> · Commit: <a href="{base}/commit/{q(commit)}"><code>{commit}</code></a></p>
 <p class="muted">Started: {started} · Finished: {finished or "—"} · Duration: {_ci_elapsed(started, finished)} · Email: {notification or "not queued"}</p>{run_link}{logs}</section>'''))
         listing = join_html(entries) if entries else safe_html('<section class="box"><h2>No deployments yet</h2><p>Deployment attempts appear here after matching CI succeeds. Skipped deployments are not recorded.</p></section>')
-        older = _pagination(base + "/ci/deployments", {"before": before} if before else {}, page, len(rows) > 25) if deployment_id is None else safe_html("")
+        older = _pagination(base + "/ci/deployments", {"before": before} if before else {}, page, page * size < total, total=total, per_page=size) if deployment_id is None else safe_html("")
         body = html_t(t'''{_ci_tabs(base, "deployments")}<div class="topbar"><h2>Deployment history</h2><a class="pill" href="{base}/ci/deployments">Latest deployments</a></div>
 <p class="muted">Deployment results are separate from CI results. Open a deployment for output. Refresh to update running attempts and email delivery.</p>
 <p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs#ci-guide-deployment">Deployment documentation</a></p>{listing}{older}''')
@@ -2511,17 +2588,19 @@ document.addEventListener("DOMContentLoaded", function() {{
         filters["q"] = filters["q"][:128]
         cursor = (query_params.get("before") or [""])[0]
         before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
-        page = _page_number(query_params)
+        from .database import db_ci_runs_count
+        size = _page_size(query_params)
+        total = await _call_in_thread(db_ci_runs_count, owner, repo, status=filters["status"], event=filters["event"], branch=filters["branch"], query=filters["q"], before=before)
+        page = _clamp_page(_page_number(query_params), total, size)
         runs = await _call_in_thread(
-            db_ci_runs_list, owner, repo, 26,
+            db_ci_runs_list, owner, repo, size,
             status=filters["status"], event=filters["event"],
             branch=filters["branch"], query=filters["q"],
             summary=True,
             before=before,
-            offset=(page - 1) * 25,
+            offset=(page - 1) * size,
         )
-        has_next = len(runs) > 25
-        runs = runs[:25]
+        has_next = page * size < total
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows = []
@@ -2550,11 +2629,12 @@ document.addEventListener("DOMContentLoaded", function() {{
             for value, label in branch_values
         ])
         filter_form = safe_html(html_t(t'''<div class="box"><h2>Find runs</h2><form method="GET" action="{base}/ci" class="row">
+<input type="hidden" name="per_page" value="{size}">
 <input aria-label="Search runs" name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
 <select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
 <select aria-label="Branch" name="branch">{branch_options}</select><button type="submit">Filter runs</button>
 <a class="pill" href="{base}/ci">Clear filters</a></form></div>'''))
-        pagination = _pagination(base + "/ci", {**{key: value for key, value in filters.items() if value}, **({"before": before} if before is not None else {})}, page, has_next)
+        pagination = _pagination(base + "/ci", {**{key: value for key, value in filters.items() if value}, **({"before": before} if before is not None else {})}, page, has_next, total=total, per_page=size)
         results_html = safe_html(html_t(t'''<div id="ci-results">
 <div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>'''))
         if partial:
@@ -2946,10 +3026,14 @@ form.addEventListener("change", update); update();
         params = parse_qs(urlparse(self.path).query or "")
         cursor = (params.get("before") or [""])[0]
         before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
-        artifacts = await _call_in_thread(db_ci_artifacts_list, owner, repo, before=before, limit=51)
+        from .database import db_ci_artifacts_count
+        size = _page_size(params)
+        total = await _call_in_thread(db_ci_artifacts_count, owner, repo, before)
+        page = _clamp_page(_page_number(params), total, size)
+        artifacts = await _call_in_thread(db_ci_artifacts_list, owner, repo, before=before, limit=size, offset=(page - 1) * size)
         rows = []
-        for run_id, branch, commit, status, event, created, size, expires in artifacts[:50]:
-            size_label = f"{size / (1024 * 1024):.1f} MiB" if size >= 1024 * 1024 else f"{size / 1024:.1f} KiB"
+        for run_id, branch, commit, status, event, created, archive_size, expires in artifacts:
+            size_label = f"{archive_size / (1024 * 1024):.1f} MiB" if archive_size >= 1024 * 1024 else f"{archive_size / 1024:.1f} KiB"
             rows.append(html_t(t'''<tr><td><a class="ci-artifact-name" href="{base}/ci/runs/{run_id}/artifacts">ci-{run_id}-artifacts.zip</a><div class="muted">{size_label} · Created {created} UTC</div></td>
 <td><a href="{base}/ci/runs/{run_id}">Run #{run_id}</a> <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span><div class="muted">{branch or "—"} · <code>{commit[:8]}</code> · {event.replace("_", " ")}</div></td>
 <td><span class="muted">{("Expires " + expires + " UTC") if expires else "Never expires"}</span></td><td><a class="pill" href="{base}/ci/runs/{run_id}/artifacts" aria-label="Download artifacts from run {run_id}">Download ZIP ↓</a></td></tr>'''))
@@ -2957,9 +3041,7 @@ form.addEventListener("change", update); update();
             listing = safe_html(html_t(t'<div class="ci-table-scroll"><table><thead><tr><th scope="col">Archive</th><th scope="col">Source run</th><th scope="col">Retention</th><th scope="col">Download</th></tr></thead><tbody>{join_html(rows)}</tbody></table></div>'))
         else:
             listing = safe_html(html_t(t'''<div class="ci-artifacts-empty"><div class="ci-artifact-symbol" aria-hidden="true">↓</div><h2>{"No older artifacts" if before else "No artifacts yet"}</h2><p class="muted">Save build packages, screenshots, or reports from your CI runs.<br>Configure file patterns in CI settings to start collecting downloads.</p><a class="pill" href="{base}/ci/config">Configure artifacts</a> <a class="pill" href="{base}/ci">View CI runs</a></div>'''))
-        pagination = safe_html("")
-        if len(artifacts) > 50:
-            pagination = safe_html(html_t(t'<a class="pill" href="{base}/artifacts?before={artifacts[49][0]}">Older artifacts →</a>'))
+        pagination = _pagination(base + "/artifacts", {"before": before} if before is not None else {}, page, page * size < total, total=total, per_page=size)
         back = safe_html(html_t(t'<a class="pill" href="{base}/artifacts">Newest artifacts</a>')) if before else safe_html("")
         body = safe_html(html_t(t'''<main class="ci-page">{_repo_tabs(base, "artifacts")}<div class="topbar"><div><h2>Artifacts</h2><p class="muted">Build outputs from your CI runs, ready to download.</p></div><a class="pill" href="{base}/ci/config">Artifact settings</a></div>
 <section class="box ci-artifacts-panel"><div class="ci-section-heading"><h2>Available downloads</h2><span class="muted">Retention configured in CI settings; count limits also apply</span></div>{listing}<div class="row">{back}{pagination}</div></section></main>'''))
@@ -2997,11 +3079,17 @@ form.addEventListener("change", update); update();
             skip = max(0, int((qs.get("skip") or ["0"])[0]))
         except ValueError:
             skip = 0
+        size = _page_size(qs, default=50)
+        if "page" in qs:
+            skip = (_page_number(qs) - 1) * size
         partial = (qs.get("partial") or [""])[0] == "1"
         history_path = _clean_repo_path((qs.get("path") or [""])[0])
-        commits = await _git_list_commits(repo_git, resolved_ref, limit=51, skip=skip, **({"path": history_path} if history_path else {}))
-        has_more = len(commits) > 50
-        commits = commits[:50]
+        total = await _git_commit_count(repo_git, resolved_ref, history_path)
+        if not partial and total is not None:
+            skip = (_clamp_page(skip // size + 1, total, size) - 1) * size
+        commits = await _git_list_commits(repo_git, resolved_ref, limit=size + 1, skip=skip, **({"path": history_path} if history_path else {}))
+        has_more = len(commits) > size
+        commits = commits[:size]
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         groups = {}
         for commit in commits:
@@ -3030,17 +3118,18 @@ form.addEventListener("change", update); update();
         load_more = (
             safe_html(
                 html_t(
-                    t"<button id=\"loadMoreCommits\" type=\"button\" data-ref=\"{resolved_ref}\" data-path=\"{history_path}\" data-next-skip=\"{len(commits)}\">Load more commits</button>"
+                    t"<button id=\"loadMoreCommits\" type=\"button\" data-ref=\"{resolved_ref}\" data-path=\"{history_path}\" data-next-skip=\"{skip + len(commits)}\">Load more commits</button>"
                 )
             )
             if has_more
             else safe_html("")
         )
+        pagination = _pagination(base + "/commits", {"ref": resolved_ref, **({"path": history_path} if history_path else {})}, skip // size + 1, has_more, total=total, per_page=size)
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><h2>Commits</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
-<div class="box"><p class="muted">ref: <code>{ref}</code> {history_path}</p><table><tbody id="commitRows">{rows_html}</tbody></table>
-<div id="loadMoreStatus" class="muted" style="margin-top:10px">{load_more}</div></div>
+<div class="box"><div class="topbar"><p class="muted">ref: <code>{ref}</code> {history_path}</p>{pagination}</div><table><tbody id="commitRows">{rows_html}</tbody></table>
+<div id="loadMoreStatus" class="muted" style="margin-top:10px">{load_more}</div>{pagination}</div>
 <script>
 (function() {{
     const button = document.getElementById("loadMoreCommits");
@@ -3053,6 +3142,7 @@ form.addEventListener("change", update); update();
         const params = new URLSearchParams({{
             ref: button.dataset.ref,
             skip: button.dataset.nextSkip,
+            per_page: "{size}",
             partial: "1"
         }});
         if (button.dataset.path) params.set("path", button.dataset.path);
@@ -3128,6 +3218,7 @@ form.addEventListener("change", update); update();
         if not meta:
             return await self._not_found()
         files = await _git_commit_name_status(repo_git, commit)
+        files, pagination, _page = _paginate_items(files, self.path)
         patch_text, truncated = await _git_commit_patch(repo_git, commit)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         parent_links = []
@@ -3149,7 +3240,7 @@ form.addEventListener("change", update); update();
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div><h2><code>{commit[:8]}</code> {meta['subject']}</h2>
 <div class="muted">{meta['author_name']} &lt;{meta['author_email']}&gt; · {meta['date']}</div>{parents_html}</div>
 <div>{_repo_code_menu(owner, repo, commit)}</div></div>
-<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table></div>
+<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table>{pagination}</div>
 <div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Patch</h2>{patch_html}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Commit {commit[:8]} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
@@ -3235,7 +3326,8 @@ form.addEventListener("change", update); update();
         # Show folders first, then files. Keep alphabetical order inside each group.
         entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
 
-        overview = await repository_overview(owner, repo, repo_git, commit, entries, subpath=subpath)
+        entries, pagination, page = _paginate_items(entries, self.path)
+        overview = await repository_overview(owner, repo, repo_git, commit, entries, subpath=subpath, page=page, page_size=_page_size(parse_qs(urlparse(self.path).query or "")))
         rows = []
         for kind, name in entries:
             if kind == "tree":
@@ -3259,7 +3351,7 @@ form.addEventListener("change", update); update();
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{_repo_breadcrumbs(owner, repo, ref, subpath)}<p class="muted">ref: <code>{ref}</code></p></div>
 <div>{_repo_code_menu(owner, repo, ref)}</div></div>
-{up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div></div>"""
+{up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div>{pagination}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 

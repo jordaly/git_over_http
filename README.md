@@ -327,9 +327,13 @@ event/branch/PR. Cancelled and interrupted runs do not send email. Filters and
 Previous/Next pagination lets you browse retained history; the repository badge shows
 the default branch and marks results stale when its commit changes.
 
-The home repository list, CI Runs, and Deployments use **25 items per page** with
-Previous/Next controls and a page number. Repository search and CI run filters
-are preserved across pages. Searches start on page 1. Pagination is a live view:
+Growing lists default to **25 items per page** with consistent First/Previous/Next/Last
+controls, numbered pages, result totals, a page-size selector (10/25/50/100), and a
+jump-to-page field: repositories, CI runs, deployments, artifacts, tokens, users, branches,
+pull requests and their commits, directory entries, and commit changed-file lists.
+Full commit history retains 50-commit chunks and Load more, with page links too.
+Searches, filters, sorting, selected revisions, and paths are preserved across pages.
+New searches start on page 1. Pagination is a live view:
 new entries or retention cleanup can shift entries between pages on refresh.
 See [Retention and pagination](docs/ci-retention.md) for examples and limits.
 

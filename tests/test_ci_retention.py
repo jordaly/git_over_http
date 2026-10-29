@@ -86,3 +86,7 @@ class RetentionTests(unittest.TestCase):
         first = database.db_ci_runs_list("owner", "repo", 3, summary=True)
         second = database.db_ci_runs_list("owner", "repo", 3, summary=True, offset=3)
         self.assertEqual([row[0] for row in first + second], ids[::-1])
+        self.assertEqual(database.db_ci_runs_count("owner", "repo", status="success"), 6)
+        self.assertEqual(database.db_ci_runs_count("owner", "repo", query="a" * 40), 6)
+        self.assertEqual(database.db_ci_runs_count("owner", "repo", query="%"), 0)
+        self.assertEqual(database.db_ci_runs_count("owner", "repo", before=ids[2]), 2)

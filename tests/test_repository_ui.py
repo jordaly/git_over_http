@@ -47,6 +47,13 @@ class RepositoryUITests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.PIPE, text=True).strip()
 
+    def fixture_user(self):
+        conn = database._db_connect()
+        try:
+            return conn.execute("INSERT INTO users(username,pass_salt,pass_hash) VALUES('pagination-user',?,?)", (b"salt", b"unused-test-hash")).lastrowid
+        finally:
+            conn.close()
+
     def request(self, path, fields=None, *, binary=False):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
         try:
@@ -112,8 +119,138 @@ class RepositoryUITests(unittest.TestCase):
             _, second = self.request("/?q=app&page=2")
             self.assertIn("Page 2", second)
             self.assertIn('href="/r/owner/app-25"', second)
-            self.assertIn('href="/?q=app&amp;page=1"', second)
+            self.assertIn('href="/?q=app&amp;page=1&amp;per_page=25"', second)
             self.assertNotIn('rel="next"', second)
+
+    def test_first_last_and_page_size_work_across_lists(self):
+        repos = [("owner", f"app-{index:02}", f"app-{index:02}.git") for index in range(35)]
+        with mock.patch("pygithost.application._scan_repos", return_value=repos):
+            _, first = self.request("/?q=app&per_page=10")
+            self.assertIn('aria-label="Go to last page"', first)
+            self.assertIn("page=4&amp;per_page=10", first)
+            self.assertIn("Showing 1–10 of 35", first)
+            _, last = self.request("/?q=app&per_page=10&page=4")
+            self.assertIn('href="/r/owner/app-34"', last)
+            self.assertIn("Showing 31–35 of 35", last)
+            self.assertIn('aria-label="Go to first page"', last)
+            self.assertNotIn('aria-label="Go to last page"', last)
+        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
+        for index in range(35):
+            commit = f"{index:040x}"
+            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", commit, "{}")
+            database.db_ci_run_update(run_id, status="success")
+            database.db_deployment_claim(run_id, FLAT_OWNER_UI, "project", commit)
+            database.db_deployment_finish(run_id, "success", "")
+        for suffix in ("/ci?status=success", "/ci/deployments?"):
+            _, first = self.request(self.base + suffix + "&per_page=10")
+            _, last = self.request(self.base + suffix + "&per_page=10&page=4")
+            self.assertIn("page=4&amp;per_page=10", first)
+            self.assertIn("Showing 31–35 of 35", last)
+            self.assertIn('aria-label="Go to first page"', last)
+
+    def test_tokens_and_users_tables_are_paginated(self):
+        tokens = [(index, f"token-{index:02}", "read", True, "2026-01-01", None, None, "active") for index in range(30)]
+        with mock.patch("pygithost.application.db_list_tokens_for_user", return_value=tokens):
+            _, first = self.request("/tokens")
+            _, second = self.request("/tokens?page=2")
+        self.assertIn("token-00", first)
+        self.assertNotIn("token-25", first)
+        self.assertIn("token-25", second)
+        self.assertNotIn("token-00", second)
+        self.assertIn('rel="prev"', second)
+        users = [(index, f"person-{index:02}", False, True, "2026-01-01") for index in range(30)]
+        with mock.patch("pygithost.application._require_admin", return_value=True), mock.patch("pygithost.application.db_list_users", return_value=users):
+            _, page = self.request("/admin/users?page=2")
+        table = page.split("All users</h2><table>", 1)[1].split("</table>", 1)[0]
+        self.assertIn("person-25", table)
+        self.assertNotIn("person-00", table)
+        self.assertIn('value="0">person-00</option>', page)  # Reset form still covers all users.
+
+    def test_root_tree_and_commit_files_are_paginated_with_metadata(self):
+        (self.source / "src").mkdir()
+        for index in range(30):
+            (self.source / f"file-{index:02}.txt").write_text("root")
+            (self.source / "src" / f"nested-{index:02}.txt").write_text("nested")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Many files")
+        sha = self.git("-C", self.source, "rev-parse", "HEAD")
+        self.git("-C", self.source, "push", self.bare, "main")
+        for suffix, first_name, last_name in [
+            ("", "file-00.txt", "file-29.txt"),
+            ("/tree/main/src/", "nested-00.txt", "nested-29.txt"),
+        ]:
+            _, first = self.request(self.base + suffix)
+            _, second = self.request(self.base + suffix + "?page=2")
+            table = first.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+            self.assertIn(first_name, table)
+            self.assertNotIn(last_name, table)
+            table = second.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+            self.assertIn(last_name, table)
+            self.assertNotIn(first_name, table)
+            self.assertIn("Many files", table)
+            self.assertIn('rel="prev"', second)
+        _, first = self.request(self.base + "/commit/" + sha)
+        _, second = self.request(self.base + "/commit/" + sha + "?page=2")
+        self.assertIn('rel="next"', first)
+        self.assertIn('rel="prev"', second)
+        _, expanded = self.request(self.base + "?per_page=100")
+        table = expanded.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertIn("file-00.txt", table)
+        self.assertIn("file-29.txt", table)
+        self.assertEqual(table.count('class="repo-entry-message"><a'), 32)
+
+    def test_pull_requests_and_artifacts_are_paginated(self):
+        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0, "artifact_retention_days": 0}))
+        user_id = self.fixture_user()
+        for index in range(30):
+            database.db_pr_create(FLAT_OWNER_UI, "project", f"Request {index:02}", "", "feature/api", "main", user_id)
+            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}")
+            database.db_ci_artifact_set(run_id, b"zip")
+            database.db_ci_run_update(run_id, status="success")
+        for suffix in ("/pulls?status=open", "/artifacts?"):
+            _, first = self.request(self.base + suffix)
+            _, second = self.request(self.base + suffix + "&page=2")
+            self.assertIn('rel="next"', first)
+            self.assertIn('rel="prev"', second)
+            self.assertNotIn('rel="next"', second)
+        _, second = self.request(self.base + "/pulls?status=open&page=2")
+        self.assertIn("Request 00", second)
+        self.assertNotIn("Request 29", second)
+        self.assertIn("status=open&amp;page=1", second)
+
+    def test_branch_pagination_preserves_sort_and_filter(self):
+        for index in range(30):
+            self.git("--git-dir", self.bare, "branch", f"topic-{index:02}", "main")
+        _, first = self.request(self.base + "/branches?q=topic&sort=name")
+        _, second = self.request(self.base + "/branches?q=topic&sort=name&page=2")
+        self.assertIn("topic-00", first)
+        self.assertNotIn('data-branch="topic-29"', first)
+        self.assertIn("topic-29", second)
+        self.assertIn("q=topic&amp;sort=name&amp;page=1", second)
+
+    def test_pull_request_commit_pagination_and_history_page_links(self):
+        self.git("-C", self.source, "commit", "--allow-empty", "-m", "Feature commit")
+        self.git("-C", self.source, "push", self.bare, "HEAD:feature/api")
+        user_id = self.fixture_user()
+        pr_id = database.db_pr_create(FLAT_OWNER_UI, "project", "Paged PR", "", "feature/api", "main", user_id)
+        commits = [{"hash": f"{index:040x}", "subject": f"Paged commit {index:02}",
+                    "author_name": "Test", "date": "2026-01-01T12:00:00+00:00"} for index in range(60)]
+        async def git_commits(_bare, _ref, limit=100, skip=0, **_kwargs):
+            return commits[skip:skip + limit]
+        with mock.patch("pygithost.application._git_list_commits", side_effect=git_commits), mock.patch("pygithost.application._git_commit_count", new=mock.AsyncMock(return_value=60)):
+            _, first = self.request(self.base + f"/pulls/{pr_id}")
+            _, second = self.request(self.base + f"/pulls/{pr_id}?page=2")
+            self.assertIn("Paged commit 00", first)
+            self.assertNotIn("Paged commit 25", first)
+            self.assertIn("Paged commit 25", second)
+            self.assertNotIn("Paged commit 00", second)
+            self.assertIn('rel="prev"', second)
+            _, history = self.request(self.base + "/commits?ref=main&page=2")
+            self.assertIn("Paged commit 50", history)
+            self.assertNotIn("Paged commit 00", history)
+            self.assertIn('rel="prev"', history)
+            self.assertEqual(history.count('aria-label="Pagination"'), 2)
+            self.assertIn('rel="prev"', history.split('<tbody id="commitRows">', 1)[0])
 
     def test_run_and_deployment_pagination(self):
         database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
@@ -436,7 +573,7 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_contributors_can_expand_beyond_first_five(self):
         people = [{"name": f"Contributor {index}", "commits": 10 - index} for index in range(7)]
-        database.db_repository_overview_set(FLAT_OWNER_UI, "project", self.sha,
+        database.db_repository_overview_set(FLAT_OWNER_UI, "project", self.sha + ":page=1",
             json.dumps({"latest": None, "entries": {}, "commit_count": 49, "contributors": people}))
         status, page = self.request(self.base)
         self.assertEqual(status, 200)

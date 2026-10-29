@@ -58,15 +58,48 @@ meaning unlimited. Repository settings allow values up to 1000000.
 
 ## Browse multiple pages
 
-These lists show **25 entries per page**:
+These lists default to **25 entries per page**:
 
 - **Home → Repositories:** sorted by owner and repository name; search is preserved.
 - **CI → Runs:** newest run first; status, event, branch, and text filters are preserved.
 - **CI → Deployments:** newest attempt first, independent of retained CI history.
+- **Artifacts:** newest run's archive first; age/count policies still apply.
+- **Tokens** and **Admin → Users:** paginated management tables. The password-reset
+  selector continues to include all users, not just the current page.
+- **Pull requests:** pagination preserves the selected open/closed/merged/all filter.
+- **Pull request → Commits:** 25 commits per page, without the former 200-commit cap.
+- **Code** and **folder browsing:** folders first, then files, with last-commit
+  metadata for the visible page. Each directory starts its own pagination.
+- **Commit → Files:** the changed-file list is paginated; the patch remains a
+  separate, bounded view of the commit.
+- **Branches:** filters and sorting survive page changes; the default branch
+  remains in its own section when it matches the filter.
 
-Use **Previous** and **Next** under each list. The current page number is displayed;
-Next disappears when there are no more results. Submitting a new search/filter
-starts at page 1. Pages are live rather than frozen snapshots: new entries or
+Full **commit history** retains its existing 50-commit chunks and Load more button,
+and also provides Previous/Next page links. The selected revision and path filter
+are preserved. Commit-history page controls appear above and below the table,
+near the Repo, Branches, and Pull requests navigation. Those navigation links
+open their own separately paginated lists, starting on their first page.
+Fixed-size documentation/reference tables are not paginated.
+
+Each list uses the same pagination controls:
+
+- **First / Last:** jump directly to the beginning or end of the list.
+- **Previous / Next:** move one page at a time.
+- **Numbered pages:** select a nearby page; ellipses mark omitted page ranges.
+- **Rows per page:** choose 10, 25, 50, or 100 and click **Apply**. This starts at
+  page 1 and preserves the current filters.
+- **Go to page:** enter a page number and click **Go**.
+- **Result summary:** shows the displayed range, total matches, and current/total pages.
+
+Unavailable controls remain visible but disabled at list boundaries. Out-of-range
+page requests are clamped to the final page. Page size, filters, sorting, revision,
+and path are preserved in navigation links. Commit history defaults to 50 entries
+and supports the same size choices; its Load more button uses the selected size.
+If a Git count cannot be obtained, commit lists omit the unknown total and Last
+control rather than guessing where the list ends.
+
+Submitting a new search/filter starts at page 1. Pages are live rather than frozen snapshots: new entries or
 cleanup can shift results between page visits. Refresh deployment pages to update
 running attempts and delivery status; CI run lists continue polling on their
 selected page.

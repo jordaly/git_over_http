@@ -597,29 +597,28 @@ def db_pr_get(pr_id: int):
         conn.close()
 
 
-def db_pr_list(owner: str, repo: str, status: str | None = None):
+def db_pr_count(owner, repo, status=None):
     conn = _db_connect()
     try:
+        return conn.execute("SELECT COUNT(*) FROM pull_requests WHERE owner=? AND repo=?" +
+            (" AND status=?" if status else ""), (owner, repo, status) if status else (owner, repo)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def db_pr_list(owner: str, repo: str, status: str | None = None, *, limit=None, offset=0):
+    conn = _db_connect()
+    try:
+        query = "SELECT id,title,source_branch,target_branch,status,created_at FROM pull_requests WHERE owner=? AND repo=?"
+        params = [owner, repo]
         if status:
-            cur = conn.execute(
-                """
-                SELECT id, title, source_branch, target_branch, status, created_at
-                FROM pull_requests
-                WHERE owner=? AND repo=? AND status=?
-                ORDER BY id DESC
-                """,
-                (owner, repo, status),
-            )
-        else:
-            cur = conn.execute(
-                """
-                SELECT id, title, source_branch, target_branch, status, created_at
-                FROM pull_requests
-                WHERE owner=? AND repo=?
-                ORDER BY id DESC
-                """,
-                (owner, repo),
-            )
+            query += " AND status=?"
+            params.append(status)
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend((max(1, min(500, int(limit))), max(0, int(offset))))
+        cur = conn.execute(query, params)
         return cur.fetchall()
     finally:
         conn.close()
@@ -744,6 +743,15 @@ def db_deployment_email_record(run_id):
         conn.close()
 
 
+def db_deployments_count(owner, repo, before=0):
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM ci_deployments WHERE owner=? AND repo=? AND (?=0 OR id<?)",
+            (owner, repo, before, before)).fetchone()[0]
+    finally:
+        conn.close()
+
+
 def db_deployments_list(owner, repo, before=0, limit=25, offset=0):
     conn = _db_connect()
     try:
@@ -856,6 +864,27 @@ def db_ci_run_update(run_id: int, **values) -> None:
             row = conn.execute("SELECT owner,repo FROM ci_runs WHERE id=?", (int(run_id),)).fetchone()
             if row:
                 _db_ci_prune_completed(conn, row[0], row[1])
+    finally:
+        conn.close()
+
+
+def db_ci_runs_count(owner, repo, *, status="", event="", branch="", query="", before=None):
+    conn = _db_connect()
+    try:
+        conditions, params = ["owner=?", "repo=?"], [owner, repo]
+        if before is not None:
+            conditions.append("id<?")
+            params.append(before)
+        for column, value in (("status", status), ("event", event), ("branch", branch)):
+            if value:
+                conditions.append(f"{column}=?")
+                params.append(value)
+        query = (query or "").strip().lower()[:128]
+        if query:
+            pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            conditions.append("(CAST(id AS TEXT) LIKE ? ESCAPE '\\' OR lower(commit_hash) LIKE ? ESCAPE '\\' OR lower(output) LIKE ? ESCAPE '\\')")
+            params.extend((pattern, pattern, pattern))
+        return conn.execute(f"SELECT COUNT(*) FROM ci_runs WHERE {' AND '.join(conditions)}", params).fetchone()[0]
     finally:
         conn.close()
 
@@ -983,7 +1012,17 @@ def db_ci_artifact_get(owner, repo, run_id, *, content=False):
         conn.close()
 
 
-def db_ci_artifacts_list(owner, repo, *, before=None, limit=50):
+def db_ci_artifacts_count(owner, repo, before=None):
+    conn = _db_connect()
+    try:
+        _db_ci_cleanup_artifacts(conn, owner, repo)
+        return conn.execute("SELECT COUNT(*) FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id WHERE r.owner=? AND r.repo=?" +
+            (" AND r.id<?" if before is not None else ""), (owner, repo, before) if before is not None else (owner, repo)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def db_ci_artifacts_list(owner, repo, *, before=None, limit=50, offset=0):
     conn = _db_connect()
     try:
         _db_ci_cleanup_artifacts(conn, owner, repo)
@@ -993,10 +1032,11 @@ def db_ci_artifacts_list(owner, repo, *, before=None, limit=50):
             conditions.append("r.id<?")
             params.append(before)
         params.append(max(1, min(int(limit), 100)))
+        params.append(max(0, int(offset)))
         return conn.execute(f"""SELECT r.id,r.branch,r.commit_hash,r.status,r.event,
             a.created_at,length(a.archive),{'datetime(a.created_at, ?)' if days else 'NULL'}
             FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id
-            WHERE {' AND '.join(conditions)} ORDER BY r.id DESC LIMIT ?""", ([f"+{days} days"] if days else []) + params).fetchall()
+            WHERE {' AND '.join(conditions)} ORDER BY r.id DESC LIMIT ? OFFSET ?""", ([f"+{days} days"] if days else []) + params).fetchall()
     finally:
         conn.close()
 

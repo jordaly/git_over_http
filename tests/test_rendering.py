@@ -1,9 +1,34 @@
 import unittest
 
-from pygithost.application import _html_page
+from pygithost.application import _html_page, _pagination
 
 
 class PageLayoutTests(unittest.TestCase):
+    def test_pagination_has_clear_boundary_states(self):
+        first = str(_pagination("/items", {}, 1, True))
+        self.assertIn('class="pagination"', first)
+        self.assertIn('aria-disabled="true"', first)
+        self.assertNotIn('rel="prev"', first)
+        self.assertIn('rel="next"', first)
+        self.assertIn('aria-current="page">Page 1', first)
+        last = str(_pagination("/items", {"q": "a&b"}, 8, False))
+        self.assertIn('rel="prev"', last)
+        self.assertNotIn('rel="next"', last)
+        self.assertIn('aria-label="Go to first page"', last)
+        self.assertIn("q=a%26b&amp;page=1", last)
+        self.assertIn('class="pagination-ellipsis"', last)
+
+    def test_pagination_includes_first_last_totals_and_forms(self):
+        markup = str(_pagination("/items", {"q": "needle"}, 5, True, total=95, per_page=10))
+        self.assertIn('aria-label="Go to first page"', markup)
+        self.assertIn('aria-label="Go to last page"', markup)
+        self.assertIn("page=10&amp;per_page=10", markup)
+        self.assertIn("Showing 41–50 of 95", markup)
+        self.assertIn("Page 5 of 10", markup)
+        self.assertIn('name="per_page"', markup)
+        self.assertIn('name="page" type="number" min="1" max="10"', markup)
+        self.assertIn('name="q" value="needle"', markup)
+
     def test_wide_page_uses_full_width_body_class(self):
         page = _html_page("Source", "content", wide=True).decode("utf-8")
         self.assertIn('<body class="wide-page">', page)

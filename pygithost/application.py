@@ -103,7 +103,7 @@ def _relative_time(value):
 
 def _ci_tabs(base, active):
     links = []
-    for key, suffix, label in (("runs", "/ci", "Runs"), ("settings", "/ci/config", "Settings"), ("docs", "/ci/docs", "Documentation")):
+    for key, suffix, label in (("runs", "/ci", "Runs"), ("deployments", "/ci/deployments", "Deployments"), ("settings", "/ci/config", "Settings"), ("docs", "/ci/docs", "Documentation")):
         current = safe_html(' aria-current="page"' if key == active else "")
         links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
     return safe_html(html_t(t'<div class="repo-ci-navigation">{_repo_tabs(base, "ci")}<nav class="ci-tabs" aria-label="CI navigation">{join_html(links)}</nav></div>'))
@@ -2436,6 +2436,39 @@ document.addEventListener("DOMContentLoaded", function() {{
         await _call_in_thread(db_email_settings_set, json.dumps(settings))
         return await self._ui_admin_email(notice="Email settings saved.")
 
+    async def _ui_deployments(self, owner, repo, deployment_id=None):
+        from .database import db_deployments_list, db_deployment_detail
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        if deployment_id is not None:
+            row = await _call_in_thread(db_deployment_detail, owner, repo, deployment_id)
+            if not row:
+                return await self._not_found()
+            rows = [row]
+        else:
+            params = parse_qs(urlparse(self.path).query or "")
+            value = (params.get("before") or [""])[0]
+            before = int(value) if value.isascii() and value.isdecimal() and len(value) < 19 else 0
+            rows = await _call_in_thread(db_deployments_list, owner, repo, before, 26)
+        entries = []
+        for row in rows[:25]:
+            identity, run_id, commit, status, started, finished, notification, raw, retained = row[:9]
+            config = json.loads(raw or "{}")
+            branch = config.get("deploy_branch", "—")
+            run_link = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}">CI run #{run_id}</a>')) if retained else safe_html(html_t(t'<span class="muted">CI run #{run_id} no longer retained</span>'))
+            logs = safe_html(html_t(t'<pre tabindex="0" aria-label="Deployment output">{row[9] or "No output yet. Logs are available when deployment finishes."}</pre>')) if deployment_id is not None else safe_html("")
+            entries.append(html_t(t'''<section class="box"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2>
+<p>Branch: <code>{branch}</code> · Commit: <a href="{base}/commit/{q(commit)}"><code>{commit}</code></a></p>
+<p class="muted">Started: {started} · Finished: {finished or "—"} · Duration: {_ci_elapsed(started, finished)} · Email: {notification or "not queued"}</p>{run_link}{logs}</section>'''))
+        listing = join_html(entries) if entries else safe_html('<section class="box"><h2>No deployments yet</h2><p>Deployment attempts appear here after matching CI succeeds. Skipped deployments are not recorded.</p></section>')
+        older = safe_html(html_t(t'<a class="pill" href="{base}/ci/deployments?before={rows[24][0]}">Older deployments →</a>')) if deployment_id is None and len(rows) > 25 else safe_html("")
+        body = html_t(t'''{_ci_tabs(base, "deployments")}<div class="topbar"><h2>Deployment history</h2><a class="pill" href="{base}/ci/deployments">Latest deployments</a></div>
+<p class="muted">Deployment results are separate from CI results. Open a deployment for output. Refresh to update running attempts and email delivery.</p>
+<p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs#ci-guide-deployment">Deployment documentation</a></p>{listing}{older}''')
+        return await _send_html(self.request, 200, _html_page(str_t(t"Deployments · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
+
     async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = "", partial: bool = False):
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
@@ -2551,10 +2584,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         steps_html = join_html([html_t(t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><strong>{step["name"]}</strong><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>''') for index, step in enumerate(steps)])
         steps_section = safe_html(html_t(t'<section class="box ci-run-steps"><div class="ci-section-heading"><h2>Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>')) if steps else safe_html("")
         artifact_size = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id)
-        from .database import db_deployment_get
+        from .database import db_deployment_get, db_deployment_email_record
         deployment = await _call_in_thread(db_deployment_get, run_id)
-        deployment_html = safe_html(html_t(t'<section class="box"><h2>Deployment: {deployment[0]}</h2><pre>{deployment[1] or "No output yet. Logs are available when deployment finishes."}</pre></section>')) if deployment else safe_html("")
+        deployment_email = await _call_in_thread(db_deployment_email_record, run_id) if deployment else None
+        deployment_html = safe_html(html_t(t'<section class="box"><h2>Deployment: {deployment[0]}</h2><p class="muted">Deployment email: {deployment_email[6] or "not queued"}</p><pre>{deployment[1] or "No output yet. Logs are available when deployment finishes."}</pre></section>')) if deployment else safe_html("")
         active = active or bool(deployment and deployment[0] == "running")
+        active = active or bool(deployment_email and deployment_email[6] in ("queued", "sending"))
         active = active or bool(run[4] == "success" and run_id in self.server.ci_manager.active)
         artifact_html = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>')) if artifact_size else safe_html("")
         reason_html = safe_html(html_t(t'<p class="warn" role="status">{waiting or meta["reason"]}</p>')) if waiting or meta["reason"] else safe_html("")
@@ -2690,11 +2725,15 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 <details class="ci-optional"{safe_html(" open" if artifact_paths else "")}><summary>Downloadable artifacts</summary><label for="ci-artifacts">File patterns, relative to checkout</label><textarea id="ci-artifacts" name="artifact_paths" placeholder="dist/*&#10;reports/**/*.xml">{artifact_paths}</textarea><label for="ci-artifact-when">Collect after</label><select id="ci-artifact-when" name="artifact_when">{artifact_options}</select><p class="muted">One pattern per line. ZIP download only; no test-output parsing. Maximum 20 MiB / 1000 files per run. Retained for 7 days or until run deletion.</p></details>
 <details class="ci-optional"{safe_html(" open" if config.get("email_mode", "off") != "off" else "")}><summary>Email notifications</summary><label for="ci-email-mode">Send notifications</label><select id="ci-email-mode" name="email_mode">{email_options}</select><div id="ci-email-settings"><label for="ci-email-recipients">Recipients, one address per line</label><textarea id="ci-email-recipients" name="email_recipients" placeholder="team@example.com">{config.get("email_recipients", "")}</textarea><p class="muted">{smtp_status} <a href="/admin/email">Server email settings</a>. Emails contain metadata, not logs or environment values.</p></div></details></section>
 <section class="box ci-setting-section"><h2>Automatic deployment</h2>
+<p class="muted"><a href="{base}/ci/docs#ci-guide-deployment">Deployment setup, script examples, security, and troubleshooting</a></p>
+<p class="muted">Deployment results send separate emails using the recipients and notification mode in Email notifications above. Choose all completions to receive success and failure messages. Server SMTP must be configured.</p>
 <label><input type="checkbox" name="deploy_enabled"{safe_html(" checked" if config.get("deploy_enabled") else "")}> Deploy after successful branch CI</label>
 <label>Deployment branch</label><input name="deploy_branch" value="{config.get('deploy_branch', 'main')}">
 <label>Absolute deployment script path</label><input name="deploy_script" value="{config.get('deploy_script', '')}" placeholder="/opt/deploy/my-app.sh">
-<label for="deploy-script-upload">Or upload a deployment script (UTF-8, maximum 64 KiB)</label><input id="deploy-script-upload" type="file" accept=".sh,.py,.bash,.txt">
-<p id="deploy-upload-status" class="muted">Uploaded scripts are stored privately on the server. On Ubuntu, include a shebang such as #!/bin/sh. Save CI settings to apply.</p>
+<label for="deploy-interpreter">Run with (optional)</label><input id="deploy-interpreter" name="deploy_interpreter" value="{config.get('deploy_interpreter', '') if config.get('deploy_interpreter') != 'direct' else ''}" placeholder="python, node, bash, or pwsh -NoProfile -File">
+<p class="muted">The server runs: runner + uploaded script path + commit SHA. Leave blank to run the file directly. Any installed interpreter is supported; no shell expansion, pipes, or command chaining. Quote executable paths containing spaces; on Windows use forward slashes in paths, for example &quot;C:/Program Files/Python/python.exe&quot;. The exact value python uses the server's Python interpreter.</p>
+<label for="deploy-script-upload">Or upload a deployment script (UTF-8, maximum 64 KiB)</label><input id="deploy-script-upload" type="file">
+<p id="deploy-upload-status" class="muted">Uploaded scripts are stored privately on the server. Set Run with to an interpreter to avoid needing a shebang. Direct scripts on Ubuntu require a shebang such as #!/bin/sh. Save CI settings to apply.</p>
 <label for="deploy-script-content">New script contents (optional; replaces the path above when saved)</label><textarea id="deploy-script-content" name="deploy_script_content" spellcheck="false">{config.get('deploy_script_content', '')}</textarea>
 <label>Deployment timeout (seconds)</label><input type="number" name="deploy_timeout" min="1" max="86400" value="{config.get('deploy_timeout', 600)}">
 <p class="warn">Trusted script runs on the Git server as its OS user, outside Docker, with network access. Keep it outside repositories and protect it from job writes. No secret redaction. Credentials belong in protected server files, not CI settings.</p>
@@ -2711,6 +2750,7 @@ upload.addEventListener("change", async () => {{
  readingScript = true;
  try {{ const content = new TextDecoder("utf-8", {{fatal:true}}).decode(await file.arrayBuffer());
  document.getElementById("deploy-script-content").value = content;
+ if (file.name.toLowerCase().endsWith(".py") && ["", "direct"].includes(form.elements.deploy_interpreter.value.trim())) form.elements.deploy_interpreter.value = "python";
  status.textContent = "Script loaded. Save CI settings to store it on the server.";
  }} catch (_) {{ status.textContent = "Could not read script as UTF-8."; }}
  finally {{ readingScript = false; }}
@@ -2763,6 +2803,7 @@ form.addEventListener("change", update); update();
             "deploy_enabled": "deploy_enabled" in form,
             "deploy_branch": form.get("deploy_branch", "main"),
             "deploy_script": form.get("deploy_script", ""),
+            "deploy_interpreter": form.get("deploy_interpreter", "direct"),
             "deploy_script_content": form.get("deploy_script_content", ""),
             "deploy_timeout": form.get("deploy_timeout", "600"),
             "repository_config": "repository_config" in form,
@@ -3123,19 +3164,24 @@ form.addEventListener("change", update); update();
         owner = unquote(owner)
         repo = unquote(repo)
         ref = unquote(ref)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not ref or ref.startswith("-") or "\0" in ref:
+            return await self._not_found()
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
             return await self._not_found()
         subpath = _clean_repo_path(subpath)
-        spec = ref + (":" + subpath if subpath else ":")
-        code, out, err = await _run_git(repo_git, ["ls-tree", spec])
+        commit = await _git_resolve_commit(repo_git, ref)
+        if not commit:
+            return await self._not_found()
+        spec = commit + (":" + subpath if subpath else ":")
+        code, out, err = await _run_git(repo_git, ["ls-tree", "-z", spec])
         if code != 0:
             msg = err.decode("utf-8", "replace")
             body = html_t(t"<h1>Tree</h1><pre>{msg}</pre><p><a class=\"pill\" href=\"/\">Back</a></p>")
             return await _send_html(self.request, 400, _html_page("Tree", safe_html(body)))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         entries: list[tuple[str, str]] = []
-        for ln in out.decode("utf-8", "replace").splitlines():
+        for ln in out.decode("utf-8", "replace").split("\0"):
             # git ls-tree: mode type object\tname
             if "\t" not in ln:
                 continue
@@ -3147,26 +3193,31 @@ form.addEventListener("change", update); update();
         # Show folders first, then files. Keep alphabetical order inside each group.
         entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
 
+        overview = await repository_overview(owner, repo, repo_git, commit, entries, subpath=subpath)
         rows = []
         for kind, name in entries:
             if kind == "tree":
                 newpath = _join_repo_path(subpath, name)
                 href = str_t(t"{base}/tree/{q(ref)}/{q(newpath, safe='/')}/")
-                rows.append(html_t(t"<tr><td style=\"width:40px\">{TREE_FOLDER_ICON}</td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
+                icon = TREE_FOLDER_ICON
             else:
                 newpath = _join_repo_path(subpath, name)
                 href = str_t(t"{base}/blob/{q(ref)}/{q(newpath, safe='/')}")
-                rows.append(html_t(t"<tr><td style=\"width:40px\">{TREE_FILE_ICON}</td><td><a class=\"tree-name\" href=\"{href}\">{name}</a></td></tr>"))
+                icon = TREE_FILE_ICON
+            change = overview["entries"].get(name)
+            message = safe_html(html_t(t'<a href="{base}/commit/{change["hash"]}" title="{change["subject"]}">{change["subject"]}</a>')) if change else safe_html('<span class="muted">—</span>')
+            changed_at = safe_html(html_t(t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>')) if change else safe_html("—")
+            rows.append(html_t(t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'))
         up = safe_html("")
         if subpath:
             parent = "/".join(subpath.split("/")[:-1])
             parent_href = str_t(t"{base}/tree/{q(ref)}/{q(parent, safe='/')}/") if parent else str_t(t"{base}/tree/{q(ref)}/")
             up = safe_html(html_t(t"<p><a class=\"pill\" href=\"{parent_href}\">Up one level</a></p>"))
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">Empty.</td></tr>')
+        rows_html = join_html(rows) if rows else safe_html('<tr><td colspan="3" class="muted">Empty.</td></tr>')
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{_repo_breadcrumbs(owner, repo, ref, subpath)}<p class="muted">ref: <code>{ref}</code></p></div>
 <div>{_repo_code_menu(owner, repo, ref)}</div></div>
-{up}<div class="box"><table>{rows_html}</table></div>"""
+{up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
@@ -3720,6 +3771,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", p)
         if m:
             return await self._ui_ci_config(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/deployments(?:/(\d+))?$", p)
+        if m:
+            return await self._ui_deployments(m.group(1), m.group(2), int(m.group(3)) if m.group(3) else None)
         m = re.match(r"^/r/([^/]+)/([^/]+)/artifacts$", p)
         if m:
             return await self._ui_artifacts(m.group(1), m.group(2))

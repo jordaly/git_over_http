@@ -38,6 +38,16 @@ class EmailPresentationTests(unittest.TestCase):
         self.assertNotIn("View run", html)
         self.assertIn("Configure a public server URL", html)
 
+    def test_deployment_email_is_distinct_and_metadata_only(self):
+        message = self.message((9, "deployment", "main", "a" * 40,
+                                "failed", "private deployment output", 0, None))
+        self.assertEqual(message["Subject"], "[Deployment] owner/repo #9: failed")
+        html = message.get_body(preferencelist=("html",)).get_content()
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        self.assertIn("Deployment failed", html)
+        self.assertIn("Event: deployment", plain)
+        self.assertNotIn("private deployment output", html + plain)
+
     def test_smtp_test_email_uses_same_design_without_fake_run_link(self):
         message = self.message((0, "test", "", "", "test", "", 0, None))
         self.assertEqual(message["Subject"], "[CI] SMTP test email")

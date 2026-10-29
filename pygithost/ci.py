@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -52,12 +53,31 @@ async def _db_call(func, *args, **kwargs):
     return result
 
 
+def deployment_prefix(value):
+    """Parse an administrator-controlled runner without using a command shell."""
+    if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in ("\0", "\n", "\r")):
+        raise ValueError("Run with must be a single command line up to 4096 characters.")
+    if value.strip() in ("", "direct"):
+        return []
+    # Retain the existing portable Python shortcut.
+    if value.strip() == "python":
+        return [sys.executable]
+    try:
+        parts = shlex.split(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid Run with quoting: {exc}") from exc
+    if not parts or not parts[0]:
+        raise ValueError("Run with requires an executable name or path.")
+    return parts
+
+
 def default_config():
     return {
         "command": "",
         "deploy_enabled": False,
         "deploy_branch": "main",
         "deploy_script": "",
+        "deploy_interpreter": "direct",
         "deploy_timeout": 600,
         "timeout_seconds": JOB_TIMEOUT,
         "env": {},
@@ -107,6 +127,8 @@ def validate_config(raw):
     if type(raw.get("deploy_enabled", False)) is not bool:
         raise ValueError("Deployment enabled must be true or false.")
     script = raw.get("deploy_script", "")
+    interpreter = raw.get("deploy_interpreter", "direct")
+    deployment_prefix(interpreter)
     branch = raw.get("deploy_branch", "main")
     if not isinstance(script, str) or "\0" in script or len(script) > 4096 or (script and not os.path.isabs(script)):
         raise ValueError("Deployment script must be an absolute path outside the repository.")
@@ -120,7 +142,7 @@ def validate_config(raw):
     if raw.get("deploy_enabled", False) and not script:
         raise ValueError("Automatic deployment requires a script path.")
     defaults.update(deploy_enabled=raw.get("deploy_enabled", False), deploy_branch=branch,
-                    deploy_script=script, deploy_timeout=deploy_timeout)
+                    deploy_script=script, deploy_timeout=deploy_timeout, deploy_interpreter=interpreter)
     timeout = raw.get("timeout_seconds", JOB_TIMEOUT)
     if isinstance(timeout, str) and timeout.isascii() and timeout.isdecimal():
         timeout = int(timeout)
@@ -363,6 +385,7 @@ class CIManager:
                 await _db_call(database.db_deployment_recover)
                 rows = await _db_call(database.db_ci_queued_runs)
                 notifications = await _db_call(database.db_ci_pending_notifications)
+                deployment_notifications = await _db_call(database.db_deployment_email_pending)
             except BaseException:
                 self._release_runner_lock()
                 raise
@@ -372,6 +395,9 @@ class CIManager:
             self.dispatcher = asyncio.create_task(self._dispatch())
             for row in notifications:
                 self._schedule_notification(row)
+            for run_id, owner, repo in deployment_notifications:
+                if run_id not in {row[0] for row in notifications}:
+                    self._schedule_notification((run_id, owner, repo))
 
     def _acquire_runner_lock(self):
         """One scheduler per database; OS releases the lock after a crash."""
@@ -445,7 +471,7 @@ class CIManager:
             if not isinstance(content, str) or "\0" in content or len(content.encode("utf-8")) > 65536:
                 raise ValueError("Deployment script must be UTF-8 text up to 64 KiB without NUL bytes.")
             content = content.replace("\r\n", "\n")
-            if os.name != "nt" and not content.startswith("#!"):
+            if os.name != "nt" and not deployment_prefix(config.get("deploy_interpreter", "direct")) and not content.startswith("#!"):
                 raise ValueError("Uploaded deployment scripts require a shebang, for example #!/bin/sh.")
             digest = hashlib.sha256((owner + "/" + repo + "\0" + content).encode()).hexdigest()
             path = Path(database.DB_PATH).resolve().parent / "deployment-scripts" / digest
@@ -690,7 +716,7 @@ class CIManager:
         snapshot = json.loads(meta["config"] or "{}")
         if not run or run[4] != "success" or not config["deploy_enabled"] or not snapshot.get("deploy_enabled"):
             return
-        if branch != config["deploy_branch"] or any(config[k] != snapshot.get(k) for k in ("deploy_branch", "deploy_script", "deploy_timeout")):
+        if branch != config["deploy_branch"] or any(config[k] != snapshot.get(k, "direct" if k == "deploy_interpreter" else None) for k in ("deploy_branch", "deploy_script", "deploy_timeout", "deploy_interpreter")):
             return
         output, truncated = bytearray(), [False]
         claimed = False
@@ -707,12 +733,13 @@ class CIManager:
                 if rc or output.decode().strip() != commit:
                     return
                 output.clear()
-                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit)
+                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
                 if not claimed:
                     return
                 env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
                     PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, CI="true")
-                rc = await self._capture_process([str(script), commit], shell=False,
+                command = deployment_prefix(config["deploy_interpreter"]) + [str(script), commit]
+                rc = await self._capture_process(command, shell=False,
                     cwd=home, env=env, output=output, truncated=truncated,
                     timeout=config["deploy_timeout"])
                 status = "success" if rc == 0 else "failed"
@@ -724,13 +751,39 @@ class CIManager:
             status = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed"
             output.extend((f"\nDeployment error: {exc}\n").encode()[:MAX_OUTPUT - len(output)])
             if not claimed:
-                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit)
+                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
         if claimed:
             await _db_call(database.db_deployment_finish, run_id, status, output.decode("utf-8", "replace"))
 
     async def _notify(self, row):
         async with self.notification_slots:
             await self._deliver_notification(row)
+            await self._deliver_deployment_notification(row)
+
+    async def _deliver_deployment_notification(self, row):
+        record = await _db_call(database.db_deployment_email_record, row[0])
+        if not record or record[6] != "queued" or record[4] == "running":
+            return
+        run_id, owner, repo, commit, status, raw, _notification, started, finished = record
+        config = json.loads(raw or "{}")
+        mode = config.get("email_mode", "off")
+        previous = await _db_call(database.db_deployment_previous_result, owner, repo, run_id)
+        if mode == "off" or (status == "success" and mode != "all" and not
+                (mode == "recovery" and previous in ("failed", "timed_out", "interrupted"))):
+            await _db_call(database.db_deployment_email_update, run_id, "skipped")
+            return
+        if not await _db_call(database.db_deployment_email_update, run_id, "sending", True):
+            return
+        try:
+            run = (run_id, "deployment", config.get("deploy_branch", ""), commit,
+                   status, "", 0, None, started, started, finished)
+            settings = await _db_call(load_settings)
+            await _db_call(send_notification, owner, repo, run,
+                validate_recipients(config.get("email_recipients", "")), settings)
+            await _db_call(database.db_deployment_email_update, run_id, "sent")
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Deployment email failed for run #%s (%s)", run_id, type(exc).__name__)
+            await _db_call(database.db_deployment_email_update, run_id, f"failed ({type(exc).__name__}; check server SMTP settings)")
 
     async def _deliver_notification(self, row):
         try:

@@ -2,13 +2,15 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from pygithost import database
-from pygithost.ci import CIManager, default_config, pipeline_config, validate_config
+from pygithost.ci import CIManager, default_config, deployment_prefix, pipeline_config, validate_config
+from pygithost.ci_documentation import ci_configuration_guide
 
 
 class DeploymentTests(unittest.IsolatedAsyncioTestCase):
@@ -122,6 +124,31 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                     **self.config, "deploy_script_content": content})
         self.assertIsNone(database.db_ci_config_get("owner", "repo"))
 
+    async def test_python_upload_without_shebang(self):
+        content = 'import sys\nprint("deployed " + sys.argv[1])\n'
+        saved = await self.manager.save_config("owner", "repo", {
+            **self.config, "deploy_interpreter": "python", "deploy_script_content": content})
+        self.config = saved
+        self.script = Path(saved["deploy_script"])
+        row = await self.run_record()
+        original = self.manager._capture_process
+        async def capture(command, **kwargs):
+            if command[0] == "git":
+                kwargs["output"].extend((self.commit + "\n").encode())
+                return 0
+            self.assertEqual(command, [sys.executable, str(self.script), self.commit])
+            return await original(command, **kwargs)
+        self.manager._capture_process = capture
+        await self.manager._deploy(row)
+        self.assertEqual(database.db_deployment_get(row[0]),
+                         ("success", "deployed " + self.commit + "\n"))
+
+    async def test_direct_upload_still_requires_shebang_on_posix(self):
+        if os.name != "nt":
+            with self.assertRaisesRegex(ValueError, "shebang"):
+                await self.manager.save_config("owner", "repo", {
+                    **self.config, "deploy_script_content": 'print("hello")'})
+
     @unittest.skipUnless(os.name == "posix", "POSIX executable script")
     async def test_real_ci_then_uploaded_deployment(self):
         bare = Path(self.temp.name) / "repo.git"
@@ -152,7 +179,95 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             pipeline_config({"version": 1, "command": "true", "deploy_enabled": True}, default_config())
 
     def test_invalid_config(self):
-        for values in [{"deploy_timeout": 0}, {"deploy_script": "relative.sh"},
+        for values in [{"deploy_interpreter": '"unclosed'}, {"deploy_timeout": 0}, {"deploy_script": "relative.sh"},
                        {"deploy_branch": "main; branch"}, {"deploy_enabled": "yes"}]:
             with self.assertRaises(ValueError):
                 validate_config({**default_config(), **values})
+
+    def test_arbitrary_runner_and_arguments(self):
+        for command, expected in [
+            ("node", ["node"]), ("bash -e", ["bash", "-e"]),
+            ("pwsh -NoProfile -File", ["pwsh", "-NoProfile", "-File"]),
+            ('"C:/Program Files/Python/python.exe" -u', ["C:/Program Files/Python/python.exe", "-u"]),
+            ("", []), ("python", [sys.executable]),
+        ]:
+            self.assertEqual(deployment_prefix(command), expected)
+
+    async def test_history_pagination_scoping_and_pruned_run(self):
+        row = await self.run_record()
+        database.db_deployment_claim(row[0], "owner", "repo", self.commit, json.dumps(self.config))
+        database.db_deployment_finish(row[0], "success", "deployment output")
+        history = database.db_deployments_list("owner", "repo")
+        self.assertEqual(len(history), 1)
+        identity = history[0][0]
+        self.assertEqual(history[0][8], row[0])
+        self.assertEqual(database.db_deployments_list("owner", "repo", identity), [])
+        self.assertEqual(database.db_deployments_list("other", "repo"), [])
+        self.assertIsNone(database.db_deployment_detail("other", "repo", identity))
+        connection = database._db_connect()
+        try:
+            connection.execute("DELETE FROM ci_runs WHERE id=?", (row[0],))
+        finally:
+            connection.close()
+        detail = database.db_deployment_detail("owner", "repo", identity)
+        self.assertIsNone(detail[8])
+        self.assertEqual(detail[9], "deployment output")
+
+    async def test_explicit_runner_does_not_require_shebang(self):
+        saved = await self.manager.save_config("owner", "repo", {
+            **self.config, "deploy_interpreter": "node", "deploy_script_content": "console.log(process.argv[2]);"})
+        self.assertEqual(saved["deploy_interpreter"], "node")
+
+    async def test_deployment_email_modes_and_duplicate_protection(self):
+        for index, (mode, status, sends) in enumerate([
+            ("off", "failed", False), ("failures", "success", False),
+            ("failures", "failed", True), ("all", "success", True),
+            ("failures", "timed_out", True), ("failures", "interrupted", True),
+        ]):
+            self.commit = f"{index:040x}"
+            self.config.update(email_mode=mode, email_recipients="deploy@example.com")
+            row = await self.run_record()
+            database.db_deployment_claim(row[0], "owner", "repo", self.commit, json.dumps(self.config))
+            database.db_deployment_finish(row[0], status, "SECRET output")
+            with patch("pygithost.ci.send_notification") as send, patch("pygithost.ci.load_settings", return_value={}):
+                await self.manager._deliver_deployment_notification(row)
+                await self.manager._deliver_deployment_notification(row)
+                self.assertEqual(send.call_count, int(sends))
+                if sends:
+                    args = send.call_args.args
+                    self.assertEqual(args[2][1], "deployment")
+                    self.assertEqual(args[2][4], status)
+                    self.assertNotIn("SECRET", str(args))
+
+    async def test_deployment_email_failure_preserves_result(self):
+        self.config.update(email_mode="all", email_recipients="deploy@example.com")
+        row = await self.run_record()
+        database.db_deployment_claim(row[0], "owner", "repo", self.commit, json.dumps(self.config))
+        database.db_deployment_finish(row[0], "success", "done")
+        with patch("pygithost.ci.send_notification", side_effect=OSError("secret password")), patch("pygithost.ci.load_settings", return_value={}):
+            await self.manager._deliver_deployment_notification(row)
+        record = database.db_deployment_email_record(row[0])
+        self.assertEqual(record[4], "success")
+        self.assertTrue(record[6].startswith("failed (OSError"))
+        self.assertNotIn("secret", record[6])
+
+    async def test_deployment_recovery_email(self):
+        self.config.update(email_mode="recovery", email_recipients="deploy@example.com")
+        first = await self.run_record()
+        database.db_deployment_claim(first[0], "owner", "repo", self.commit, json.dumps(self.config))
+        database.db_deployment_finish(first[0], "failed", "")
+        self.commit = "b" * 40
+        row = await self.run_record()
+        database.db_deployment_claim(row[0], "owner", "repo", self.commit, json.dumps(self.config))
+        database.db_deployment_finish(row[0], "success", "")
+        with patch("pygithost.ci.send_notification") as send, patch("pygithost.ci.load_settings", return_value={}):
+            await self.manager._deliver_deployment_notification(row)
+            send.assert_called_once()
+
+    def test_deployment_documentation_is_rendered(self):
+        guide = str(ci_configuration_guide())
+        for text in ['id="ci-guide-deployment"', 'href="#ci-guide-deployment"',
+                     "Or upload a deployment script", "PYGITHOST_COMMIT",
+                     "at most one deployment attempt", "not secret-redacted",
+                     "Source checkouts and CI artifacts are not automatically passed"]:
+            self.assertIn(text, guide)

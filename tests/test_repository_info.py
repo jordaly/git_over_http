@@ -67,8 +67,14 @@ class RepositoryOverviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["entries"]["src"]["subject"], "Initial source")
         self.assertEqual(result["entries"]["README.md"]["subject"], "Readme edit")
         self.assertEqual(result["commit_count"], 2)
+        nested = await repository_overview("owner", "repo", str(bare), sha,
+                                           [("blob", "example.py")], subpath="src")
+        self.assertEqual(nested["entries"]["example.py"]["subject"], "Initial source")
+        self.assertEqual(nested["latest"]["subject"], "Initial source")
         self.assertEqual({item["name"] for item in result["contributors"]}, {"Alice", "Bob"})
         with mock.patch.object(asyncio, "create_subprocess_exec", side_effect=AssertionError("Expected cached metadata")):
             self.assertEqual(await repository_overview("owner", "repo", str(bare), sha, entries), result)
+            self.assertEqual(await repository_overview("owner", "repo", str(bare), sha,
+                [("blob", "example.py")], subpath="src"), nested)
         self.assertIsNone(database.db_repository_overview_get("other", "repo", sha))
         self.assertEqual((await repository_overview("owner", "empty", str(bare), None, []))["commit_count"], 0)

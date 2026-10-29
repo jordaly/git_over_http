@@ -333,12 +333,22 @@ available feature.
 
 ### Automatic deployment
 
+See the [automatic deployment walkthrough](docs/automatic-deployment.md) for a
+safe first run, trigger reference, Ubuntu SSH example, and recovery checklist.
+The website also includes help under **CI → Docs → Deployment**.
+
 Administrators can enable **Automatic deployment** in a repository's **CI settings**.
 Choose one branch (default `main`), a deployment timeout, and either an absolute
 server-side script path or **upload a script directly in the website**. The file
 picker loads the script into an editable text field; **Save CI settings** stores
 it on the server. Uploads must be UTF-8 text, at most 64 KiB, and on Ubuntu must
-start with a shebang such as `#!/bin/sh`. Uploaded scripts are content-addressed
+start with a shebang such as `#!/bin/sh` when **Run with** is blank (direct execution).
+For cross-platform Python scripts, set **Run with** to `python`: no
+shebang is needed. Uploading a `.py` file fills this in when blank. It uses
+the Git server's Python interpreter and virtual environment; install dependencies
+there, not just inside the CI image. Other installed runners are supported too,
+for example `node`, `bash -e`, or `pwsh -NoProfile -File`. The script path and commit
+are appended as arguments; no shell expansion is performed. Uploaded scripts are content-addressed
 files in `deployment-scripts` beside the database, with owner-only permissions.
 Keep that directory in server backups; unused script versions are not deleted
 automatically.
@@ -372,8 +382,15 @@ does not inherit arbitrary server variables; scripts should use explicit
 credential paths. Logs are not secret-redacted.
 
 Deployment status and bounded logs appear separately on the CI run page after
-execution finishes; deployment failure does not turn passing tests into failing
-tests. Each repository/commit gets at most one deployment attempt, including
+execution finishes. **CI → Deployments**, next to Runs, lists deployment history;
+open an entry for its output, including after the originating CI run is pruned.
+Refresh to update active attempts. Deployment failure does not turn passing tests
+into failing tests. Separate **[Deployment]** emails use the existing repository email recipients
+and notification mode (off, failures, all completions, or failures and recovery).
+Failures include timed-out and interrupted deployments; recovery compares previous
+deployment results, not test results. Messages contain metadata only, not logs or
+scripts. Delivery status appears on the run page, and SMTP failures never change
+deployment results. Each repository/commit gets at most one deployment attempt, including
 failed attempts. Attempt records survive CI history pruning. There is no automatic
 retry or rollback. Server restarts mark unfinished deployments interrupted rather
 than replaying them; operators must verify the target's actual state. As with CI,

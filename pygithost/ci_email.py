@@ -98,6 +98,9 @@ def _notification_html(owner, repo, run, url):
         "cancelled": ("Run cancelled", "#475569", "#f1f5f9"),
         "test": ("Email is connected", "#0369a1", "#f0f9ff"),
     }.get(run[4], ("CI run update", "#475569", "#f1f5f9"))
+    if run[1] == "deployment":
+        title = {"success": "Deployment succeeded", "failed": "Deployment failed",
+                 "timed_out": "Deployment timed out", "interrupted": "Deployment interrupted"}.get(run[4], "Deployment update")
     subtitle = "SMTP settings are working. CI notifications are ready to send." if is_test else f"{owner}/{repo} · Run #{run[0]}"
     rows = []
     if not is_test:
@@ -158,6 +161,8 @@ def send_notification(owner, repo, run, recipients, settings=None):
     message["To"] = ", ".join(recipients)
     # Branch names and repository names are not trusted email header content.
     subject = f"[CI] {owner}/{repo} #{run[0]}: {run[4]}"
+    if run[1] == "deployment":
+        subject = f"[Deployment] {owner}/{repo} #{run[0]}: {run[4]}"
     message["Subject"] = subject.replace("\r", " ").replace("\n", " ")
     text = f"Repository: {owner}/{repo}\nRun: #{run[0]}\nStatus: {run[4]}\nEvent: {run[1]}\nBranch: {run[2]}\nCommit: {run[3]}\nExit code: {run[7]}\n"
     base = settings["public_url"].rstrip("/")

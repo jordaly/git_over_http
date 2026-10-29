@@ -6,10 +6,11 @@ import json
 from . import database
 
 
-async def repository_overview(owner, repo, bare, commit, entries):
+async def repository_overview(owner, repo, bare, commit, entries, subpath=""):
     if not commit:
         return {"latest": None, "entries": {}, "commit_count": 0, "contributors": []}
-    cached = await asyncio.to_thread(database.db_repository_overview_get, owner, repo, commit)
+    cache_key = commit + ":" + subpath if subpath else commit
+    cached = await asyncio.to_thread(database.db_repository_overview_get, owner, repo, cache_key)
     if cached is not None:
         return json.loads(cached)
     slots = asyncio.Semaphore(4)
@@ -39,7 +40,7 @@ async def repository_overview(owner, repo, bare, commit, entries):
     # Avoid unbounded subprocess work for unusually wide root directories.
     names = [name for _kind, name in entries[:200]]
     try:
-        results = await asyncio.wait_for(asyncio.gather(last_change(), *(last_change(name) for name in names)), timeout=15)
+        results = await asyncio.wait_for(asyncio.gather(last_change(subpath or None), *(last_change(subpath + "/" + name if subpath else name) for name in names)), timeout=15)
     except asyncio.TimeoutError:
         return {"latest": None, "entries": {}, "commit_count": None, "contributors": []}
     try:
@@ -56,5 +57,5 @@ async def repository_overview(owner, repo, bare, commit, entries):
               "commit_count": commit_count, "contributors": contributors}
     # Incomplete/failed scans should be retried rather than cached forever.
     if results[0] and all(results[1:]) and commit_count is not None:
-        await asyncio.to_thread(database.db_repository_overview_set, owner, repo, commit, json.dumps(result))
+        await asyncio.to_thread(database.db_repository_overview_set, owner, repo, cache_key, json.dumps(result))
     return result

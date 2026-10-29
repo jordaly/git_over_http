@@ -26,7 +26,7 @@ def ci_configuration_guide():
     return safe_html(html_t(t'''<section id="ci-configuration-guide" class="box ci-guide" aria-labelledby="ci-guide-heading">
 <h2 id="ci-guide-heading">CI configuration guide</h2>
 <p>On the <b>Settings</b> tab, choose <b>Single command</b>, <b>Named steps</b>, or <b>JSON in page</b> and use the same <b>Save CI settings</b> button. You can also enable a versioned <code>.pygithost-ci.json</code> file. Everything uses standard JSON: double-quoted strings, no comments, and no trailing commas.</p>
-<nav class="row" aria-label="CI guide sections"><a href="#ci-guide-start">Quick start</a><a href="#ci-guide-json">JSON reference</a><a href="#ci-guide-settings">Server settings</a><a href="#ci-guide-variables">Variables</a></nav>
+<nav class="row" aria-label="CI guide sections"><a href="#ci-guide-start">Quick start</a><a href="#ci-guide-json">JSON reference</a><a href="#ci-guide-settings">Server settings</a><a href="#ci-guide-deployment">Deployment</a><a href="#ci-guide-variables">Variables</a></nav>
 
 <details id="ci-guide-start" open><summary>Quick start: configure a pipeline</summary>
 <ol><li>Choose a runner and ensure the required tools are installed. Host runs use the server machine; Docker runs use an image already available locally.</li>
@@ -107,6 +107,73 @@ def ci_configuration_guide():
 <details id="ci-guide-variables"><summary>Built-in environment variables</summary>
 <p>These variables are supplied by CI and cannot be overridden in <code>env</code>. PR-only values may be empty for other events. <code>CI</code> is <code>true</code>; <code>PYGITHOST_COMMIT</code> is the recorded checkout commit (the base commit for PR checks), and <code>PYGITHOST_WORKTREE</code> is the checkout directory.</p>
 <ul class="ci-variable-list">{variables}</ul>
+</details>
+
+<details id="ci-guide-deployment" open><summary>Automatic deployment and script upload</summary>
+<p>Deployment runs a trusted script on the Git server after successful CI for an update to one configured branch. It is optional and disabled by default. Configure it in <b>Settings → Automatic deployment</b>, not in repository pipeline JSON.</p>
+<h3>Set up automatic deployment</h3>
+<ol><li>Configure a working CI pipeline, then enable <b>Push</b> and/or <b>PR merged</b> triggers. Ensure the branch filters include your deployment branch.</li>
+<li>Enable <b>Deploy after successful branch CI</b> and enter one exact branch name, for example <code>main</code>. This field does not accept glob patterns.</li>
+<li>Enter an absolute script path already on the server, or select a file under <b>Or upload a deployment script</b>. The upload populates the editable <b>New script contents</b> field; review it before saving. You may also paste script contents directly.</li>
+<li>Set <b>Run with</b> to the installed runner, for example <code>python</code>, <code>node</code>, <code>bash -e</code>, or <code>pwsh -NoProfile -File</code>. No shebang is needed with an explicit interpreter. A <code>.py</code> upload fills in <code>python</code> when the field is blank; this shortcut uses the server's Python interpreter and virtual environment. Leave blank for direct execution, which requires a shebang for Ubuntu scripts. Uploads must be UTF-8 without NUL bytes, at most 64 KiB; CRLF is normalized.</li>
+<li>Set the deployment timeout (default 600 seconds; allowed range 1–86400 seconds), then click <b>Save CI settings</b>. Nonempty new script contents take precedence over the path field. Uploading or saving does not execute the script.</li>
+<li>Push a new commit or merge a PR into the configured branch. Open its CI run page to inspect the separate deployment status and output.</li></ol>
+<h3>When does it deploy?</h3>
+<div class="ci-table-scroll"><table><thead><tr><th>Situation</th><th>Deploys?</th></tr></thead><tbody>
+<tr><td>Push or post-merge CI succeeds on the configured branch</td><td>Yes, if the tested commit is still the branch tip and has no prior attempt.</td></tr>
+<tr><td>PR check before merging, manually queued run, or another branch</td><td>No.</td></tr>
+<tr><td>Failed, cancelled, or timed-out CI</td><td>No.</td></tr>
+<tr><td>Deployment disabled or deployment settings changed since queueing</td><td>No.</td></tr>
+<tr><td>Same commit already attempted, including a failed deployment</td><td>No second attempt.</td></tr>
+</tbody></table></div>
+<ul><li>The run must be a successful <b>Push</b> or <b>PR merged</b> run for the exact deployment branch. PR checks and manually queued runs do not deploy.</li>
+<li>Immediately before deployment, the server verifies that the branch tip still equals the tested commit. Outdated commits are skipped.</li>
+<li>Deployment must have been enabled when the run was queued and must still be enabled. Changing the deployment branch, script path, Run with, or timeout prevents older configurations from deploying.</li>
+<li>The repository's runner slot stays occupied during deployment. Runs and deployments in that repository cannot overlap; different repositories may deploy concurrently.</li>
+<li>There is at most one deployment attempt per repository/commit, even if that attempt fails or is interrupted. Rerunning CI does not retry an already attempted deployment.</li></ul>
+<h3>Script contract: Ubuntu example</h3>
+<p><b>Cross-platform Python:</b> set <b>Run with</b> to <code>python</code> and upload or paste this script. No shebang is needed on Ubuntu or Windows. This smoke test prints the commit without deploying anything.</p>
+<pre tabindex="0" aria-label="Cross-platform Python deployment example">import sys
+
+commit = sys.argv[1]
+print("Would deploy", commit, flush=True)
+</pre>
+<p><b>Start safely:</b> first upload the harmless script below, save settings, then push a new commit to the deployment branch. Confirm its output in the run's Deployment section before configuring production access. Saving settings alone does not deploy an existing completed run.</p>
+<pre tabindex="0" aria-label="Safe deployment smoke test">#!/bin/sh
+set -eu
+printf 'Would deploy %s/%s at %s\\n' "$PYGITHOST_OWNER" "$PYGITHOST_REPO" "$1"
+</pre>
+<p>Once the smoke test works, invoke your own release tool. The following path is a placeholder: you must install and configure the tool yourself.</p>
+<pre tabindex="0" aria-label="Ubuntu deployment script example">#!/bin/sh
+set -eu
+commit="$1"
+# Replace this command with your own trusted deployment tool.
+/opt/my-app/release "$commit"
+</pre>
+<p>The server executes <b>Run with + script path + commit SHA</b> as an argument list, without a command shell. Leave Run with blank to execute the file itself. The script receives the exact tested commit as its first argument, plus <code>CI=true</code>, <code>PYGITHOST_COMMIT</code>, <code>PYGITHOST_OWNER</code>, <code>PYGITHOST_REPO</code>, and <code>PYGITHOST_BRANCH</code>. Deploy that commit, not the latest branch tip, which may change while deployment is running. Exit zero for success and nonzero for failure.</p>
+<div class="ci-table-scroll"><table><thead><tr><th>Runtime</th><th>Run with example</th></tr></thead><tbody>
+<tr><td>Python, server interpreter</td><td><code>python</code></td></tr>
+<tr><td>Python, explicit interpreter and arguments</td><td><code>python3 -u</code></td></tr>
+<tr><td>JavaScript</td><td><code>node</code></td></tr>
+<tr><td>Bash</td><td><code>bash -e</code></td></tr>
+<tr><td>PowerShell</td><td><code>pwsh -NoProfile -File</code></td></tr>
+<tr><td>Ruby / PHP</td><td><code>ruby</code> / <code>php</code></td></tr>
+</tbody></table></div>
+<p>Install the runner and dependencies on the Git server. Quote executable paths with spaces; parsing uses shell-style quoting on both platforms. For Windows paths, use forward slashes, for example <code>"C:/Program Files/Python/python.exe" -u</code>. Pipes, redirection, command chaining, and environment expansion are not supported in Run with; put that logic in the script. Uploaded filenames are content hashes without extensions, so extension-dependent runners need a wrapper. Compiled languages need a build/run wrapper too. No runner makes OS-specific script commands portable automatically.</p>
+<p>The working directory and <code>HOME</code> are temporary directories, not the CI checkout or the server user's normal home. The script does not inherit arbitrary server environment variables or the CI settings environment mapping. Source checkouts and CI artifacts are not automatically passed to it: your deployment tool must retrieve the required source or build itself. Use explicit paths for tools, SSH keys, and SSH known-hosts files. Provision these securely before enabling deployment.</p>
+<p><b>Deploying to another Ubuntu machine?</b> Install an SSH client on the Git server, provision a dedicated restricted key and a verified known-hosts file, and use explicit paths for both. Install a release tool on the target that accepts the exact commit, activates that release, and checks application health. Test as the Git server service user. Never disable SSH host verification. Stopping a local SSH process does not guarantee the remote release stops.</p>
+<h3>Security and storage</h3>
+<p class="warn"><b>This is host execution, even if CI uses Docker.</b> Deployment scripts run as the Git server's OS user with network and filesystem access. Only trusted administrators should configure them. When authentication is disabled, the IP allowlist is the administration security boundary. Never let untrusted jobs modify scripts, deployment tools, or credentials. Output is not secret-redacted, and anyone with access to the CI run can read deployment output.</p>
+<p>Keep credentials in protected server files, not uploaded script contents, repository files, or CI environment settings. Uploaded scripts are stored with owner-only permissions in <code>deployment-scripts</code> beside the database. Each content version has its own path. Include this directory in backups; unused versions are not automatically removed.</p>
+<h3>Failures, recovery, and troubleshooting</h3>
+<p><b>Where to view deployments:</b> open <b>CI → Deployments</b>, immediately next to Runs. The paginated history shows status, branch, commit, start/finish times, duration, and email state. Select a deployment to view its output; details remain available after its CI run is pruned. Refresh for updated status. Skipped deployments are not recorded.</p>
+<ul><li><b>CI passed but nothing deployed:</b> check the event, exact branch, branch filters, deployment settings at queue time, current branch tip, and whether this commit already has an attempt. An automatically skipped deployment does not create a deployment record.</li>
+<li><b>Script cannot start:</b> check its path, shebang/interpreter, executable permissions for externally installed scripts, and availability of required tools on the server. Installing tools only in the Docker CI image is not sufficient.</li>
+<li><b>SSH authentication or host verification fails:</b> the temporary HOME does not contain your normal SSH configuration. Configure explicit identity and trusted known-hosts paths; do not disable host verification.</li>
+<li><b>No live deployment output:</b> deployment logs appear when the attempt finishes, not as a live stream. Output is bounded to 1 MiB. Deployment failure or timeout does not change the successful CI test result; check the separate deployment status.</li>
+<li><b>Server restart or cancellation:</b> unfinished deployments are marked interrupted rather than replayed. Use a service supervisor to terminate subprocesses. Cancellation and timeout do not undo changes already made on the target.</li>
+<li><b>Retry or rollback:</b> there is no built-in deployment retry or automatic rollback. Inspect the target and recover with your deployment tool. A new branch commit that passes CI can trigger a new attempt; rerunning the same already-attempted commit cannot.</li></ul>
+<p>Deployment attempt records survive CI history pruning. Separate <b>[Deployment]</b> emails use the repository's existing email recipients and mode: off disables them, failures includes failed/timed-out/interrupted attempts, all completions includes successes, and failures and recovery adds success after a failed deployment. Configure server SMTP under Admin → Email first. Skipped deployments do not send messages. Emails contain metadata and an optional run link, never scripts or output. Delivery status appears in the Deployment section; email failure does not change the deployment result. Queued messages survive restart; uncertain sends are not automatically retried, and deployment email has no retry button yet. CI completion emails still describe tests, not deployment success. This feature does not provide remote runner pools, environment approvals, or a secrets manager.</p>
 </details>
 
 <details><summary>Troubleshooting</summary>

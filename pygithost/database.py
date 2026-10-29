@@ -143,6 +143,10 @@ def _db_init() -> None:
             status TEXT NOT NULL DEFAULT 'running', output TEXT NOT NULL DEFAULT '',
             started_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
             UNIQUE(owner, repo, commit_hash))""")
+        deployment_columns = {row[1] for row in conn.execute("PRAGMA table_info(ci_deployments)")}
+        for name in ("notification", "config_json"):
+            if name not in deployment_columns:
+                conn.execute(f"ALTER TABLE ci_deployments ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("""CREATE TABLE IF NOT EXISTS repository_languages (
             owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
@@ -694,11 +698,11 @@ def db_ci_config_get(owner: str, repo: str):
         conn.close()
 
 
-def db_deployment_claim(run_id, owner, repo, commit):
+def db_deployment_claim(run_id, owner, repo, commit, config_json=""):
     conn = _db_connect()
     try:
         cursor = conn.execute("""INSERT OR IGNORE INTO ci_deployments
-            (run_id,owner,repo,commit_hash) VALUES(?,?,?,?)""", (run_id, owner, repo, commit))
+            (run_id,owner,repo,commit_hash,config_json) VALUES(?,?,?,?,?)""", (run_id, owner, repo, commit, config_json))
         return cursor.rowcount == 1
     finally:
         conn.close()
@@ -707,7 +711,7 @@ def db_deployment_claim(run_id, owner, repo, commit):
 def db_deployment_finish(run_id, status, output):
     conn = _db_connect()
     try:
-        conn.execute("""UPDATE ci_deployments SET status=?, output=?,
+        conn.execute("""UPDATE ci_deployments SET status=?, output=?, notification='queued',
             finished_at=datetime('now') WHERE run_id=?""", (status, output, run_id))
     finally:
         conn.close()
@@ -724,8 +728,69 @@ def db_deployment_get(run_id):
 def db_deployment_recover():
     conn = _db_connect()
     try:
-        conn.execute("""UPDATE ci_deployments SET status='interrupted',
+        conn.execute("UPDATE ci_deployments SET notification='delivery unknown' WHERE notification='sending'")
+        conn.execute("""UPDATE ci_deployments SET status='interrupted', notification='queued',
             finished_at=datetime('now') WHERE status='running'""")
+    finally:
+        conn.close()
+
+
+def db_deployment_email_record(run_id):
+    conn = _db_connect()
+    try:
+        return conn.execute("""SELECT run_id,owner,repo,commit_hash,status,config_json,
+            notification,started_at,finished_at FROM ci_deployments WHERE run_id=?""", (run_id,)).fetchone()
+    finally:
+        conn.close()
+
+
+def db_deployments_list(owner, repo, before=0, limit=25):
+    conn = _db_connect()
+    try:
+        return conn.execute("""SELECT d.id,d.run_id,d.commit_hash,d.status,d.started_at,
+            d.finished_at,d.notification,d.config_json,r.id
+            FROM ci_deployments d LEFT JOIN ci_runs r ON r.id=d.run_id
+            WHERE d.owner=? AND d.repo=? AND (?=0 OR d.id<?)
+            ORDER BY d.id DESC LIMIT ?""", (owner, repo, before, before, limit)).fetchall()
+    finally:
+        conn.close()
+
+
+def db_deployment_detail(owner, repo, deployment_id):
+    conn = _db_connect()
+    try:
+        return conn.execute("""SELECT d.id,d.run_id,d.commit_hash,d.status,d.started_at,
+            d.finished_at,d.notification,d.config_json,r.id,d.output
+            FROM ci_deployments d LEFT JOIN ci_runs r ON r.id=d.run_id
+            WHERE d.owner=? AND d.repo=? AND d.id=?""", (owner, repo, deployment_id)).fetchone()
+    finally:
+        conn.close()
+
+
+def db_deployment_email_pending():
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT run_id,owner,repo FROM ci_deployments WHERE notification='queued'").fetchall()
+    finally:
+        conn.close()
+
+
+def db_deployment_email_update(run_id, state, claim=False):
+    conn = _db_connect()
+    try:
+        cursor = conn.execute("UPDATE ci_deployments SET notification=? WHERE run_id=?" +
+            (" AND notification='queued'" if claim else ""), (state, run_id))
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def db_deployment_previous_result(owner, repo, run_id):
+    conn = _db_connect()
+    try:
+        row = conn.execute("""SELECT status FROM ci_deployments WHERE owner=? AND repo=?
+            AND run_id<? AND status!='running' ORDER BY id DESC LIMIT 1""", (owner, repo, run_id)).fetchone()
+        return row[0] if row else None
     finally:
         conn.close()
 

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "pipelines": [
+    {
+      "name": "release",
+      "triggers": {"push": {"enabled": true, "branches": ["main"]}, "manual": {"enabled": true}},
+      "steps": [{"name": "Tests", "run": "python -m unittest discover -v"}]
+    }
+  ],
+  "deployments": [
+    {
+      "name": "production",
+      "pipeline": "release",
+      "enabled": false,
+      "branch": "main",
+      "run_with": "python",
+      "script_content": "import os, sys\nprint('Would deploy', sys.argv[1], 'from', os.environ['PYGITHOST_PIPELINE'])\n",
+      "timeout_seconds": 120
+    }
+  ]
+}

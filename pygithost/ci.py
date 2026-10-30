@@ -41,6 +41,7 @@ BUILTINS = {
     "PYGITHOST_HEAD_BRANCH",
     "PYGITHOST_BASE_COMMIT",
     "PYGITHOST_WORKTREE",
+    "PYGITHOST_PIPELINE",
 }
 
 
@@ -74,6 +75,10 @@ def deployment_prefix(value):
 
 def default_config():
     return {
+        "pipeline_id": "default",
+        "deployment_name": "",
+        "deployment_targets": [],
+        "pipelines": [],
         "command": "",
         "deploy_enabled": False,
         "deploy_branch": "main",
@@ -98,6 +103,7 @@ def default_config():
         "email_mode": "off",
         "cancel_superseded": False,
         "repository_config": False,
+        "repository_file": ".pygithost-ci.json",
         "require_ci": False,
         "block_direct_pushes": False,
         "protected_branches": "main",
@@ -109,7 +115,7 @@ def default_config():
     }
 
 
-def validate_config(raw):
+def validate_config(raw, *, nested=False):
     if not isinstance(raw, dict):
         raise ValueError("CI configuration must be a mapping.")
     command = raw.get("command", "")
@@ -242,6 +248,48 @@ def validate_config(raw):
     if when not in ("always", "success", "failure"):
         raise ValueError("Artifact when must be always, success, or failure.")
     defaults["artifacts"] = {"paths": paths, "when": when}
+    identity = raw.get("pipeline_id", "default")
+    if not isinstance(identity, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", identity):
+        raise ValueError("Pipeline IDs must contain 1–64 letters, digits, underscores or hyphens.")
+    defaults["pipeline_id"] = identity
+    deployment_name = raw.get("deployment_name", "")
+    if not isinstance(deployment_name, str) or (deployment_name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", deployment_name)):
+        raise ValueError("Invalid deployment name.")
+    defaults["deployment_name"] = deployment_name
+    filename = raw.get("repository_file", ".pygithost-ci.json")
+    if not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.json", filename) or ".." in filename:
+        raise ValueError("Repository pipeline file must be a root-level JSON filename.")
+    defaults["repository_file"] = filename
+    pipelines = raw.get("pipelines", [])
+    if not isinstance(pipelines, list) or len(pipelines) > 15 or (nested and pipelines):
+        raise ValueError("Use at most 15 additional pipelines, without nested pipelines.")
+    seen = {identity}
+    defaults["pipelines"] = []
+    for item in pipelines:
+        if not isinstance(item, dict) or "pipeline_id" not in item:
+            raise ValueError("Each additional pipeline requires a pipeline_id.")
+        if set(item) - (set(default_config()) | {"pipeline_id", "pipeline_mode", "deploy_script_content"}):
+            raise ValueError("Unknown additional pipeline field.")
+        if any(item.get(key) for key in ("require_ci", "block_direct_pushes")):
+            raise ValueError("Merge and branch protections belong to repository settings.")
+        child = validate_config(item, nested=True)
+        if child["pipeline_id"] in seen:
+            raise ValueError("Pipeline IDs must be unique; default is reserved.")
+        seen.add(child["pipeline_id"])
+        defaults["pipelines"].append(child)
+    targets = raw.get("deployment_targets", [])
+    target_fields = {"deployment_name", "deploy_enabled", "deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter", "email_mode", "email_recipients"}
+    if not isinstance(targets, list) or len(targets) > 32:
+        raise ValueError("Use at most 32 deployment targets.")
+    seen_targets = set()
+    for target in targets:
+        if not isinstance(target, dict) or set(target) - target_fields or not isinstance(target.get("deployment_name"), str) or not target["deployment_name"]:
+            raise ValueError("Deployment targets require a name and deployment fields only.")
+        if target["deployment_name"] in seen_targets:
+            raise ValueError("Deployment names must be unique.")
+        seen_targets.add(target["deployment_name"])
+        checked = validate_config({**defaults, **target, "pipelines": [], "deployment_targets": []})
+        defaults["deployment_targets"].append({key: checked[key] for key in target_fields if key in checked})
     return defaults
 
 
@@ -494,7 +542,19 @@ class CIManager:
 
     async def config(self, owner, repo):
         raw = await _db_call(database.db_ci_config_get, owner, repo)
-        return validate_config(json.loads(raw)) if raw else default_config()
+        if not raw:
+            return default_config()
+        parsed = json.loads(raw)
+        config = validate_config(parsed)
+        if "document" in parsed:
+            config["document"] = parsed["document"]
+        return config
+
+    async def save_document(self, owner, repo, document):
+        from .ci_config import compile_document
+        config = compile_document(document)
+        await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
+        return config
 
     async def save_config(self, owner, repo, config):
         if config.get("deploy_script_content"):
@@ -502,6 +562,35 @@ class CIManager:
         config = validate_config(config)
         await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
         return config
+
+    @staticmethod
+    def pipelines(config):
+        root = {key: value for key, value in config.items() if key not in ("document", "pipelines")}
+        root["pipelines"] = []
+        items = [root, *config.get("pipelines", [])]
+        if "document" in config:
+            names = config["document"]["pipelines"]
+            if isinstance(names, list):
+                names = {item["name"] for item in names}
+            items = [item for item in items if item.get("pipeline_id", "default") in names]
+        return items
+
+    async def merge_check(self, owner, repo, pr_id, base, head, branch):
+        config = await self.config(owner, repo)
+        checks = []
+        for item in self.pipelines(config):
+            if item["pipeline_id"] != "default" or "document" in config:
+                if not (item["command"] or item["steps"] or item["repository_config"]):
+                    continue
+                if not self._matches(item["pr_branches"], branch):
+                    continue
+                if not any(item["events"].get(key) for key in ("pr_opened", "pr_updated", "pr_reopened")):
+                    continue
+            check = await _db_call(database.db_ci_merge_check, owner, repo, pr_id, base, head, item["pipeline_id"])
+            if not check or check[1] != "success":
+                return check
+            checks.append(check)
+        return checks[-1] if checks else None
 
     async def deployment_script_content(self, owner, repo, config):
         """Return database-backed contents, or a verified legacy upload."""
@@ -546,7 +635,8 @@ class CIManager:
             if process.returncode:
                 raise ValueError("Cannot read .pygithost-ci.json at the recorded commit.")
             return stdout
-        tree = (await git("ls-tree", commit, "--", ".pygithost-ci.json")).decode().split()
+        filename = config.get("repository_file", ".pygithost-ci.json")
+        tree = (await git("ls-tree", commit, "--", filename)).decode().split()
         if len(tree) < 3 or tree[0] not in ("100644", "100755") or tree[1] != "blob":
             raise ValueError("Missing regular .pygithost-ci.json file.")
         blob = tree[2]
@@ -562,12 +652,28 @@ class CIManager:
             fnmatch.fnmatchcase(branch, pattern) for pattern in patterns
         )
 
-    async def enqueue(self, owner, repo, event, branch="", commit="", payload=None):
+    async def enqueue(self, owner, repo, event, branch="", commit="", payload=None, *, pipeline=None):
         async with self.enqueue_lock:
-            return await self._enqueue(owner, repo, event, branch, commit, payload)
+            configs = self.pipelines(await self.config(owner, repo))
+            if pipeline is not None:
+                configs = [item for item in configs if item["pipeline_id"] == pipeline]
+                if not configs:
+                    raise ValueError("Unknown pipeline.")
+            first = None
+            for config in configs:
+                identity = config["pipeline_id"]
+                run_payload = {**(payload or {})}
+                if identity != "default":
+                    run_payload["pipeline_id"] = identity
+                else:
+                    run_payload.pop("pipeline_id", None)
+                run = await self._enqueue(owner, repo, event, branch, commit,
+                    run_payload, selected=config)
+                first = first or run
+            return first
 
-    async def _enqueue(self, owner, repo, event, branch="", commit="", payload=None, snapshot=None):
-        config = snapshot or await self.config(owner, repo)
+    async def _enqueue(self, owner, repo, event, branch="", commit="", payload=None, snapshot=None, selected=None):
+        config = snapshot or selected or await self.config(owner, repo)
         key = {
             "push": "push",
             "pull_request": "pr_opened",
@@ -598,7 +704,7 @@ class CIManager:
         if config["cancel_superseded"] and event != "manual":
             for old in list(self.pending.values()) + [r for r, _ in self.active.values()]:
                 old_payload = json.loads(old[6] or "{}")
-                if old[1:5] == (owner, repo, event, branch) and old_payload.get("pr_number") == (payload or {}).get("pr_number"):
+                if old[1:5] == (owner, repo, event, branch) and old_payload.get("pr_number") == (payload or {}).get("pr_number") and old_payload.get("pipeline_id", "default") == config.get("pipeline_id", "default"):
                     await self._cancel(owner, repo, old[0])
         queue_full = len(self.pending) >= self.queue_limit
         payload = payload or {}
@@ -739,16 +845,36 @@ class CIManager:
         task.add_done_callback(self.notification_tasks.discard)
 
     async def _deploy(self, row):
-        """Run a trusted external script, never repository-controlled commands."""
+        """Run each independently named target linked to this pipeline."""
         run_id, owner, repo, event, branch, commit, _payload = row
-        run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
-        config = await self.config(owner, repo)
+        repository_config = await self.config(owner, repo)
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
         snapshot = json.loads(meta["config"] or "{}") if meta else {}
+        identity = snapshot.get("pipeline_id", "default")
+        config = next((item for item in self.pipelines(repository_config) if item["pipeline_id"] == identity), default_config())
+        if snapshot.get("deployment_targets"):
+            current = {target["deployment_name"]: target for target in config.get("deployment_targets", [])}
+            for target in snapshot["deployment_targets"]:
+                name = target["deployment_name"]
+                effective = current.get(name, {"deploy_enabled": False})
+                await self._deploy_target(row, {**config, **effective}, {**snapshot, **target})
+        else:
+            # Preserve queued pre-migration snapshots by matching their original
+            # pipeline ID to the migration-generated target name.
+            current = next((target for target in config.get("deployment_targets", [])
+                            if target["deployment_name"] == identity), {})
+            await self._deploy_target(row, {**config, **current}, snapshot)
+
+    async def _deploy_target(self, row, config, snapshot):
+        """Run one trusted host script with isolated attempt/result bookkeeping."""
+        run_id, owner, repo, event, branch, commit, _payload = row
+        identity = snapshot.get("pipeline_id", "default")
+        deployment_key = snapshot.get("deployment_name") or identity
+        run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
         if not run or run[4] != "success" or not (config["deploy_enabled"] or snapshot.get("deploy_enabled")):
             return
         async def skip(reason):
-            await _db_call(database.db_ci_run_update, run_id, reason="Deployment skipped: " + reason)
+            await _db_call(database.db_ci_run_update, run_id, reason="Deployment skipped: " + deployment_key + ": " + reason)
         if event not in ("push", "pull_request_merged"):
             await skip("only Push and PR merged runs deploy; manual runs and PR checks do not.")
             return
@@ -776,7 +902,7 @@ class CIManager:
                 output.clear()
                 claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
                 if not claimed:
-                    await skip("this repository/commit already has a deployment attempt; see Deployments.")
+                    await skip("this repository/deployment/commit already has a deployment attempt; see Deployments.")
                     return
                 if config.get("deploy_script_content"):
                     prefix = deployment_prefix(config["deploy_interpreter"])
@@ -791,7 +917,8 @@ class CIManager:
                     if script.is_relative_to(Path(bare)) or not script.is_file():
                         raise ValueError("Deployment script must exist outside the repository.")
                 env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
-                    PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, CI="true")
+                    PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, PYGITHOST_PIPELINE=identity,
+                    PYGITHOST_DEPLOYMENT=deployment_key, CI="true")
                 command = deployment_prefix(config["deploy_interpreter"]) + [str(script), commit]
                 rc = await self._capture_process(command, shell=False,
                     cwd=home, env=env, output=output, truncated=truncated,
@@ -799,7 +926,7 @@ class CIManager:
                 status = "success" if rc == 0 else "failed"
         except asyncio.CancelledError:
             if claimed:
-                await _db_call(database.db_deployment_finish, run_id, "interrupted", output.decode("utf-8", "replace"))
+                await _db_call(database.db_deployment_finish, run_id, "interrupted", output.decode("utf-8", "replace"), deployment_key)
             raise
         except Exception as exc:
             status = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed"
@@ -807,7 +934,7 @@ class CIManager:
             if not claimed:
                 claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
         if claimed:
-            await _db_call(database.db_deployment_finish, run_id, status, output.decode("utf-8", "replace"))
+            await _db_call(database.db_deployment_finish, run_id, status, output.decode("utf-8", "replace"), deployment_key)
 
     async def _notify(self, row):
         async with self.notification_slots:
@@ -815,18 +942,23 @@ class CIManager:
             await self._deliver_deployment_notification(row)
 
     async def _deliver_deployment_notification(self, row):
-        record = await _db_call(database.db_deployment_email_record, row[0])
+        records = await _db_call(database.db_deployments_for_run, row[0])
+        for record in records:
+            await self._deliver_target_notification(row, record[1])
+
+    async def _deliver_target_notification(self, row, deployment_key):
+        record = await _db_call(database.db_deployment_email_record, row[0], deployment_key)
         if not record or record[6] != "queued" or record[4] == "running":
             return
         run_id, owner, repo, commit, status, raw, _notification, started, finished = record
         config = json.loads(raw or "{}")
         mode = config.get("email_mode", "off")
-        previous = await _db_call(database.db_deployment_previous_result, owner, repo, run_id)
+        previous = await _db_call(database.db_deployment_previous_result, owner, repo, run_id, deployment_key)
         if mode == "off" or (status == "success" and mode != "all" and not
                 (mode == "recovery" and previous in ("failed", "timed_out", "interrupted"))):
-            await _db_call(database.db_deployment_email_update, run_id, "skipped")
+            await _db_call(database.db_deployment_email_update, run_id, "skipped", False, deployment_key)
             return
-        if not await _db_call(database.db_deployment_email_update, run_id, "sending", True):
+        if not await _db_call(database.db_deployment_email_update, run_id, "sending", True, deployment_key):
             return
         try:
             run = (run_id, "deployment", config.get("deploy_branch", ""), commit,
@@ -834,10 +966,10 @@ class CIManager:
             settings = await _db_call(load_settings)
             await _db_call(send_notification, owner, repo, run,
                 validate_recipients(config.get("email_recipients", "")), settings)
-            await _db_call(database.db_deployment_email_update, run_id, "sent")
+            await _db_call(database.db_deployment_email_update, run_id, "sent", False, deployment_key)
         except Exception as exc:
             logging.getLogger(__name__).warning("Deployment email failed for run #%s (%s)", run_id, type(exc).__name__)
-            await _db_call(database.db_deployment_email_update, run_id, f"failed ({type(exc).__name__}; check server SMTP settings)")
+            await _db_call(database.db_deployment_email_update, run_id, f"failed ({type(exc).__name__}; check server SMTP settings)", False, deployment_key)
 
     async def _deliver_notification(self, row):
         try:
@@ -1065,6 +1197,7 @@ class CIManager:
                         "PYGITHOST_HEAD_BRANCH": payload.get("head_branch", branch),
                         "PYGITHOST_BASE_COMMIT": payload.get("base_commit", ""),
                         "PYGITHOST_WORKTREE": worktree,
+                        "PYGITHOST_PIPELINE": config.get("pipeline_id", "default"),
                     }
                 )
                 env.update(config["env"])

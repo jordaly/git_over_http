@@ -479,7 +479,9 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(handler._ui_ci_config("owner", "repo"), timeout=3)
         page = send_html.await_args.args[2].decode("utf-8")
-        self.assertIn('name="command"', page)
+        self.assertIn('name="configuration_json"', page)
+        self.assertNotIn('name="command"', page)
+        self.assertNotIn('name="pipeline_mode"', page)
         self.assertIn('action="/r/owner/repo/ci/config"', page)
         self.assertIn('href="/r/owner/repo/ci"', page)
         self.assertNotIn("Recent runs", page)

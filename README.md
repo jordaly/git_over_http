@@ -3,6 +3,33 @@
 A dependency-free asynchronous Git Smart HTTP server with a web interface,
 authentication, repository browsing, branches, tokens, users, and pull requests.
 
+## Documentation
+
+- [Getting started](docs/getting-started.md): local setup, configuration, first
+  login, Git access, and troubleshooting.
+- [Repository interface](#repository-interface): browsing files and managing branches.
+- [Continuous integration](#continuous-integration): runners, pipelines, protections,
+  artifacts, and notifications.
+- [Pipeline guide](docs/pipelines.md): step-by-step setup, JSON examples, variables,
+  artifacts, and troubleshooting.
+- [Every CI option](docs/ci-options.md): types, built-in defaults, examples, independence,
+  limits, and complete downloadable JSON configurations.
+- [Grouped-configuration migration](docs/ci-migration.md): old-to-new field mapping,
+  supported design choices, and a safe migration checklist.
+- [Multiple-pipeline examples](docs/pipeline-examples.md): independent checks,
+  Git-managed pipelines, and staging/production deployments.
+- [Automatic deployment walkthrough](docs/automatic-deployment.md).
+- [Retention and pagination](docs/ci-retention.md).
+- [Remote CI runners](docs/remote-ci-runners.md): design proposal, not an available feature.
+
+The full reference, recipes, deployment/retention guides and complete JSON examples
+are also rendered directly in each repository's **CI → Documentation** page.
+
+> **Security:** generated configuration listens on all interfaces and disables
+> authentication by default. IP filtering is enabled, but its generated allowlist
+> contains example private-network addresses. Review these settings before starting
+> the server. Use the loopback-only setup below for a first run.
+
 ## Requirements
 
 - Python 3.14 or newer (the UI renderer uses Python t-strings)
@@ -16,6 +43,11 @@ Generate a platform-specific configuration file:
 python server.py generate-config --platform Linux
 ```
 
+If the file already exists, generation refuses to overwrite it. Edit the existing
+file or use `--config` to choose another destination; use `--overwrite` only when
+you intentionally want to replace it. Use `--print` to inspect generated defaults
+without writing a file. Supported platforms are `Linux`, `Darwin`, and `Windows`.
+
 Review `pygithost.config.json`, particularly `git_project_root`,
 `git_http_backend`, `db_path`, and the allowed client IPs, then run:
 
@@ -28,6 +60,10 @@ The package entry point is equivalent:
 ```sh
 python -m pygithost run --config pygithost.config.json
 ```
+
+For a safe local setup and a configuration reference, follow
+[Getting started](docs/getting-started.md). Configuration changes require a server
+restart; settings saved through the web interface take effect as documented below.
 
 ## Project structure
 
@@ -59,6 +95,20 @@ Run the suite with the project virtual environment:
 ```
 
 The integration tests use the real `git-http-backend` and bind a loopback port.
+
+Per-option CI validation and configuration-mapping tests run with the regular suite.
+To also check documentation and Settings example highlighting in a real Chromium
+browser, opt in with an installed executable:
+
+```sh
+PYGITHOST_TEST_BROWSER=chromium .venv/bin/python -m unittest tests.test_ci_docs.DocumentationBrowserTests -v
+```
+
+This starts a disposable local test server and checks the browser-generated Prism
+tokens, not just HTML attributes. The browser harness disables Chromium's sandbox
+only for the disposable local test; it is not a production browser configuration.
+Docker integration is separately opt-in (see below), Windows process tests require
+Windows, and SMTP/TLS delivery tests use mocks rather than sending real mail.
 
 ## Repository interface
 
@@ -132,9 +182,35 @@ protects access to these settings, as with other administration pages.
 
 ## Continuous integration
 
-Open a repository's **CI → CI settings** page as an administrator. Set a command
-(for example `python -m unittest discover -v`), select triggers, and save. Enable
-the **manual** trigger to queue a branch from the CI page. Write access is required
+Open **CI → Settings** as an administrator. All CI settings now use one JSON
+document: independent named `pipelines` and `deployments` arrays, plus repository-wide
+`policies` / `retention`. Execution, triggers and cancellation are grouped by purpose.
+Edit the document and click **Save configuration**. For example:
+
+```json
+{
+  "version": 1,
+  "pipelines": [
+    {
+      "name": "tests",
+      "triggers": {"push": {"enabled": true}, "manual": {"enabled": true}},
+      "steps": [
+        {"name": "Check Python", "run": "python --version"},
+        {"name": "Tests", "run": "python -m unittest discover -v"}
+      ]
+    }
+  ],
+  "deployments": []
+}
+```
+
+Each pipeline has its own ordered steps, with individual statuses and logs.
+A failed step skips later steps. Files persist between steps, but shell state
+does not. Add other independently configured objects to `pipelines`; every object
+has its own `name`. There is no shared defaults object; see the
+[complete examples](docs/pipeline-examples.md).
+
+Enable the **manual** trigger to queue a branch from the CI page. Write access is required
 to queue, cancel, or rerun jobs; configuration and email retries require admin
 access when authentication is enabled. With authentication disabled, the IP
 allowlist is the security boundary, including for CI administration.
@@ -174,13 +250,11 @@ Jobs expose `CI=true` and `PYGITHOST_OWNER`, `PYGITHOST_REPO`,
 `PYGITHOST_REPOSITORY`, `PYGITHOST_EVENT`, `PYGITHOST_REF`, `PYGITHOST_BRANCH`,
 `PYGITHOST_COMMIT`, `PYGITHOST_OLD_COMMIT`, `PYGITHOST_PR_NUMBER`,
 `PYGITHOST_BASE_BRANCH`, `PYGITHOST_HEAD_BRANCH`, `PYGITHOST_BASE_COMMIT`, and
-`PYGITHOST_WORKTREE`. Built-in variable names cannot be overridden.
+`PYGITHOST_WORKTREE`, and `PYGITHOST_PIPELINE`. Built-in variable names cannot be overridden.
 
-Commands and step `run` strings also support dependency-free Jinja-style
-placeholders: `{{ env.NAME }}`. For example, configure `DB_PASSWORD=value` in CI
-settings and use `"command": "my-tool --password \"{{ env.DB_PASSWORD }}\""`
-in pipeline JSON. Omit JSON `env` to inherit the server mapping; JSON `env`, when
-provided, replaces it. Configured and built-in CI variables are available.
+Step `run` strings support dependency-free placeholders: `{{ env.NAME }}`.
+Put variables under each pipeline's `execution.env`; they are not shared with other pipelines.
+Configured and built-in CI variables are available.
 Substitution occurs once immediately before command execution; missing variables
 fail the command's run/step. No Jinja filters, loops, function calls, or expression
 evaluation are supported. Inserted values are not recursively expanded or
@@ -188,88 +262,43 @@ automatically shell-escaped: quote appropriately for the runner shell. This is
 not secret management; environment values remain in plaintext snapshots and logs
 are not redacted. Prefer tools reading sensitive values directly from their environment.
 
-Branch filters use one case-sensitive glob per line (`main`, `release/*`); blank
-means all branches. PR filters match the **target** branch.
+`triggers.push.branches` and `triggers.pull_request.branches` use arrays of case-sensitive globs
+(`["main", "release/*"]`); omitted filters or `[]` match all branches. PR filters
+match the **target** branch.
 
-### Versioned JSON pipelines and named steps
+### JSON configuration
 
-Existing single-command CI settings continue to work. To use named sequential
-steps, choose **Named steps** under **What should run?** and enter a JSON array of
-`name`/`run` objects. Only the selected command mode is saved. Settings are grouped
-into pipeline, triggers, runner, protection, and collapsible optional sections.
-**Single command**, **Named steps**, and **JSON in page** are three equal choices
-under **What should run?**, sharing one **Save CI settings** button. Turn off
-Git-based configuration to edit the server pipeline. JSON in page saves without
-creating a repository file or commit. Triggers, runner/image, email and protection
-policies use the same form. Command/steps are replaced; supplied JSON environment,
-artifact and timeout fields override their form fields; omitted fields use the
-form values. The selected editor is remembered after saving. As an
-administrator setting, an inline timeout can raise the server limit. Invalid JSON
-is redisplayed for correction without changing saved settings.
+The [pipeline guide](docs/pipelines.md) is the configuration reference; the
+[examples](docs/pipeline-examples.md) cover multiple checks and staging/production.
+Each pipeline independently defines execution, triggers, cancellation, artifacts and
+notifications. Each object in `deployments` has its own name, script and pipeline
+reference. Multiple targets can reference one pipeline without sharing results,
+logs or email state. Protection and retention remain repository-wide under
+`policies` and `retention`. No execution/email configuration is inherited.
 
-Alternatively, enable **Load .pygithost-ci.json from Git** in
-the repository's server-side CI settings and commit a file such as:
-
-```json
-{
-  "version": 1,
-  "steps": [
-    {
-      "name": "Test",
-      "run": "python -m unittest discover -v"
-    },
-    {
-      "name": "Compile",
-      "run": "python -m compileall -q pygithost"
-    }
-  ],
-  "artifacts": {
-    "paths": ["pygithost/__pycache__/*.pyc"],
-    "when": "always"
-  }
-}
-```
-
-- Each step starts a **separate shell** in the checkout root, with the configured
-  environment. Files persist, but `cd`, `export`, and shell variables do not carry
-  over. Docker steps also start separate containers; only the checkout persists,
-  not container `/tmp` or other container state.
-- Each step has its own status, exit code, duration, and logs. A nonzero exit code
-  stops execution and skips remaining steps. The timeout is a total budget for
-  checkout, PR merge preparation, and all steps—not a new budget per step.
-- `command` and `steps` are mutually exclusive. A file may also contain `env`,
-  `artifacts`, and `timeout_seconds`; version defaults to `1`. Unknown fields are
-  rejected. There are at most 64 steps, with commands up to 8192 characters.
-- Server settings still select **triggers, branch filters, runner/image, email,
-  and protection policies**. A repository timeout cannot exceed the server's
-  configured timeout. Repository `env`, when supplied, replaces the server's
-  ordinary job environment mapping; it cannot override built-in variables.
-- The file is read from the exact recorded commit and snapshotted when queued.
-  **PR checks use the recorded target/base commit's file**, not the PR head's
-  potentially unreviewed pipeline. Pipeline changes in a PR take effect after
-  merging; push/manual runs use the selected commit's file.
-- Opting in requires a regular `.pygithost-ci.json` file, limited to 64 KiB.
-  Missing, malformed, or disallowed configuration creates a failed configuration
-  run; it never silently falls back to the server command. Successful enqueueing
-  snapshots the effective configuration, so reruns use that same configuration.
+The old mode selectors, separate forms and additional-pipeline array editor have
+been removed. Existing configurations open in the new JSON format, with commands
+converted to a named step and Git-backed sources preserved as `file` entries.
+Saving replaces the complete document; invalid input never changes saved settings.
+Jobs remain sequential per repository. See the guide for limits and migration.
 
 ### Optional merge and branch protections
 
-Both settings live in the repository's **CI settings**, are administrator-only
+Both settings live under `policies` in the repository's configuration JSON, are administrator-only
 when authentication is enabled, and default to **off**:
 
-- **Require successful CI before merging**: the newest qualifying PR check for
+- **`require_ci`**: the newest qualifying PR check for each applicable pipeline for
   this PR's exact current source **and** target commit must be successful.
   Missing, stale, pending, failed, cancelled, interrupted, or timed-out checks
   block merging. Manual/push runs and checks from another PR do not qualify.
   Enable PR opened, updated, and reopened triggers so checks are produced.
   The merge endpoint enforces this independently of the UI; the Git ref update
   atomically verifies source and target SHAs to reject concurrent branch changes.
-- **Block direct pushes**: rejects HTTP pushes to configured branch patterns,
+- **`block_direct_pushes`**: rejects HTTP pushes to configured branch patterns,
   including creations, force-pushes, and deletions. Other branches remain writable;
   approved PR merges through the server remain allowed. Protected branches cannot
   be created/deleted through the branch UI either. Patterns are case-sensitive,
-  one per line (for example `main` and `release/*`). Initialize the branch before
+  supplied as `policies.protected_branches` (for example `["main", "release/*"]`). Initialize the branch before
   enabling protection.
 
 These controls are independent: enable both to require a PR and passing CI.
@@ -283,7 +312,7 @@ malicious jobs modifying refs directly.
 
 ### Downloadable artifacts
 
-Configure relative file globs in **Artifacts** or the JSON file's `artifacts.paths`.
+Configure relative file globs in each producing pipeline's `artifacts.paths`.
 `artifacts.when` accepts `always` (default), `success`, or `failure`. Artifacts are
 collected after execution and before checkout cleanup, including after failures
 or timeouts as selected; cancelled runs do not collect artifacts. The run page
@@ -300,7 +329,8 @@ Downloads also remain available on each CI run page.
   matched entries. Collection errors/limit violations fail the run explicitly.
 - Archives are stored in SQLite, not publicly served from the static directory.
   Downloads use the same access controls as CI logs, and are attachments only.
-- Configure **CI → Settings → Additional settings → Artifact and run retention**:
+- Configure `retention.artifacts.days`, `retention.artifacts.max_count`,
+  and `retention.runs.max_count` in **CI → Settings → Configuration JSON**:
   artifact expiration defaults to **7 days**, maximum bundles defaults to **0
   (unlimited)**, and completed-run retention defaults to **100** (or the server
   environment default). Each field accepts **0** to disable that limit. Set both
@@ -382,21 +412,14 @@ See the [automatic deployment walkthrough](docs/automatic-deployment.md) for a
 safe first run, trigger reference, Ubuntu SSH example, and recovery checklist.
 The website also includes help under **CI → Docs → Deployment**.
 
-Administrators can enable **Automatic deployment** in a repository's **CI settings**.
-Choose one branch (default `main`), a deployment timeout, and either an absolute
-server-side script path or **upload a script directly in the website**. The file
-picker loads the script into an editable text field; **Save CI settings** stores
-it on the server. Uploads must be UTF-8 text, at most 64 KiB, and on Ubuntu must
-start with a shebang such as `#!/bin/sh` when **Run with** is blank (direct execution).
-For cross-platform Python scripts, set **Run with** to `python`: no
-shebang is needed. Uploading a `.py` file fills this in when blank. It uses
-the Git server's Python interpreter and virtual environment; install dependencies
-there, not just inside the CI image. Other installed runners are supported too,
-for example `node`, `bash -e`, or `pwsh -NoProfile -File`. The script path and commit
-are appended as arguments; no shell expansion is performed. Uploaded/pasted contents
-are stored in SQLite and shown again in settings. A temporary file is created only
-when deployment executes, then removed. Legacy files in `deployment-scripts` remain
-supported; reopen and save their contents to migrate them into the database.
+Add an object to `deployments` with `name`, `pipeline`, `branch`, `script` (absolute host
+path), and optional `timeout_seconds`. Alternatively use `script_content` and
+`run_with` for inline scripts. A deployment block enables it unless `enabled` is
+false. `run_with: "python"` selects the Git server's interpreter and virtual
+environment; install dependencies there, not just in the CI image. Direct POSIX
+execution requires a shebang. Script content is UTF-8, at most 64 KiB, stored in
+SQLite, and written to a temporary file only during execution. There is no separate
+upload form. See the guide for the complete JSON example and migration details.
 
 Enable the **Push** and/or **PR merged** CI triggers. After a successful run for
 an actual update to the selected branch, the server checks that its tip still
@@ -435,7 +458,7 @@ and notification mode (off, failures, all completions, or failures and recovery)
 Failures include timed-out and interrupted deployments; recovery compares previous
 deployment results, not test results. Messages contain metadata only, not logs or
 scripts. Delivery status appears on the run page, and SMTP failures never change
-deployment results. Each repository/commit gets at most one deployment attempt, including
+deployment results. Each repository/deployment/commit gets at most one deployment attempt, including
 failed attempts. Attempt records survive CI history pruning. There is no automatic
 retry or rollback. Server restarts mark unfinished deployments interrupted rather
 than replaying them; operators must verify the target's actual state. As with CI,
@@ -497,8 +520,8 @@ web checkbox described above. Authentication is optional
 when the username is omitted. `PYGITHOST_PUBLIC_URL` is optional and may include
 a deployment path prefix; it supplies the run link in messages.
 
-In each repository's CI settings, enter up to 20 plain recipient addresses and
-choose **Off**, **Failures only**, **All completions**, or **Failures and recovery**.
+On each pipeline or deployment, set `notifications.email.recipients` to an array of up
+to 20 addresses and `notifications.email.mode` to `off`, `failures`, `all`, or `recovery`.
 Recovery means the first success after a failed/timed-out result for the same
 event/branch, or the same PR across opened/updated/reopened events. Messages contain
 run metadata and a link, never commands, logs, or environment values. Recipients

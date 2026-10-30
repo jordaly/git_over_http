@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlparse, urlencode
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 from .config import AppConfig
 from .context import AppContext
-from .ci import CIManager, default_config as ci_default_config, protected_branch, pipeline_config
+from .ci import CIManager, default_config as ci_default_config, protected_branch
 from .ci_protection import prepare_hooks
 from .ci_documentation import ci_configuration_guide
 from .languages import repository_languages
@@ -2366,7 +2366,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         can_write = _has_write_scope(self)
         merge_box = safe_html("")
         ci_policy = await self.server.ci_manager.config(owner, repo)
-        check = await _call_in_thread(db_ci_merge_check, owner, repo, pr_id, tgt_commit or "", src_commit or "")
+        check = await self.server.ci_manager.merge_check(owner, repo, pr_id, tgt_commit or "", src_commit or "", tgt_branch)
         ci_passed = bool(check and check[1] == "success" and src_commit and tgt_commit)
         ci_label = check[1].replace("_", " ") if check else "not run for current commits (missing or outdated)"
         ci_requirement = "required" if ci_policy["require_ci"] else "informational"
@@ -2469,7 +2469,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
             src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
             policy = await self.server.ci_manager.config(owner, repo)
-            check = await _call_in_thread(db_ci_merge_check, owner, repo, pr_id, tgt or "", src or "")
+            check = await self.server.ci_manager.merge_check(owner, repo, pr_id, tgt or "", src or "", tgt_branch)
             if policy["require_ci"] and (not tgt or not src or not check or check[1] != "success"):
                 return await self._ui_pull_view(owner, repo, pr_id, "Merge blocked: successful CI is required for the current source and target commits.", "warn")
             before_refs = await self.server._branch_refs(owner, repo)
@@ -2585,13 +2585,13 @@ document.addEventListener("DOMContentLoaded", function() {{
             run_link = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}">CI run #{run_id}</a>')) if retained else safe_html(html_t(t'<span class="muted">CI run #{run_id} no longer retained</span>'))
             logs = safe_html(html_t(t'<pre tabindex="0" aria-label="Deployment output">{row[9] or "No output yet. Logs are available when deployment finishes."}</pre>')) if deployment_id is not None else safe_html("")
             entries.append(html_t(t'''<section class="box"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2>
-<p>Branch: <code>{branch}</code> · Commit: <a href="{base}/commit/{q(commit)}"><code>{commit}</code></a></p>
+<p>Deployment: <code>{config.get("deployment_name") or config.get("pipeline_id", "default")}</code> · Pipeline: <code>{config.get("pipeline_id", "default")}</code> · Branch: <code>{branch}</code> · Commit: <a href="{base}/commit/{q(commit)}"><code>{commit}</code></a></p>
 <p class="muted">Started: {started} · Finished: {finished or "—"} · Duration: {_ci_elapsed(started, finished)} · Email: {notification or "not queued"}</p>{run_link}{logs}</section>'''))
         listing = join_html(entries) if entries else safe_html('<section class="box"><h2>No deployments yet</h2><p>Deployment attempts appear here after matching CI succeeds. Skipped deployments are not recorded.</p></section>')
         older = _pagination(base + "/ci/deployments", {"before": before} if before else {}, page, page * size < total, total=total, per_page=size) if deployment_id is None else safe_html("")
         body = html_t(t'''{_ci_tabs(base, "deployments")}<div class="topbar"><h2>Deployment history</h2><a class="pill" href="{base}/ci/deployments">Latest deployments</a></div>
 <p class="muted">Deployment results are separate from CI results. Open a deployment for output. Refresh to update running attempts and email delivery.</p>
-<p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs#ci-guide-deployment">Deployment documentation</a></p>{listing}{older}''')
+<p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs?guide=deployment">Deployment documentation</a></p>{listing}{older}''')
         return await _send_html(self.request, 200, _html_page(str_t(t"Deployments · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
 
     async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = "", partial: bool = False):
@@ -2626,6 +2626,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             branch=filters["branch"], query=filters["q"],
             summary=True,
             warnings=filters["warnings"], include_warnings=True,
+            include_pipeline=True,
             before=before,
             offset=(page - 1) * size,
         )
@@ -2635,7 +2636,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         rows = []
         for run in runs:
             warning = safe_html(html_t(t'<a class="ci-warning-badge" href="{base}/ci/runs/{run[0]}#ci-run-warnings" title="{run[11]}"><span aria-hidden="true">⚠</span> Warning</a>')) if run[11] else safe_html('<span class="muted">—</span>')
-            rows.append(html_t(t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a></td><td>{run[1].replace("_", " ")}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></td><td>{warning}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
+            rows.append(html_t(t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a><br><small>{run[12]}</small></td><td>{run[1].replace("_", " ")}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></td><td>{warning}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
         empty = "No runs match these filters." if any(filters.values()) else "No CI runs yet."
         runs_html = join_html(rows) if rows else safe_html(html_t(t'<tr><td colspan="9" class="muted">{empty}</td></tr>'))
         filter_options = {
@@ -2675,12 +2676,14 @@ document.addEventListener("DOMContentLoaded", function() {{
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
         config_raw = await _call_in_thread(db_ci_config_get, owner, repo)
         config = json.loads(config_raw) if config_raw else ci_default_config()
-        manual_enabled = bool((config.get("command") or config.get("steps") or config.get("repository_config")) and config.get("events", {}).get("manual") and branches and _has_write_scope(self))
+        pipelines = CIManager.pipelines(config)
+        pipeline_options = join_html([html_t(t'<option value="{item.get("pipeline_id", "default")}">{item.get("pipeline_id", "default")}</option>') for item in pipelines])
+        manual_enabled = bool(any((item.get("command") or item.get("steps") or item.get("repository_config")) and item.get("events", {}).get("manual") for item in pipelines) and branches and _has_write_scope(self))
         disabled = safe_html("" if manual_enabled else " disabled")
         manual_notice = "" if manual_enabled else "Manual runs require write access, a pipeline, the manual trigger, and an existing branch."
         notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
         body = html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><h2>CI runs</h2></div>{notice_html}
-<div class="box"><h2>Run manually</h2><p>{manual_notice}</p><form method="POST" action="{base}/ci/run"><select name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button></form></div>{filter_form}{results_html}
+<div class="box"><h2>Run manually</h2><p>{manual_notice}</p><form method="POST" action="{base}/ci/run"><label>Pipeline</label><select name="pipeline">{pipeline_options}</select><select name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button></form></div>{filter_form}{results_html}
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
         await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
 
@@ -2719,12 +2722,10 @@ document.addEventListener("DOMContentLoaded", function() {{
         steps_html = join_html([html_t(t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><strong>{step["name"]}</strong><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>''') for index, step in enumerate(steps)])
         steps_section = safe_html(html_t(t'<section class="box ci-run-steps"><div class="ci-section-heading"><h2>Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>')) if steps else safe_html("")
         artifact_size = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id)
-        from .database import db_deployment_get, db_deployment_email_record
-        deployment = await _call_in_thread(db_deployment_get, run_id)
-        deployment_email = await _call_in_thread(db_deployment_email_record, run_id) if deployment else None
-        deployment_html = safe_html(html_t(t'<section class="box"><h2>Deployment: {deployment[0]}</h2><p class="muted">Deployment email: {deployment_email[6] or "not queued"}</p><pre>{deployment[1] or "No output yet. Logs are available when deployment finishes."}</pre></section>')) if deployment else safe_html("")
-        active = active or bool(deployment and deployment[0] == "running")
-        active = active or bool(deployment_email and deployment_email[6] in ("queued", "sending"))
+        from .database import db_deployments_for_run
+        deployments = await _call_in_thread(db_deployments_for_run, run_id)
+        deployment_html = join_html([html_t(t'<section class="box"><h2>Deployment: {entry[2]} · {json.loads(entry[5] or "{}").get("deployment_name") or entry[1]}</h2><p class="muted">Deployment email: {entry[4] or "not queued"}</p><pre>{entry[3] or "No output yet. Logs are available when deployment finishes."}</pre></section>') for entry in deployments])
+        active = active or any(entry[2] == "running" or entry[4] in ("queued", "sending") for entry in deployments)
         active = active or bool(run[4] == "success" and run_id in self.server.ci_manager.active)
         artifact_html = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>')) if artifact_size else safe_html("")
         reason = waiting or meta["reason"]
@@ -2733,7 +2734,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
 <section class="box ci-run-overview" aria-label="Run summary"><div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
 {warning_html}{reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
-<details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
+<details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Pipeline</dt><dd>{payload.get("pipeline_id", "default")}</dd><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
 <pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details>{deployment_html}</div>'''))
         if partial:
@@ -2777,8 +2778,21 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        from .ci_docs import GUIDES, EXAMPLES, manual_content
+        query = parse_qs(urlparse(self.path).query)
+        guide = (query.get("guide") or ["reference"])[0]
+        example = (query.get("example") or [""])[0]
+        try:
+            content = await _call_in_thread(manual_content, guide, example, base + "/ci/docs")
+        except OSError:
+            content = ci_configuration_guide()
+        if content is None:
+            return await self._not_found()
+        guide_links = join_html([html_t(t'<a class="pill" href="{base}/ci/docs?guide={key}"{safe_html(" aria-current=\"page\"" if key == guide and not example else "")}>{title}</a>') for key, (title, _path) in GUIDES.items()])
+        example_links = join_html([html_t(t'<a class="pill" href="{base}/ci/docs?example={key}">{title}</a>') for key, (title, _path) in EXAMPLES.items()])
         body = safe_html(html_t(t'''<main class="ci-page">{_ci_tabs(base, "docs")}<div class="topbar"><h2>CI documentation</h2></div>
-{ci_configuration_guide()}</main>'''))
+<nav class="row" aria-label="Documentation sections">{guide_links}</nav><section class="box"><h2>Complete JSON examples</h2><nav class="row" aria-label="Configuration examples">{example_links}</nav></section>
+<article id="ci-configuration-guide" class="box ci-guide">{content}</article></main><script src="/static/ci-docs.js" defer></script>'''))
         return await _send_html(self.request, 200, _html_page(str_t(t"CI documentation · {owner}/{repo}"), body))
 
     async def _ui_ci_config(self, owner: str, repo: str, notice: str = "", submitted=None, error=False):
@@ -2787,147 +2801,37 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
-        config = submitted if submitted is not None else await self.server.ci_manager.config(owner, repo)
-        if submitted is None:
-            content = await self.server.ci_manager.deployment_script_content(owner, repo, config)
-            config = {**config, "deploy_script_content": content}
+        from .ci_config import EXAMPLE, editor_document
+        config = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        env_text = config.get("env_text", "\n".join(f"{key}={value}" for key, value in config["env"].items()))
-        steps_text = config.get("steps_text", json.dumps(config.get("steps", []), indent=2))
-        pipeline_mode = config.get("pipeline_mode") or ("steps" if config.get("steps") else "command")
-        if "pipeline_text" in config:
-            pipeline_mode = "json"
-        if pipeline_mode not in ("command", "steps", "json"):
-            pipeline_mode = "steps" if config.get("steps") else "command"
-        pipeline_example = {"version": 1, "env": config["env"],
-            "timeout_seconds": config.get("timeout_seconds", 1800),
-            "artifacts": config.get("artifacts", {"paths": [], "when": "always"})}
-        if config.get("steps"):
-            pipeline_example["steps"] = config["steps"]
-        else:
-            pipeline_example["command"] = config["command"] or "python -m unittest discover -v"
-        pipeline_text = config.get("pipeline_text", json.dumps(pipeline_example, indent=2))
-        artifact_paths = "\n".join(config.get("artifacts", {}).get("paths", []))
-        artifact_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("artifacts", {}).get("when", "always") == value else "")}>{value}</option>') for value in ("always", "success", "failure")])
-        checks = {key: safe_html(" checked") if value else safe_html("") for key, value in config["events"].items()}
-        event_labels = {"push": ("Push", "When commits are pushed"),
-            "pr_opened": ("PR opened", "Check new pull requests"),
-            "pr_updated": ("PR updated", "Recheck changes to either branch"),
-            "pr_reopened": ("PR reopened", "Recheck reopened pull requests"),
-            "pr_merged": ("PR merged", "Run after a merge"),
-            "manual": ("Manual", "Allow runs from the Runs tab")}
-        event_controls = join_html([
-            html_t(t'<label class="ci-choice"><input type="checkbox" name="event_{key}"{checks[key]}/><span><strong>{event_labels[key][0]}</strong><small>{event_labels[key][1]}</small></span></label>')
-            for key in checks])
+        document = editor_document(config)
+        text = submitted if isinstance(submitted, str) else json.dumps(document, indent=2)
+        from .ci_schema import group_document
+        example = json.dumps(group_document(EXAMPLE), indent=2)
         notice_html = safe_html(html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')) if notice else safe_html("")
-        runner_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("runner", "host") == value else "")}>{value}</option>') for value in ("host", "docker")])
-        email_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if config.get("email_mode", "off") == value else "")}>{label}</option>') for value, label in (("off", "Off"), ("failures", "Failures only"), ("all", "All completions"), ("recovery", "Failures and recovery"))])
-        shell_name = "cmd.exe" if os.name == "nt" else "/bin/sh"
-        smtp = await _call_in_thread(load_email_settings)
-        smtp_status = "SMTP host and sender are configured; verify delivery from Email settings." if smtp.get("host") and smtp.get("sender") else "SMTP is not configured: set up Email settings first."
-        source_label = "Repository file" if config.get("repository_config") else "Server settings"
-        trigger_count = sum(bool(value) for value in config["events"].values())
-        body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><div><h2>CI settings</h2><p class="muted">Configure your pipeline, automate checks, and protect what ships.</p></div></div>{notice_html}
-<div class="ci-settings-overview"><span><small>PIPELINE SOURCE</small><strong>{source_label}</strong></span><span><small>AUTOMATION</small><strong>{trigger_count} event triggers enabled</strong></span><a href="{base}/ci/docs"><strong>Configuration guide ↗</strong><small>Examples, options, and troubleshooting</small></a></div>
-<div class="ci-settings-layout">
+        retention = json.dumps({key: config.get(key, ci_default_config()[key]) for key in
+            ("artifact_retention_days", "artifact_retention_count", "run_retention_count")})
+        body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><h2>CI configuration</h2><a class="pill" href="{base}/ci/docs">JSON reference and examples</a></div>{notice_html}
 <form id="ci-settings-form" class="ci-settings-form" method="POST" action="{base}/ci/config">
-<section class="box ci-setting-section" aria-labelledby="ci-pipeline-heading"><h2 id="ci-pipeline-heading"><span class="ci-section-number">1</span> What should run?</h2>
-<label class="ci-choice"><input id="ci-repository-source" type="checkbox" name="repository_config"{safe_html(" checked" if config.get("repository_config") else "")}><span><strong>Load .pygithost-ci.json from Git</strong><small>Keep your pipeline versioned alongside your code.</small></span></label>
-<p id="ci-repository-help" class="muted">When enabled, the repository file replaces command/steps and may override environment, artifacts and timeout. PR checks use the target commit's file. Missing or invalid files fail the run. The fields below are saved server defaults, not an editor for the Git file.</p>
-<div id="ci-server-pipeline"><fieldset class="ci-mode-picker"><legend>Choose how to define your commands</legend>
-<label class="ci-choice"><input type="radio" name="pipeline_mode" value="command"{safe_html(" checked" if pipeline_mode == "command" else "")}><span><span class="ci-mode-symbol" aria-hidden="true">&gt;_</span><strong>Single command</strong><small>The simplest way to get started.</small></span></label>
-<label class="ci-choice"><input type="radio" name="pipeline_mode" value="steps"{safe_html(" checked" if pipeline_mode == "steps" else "")}><span><span class="ci-mode-symbol" aria-hidden="true">01 / 02</span><strong>Named steps</strong><small>Sequential commands with individual results.</small></span></label>
-<label class="ci-choice"><input type="radio" name="pipeline_mode" value="json"{safe_html(" checked" if pipeline_mode == "json" else "")}><span><span class="ci-mode-symbol" aria-hidden="true">{{ }}</span><strong>JSON in page</strong><small>Paste a complete pipeline without a Git commit.</small></span></label></fieldset>
-<div data-pipeline-mode="command"><label for="ci-command">Command</label><textarea id="ci-command" name="command" placeholder="python -m unittest discover -v" spellcheck="false">{config["command"]}</textarea></div>
-<div data-pipeline-mode="steps"><label for="ci-steps">Named steps (JSON array)</label><textarea id="ci-steps" name="steps" rows="8" spellcheck="false" placeholder='[{{"name": "Test", "run": "python -m unittest discover -v"}}]'>{steps_text}</textarea><p class="muted">Each step starts a separate shell in the checkout root. Files persist; shell variables and directory changes do not. A failure skips later steps.</p></div>
-<div data-pipeline-mode="json"><label for="ci-pipeline-json">Pipeline JSON (maximum 64 KiB)</label><textarea id="ci-pipeline-json" name="pipeline_json" rows="18" spellcheck="false">{pipeline_text}</textarea>
-<p class="muted">Use the same format as .pygithost-ci.json. Save CI settings stores this pipeline on the server, without creating a file or commit. This editor shows the saved server pipeline, not the file in Git.</p>
-<p class="muted">JSON replaces command/steps and overrides any environment, timeout, or artifact values supplied below. Omitted optional fields use the form values. Triggers, runner/image, email and protections still use the form.</p></div></div>
-</section>
-<section class="box ci-setting-section" aria-labelledby="ci-triggers-heading"><h2 id="ci-triggers-heading"><span class="ci-section-number">2</span> When should it run?</h2>
-<p class="muted">Choose at least one trigger. Enable Manual to queue runs from the Runs tab.</p><div class="ci-choice-grid">{event_controls}</div>
-<p id="ci-no-triggers" class="warn" hidden>No triggers selected. CI will not queue new runs until you enable an event.</p>
-<details class="ci-optional"{safe_html(" open" if config["push_branches"] or config["pr_branches"] else "")}><summary>Limit which branches trigger runs</summary>
-<div class="ci-fields-grid"><div><label for="ci-push-branches">Push branches</label><textarea id="ci-push-branches" name="push_branches" placeholder="main&#10;release/*">{config["push_branches"]}</textarea></div><div><label for="ci-pr-branches">PR target branches</label><textarea id="ci-pr-branches" name="pr_branches" placeholder="main">{config["pr_branches"]}</textarea></div></div><p class="muted">One case-sensitive glob per line. Leave blank for all branches. PR filters match the target, not the source.</p></details>
-<label class="ci-choice"><input type="checkbox" name="cancel_superseded"{safe_html(" checked" if config.get("cancel_superseded") else "")}><span><strong>Cancel superseded runs</strong><small>Stop older matching runs when newer changes arrive. Manual runs are not superseded.</small></span></label></section>
-<section class="box ci-setting-section" aria-labelledby="ci-runner-heading"><h2 id="ci-runner-heading"><span class="ci-section-number">3</span> Where should it run?</h2>
-<div class="ci-fields-grid"><div><label for="ci-runner">Runner</label><select id="ci-runner" name="runner">{runner_options}</select></div><div><label for="ci-timeout">Total timeout (seconds)</label><input id="ci-timeout" type="number" name="timeout_seconds" min="1" step="1" required value="{config.get('timeout_seconds', 1800)}"><p class="muted">Includes checkout and all steps. 1800 seconds = 30 minutes.</p></div></div>
-<p id="ci-host-warning" class="warn"><strong>Host: trusted code only.</strong> Jobs run as the server's OS user and can access its filesystem. Use an unprivileged account. Shell: {shell_name}.</p>
-<div id="ci-docker-settings"><label for="ci-image">Docker image</label><input id="ci-image" name="image" value="{config.get("image", "python:3.14-slim")}"><p class="muted">Requires a local Docker daemon and a pre-pulled image containing your dependencies and /bin/sh. No network access; pin an immutable image digest for reproducibility.</p></div></section>
-<section class="box ci-setting-section" aria-labelledby="ci-protection-heading"><h2 id="ci-protection-heading"><span class="ci-section-number">4</span> Merge and branch protection <span class="muted">Optional</span></h2>
-<label class="ci-choice"><input id="ci-require-checks" type="checkbox" name="require_ci"{safe_html(" checked" if config.get("require_ci") else "")}><span><strong>Require successful CI before merging</strong><small>Only a passing PR check for the current source and target commits qualifies.</small></span></label>
-<p id="ci-check-trigger-warning" class="warn" hidden>Required checks work best with PR opened, updated and reopened triggers enabled. Missing checks block merging.</p>
-<label class="ci-choice"><input id="ci-block-pushes" type="checkbox" name="block_direct_pushes"{safe_html(" checked" if config.get("block_direct_pushes") else "")}><span><strong>Block direct pushes to protected branches</strong><small>Reject direct pushes, force-pushes, creation and deletion. PR merges remain allowed.</small></span></label>
-<div id="ci-protected-patterns"><label for="ci-protected-branches">Protected branch patterns</label><textarea id="ci-protected-branches" name="protected_branches" placeholder="main&#10;release/*">{config.get("protected_branches", "main")}</textarea><p class="muted">One pattern per line. Create the branch before enabling protection.</p></div>
-<p class="muted">These switches are independent and off by default. Enable both to require PRs and passing CI. Local filesystem/SSH access is outside this HTTP server's control.</p></section>
-<section class="box ci-setting-section" aria-labelledby="ci-extras-heading"><h2 id="ci-extras-heading"><span class="ci-section-number">5</span> Additional settings</h2>
-<details class="ci-optional"{safe_html(" open" if env_text else "")}><summary>Environment variables</summary><label for="ci-env">KEY=value, one per line</label><textarea id="ci-env" name="env" placeholder="PYTHONUNBUFFERED=1" spellcheck="false">{env_text}</textarea><p class="muted">Not a secret store: values are saved in plaintext snapshots and are not redacted from logs. Built-in CI variables cannot be overridden.</p></details>
-<details class="ci-optional"{safe_html(" open" if artifact_paths else "")}><summary>Downloadable artifacts</summary><label for="ci-artifacts">File patterns, relative to checkout</label><textarea id="ci-artifacts" name="artifact_paths" placeholder="dist/*&#10;reports/**/*.xml">{artifact_paths}</textarea><label for="ci-artifact-when">Collect after</label><select id="ci-artifact-when" name="artifact_when">{artifact_options}</select><p class="muted">One pattern per line. ZIP download only; no test-output parsing. Maximum 20 MiB / 1000 files per run. Retention is configured below.</p></details>
-<details class="ci-optional"><summary>Artifact and run retention</summary>
-<label for="artifact-retention-days">Artifact expiration (days; 0 = never expire)</label><input id="artifact-retention-days" type="number" name="artifact_retention_days" min="0" max="36500" required value="{config.get('artifact_retention_days', 7)}">
-<label for="artifact-retention-count">Maximum artifact bundles (0 = unlimited)</label><input id="artifact-retention-count" type="number" name="artifact_retention_count" min="0" max="1000000" required value="{config.get('artifact_retention_count', 0)}">
-<label for="run-retention-count">Completed CI runs to retain (0 = unlimited)</label><input id="run-retention-count" type="number" name="run_retention_count" min="0" max="1000000" required value="{config.get('run_retention_count', ci_default_config()['run_retention_count'])}">
-<p class="muted">One artifact bundle is one run's ZIP, not an individual file. Expiration and count limits both apply; set both artifact limits to 0 to keep artifacts forever. Oldest bundles (by run ID) are removed first. Runs with retained artifacts, active runs, and pending notifications are protected, so the run limit may be exceeded.</p>
-<p class="warn">Saving applies retention to existing data immediately. Lower limits can permanently delete old artifacts and completed runs; increasing limits cannot restore them. Unlimited retention can fill server storage.</p></details>
-<details class="ci-optional"{safe_html(" open" if config.get("email_mode", "off") != "off" else "")}><summary>Email notifications</summary><label for="ci-email-mode">Send notifications</label><select id="ci-email-mode" name="email_mode">{email_options}</select><div id="ci-email-settings"><label for="ci-email-recipients">Recipients, one address per line</label><textarea id="ci-email-recipients" name="email_recipients" placeholder="team@example.com">{config.get("email_recipients", "")}</textarea><p class="muted">{smtp_status} <a href="/admin/email">Server email settings</a>. Emails contain metadata, not logs or environment values.</p></div></details></section>
-<section class="box ci-setting-section"><h2>Automatic deployment</h2>
-<p class="muted"><a href="{base}/ci/docs#ci-guide-deployment">Deployment setup, script examples, security, and troubleshooting</a></p>
-<p class="muted">Deployment results send separate emails using the recipients and notification mode in Email notifications above. Choose all completions to receive success and failure messages. Server SMTP must be configured.</p>
-<label><input type="checkbox" name="deploy_enabled"{safe_html(" checked" if config.get("deploy_enabled") else "")}> Deploy after successful branch CI</label>
-<label>Deployment branch</label><input name="deploy_branch" value="{config.get('deploy_branch', 'main')}">
-<label>Absolute deployment script path</label><input name="deploy_script" value="{config.get('deploy_script', '')}" placeholder="/opt/deploy/my-app.sh">
-<label for="deploy-interpreter">Run with (optional)</label><input id="deploy-interpreter" name="deploy_interpreter" value="{config.get('deploy_interpreter', '') if config.get('deploy_interpreter') != 'direct' else ''}" placeholder="python, node, bash, or pwsh -NoProfile -File">
-<p class="muted">The server runs: runner + uploaded script path + commit SHA. Leave blank to run the file directly. Any installed interpreter is supported; no shell expansion, pipes, or command chaining. Quote executable paths containing spaces; on Windows use forward slashes in paths, for example &quot;C:/Program Files/Python/python.exe&quot;. The exact value python uses the server's Python interpreter.</p>
-<label for="deploy-script-upload">Or upload a deployment script (UTF-8, maximum 64 KiB)</label><input id="deploy-script-upload" type="file">
-<p id="deploy-upload-status" class="muted">Uploaded scripts are stored privately on the server. Set Run with to an interpreter to avoid needing a shebang. Direct scripts on Ubuntu require a shebang such as #!/bin/sh. Save CI settings to apply.</p>
-<label for="deploy-script-content">Deployment script contents (uploaded scripts shown here)</label><textarea id="deploy-script-content" name="deploy_script_content" spellcheck="false">{config.get('deploy_script_content', '')}</textarea>
-<p class="muted">The current uploaded script is stored in the database and loaded here for review and editing. A temporary script file is created only when deployment executes and removed afterward; no path is needed. To use an external script path instead, clear this field first. External server files are not loaded into this editor.</p>
-<label>Deployment timeout (seconds)</label><input type="number" name="deploy_timeout" min="1" max="86400" value="{config.get('deploy_timeout', 600)}">
-<p class="warn">Trusted script runs on the Git server as its OS user, outside Docker, with network access. Keep it outside repositories and protect it from job writes. No secret redaction. Credentials belong in protected server files, not CI settings.</p>
-<p class="muted">Enable Push and/or PR merged triggers above. Only successful updates of this branch deploy, and only while the tested commit is still its tip. PR checks and manual runs do not deploy. The script receives the exact commit as its first argument and PYGITHOST_COMMIT. One attempt per commit; no automatic retries or rollback.</p></section>
-<p class="warn" role="note"><strong>Retention changes can permanently delete data.</strong> Saving lower artifact expiration, artifact count, or completed-run limits applies to existing data immediately. Deleted artifacts and runs cannot be restored by increasing the limits. A value of 0 disables that limit; unlimited retention can fill the server disk.</p>
-<div class="ci-save-bar"><span class="muted">Pipeline changes apply to new runs.<br>Retention changes apply to existing data immediately.<br>Disabling deployment also prevents pending deployments.</span><button type="submit">Save CI settings <span aria-hidden="true">→</span></button></div></form></div>
+<section class="box"><h2>Independent pipelines and deployments</h2><p>Use two arrays: pipelines and deployments. Every object has a name. Each pipeline defines its own execution, triggers, cancellation, artifacts and notifications; there are no shared defaults. Each deployment references its pipeline by name. Policies and retention remain repository-wide.</p>
+<label for="ci-config-json">Configuration JSON (maximum 256 KiB)</label><textarea id="ci-config-json" name="configuration_json" rows="32" spellcheck="false">{text}</textarea>
+<p class="warn">Host jobs and deployment scripts run as the server user. Use trusted code only. Environment values and scripts are stored in plaintext; logs are not secret-redacted.</p>
+<p class="warn">Saving replaces the complete configuration. Lower retention limits can permanently delete existing data immediately. Removing pipelines stops new runs and pending deployments, not already queued CI commands.</p>
+<button type="submit">Save configuration</button><span id="ci-json-status" role="status" class="muted"></span></section></form>
+<details class="box ci-guide"><summary>Example: independent named pipelines</summary><pre class="language-json"><code class="language-json">{example}</code></pre></details>
+<script src="/static/ci-docs.js" defer></script>
 <script>(function() {{
 const form = document.getElementById("ci-settings-form");
-const retentionNames = ["artifact_retention_days", "artifact_retention_count", "run_retention_count"];
-const originalRetention = Object.fromEntries(retentionNames.map(name => [name, Number(form.elements[name].value)]));
-const upload = document.getElementById("deploy-script-upload");
-let readingScript = false;
-upload.addEventListener("change", async () => {{
- const file = upload.files[0]; if (!file) return;
- const status = document.getElementById("deploy-upload-status");
- if (file.size > 65536) {{ status.textContent = "Script exceeds 64 KiB."; upload.value = ""; return; }}
- readingScript = true;
- try {{ const content = new TextDecoder("utf-8", {{fatal:true}}).decode(await file.arrayBuffer());
- document.getElementById("deploy-script-content").value = content;
- if (file.name.toLowerCase().endsWith(".py") && ["", "direct"].includes(form.elements.deploy_interpreter.value.trim())) form.elements.deploy_interpreter.value = "python";
- status.textContent = "Script loaded. Save CI settings to store it on the server.";
- }} catch (_) {{ status.textContent = "Could not read script as UTF-8."; }}
- finally {{ readingScript = false; }}
-}});
+const original = {safe_html(retention)};
 form.addEventListener("submit", event => {{
- if (readingScript) {{ event.preventDefault(); return; }}
- const stricter = retentionNames.some(name => {{
-  const value = Number(form.elements[name].value), previous = originalRetention[name];
-  return Number.isFinite(value) && value > 0 && (previous === 0 || value < previous);
- }});
- if (stricter && !window.confirm("These retention limits may permanently delete existing CI artifacts and completed runs immediately. Increasing limits later cannot restore deleted data. Save changes?")) event.preventDefault();
+ let config; try {{ config = JSON.parse(form.elements.configuration_json.value); }}
+ catch (error) {{ event.preventDefault(); document.getElementById("ci-json-status").textContent = "Invalid JSON: " + error.message; return; }}
+ const retention = config.retention || {{}};
+ const settings = config.settings || {{artifact_retention_days:retention.artifacts?.days, artifact_retention_count:retention.artifacts?.max_count, run_retention_count:retention.runs?.max_count}};
+ const defaults = {{artifact_retention_days:7, artifact_retention_count:0, run_retention_count:{ci_default_config()["run_retention_count"]}}};
+ const stricter = Object.keys(original).some(key => {{const value = settings[key] ?? defaults[key]; return value > 0 && (original[key] === 0 || value < original[key]); }});
+ if (stricter && !window.confirm("These retention limits may permanently delete existing CI artifacts and completed runs immediately. Save configuration?")) event.preventDefault();
 }});
-function update() {{
- const repository = form.elements.repository_config.checked;
- document.getElementById("ci-server-pipeline").hidden = repository;
- const mode = form.querySelector('input[name="pipeline_mode"]:checked').value;
- form.querySelectorAll("[data-pipeline-mode]").forEach(node => node.hidden = node.dataset.pipelineMode !== mode);
- const docker = form.elements.runner.value === "docker";
- document.getElementById("ci-docker-settings").hidden = !docker;
- document.getElementById("ci-host-warning").hidden = docker;
- document.getElementById("ci-protected-patterns").hidden = !form.elements.block_direct_pushes.checked;
- document.getElementById("ci-email-settings").hidden = form.elements.email_mode.value === "off";
- const triggers = [...form.querySelectorAll('input[name^="event_"]')];
- document.getElementById("ci-no-triggers").hidden = triggers.some(input => input.checked);
- document.getElementById("ci-check-trigger-warning").hidden = !form.elements.require_ci.checked || ["pr_opened", "pr_updated", "pr_reopened"].every(key => form.elements["event_" + key].checked);
-}}
-form.addEventListener("change", update); update();
 }})();</script>''')
         return await _send_html(self.request, 200,
             _html_page(str_t(t"CI settings · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page ci-settings-page">{safe_html(body)}</main>'))))
@@ -2939,72 +2843,22 @@ form.addEventListener("change", update); update();
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
         form = await self._read_form_urlencoded()
-        if form.get("config_mode") == "json":
-            current = await self.server.ci_manager.config(owner, repo)
-            text = form.get("pipeline_json", "")
-            try:
-                if len(text.encode("utf-8")) > 65536:
-                    raise ValueError("Pipeline JSON exceeds 64 KiB.")
-                config = pipeline_config(json.loads(text), current, enforce_timeout=False)
-                config["repository_config"] = False
-                config["pipeline_mode"] = "json"
-                await self.server.ci_manager.save_config(owner, repo, config)
-            except (ValueError, RecursionError) as exc:
-                return await self._ui_ci_config(owner, repo, notice=f"Pipeline JSON: {exc}",
-                    submitted={**current, "pipeline_text": text}, error=True)
-            return await self._ui_ci_config(owner, repo, notice="Pipeline JSON saved on the server. Loading configuration from Git is off.")
-        config = {**ci_default_config(), "command": form.get("command", ""), "env_text": form.get("env", ""),
-            "runner": form.get("runner", "host"), "image": form.get("image", "python:3.14-slim"),
-            "email_mode": form.get("email_mode", "off"), "email_recipients": form.get("email_recipients", ""),
-            "cancel_superseded": "cancel_superseded" in form,
-            "deploy_enabled": "deploy_enabled" in form,
-            "deploy_branch": form.get("deploy_branch", "main"),
-            "deploy_script": form.get("deploy_script", ""),
-            "deploy_interpreter": form.get("deploy_interpreter", "direct"),
-            "deploy_script_content": form.get("deploy_script_content", ""),
-            "deploy_timeout": form.get("deploy_timeout", "600"),
-            "repository_config": "repository_config" in form,
-            "require_ci": "require_ci" in form,
-            "block_direct_pushes": "block_direct_pushes" in form,
-            "protected_branches": form.get("protected_branches", "main"),
-            "steps_text": form.get("steps", "[]"),
-            "pipeline_mode": form.get("pipeline_mode", ""),
-            **({"pipeline_text": form.get("pipeline_json", "")} if form.get("pipeline_mode") == "json" else {}),
-            "artifacts": {"paths": [line.strip() for line in form.get("artifact_paths", "").splitlines() if line.strip()], "when": form.get("artifact_when", "always")},
-            "timeout_seconds": form.get("timeout_seconds", "1800"),
-            "artifact_retention_days": form.get("artifact_retention_days", "7"),
-            "artifact_retention_count": form.get("artifact_retention_count", "0"),
-            "run_retention_count": form.get("run_retention_count", str(ci_default_config()["run_retention_count"])),
-            "push_branches": form.get("push_branches", ""), "pr_branches": form.get("pr_branches", ""),
-            "events": {key: f"event_{key}" in form for key in ci_default_config()["events"]}}
-        env = {}
-        for line in (form.get("env") or "").splitlines():
-            if not line.strip(): continue
-            if "=" not in line:
-                return await self._ui_ci_config(owner, repo, notice="Each environment entry must use KEY=value.", submitted=config, error=True)
-            key, value = line.split("=", 1)
-            if key.strip() in env:
-                return await self._ui_ci_config(owner, repo, notice="Environment variable names must be unique.", submitted=config, error=True)
-            env[key.strip()] = value
-        config["env"] = env
+        text = form.get("configuration_json", "")
         try:
-            mode = form.get("pipeline_mode", "")
-            if mode not in ("", "command", "steps", "json"):
-                raise ValueError("Choose single command, named steps, or JSON in page.")
-            config["steps"] = [] if mode in ("command", "json") else json.loads(config["steps_text"] or "[]")
-            if mode == "json" and not config["repository_config"]:
-                text = form.get("pipeline_json", "")
-                if len(text.encode("utf-8")) > 65536:
-                    raise ValueError("Pipeline JSON exceeds 64 KiB.")
-                config = pipeline_config(json.loads(text), config, enforce_timeout=False)
-            if mode == "steps":
-                config["command"] = ""
-                if not config["steps"] and not config["repository_config"]:
-                    raise ValueError("Add at least one named step, or choose Single command.")
-            await self.server.ci_manager.save_config(owner, repo, config)
+            if len(text.encode("utf-8")) > 262144:
+                raise ValueError("Configuration JSON exceeds 256 KiB.")
+            def unique_keys(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError(f"Duplicate JSON key: {key}")
+                    result[key] = value
+                return result
+            document = json.loads(text, object_pairs_hook=unique_keys)
+            await self.server.ci_manager.save_document(owner, repo, document)
         except (ValueError, RecursionError) as exc:
-            return await self._ui_ci_config(owner, repo, notice=str(exc), submitted=config, error=True)
-        return await self._ui_ci_config(owner, repo, notice="CI settings saved.")
+            return await self._ui_ci_config(owner, repo, notice=str(exc), submitted=text, error=True)
+        return await self._ui_ci_config(owner, repo, notice="Configuration saved.")
 
     async def _ui_ci_run(self, owner: str, repo: str):
         owner, repo = unquote(owner), unquote(repo)
@@ -3018,7 +2872,7 @@ form.addEventListener("change", update); update();
         if not commit:
             return await self._ui_ci(owner, repo, notice="Select a valid branch.")
         try:
-            run_id = await self.server.ci_manager.enqueue(owner, repo, "manual", branch, commit)
+            run_id = await self.server.ci_manager.enqueue(owner, repo, "manual", branch, commit, pipeline=form.get("pipeline", "default"))
         except ValueError as exc:
             return await self._ui_ci(owner, repo, notice=str(exc))
         if run_id:

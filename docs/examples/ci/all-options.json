@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "pipelines": [
+    {
+      "name": "checks",
+      "execution": {
+        "runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600,
+        "env": {"PYTHONUNBUFFERED": "1", "BUILD_MODE": "development"}
+      },
+      "cancellation": {"superseded": true},
+      "triggers": {
+        "push": {"enabled": true, "branches": ["main", "develop", "release/*"]},
+        "pull_request": {"enabled": true, "branches": ["main", "develop"], "events": ["opened", "updated", "reopened", "merged"]},
+        "manual": {"enabled": true}
+      },
+      "steps": [
+        {"name": "Check Python version", "run": "python --version"},
+        {"name": "Run tests", "run": "python -m unittest discover -v"},
+        {"name": "Compile source", "run": "python -m compileall -q ."}
+      ],
+      "artifacts": {"paths": ["reports/**/*.xml", "coverage/*"], "when": "always"},
+      "notifications": {"email": {"mode": "off", "recipients": ["ci@example.com", "ops@example.com"]}}
+    },
+    {
+      "name": "release-build",
+      "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 900, "env": {"BUILD_MODE": "production"}},
+      "cancellation": {"superseded": false},
+      "triggers": {"push": {"enabled": true, "branches": ["main", "release/*"]}, "manual": {"enabled": true}},
+      "steps": [{"name": "Tests", "run": "python -m unittest discover -v"}],
+      "artifacts": {"paths": ["dist/*"], "when": "success"},
+      "notifications": {"email": {"mode": "off", "recipients": []}}
+    }
+  ],
+  "deployments": [
+    {"name": "staging", "pipeline": "checks", "enabled": false, "branch": "develop", "script": "/opt/deploy/staging.sh", "run_with": "bash -e", "timeout_seconds": 600},
+    {"name": "production", "pipeline": "release-build", "enabled": false, "branch": "main", "script": "/opt/deploy/production.sh", "run_with": "bash -e", "timeout_seconds": 900, "notifications": {"email": {"mode": "off", "recipients": ["ops@example.com"]}}}
+  ],
+  "policies": {"require_ci": false, "block_direct_pushes": false, "protected_branches": ["main", "release/*"]},
+  "retention": {"artifacts": {"days": 30, "max_count": 50}, "runs": {"max_count": 100}}
+}

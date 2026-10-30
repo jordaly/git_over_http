@@ -61,6 +61,77 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(database.db_deployment_get(second[0]))
         self.assertEqual(self.manager._capture_process.await_count, 3)
 
+    async def test_two_named_targets_keep_results_logs_and_email_independent(self):
+        document = {"pipelines": [{"name": "checks", "steps": [{"name": "Test", "run": "echo test"}]}],
+            "deployments": [
+                {"name": "staging", "pipeline": "checks", "script": str(self.script)},
+                {"name": "production", "pipeline": "checks", "script": str(self.script),
+                 "notifications": {"email": {"mode": "all", "recipients": ["ops@example.com"]}}}]}
+        config = await self.manager.save_document("owner", "repo", document)
+        run_id = database.db_ci_run_create("owner", "repo", "push", "main", self.commit, "{}", json.dumps(config))
+        database.db_ci_run_update(run_id, status="success")
+        row = (run_id, "owner", "repo", "push", "main", self.commit, "{}")
+        async def capture(command, **kwargs):
+            if command[0] == "git":
+                kwargs["output"].extend((self.commit + "\n").encode())
+                return 0
+            name = kwargs["env"]["PYGITHOST_DEPLOYMENT"]
+            kwargs["output"].extend(name.encode())
+            return 1 if name == "staging" else 0
+        self.manager._capture_process = AsyncMock(side_effect=capture)
+        await self.manager._deploy(row)
+        attempts = database.db_deployments_for_run(run_id)
+        self.assertEqual([(entry[1], entry[2], entry[3]) for entry in attempts],
+                         [("staging", "failed", "staging"), ("production", "success", "production")])
+        self.assertEqual(database.db_ci_run_get("owner", "repo", run_id)[4], "success")
+        with patch("pygithost.ci.send_notification") as send, patch("pygithost.ci.load_settings", return_value={}):
+            await self.manager._deliver_deployment_notification(row)
+            send.assert_called_once()
+        attempts = database.db_deployments_for_run(run_id)
+        self.assertEqual([entry[4] for entry in attempts], ["skipped", "sent"])
+        await self.manager._deploy(row)
+        self.assertEqual(len(database.db_deployments_for_run(run_id)), 2)
+
+    async def test_independent_deployments_for_same_commit_and_removed_pipeline(self):
+        child = {**self.config, "pipeline_id": "staging"}
+        self.config["pipelines"] = [child]
+        await self.manager.save_config("owner", "repo", self.config)
+        self.capture()
+        rows = []
+        for config in (self.config, child):
+            run_id = database.db_ci_run_create("owner", "repo", "push", "main", self.commit,
+                "{}", json.dumps(validate_config(config)))
+            database.db_ci_run_update(run_id, status="success")
+            row = (run_id, "owner", "repo", "push", "main", self.commit, "{}")
+            rows.append(row)
+            await self.manager._deploy(row)
+            self.assertEqual(database.db_deployment_get(run_id)[0], "success")
+        self.assertEqual(self.manager._capture_process.await_count, 4)
+        # A removed pipeline's pending snapshot must never use default's script.
+        await self.manager.save_config("owner", "repo", {**self.config, "pipelines": []})
+        self.manager._capture_process.reset_mock()
+        await self.manager._deploy(rows[1])
+        self.manager._capture_process.assert_not_awaited()
+
+    def test_legacy_deployment_migration_preserves_records(self):
+        conn = database._db_connect()
+        try:
+            conn.execute("DROP TABLE ci_deployments")
+            conn.execute("""CREATE TABLE ci_deployments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
+                owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running', output TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
+                UNIQUE(owner,repo,commit_hash))""")
+            conn.execute("INSERT INTO ci_deployments(run_id,owner,repo,commit_hash,status,output) VALUES(1,'owner','repo','sha','success','legacy output')")
+        finally:
+            conn.close()
+        database._db_init()
+        database._db_init()
+        self.assertEqual(database.db_deployment_get(1), ("success", "legacy output"))
+        self.assertFalse(database.db_deployment_claim(2, "owner", "repo", "sha"))
+        self.assertTrue(database.db_deployment_claim(3, "owner", "repo", "sha", '{"pipeline_id":"staging"}'))
+
     async def test_conditions_exclude_pr_manual_wrong_branch_and_failure(self):
         self.capture()
         for args in [("manual", "main", "success"), ("pull_request", "main", "success"),
@@ -280,8 +351,8 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     def test_deployment_documentation_is_rendered(self):
         guide = str(ci_configuration_guide())
-        for text in ['id="ci-guide-deployment"', 'href="#ci-guide-deployment"',
-                     "Or upload a deployment script", "PYGITHOST_COMMIT",
-                     "at most one deployment attempt", "not secret-redacted",
-                     "Source checkouts and CI artifacts are not automatically passed"]:
+        for text in ['id="every-deployment-option"', 'href="#every-deployment-option"',
+                     "script_content", "PYGITHOST_COMMIT",
+                     "one attempt", "not secret-redacted",
+                     "automatic artifact handoff"]:
             self.assertIn(text, guide)

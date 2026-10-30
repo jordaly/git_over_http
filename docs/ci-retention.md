@@ -2,9 +2,21 @@
 
 ## Configure retention in the website
 
-Open a repository's **CI → Settings → Additional settings → Artifact and run
-retention**. Administrator access is required when authentication is enabled.
-Set the limits and click **Save CI settings**.
+Open **CI → Settings** as an administrator. Set limits once under `retention`
+in the configuration JSON, then click **Save configuration**. For example, merge
+this section into your existing document, keeping its `pipelines`:
+
+```json
+{
+  "retention": {
+    "artifacts": {"days": 30, "max_count": 50},
+    "runs": {"max_count": 100}
+  }
+}
+```
+
+Saving replaces the whole document, so do not replace your pipelines with this
+retention-only snippet. See the [JSON guide](pipelines.md) for the complete format.
 
 | Setting | Default | Zero means | Maximum |
 | --- | --- | --- | --- |

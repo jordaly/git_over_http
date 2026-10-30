@@ -82,6 +82,78 @@ class RepositoryUITests(unittest.TestCase):
         _, page = self.request("/?" + urlencode({"q": '\"><script>alert(1)</script>'}))
         self.assertNotIn("<script>alert(1)</script>", page)
 
+    def test_multiple_pipeline_settings_and_manual_selection(self):
+        document = {"defaults": {"events": {"manual": True}}, "pipelines": {
+            "lint": {"steps": [{"name": "Lint", "run": "echo lint"}]}}}
+        status, page = self.request(self.base + "/ci/config", {
+            "configuration_json": json.dumps(document)})
+        self.assertEqual(status, 200)
+        self.assertIn("Configuration saved", page)
+        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
+        self.assertEqual(application.CIManager.pipelines(saved)[0]["pipeline_id"], "lint")
+        _, page = self.request(self.base + "/ci")
+        self.assertIn('<option value="lint">lint</option>', page)
+        status, _ = self.request(self.base + "/ci/run", {"branch": "main", "pipeline": "lint"})
+        self.assertEqual(status, 303)
+        rows = database.db_ci_runs_list(FLAT_OWNER_UI, "project")
+        self.assertEqual(len(rows), 1)
+        meta = database.db_ci_run_metadata(FLAT_OWNER_UI, "project", rows[0][0])
+        self.assertEqual(json.loads(meta["config"])["pipeline_id"], "lint")
+        _, page = self.request(self.base + "/ci/config", {
+            "configuration_json": '{"pipelines":{"lint":{"command":"echo old"}}}'})
+        self.assertIn("unknown fields: command", page)
+        self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project")), saved)
+
+    def test_full_ci_documentation_and_examples_are_shown_in_page(self):
+        status, page = self.request(self.base + "/ci/docs")
+        self.assertEqual(status, 200)
+        for heading in ("Every execution option", "Every deployment option", "Every repository setting",
+                        "Independent configuration", "Troubleshooting"):
+            self.assertIn(heading, page)
+        self.assertIn('<table>', page)
+        self.assertIn('src="/static/ci-docs.js"', page)
+        self.assertIn('id="every-execution-option"', page)
+        self.assertIn(self.base + '/ci/docs?example=all-options', page)
+        self.assertNotIn('href="examples/ci/', page)
+        status, page = self.request(self.base + "/ci/docs?example=all-options")
+        self.assertEqual(status, 200)
+        self.assertIn('&quot;branches&quot;', page)
+        self.assertIn('<code class="language-json">', page)
+        self.assertIn('&quot;protected_branches&quot;', page)
+        status, page = self.request(self.base + "/ci/docs?guide=deployment")
+        self.assertEqual(status, 200)
+        self.assertIn("Safe first run", page)
+        status, page = self.request(self.base + "/ci/docs?guide=migration")
+        self.assertEqual(status, 200)
+        self.assertIn("Old field", page)
+        self.assertIn("What remains repository-wide", page)
+        for path in ("?guide=../../LICENSE", "?example=../../pygithost.config"):
+            status, _page = self.request(self.base + "/ci/docs" + path)
+            self.assertEqual(status, 404)
+
+    def test_grouped_configuration_is_saved_and_legacy_is_presented_grouped(self):
+        import html
+        _, page = self.request(self.base + "/ci/config")
+        self.assertIn('<code class="language-json">', page)
+        self.assertIn('src="/static/ci-docs.js"', page)
+        editor = page.split('name="configuration_json"', 1)[1].split(">", 1)[1].split("</textarea>", 1)[0]
+        migrated = json.loads(html.unescape(editor))
+        self.assertIn("policies", migrated)
+        self.assertNotIn("settings", migrated)
+        document = json.loads(Path("docs/examples/ci/all-options.json").read_text())
+        status, page = self.request(self.base + "/ci/config", {"configuration_json": json.dumps(document)})
+        self.assertEqual(status, 200)
+        self.assertIn("Configuration saved", page)
+        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
+        self.assertEqual(saved["document"], document)
+        _, page = self.request(self.base + "/ci/config")
+        editor = page.split('name="configuration_json"', 1)[1].split(">", 1)[1].split("</textarea>", 1)[0]
+        self.assertEqual(json.loads(html.unescape(editor)), document)
+        document["pipelines"][0]["execution"]["working_directory"] = "."
+        _, page = self.request(self.base + "/ci/config", {"configuration_json": json.dumps(document)})
+        self.assertIn("unsupported fields: working_directory", page)
+        self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project")), saved)
+
     def test_server_display_name_is_editable_persistent_and_escaped(self):
         _, home = self.request("/")
         self.assertIn('href="/admin/settings"', home)
@@ -363,38 +435,33 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_retention_settings_are_saved_from_website(self):
         status, page = self.request(self.base + "/ci/config", {
-            "command": "echo test", "artifact_retention_days": "0",
-            "artifact_retention_count": "12", "run_retention_count": "0"})
+            "configuration_json": json.dumps({"pipelines": {}, "settings": {
+                "artifact_retention_days": 0, "artifact_retention_count": 12, "run_retention_count": 0}})})
         self.assertEqual(status, 200)
-        self.assertIn("CI settings saved", page)
+        self.assertIn("Configuration saved", page)
         saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
         self.assertEqual(saved["artifact_retention_days"], 0)
         self.assertEqual(saved["artifact_retention_count"], 12)
         self.assertEqual(saved["run_retention_count"], 0)
-        self.assertIn('<p class="warn" role="note"><strong>Retention changes can permanently delete data.', page)
-        self.assertIn("Retention changes apply to existing data immediately.", page)
+        self.assertIn("permanently delete existing data immediately", page)
         self.assertIn('window.confirm("These retention limits may permanently delete', page)
 
     def test_pasted_deployment_script_with_blank_path_saves_in_json_mode(self):
         content = 'import sys\nprint("deploying", sys.argv[1])\n'
-        for mode in ("json", "command", "steps"):
-            status, page = self.request(self.base + "/ci/config", {
-                "pipeline_mode": mode,
-                "pipeline_json": json.dumps({"version": 1, "command": "echo tests"}),
-                "command": "echo tests" if mode == "command" else "",
-                "steps": json.dumps([{"name": "Test", "run": "echo tests"}]),
-                "deploy_enabled": "on", "deploy_script": "",
-                "deploy_interpreter": "python", "deploy_script_content": content,
-            })
-            self.assertEqual(status, 200)
-            self.assertIn("CI settings saved", page, mode)
-            saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
-            self.assertTrue(saved["deploy_enabled"])
-            self.assertEqual(saved["deploy_script"], "")
-            self.assertEqual(saved["deploy_script_content"], content)
-            _, reopened = self.request(self.base + "/ci/config")
-            editor = reopened.split('id="deploy-script-content"', 1)[1].split("</textarea>", 1)[0]
-            self.assertIn('print(&quot;deploying&quot;, sys.argv[1])', editor)
+        status, page = self.request(self.base + "/ci/config", {
+            "configuration_json": json.dumps({"pipelines": {"default": {
+                "steps": [{"name": "Tests", "run": "echo tests"}],
+                "deployment": {"run_with": "python", "script_content": content}}}})})
+        self.assertEqual(status, 200)
+        self.assertIn("Configuration saved", page)
+        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
+        self.assertTrue(saved["deploy_enabled"])
+        self.assertEqual(saved["deploy_script"], "")
+        self.assertEqual(saved["deploy_script_content"], content)
+        _, reopened = self.request(self.base + "/ci/config")
+        import html
+        editor = reopened.split('name="configuration_json"', 1)[1].split(">", 1)[1].split("</textarea>", 1)[0]
+        self.assertEqual(json.loads(html.unescape(editor))["deployments"][0]["script_content"], content)
 
     def test_branch_to_pr_prefills_source_and_target(self):
         status, page = self.request(self.base + "/pulls?source=feature%2Fapi&target=main")

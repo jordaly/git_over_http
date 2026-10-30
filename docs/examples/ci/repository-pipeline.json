@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "steps": [
+    {"name": "Python version", "run": "python --version"},
+    {"name": "Tests", "run": "python -m unittest discover -v"}
+  ],
+  "env": {"PYTHONUNBUFFERED": "1"},
+  "artifacts": {"paths": ["reports/**/*.xml"], "when": "failure"},
+  "timeout_seconds": 300
+}

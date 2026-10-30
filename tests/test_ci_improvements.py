@@ -235,7 +235,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         run = database.db_ci_run_get("owner", "repo", row[0])
         self.assertEqual(run[4], "success", run[5])
         self.assertIn("docker-ok", run[5])
-        result = subprocess.run(["docker", "inspect", f"pygithost-ci-{os.getpid()}-{row[0]}"], capture_output=True)
+        result = subprocess.run(["docker", "inspect", f"pygithost-ci-{os.getpid()}-{row[0]}-0"], capture_output=True)
         self.assertNotEqual(result.returncode, 0, "CI container was not removed")
 
     @unittest.skipUnless(os.name == "posix" and os.environ.get("PYGITHOST_TEST_DOCKER_IMAGE"), "set PYGITHOST_TEST_DOCKER_IMAGE to a local Linux image for Docker integration")
@@ -243,14 +243,13 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         bare, commit = self.repository()
         manager = self.manager(bare)
         row = list(self.configured_run({"runner": "docker", "image": os.environ["PYGITHOST_TEST_DOCKER_IMAGE"],
-            "command": "printf 'container-started\\n'; sleep 30"}))
+            "command": "printf 'container-started\\n'; sleep 30", "timeout_seconds": 3}))
         row[5] = commit
-        with mock.patch("pygithost.ci.JOB_TIMEOUT", 3):
-            await manager._execute(tuple(row))
+        await manager._execute(tuple(row))
         run = database.db_ci_run_get("owner", "repo", row[0])
         self.assertEqual(run[4], "timed_out", run[5])
         self.assertIn("container-started", run[5])
-        result = subprocess.run(["docker", "inspect", f"pygithost-ci-{os.getpid()}-{row[0]}"], capture_output=True)
+        result = subprocess.run(["docker", "inspect", f"pygithost-ci-{os.getpid()}-{row[0]}-0"], capture_output=True)
         self.assertNotEqual(result.returncode, 0, "Timed-out container was not removed")
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
@@ -355,7 +354,9 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         handler.server = SimpleNamespace(ci_manager=self.manager())
         handler.request = SimpleNamespace()
         handler.remote_is_admin = True
-        handler._read_form_urlencoded = AsyncMock(return_value={"command": "echo unsaved", "env": "invalid entry", "event_manual": "on", "email_recipients": "invalid", "runner": "docker", "image": "custom:tag"})
+        handler._read_form_urlencoded = AsyncMock(return_value={"configuration_json": json.dumps({
+            "defaults": {"runner": "docker", "image": "custom:tag", "env": "invalid entry"},
+            "pipelines": {"unsaved": {"steps": [{"name": "Test", "run": "echo unsaved"}]}}})})
         with (
             mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),
             mock.patch("pygithost.application._send_html", new_callable=AsyncMock) as send,

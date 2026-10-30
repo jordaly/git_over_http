@@ -147,6 +147,24 @@ def _db_init() -> None:
         for name in ("notification", "config_json"):
             if name not in deployment_columns:
                 conn.execute(f"ALTER TABLE ci_deployments ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+        if "pipeline_id" not in deployment_columns:
+            # Replace the old repository/commit uniqueness constraint, retaining
+            # IDs and historical attempts as the default pipeline's records.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""CREATE TABLE ci_deployments_multi (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
+                owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running', output TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
+                notification TEXT NOT NULL DEFAULT '', config_json TEXT NOT NULL DEFAULT '',
+                pipeline_id TEXT NOT NULL DEFAULT 'default',
+                UNIQUE(owner,repo,commit_hash,pipeline_id))""")
+            conn.execute("""INSERT INTO ci_deployments_multi
+                SELECT id,run_id,owner,repo,commit_hash,status,output,started_at,finished_at,
+                    notification,config_json,'default' FROM ci_deployments""")
+            conn.execute("DROP TABLE ci_deployments")
+            conn.execute("ALTER TABLE ci_deployments_multi RENAME TO ci_deployments")
+            conn.execute("COMMIT")
         conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("""CREATE TABLE IF NOT EXISTS repository_languages (
             owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
@@ -724,17 +742,18 @@ def db_deployment_claim(run_id, owner, repo, commit, config_json=""):
     conn = _db_connect()
     try:
         cursor = conn.execute("""INSERT OR IGNORE INTO ci_deployments
-            (run_id,owner,repo,commit_hash,config_json) VALUES(?,?,?,?,?)""", (run_id, owner, repo, commit, config_json))
+            (run_id,owner,repo,commit_hash,config_json,pipeline_id) VALUES(?,?,?,?,?,?)""", (run_id, owner, repo, commit, config_json, json.loads(config_json or "{}").get("deployment_name") or json.loads(config_json or "{}").get("pipeline_id", "default")))
         return cursor.rowcount == 1
     finally:
         conn.close()
 
 
-def db_deployment_finish(run_id, status, output):
+def db_deployment_finish(run_id, status, output, deployment_key=None):
     conn = _db_connect()
     try:
         conn.execute("""UPDATE ci_deployments SET status=?, output=?, notification='queued',
-            finished_at=datetime('now') WHERE run_id=?""", (status, output, run_id))
+            finished_at=datetime('now') WHERE run_id=? AND pipeline_id=COALESCE(?,
+                (SELECT pipeline_id FROM ci_deployments WHERE run_id=? ORDER BY id LIMIT 1))""", (status, output, run_id, deployment_key, run_id))
     finally:
         conn.close()
 
@@ -757,11 +776,12 @@ def db_deployment_recover():
         conn.close()
 
 
-def db_deployment_email_record(run_id):
+def db_deployment_email_record(run_id, deployment_key=None):
     conn = _db_connect()
     try:
         return conn.execute("""SELECT run_id,owner,repo,commit_hash,status,config_json,
-            notification,started_at,finished_at FROM ci_deployments WHERE run_id=?""", (run_id,)).fetchone()
+            notification,started_at,finished_at FROM ci_deployments WHERE run_id=?
+            AND (? IS NULL OR pipeline_id=?) ORDER BY id LIMIT 1""", (run_id, deployment_key, deployment_key)).fetchone()
     finally:
         conn.close()
 
@@ -806,22 +826,33 @@ def db_deployment_email_pending():
         conn.close()
 
 
-def db_deployment_email_update(run_id, state, claim=False):
+def db_deployment_email_update(run_id, state, claim=False, deployment_key=None):
     conn = _db_connect()
     try:
-        cursor = conn.execute("UPDATE ci_deployments SET notification=? WHERE run_id=?" +
-            (" AND notification='queued'" if claim else ""), (state, run_id))
+        cursor = conn.execute("""UPDATE ci_deployments SET notification=? WHERE run_id=?
+            AND pipeline_id=COALESCE(?,(SELECT pipeline_id FROM ci_deployments WHERE run_id=? ORDER BY id LIMIT 1))""" +
+            (" AND notification='queued'" if claim else ""), (state, run_id, deployment_key, run_id))
         return cursor.rowcount == 1
     finally:
         conn.close()
 
 
-def db_deployment_previous_result(owner, repo, run_id):
+def db_deployment_previous_result(owner, repo, run_id, deployment_key=None):
     conn = _db_connect()
     try:
         row = conn.execute("""SELECT status FROM ci_deployments WHERE owner=? AND repo=?
-            AND run_id<? AND status!='running' ORDER BY id DESC LIMIT 1""", (owner, repo, run_id)).fetchone()
+            AND pipeline_id=COALESCE(?,(SELECT pipeline_id FROM ci_deployments WHERE run_id=? ORDER BY id LIMIT 1))
+            AND run_id<? AND status!='running' ORDER BY id DESC LIMIT 1""", (owner, repo, deployment_key, run_id, run_id)).fetchone()
         return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def db_deployments_for_run(run_id):
+    conn = _db_connect()
+    try:
+        return conn.execute("""SELECT id,pipeline_id,status,output,notification,config_json
+            FROM ci_deployments WHERE run_id=? ORDER BY id""", (run_id,)).fetchall()
     finally:
         conn.close()
 
@@ -945,6 +976,7 @@ def db_ci_runs_list(
     offset: int = 0,
     warnings: str = "",
     include_warnings: bool = False,
+    include_pipeline: bool = False,
 ):
     conn = _db_connect()
     try:
@@ -971,8 +1003,9 @@ def db_ci_runs_list(
         params.append(max(1, min(int(limit), 500)))
         params.append(max(0, int(offset)))
         output_column = "''" if summary else "output"
+        pipeline_column = ",COALESCE(json_extract(payload_json,'$.pipeline_id'),'default')" if include_pipeline else ""
         return conn.execute(
-            f"SELECT id,event,branch,commit_hash,status,{output_column},truncated,return_code,created_at,started_at,finished_at{',warnings' if include_warnings else ''} "
+            f"SELECT id,event,branch,commit_hash,status,{output_column},truncated,return_code,created_at,started_at,finished_at{',warnings' if include_warnings else ''}{pipeline_column} "
             f"FROM ci_runs WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -1087,7 +1120,7 @@ def db_ci_artifacts_list(owner, repo, *, before=None, limit=50, offset=0):
         conn.close()
 
 
-def db_ci_merge_check(owner, repo, pr_id, base, head):
+def db_ci_merge_check(owner, repo, pr_id, base, head, pipeline_id="default"):
     """Only the newest run for this exact PR base/head pair counts."""
     conn = _db_connect()
     try:
@@ -1096,7 +1129,8 @@ def db_ci_merge_check(owner, repo, pr_id, base, head):
             AND json_extract(payload_json,'$.pr_number')=?
             AND json_extract(payload_json,'$.base_commit')=?
             AND json_extract(payload_json,'$.head_commit')=?
-            ORDER BY id DESC LIMIT 1""", (owner, repo, pr_id, base, head)).fetchone()
+            AND COALESCE(json_extract(payload_json,'$.pipeline_id'),'default')=?
+            ORDER BY id DESC LIMIT 1""", (owner, repo, pr_id, base, head, pipeline_id)).fetchone()
         return row
     finally:
         conn.close()
@@ -1106,9 +1140,9 @@ def db_ci_previous_result(owner: str, repo: str, branch: str, event: str, run_id
     conn = _db_connect()
     try:
         if pr_number is not None and event != "pull_request_merged":
-            row = conn.execute("SELECT status FROM ci_runs WHERE owner=? AND repo=? AND event IN ('pull_request','pull_request_updated','pull_request_reopened') AND json_extract(payload_json,'$.pr_number')=? AND id<? AND status IN ('success','failed','timed_out') ORDER BY id DESC LIMIT 1", (owner, repo, pr_number, run_id)).fetchone()
+            row = conn.execute("SELECT status FROM ci_runs WHERE owner=? AND repo=? AND event IN ('pull_request','pull_request_updated','pull_request_reopened') AND json_extract(payload_json,'$.pr_number')=? AND COALESCE(json_extract(payload_json,'$.pipeline_id'),'default')=(SELECT COALESCE(json_extract(payload_json,'$.pipeline_id'),'default') FROM ci_runs WHERE id=?) AND id<? AND status IN ('success','failed','timed_out') ORDER BY id DESC LIMIT 1", (owner, repo, pr_number, run_id, run_id)).fetchone()
         else:
-            row = conn.execute("SELECT status FROM ci_runs WHERE owner=? AND repo=? AND branch=? AND event=? AND id<? AND status IN ('success','failed','timed_out') ORDER BY id DESC LIMIT 1", (owner, repo, branch, event, run_id)).fetchone()
+            row = conn.execute("SELECT status FROM ci_runs WHERE owner=? AND repo=? AND branch=? AND event=? AND COALESCE(json_extract(payload_json,'$.pipeline_id'),'default')=(SELECT COALESCE(json_extract(payload_json,'$.pipeline_id'),'default') FROM ci_runs WHERE id=?) AND id<? AND status IN ('success','failed','timed_out') ORDER BY id DESC LIMIT 1", (owner, repo, branch, event, run_id, run_id)).fetchone()
         return row[0] if row else None
     finally:
         conn.close()

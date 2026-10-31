@@ -168,3 +168,30 @@
 .pr-comment .danger { border: 1px solid var(--error-border); color: var(--error-fg); background: transparent; }
 .add { color: var(--ok-fg, #1a7f37); }
 .del { color: var(--error-fg, #cf222e); }
+
+/* Pull request status and listing UX */
+.pill.pill-open { color: var(--ok-fg, #1a7f37); border-color: var(--ok-border, currentColor); background: var(--ok-bg, rgba(26,127,55,.08)); }
+.pill.pill-merged { color: #8250df; border-color: #8250df; background: rgba(130,80,223,.08); }
+.pill.pill-closed { color: var(--error-fg, #cf222e); border-color: var(--error-border, currentColor); background: var(--error-bg, rgba(207,34,46,.08)); }
+.pull-tab { font-weight: 500; }
+.pull-tab-active { color: var(--fg); border-color: var(--fg); font-weight: 600; }
+.pull-status-icon { display: inline-block; min-width: 1.1em; font-weight: 700; }
+.pull-status-open { color: var(--ok-fg, #1a7f37); }
+.pull-status-merged { color: #8250df; }
+.pull-status-closed { color: var(--error-fg, #cf222e); }
+.pull-file-badge { display: inline-flex; width: 20px; height: 20px; align-items: center; justify-content: center; border-radius: 5px; font-size: 12px; font-weight: 700; border: 1px solid var(--border-strong); color: var(--muted); }
+.pull-file-added { color: var(--ok-fg, #1a7f37); border-color: var(--ok-border, currentColor); background: var(--ok-bg, rgba(26,127,55,.08)); }
+.pull-file-deleted { color: var(--error-fg, #cf222e); border-color: var(--error-border, currentColor); background: var(--error-bg, rgba(207,34,46,.08)); }
+tr.pr-file-selected { background: var(--warn-bg, rgba(154,103,0,.08)); }
+tr.pr-file-selected td:first-child { border-left: 3px solid var(--warn-border, currentColor); }
+.pr-list-row td small { font-size: 12px; }
+.pr-comment:hover { border-color: var(--border-strong); }
+.pr-comment textarea { font-family: inherit; }
+
+/* Web conflict resolver */
+.pr-resolve-files fieldset.pr-conflict-file { border: 1px solid var(--border-strong); border-radius: 6px; padding: 10px 12px; margin: 14px 0; }
+.pr-resolve-files fieldset.pr-conflict-file legend { background: var(--bg, #fff); padding: 0 6px; color: var(--muted); font-size: 13px; }
+.pr-resolve-files fieldset.pr-conflict-file textarea { width: 100%; min-height: 120px; font-family: var(--mono, monospace); font-size: 12.5px; color: var(--fg); white-space: pre; }
+.pr-resolve-files label { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; }
+.pr-resolve-form { margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border-strong); }
+.pr-resolve-form textarea { width: 100%; min-height: 60px; }

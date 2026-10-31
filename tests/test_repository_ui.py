@@ -509,9 +509,11 @@ class RepositoryUITests(unittest.TestCase):
     def test_branch_to_pr_prefills_source_and_target(self):
         status, page = self.request(self.base + "/pulls?source=feature%2Fapi&target=main")
         self.assertEqual(status, 200)
-        self.assertIn('id="new-pull-request"', page)
+        self.assertIn('href="/r/root/project/pulls/new', page)
+        status, page = self.request(self.base + "/pulls/new?source=feature%2Fapi&target=main")
+        self.assertEqual(status, 200)
         self.assertIn('<option value="feature/api" selected>', page)
-        self.assertIn('aria-current="page">Pull requests', page)
+        self.assertIn('action="/r/root/project/pulls/create"', page)
 
     def test_delete_rejects_changed_protected_and_default_branches(self):
         self.git("-C", self.source, "commit", "--allow-empty", "-m", "New branch work")

@@ -8,13 +8,15 @@
     const viewStates = new Map(), expanded = new Set(), opened = [];
     let snapshot, editor, diff, originalModel, deletedModel, active = null, busy = false, reviewing = false;
     const single = () => root.dataset.mode === "single";
+    const resolveMode = () => root.dataset.mode === "resolve";
+    const resolveState = () => resolveMode() && snapshot;
     const dirty = () => changes.size > 0;
     const status = text => { el("status").textContent = text; };
     const basename = filename => filename.split("/").at(-1);
     const validPath = filename => filename && !filename.split("/").some(p => !p || p === "." || p === ".." || p.toLowerCase() === ".git") && !/[\\\x00-\x1f]/.test(filename);
 
-    async function api(action, params = {}, post) {
-        const url = new URL(root.dataset.base + "/" + action, location.origin);
+    async function api(action, params = {}, post, baseOverride = null) {
+        const url = new URL((baseOverride || root.dataset.base) + "/" + action, location.origin);
         Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
         const response = await fetch(url, post ? {
             method: "POST", credentials: "same-origin",
@@ -28,6 +30,7 @@
     function lock(value) {
         busy = value;
         root.querySelectorAll("button, select, input, textarea").forEach(node => { node.disabled = value; });
+        if (resolveMode()) el("branch").disabled = true;
         if (editor) editor.updateOptions({readOnly: value || !active || changes.get(active) === null});
         if (diff) diff.updateOptions({readOnly: true});
     }
@@ -60,7 +63,7 @@
         if (editor && active) viewStates.set(active, editor.saveViewState());
     }
     function updateLocation() {
-        if (!snapshot) return;
+        if (!snapshot || resolveMode()) return;
         const url = new URL(location.href);
         url.searchParams.set("branch", snapshot.branch);
         if (active) url.searchParams.set("path", active);
@@ -247,14 +250,38 @@
         models.clear(); originals.clear(); changes.clear(); viewStates.clear(); opened.length = 0; active = null;
     }
     async function load() {
+        clear();
+        if (resolveMode()) return loadResolve();
         const next = await api("snapshot", {branch: el("branch").value});
-        clear(); snapshot = next; expanded.clear();
+        snapshot = next; expanded.clear();
         if (root.dataset.folder) expandParents(root.dataset.folder + "/placeholder");
         const filename = root.dataset.path;
         if (filename && snapshot.files.some(file => file.path === filename)) await open(filename);
         else if (single()) throw new Error("This file does not exist on the selected branch.");
         else show(null);
         if (!filename) status("Branch " + snapshot.branch + " at " + snapshot.commit.slice(0, 10) + ". Choose a file to edit.");
+    }
+    async function loadResolve() {
+        // Resolve mode rebuilds the workbench from the conflict list instead of
+        // a branch snapshot; every conflicted file starts as a pending change.
+        const pr = root.dataset.pr;
+        const targets = JSON.parse(root.dataset.conflicts || "[]");
+        snapshot = {branch: root.dataset.branch, commit: root.dataset.commit, files: []};
+        for (const filename of targets) {
+            const data = await api("conflict", {pr: pr, branch: snapshot.branch, path: filename});
+            if (data.content === null) {
+                originals.set(filename, ""); changes.set(filename, null);
+            } else {
+                originals.set(filename, data.content);
+                model(filename, data.content);
+                changes.set(filename, data.content);
+            }
+            opened.push(filename);
+        }
+        show(targets[0] || null);
+        status(targets.length
+            ? "Edit every conflicted file until the <<<<<<<, ======= and >>>>>>> markers are gone, then apply the resolution."
+            : "No conflicted files remain. Back to the pull request to merge.");
     }
     function discardFile(filename) {
         changes.delete(filename);
@@ -360,7 +387,7 @@
             if (event.key === "Enter") first?.click(); else first?.focus();
         }
     };
-    el("expand").onclick = event => {
+    el("expand") && (el("expand").onclick = event => {
         event.preventDefault();
         if (busy) return;
         root.dataset.mode = "workspace";
@@ -370,7 +397,7 @@
         if (snapshot) url.searchParams.set("branch", snapshot.branch);
         // Switch layouts without navigating: the model, undo history and edits survive.
         history.replaceState(null, "", url); render(); editor?.layout(); diff?.layout();
-    };
+    });
     function addFile(filename) {
         if (!validPath(filename)) throw new Error("Invalid path.");
         if (allFiles().some(existing => existing === filename || existing.startsWith(filename + "/") || filename.startsWith(existing + "/"))) {
@@ -378,13 +405,13 @@
         }
         model(filename, ""); changes.set(filename, ""); expandParents(filename); show(filename);
     }
-    el("new").onclick = () => run(async () => {
+    el("new") && (el("new").onclick = () => run(async () => {
         const filename = prompt("New file path (relative to repository root):", root.dataset.folder ? root.dataset.folder + "/" : "");
         if (!filename) return;
         addFile(filename); status("New file added to pending changes.");
-    });
-    el("explorer-new").onclick = () => el("new").click();
-    el("new-folder").onclick = () => run(async () => {
+    }));
+    el("explorer-new") && (el("explorer-new").onclick = () => el("new").click());
+    el("new-folder") && (el("new-folder").onclick = () => run(async () => {
         const answer = prompt("New folder path (relative to repository root). A .gitkeep file will be added because Git does not track empty folders:", root.dataset.folder ? root.dataset.folder + "/" : "");
         if (!answer) return;
         const folder = answer.replace(/\/$/, "");
@@ -392,10 +419,11 @@
         if (allFiles().some(existing => existing === folder || existing.startsWith(folder + "/"))) throw new Error("That file or folder already exists.");
         addFile(folder + "/.gitkeep");
         status("New folder " + folder + " added with .gitkeep. Commit to save it, or discard its changes to remove it.");
-    });
+    }));
     el("delete").onclick = () => run(async () => {
         if (!active || !confirm("Mark " + active + " for deletion?")) return;
-        if (snapshot.files.some(file => file.path === active)) changes.set(active, null);
+        // Resolve mode keeps a model so the file stays visible and can be restored.
+        if (resolveMode() || snapshot.files.some(file => file.path === active)) changes.set(active, null);
         else { discardFile(active); active = null; }
         show(active); status("Deletion is pending until committed.");
     });
@@ -414,6 +442,16 @@
         event.preventDefault();
         run(async () => {
             if (!dirty()) throw new Error("No pending changes.");
+            if (resolveMode()) {
+                // The resolver expects every conflicted file as a pending change.
+                const result = await api("commit", {}, {branch: snapshot.branch, base: snapshot.commit,
+                    message: el("message").value, changes: Object.fromEntries(changes)}, root.dataset.commitUrl);
+                el("message").value = "";
+                changes.clear(); render();
+                status("Resolution committed to " + snapshot.branch + (result.warning ? ". " + result.warning : "") + ". Returning to the pull request…");
+                setTimeout(() => { location.href = root.dataset.return; }, 800);
+                return;
+            }
             const wasReviewing = reviewing;
             const result = await api("commit", {}, {branch: snapshot.branch, base: snapshot.commit,
                 message: el("message").value, changes: Object.fromEntries(changes)});

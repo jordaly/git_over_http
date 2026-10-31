@@ -59,6 +59,54 @@ This addresses both the old anonymous-author `FOREIGN KEY constraint failed` bug
 and `NOT NULL constraint failed: pull_requests.author_user_id` on legacy schemas.
 Do not disable foreign-key checks or create user ID `0` as a workaround.
 
+## PR discussion, editing and merge readiness
+
+Open PRs support a **Discussion** panel: comments are listed in order with author
+and time, and write-authorized users can add comments (up to 50,000 characters).
+Comment authors and administrators can delete comments; with authentication
+disabled, the IP-allowlist trust model also allows moderation. Open PRs also
+offer an inline **Edit title and description** form.
+
+The PR page shows a **Changed files** table with per-file added/deleted counts and
+added/deleted/modified badges (A/D/M). Selecting a file highlights it and filters
+the diff section to that file; **All files** restores the full diff. Diffs are
+computed from the **merge base**, so unrelated target-branch changes do not appear.
+The pull-request list shows Open/Merged/Closed/All tabs with counts, comment
+counts, colored status markers and relative creation times with exact-date
+tooltips. **+ New pull request** opens a dedicated creation page
+(`pulls/new`) with branch prefill support; the list page itself is not cluttered
+with the form. When the target branch has advanced past the merge base,
+the merge panel reports a simulated merge: a conflict warning appears before you
+attempt the ff-only merge, or a note that a clean fast-forward is still possible.
+
+## Resolving conflicts in the web UI
+
+The **Resolve conflicts in the web IDE** link in the conflict warning opens the
+Web IDE in resolve mode directly (see below). The simpler form-based resolver
+remains at `pulls/<id>/resolve` as a fallback; it simulates the three-way merge
+and lists every conflicted file
+with a textarea containing Git conflict markers (`<<<<<<< HEAD (source branch)`,
+`=======`, `>>>>>>> target (branch)`):
+
+- Edit the marked sections to the exact content the file should have, then
+  **Apply resolution**. The file is deleted instead when *Delete this file* is
+  checked (pre-checked when the target deleted the file).
+- Files that are binary, too large or otherwise not text-mergeable show the
+  source content with a note instead of markers.
+- **Open in Web IDE** switches to the same editor as the browser IDE in resolve
+  mode: the conflicted files are preloaded with markers, the branch is locked to
+  the source branch, and *Apply resolution* commits the same merge commit.
+- Applying creates a **merge commit on the source branch** (parents: source
+  commit, target commit) so the source now contains the target, the activity
+  feed records the resolution, a `pull_request` CI run is queued, and the
+  normally ff-only merge becomes available.
+- The ref update is a compare-and-swap against the commit you started from: if
+  the source branch advanced while you were editing, applying fails with a
+  "reload and resolve again" message and the branch is left unchanged.
+- Limits: 1 MiB per resolution, at most 40 conflicted files can be presented;
+  more than that must be resolved with Git and pushed. Resolutions must cover
+  every conflicted file before a commit is created.
+
 ## Permalinks
 
 **Permalink** points at the file in a specific commit. It keeps showing that exact

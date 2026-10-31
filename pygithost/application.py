@@ -29,6 +29,7 @@ from .ci_documentation import ci_configuration_guide
 from .languages import repository_languages
 from .repository_info import repository_overview
 from .readme import render_readme
+from . import pr_resolver
 from .ci_email import load_settings as load_email_settings, validate_settings as validate_email_settings, validate_recipients, send_notification
 from .database import (
     _db_init,
@@ -47,6 +48,13 @@ from .database import (
     db_pr_get,
     db_pr_list,
     db_pr_mark_merged,
+    db_pr_comment_add,
+    db_pr_comment_list,
+    db_pr_comment_count,
+    db_pr_comment_get,
+    db_pr_comment_update,
+    db_pr_comment_delete,
+    db_pr_update_text,
     db_ci_runs_list,
     db_ci_run_get,
     db_ci_latest_run,
@@ -175,6 +183,18 @@ def _ci_tabs(base, active):
         current = safe_html(' aria-current="page"' if key == active else "")
         links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
     return safe_html(html_t(t'<div class="repo-ci-navigation">{_repo_tabs(base, "ci")}<nav class="ci-tabs" aria-label="CI navigation">{join_html(links)}</nav></div>'))
+
+
+def _pr_create_form_html(base, opt_src, opt_tgt, warn_merge):
+    """The pull-request creation form, shared by the dedicated page and any embeds."""
+    return safe_html(html_t(
+        t'''<form method="POST" action="{base}/pulls/create">
+<div class="row"><div style="min-width:220px"><label>Source branch</label><select name="source_branch" required>{opt_src}</select></div>
+<div style="min-width:220px"><label>Target branch</label><select name="target_branch" required>{opt_tgt}</select></div></div>
+<div class="row" style="margin-top:10px"><div style="flex:1;min-width:260px"><label>Title</label><input name="title" placeholder="Add feature X" required style="width:100%"/></div></div>
+<div style="margin-top:10px"><label>Description</label><textarea name="body" placeholder="What does this change?"></textarea></div>
+<div style="margin-top:10px"><button type="submit">Create PR</button></div></form>{warn_merge}'''
+    ))
 
 
 def _repo_tabs(base, active):
@@ -853,8 +873,11 @@ async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100, ski
     return commits
 
 
-async def _git_diff_between(repo_git: str, base: str, head: str, max_bytes: int = PR_PATCH_MAX_BYTES) -> tuple[str, bool]:
-    code, out, err = await _run_git(repo_git, ["diff", "--no-color", base + ".." + head])
+async def _git_diff_between(repo_git: str, base: str, head: str, max_bytes: int = PR_PATCH_MAX_BYTES, path: str = "") -> tuple[str, bool]:
+    args = ["diff", "--no-color", base + ".." + head]
+    if path:
+        args += ["--", path]
+    code, out, err = await _run_git(repo_git, args)
     if code != 0:
         return err.decode("utf-8", "replace") or "Could not render diff.", False
     if len(out) > max_bytes:
@@ -896,6 +919,23 @@ async def _git_merge_base(repo_git: str, a: str, b: str) -> str | None:
     if code != 0:
         return None
     return out.decode("utf-8", "replace").strip() or None
+
+
+def _relative_time(value: str) -> str:
+    """Humanize a SQLite UTC 'YYYY-MM-DD HH:MM:SS' timestamp."""
+    try:
+        from datetime import datetime, timezone
+        stamp = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        seconds = (datetime.now(timezone.utc) - stamp).total_seconds()
+    except (ValueError, TypeError):
+        return ""
+    if seconds < 0:
+        seconds = 0
+    for step, label in ((86400 * 30, "month"), (86400 * 7, "week"), (86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= step:
+            count = int(seconds // step)
+            return f"{count} {label}{'s' if count != 1 else ''} ago"
+    return "just now"
 
 
 async def _git_merge_conflicts(repo_git: str, target_ref: str, source_ref: str) -> list[str]:
@@ -2268,7 +2308,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 del_html = safe_html('<span class="muted repo-lock">Read only</span>')
             default_pill = safe_html(' <span class="pill repo-default">Default</span>' if b == default_branch else "")
             protected_pill = safe_html(' <span class="pill">Protected</span>' if is_protected else "")
-            compare_link = safe_html(html_t(t'<a class="pill" href="{base}/pulls?{urlencode({"source": b, "target": default_branch})}#new-pull-request">New pull request</a>')) if b != default_branch else safe_html("")
+            compare_link = safe_html(html_t(t'<a class="pill" href="{base}/pulls/new?{urlencode({"source": b, "target": default_branch})}">New pull request</a>')) if b != default_branch else safe_html("")
             row = html_t(t'''<article class="repo-branch-row"><div class="repo-branch-info"><div class="repo-branch-name"><a href="{browse}"><code>{b}</code></a>{default_pill}{protected_pill}</div>
 <p class="repo-commit-subject"><a href="{base}/commit/{sha}" title="{subject}">{subject or "Untitled commit"}</a></p><p class="muted"><a href="{base}/commit/{sha}"><code>{sha[:8]}</code></a> · {author} · <time datetime="{updated}">{updated.replace("T", " ")}</time></p></div>
 <div class="repo-branch-actions"><a class="pill" href="{base}/commits?ref={q(b)}">Commits</a>{compare_link}{del_html}</div></article>''')
@@ -2355,12 +2395,17 @@ document.addEventListener("DOMContentLoaded", function() {{
         status = (qs.get("status") or ["open"])[0].strip().lower()
         if status not in ("open", "closed", "merged", "all"):
             status = "open"
-        from .database import db_pr_count
+        from .database import db_pr_count, db_pr_comment_counts
         size = _page_size(qs)
-        total = await _call_in_thread(db_pr_count, owner, repo, None if status == "all" else status)
+        totals = {}
+        for tab in ("open", "merged", "closed"):
+            totals[tab] = await asyncio.to_thread(db_pr_count, owner, repo, tab)
+        totals["all"] = await asyncio.to_thread(db_pr_count, owner, repo)
+        total = totals.get(status, 0)
         page = _clamp_page(_page_number(qs), total, size)
         rows_db = await asyncio.to_thread(db_pr_list, owner, repo, None if status == "all" else status, limit=size, offset=(page - 1) * size)
         pagination = _pagination(str_t(t"/r/{q(owner)}/{q(repo)}/pulls"), {key: values[0] for key, values in qs.items() if key != "page"}, page, page * size < total, total=total, per_page=size)
+        comment_counts = await asyncio.to_thread(db_pr_comment_counts, [row[0] for row in rows_db])
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html("")
         if notice:
@@ -2369,50 +2414,64 @@ document.addEventListener("DOMContentLoaded", function() {{
 
         rows = []
         for pr_id, title, src, tgt, st, created_at in rows_db:
+            count = comment_counts.get(pr_id, 0)
+            when = _relative_time(created_at) or created_at
+            count_suffix = safe_html(f'<small title="{count} comment(s)">💬 {count}</small>' if count else "")
+            icon = "&#10003;" if st == "merged" else "…" if st == "open" else "—"
             rows.append(
                 html_t(
-                    t"""<tr>
-<td><a href="{base}/pulls/{pr_id}">PR #{pr_id}: {title}</a></td>
-<td class="muted"><code>{src}</code> → <code>{tgt}</code></td>
-<td><span class="pill">{st}</span></td><td class="muted">{created_at}</td></tr>"""
+                    t"""<tr class="pr-list-row">
+<td><a href="{base}/pulls/{pr_id}"><span class="pull-status-icon pull-status-{st}" aria-hidden="true">{icon}</span> PR #{pr_id}: {title}</a></td>
+<td class="muted"><code>{src}</code> → <code>{tgt}</code> {count_suffix}</td>
+<td><span class="pill pill-{st}">{st}</span></td><td class="muted"><small title="{created_at}">{when}</small></td></tr>"""
                 )
             )
-        default_branch = await _git_default_branch(repo_git)
-        branches = await _git_list_branches(repo_git)
-        selected_source = (qs.get("source") or [""])[0]
-        selected_target = (qs.get("target") or [default_branch])[0]
-        if selected_target not in branches:
-            selected_target = default_branch
-        opt_src = join_html([html_t(t'<option value="{b}"{safe_html(" selected" if b == selected_source else "")}>{b}</option>') for b in branches])
-        opt_tgt_list = []
-        for b in branches:
-            selected = safe_html(" selected") if b == selected_target else safe_html("")
-            opt_tgt_list.append(html_t(t"<option value=\"{b}\"{selected}>{b}</option>"))
-        opt_tgt = join_html(opt_tgt_list)
-        can_write = _has_write_scope(self)
-        warn_merge = safe_html(
-            '<div class="warn" style="margin-top:10px">Merging is <b>fast-forward only</b> on this server.</div>'
-            if can_write
-            else '<div class="warn" style="margin-top:10px">You don’t have <code>write</code> scope; you can open PRs but cannot merge.</div>'
-        )
         rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No pull requests.</td><td></td><td></td><td></td></tr>')
         body = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Pull requests</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="/">Home</a></div></div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>
-<a class="pill" href="{base}/pulls?status=open">Open</a> <a class="pill" href="{base}/pulls?status=merged">Merged</a> <a class="pill" href="{base}/pulls?status=closed">Closed</a> <a class="pill" href="{base}/pulls?status=all">All</a>
-</div><div class="muted">Filter: <code>{status}</code></div></div></div>
-<div id="new-pull-request" class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Open a pull request</h2>
-<form method="POST" action="{base}/pulls/create">
-<div class="row"><div style="min-width:220px"><label>Source branch</label><select name="source_branch" required>{opt_src}</select></div>
-<div style="min-width:220px"><label>Target branch</label><select name="target_branch" required>{opt_tgt}</select></div></div>
-<div class="row" style="margin-top:10px"><div style="flex:1;min-width:260px"><label>Title</label><input name="title" placeholder="Add feature X" required style="width:100%"/></div></div>
-<div style="margin-top:10px"><label>Description</label><textarea name="body" placeholder="What does this change?"></textarea></div>
-<div style="margin-top:10px"><button type="submit">Create PR</button></div></form>{warn_merge}</div>
+<a class="pill pull-tab{' pull-tab-active' if status == 'open' else ''}" href="{base}/pulls?status=open">Open {totals['open']}</a> <a class="pill pull-tab{' pull-tab-active' if status == 'merged' else ''}" href="{base}/pulls?status=merged">Merged {totals['merged']}</a> <a class="pill pull-tab{' pull-tab-active' if status == 'closed' else ''}" href="{base}/pulls?status=closed">Closed {totals['closed']}</a> <a class="pill pull-tab{' pull-tab-active' if status == 'all' else ''}" href="{base}/pulls?status=all">All {totals['all']}</a>
+</div><div><a class="pill pull-tab-active" href="{base}/pulls/new">+ New pull request</a></div></div></div>
 <div class="box"><table>{rows_html}</table>{pagination}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Pull requests · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    async def _ui_pulls_new(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+        """Dedicated pull-request creation page (linked from '+ New pull request')."""
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        repo_git = _repo_bare_path(owner, repo)
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query or "")
+        default_branch = await _git_default_branch(repo_git)
+        branches = await _git_list_branches(repo_git)
+        if not branches:
+            return await self._ui_pulls(owner, repo, "Create a branch before opening a pull request.", "warn")
+        selected_source = (qs.get("source") or [""])[0]
+        selected_target = (qs.get("target") or [default_branch])[0]
+        if selected_target not in branches:
+            selected_target = default_branch
+        opt_src = join_html([html_t(t'<option value="{b}"{safe_html(" selected" if b == selected_source else "")}>{b}</option>') for b in branches])
+        opt_tgt = join_html([html_t(t'<option value="{b}"{safe_html(" selected" if b == selected_target else "")}>{b}</option>') for b in branches])
+        warn_merge = safe_html('<div class="warn" style="margin-top:10px">Merging is <b>fast-forward only</b> on this server.</div>')
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        body = html_t(
+            t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Open a pull request</h2>
+<div><a class="pill" href="{base}/pulls">All pull requests</a> <a class="pill" href="{base}">Repo</a></div></div>
+{notice_html}
+<div class="box" style="margin-bottom:14px">{_pr_create_form_html(base, opt_src, opt_tgt, warn_merge)}</div>"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"Open a pull request · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
     async def _ui_pulls_create(self, owner: str, repo: str):
         owner = unquote(owner)
@@ -2430,17 +2489,17 @@ document.addEventListener("DOMContentLoaded", function() {{
         source_branch = (form.get("source_branch") or "").strip()
         target_branch = (form.get("target_branch") or "").strip()
         if not title:
-            return await self._ui_pulls(owner, repo, "Title is required.", "warn")
+            return await self._ui_pulls_new(owner, repo, "Title is required.", "warn")
         if not (_safe_branch_name(source_branch) and _safe_branch_name(target_branch)):
-            return await self._ui_pulls(owner, repo, "Invalid branch name.", "warn")
+            return await self._ui_pulls_new(owner, repo, "Invalid branch name.", "warn")
         if source_branch == target_branch:
-            return await self._ui_pulls(owner, repo, "Source and target must be different.", "warn")
+            return await self._ui_pulls_new(owner, repo, "Source and target must be different.", "warn")
         src = await _git_resolve_commit(repo_git, "refs/heads/" + source_branch)
         tgt = await _git_resolve_commit(repo_git, "refs/heads/" + target_branch)
         if not src:
-            return await self._ui_pulls(owner, repo, str_t(t"Source branch not found: {source_branch}"), "warn")
+            return await self._ui_pulls_new(owner, repo, str_t(t"Source branch not found: {source_branch}"), "warn")
         if not tgt:
-            return await self._ui_pulls(owner, repo, str_t(t"Target branch not found: {target_branch}"), "warn")
+            return await self._ui_pulls_new(owner, repo, str_t(t"Target branch not found: {target_branch}"), "warn")
         pr_id = await asyncio.to_thread(db_pr_create, owner, repo, title, body, source_branch, target_branch, self.remote_user_id)
         await self.server.ci_manager.enqueue(owner, repo, "pull_request", target_branch, tgt,
             {"pr_number": pr_id, "base_branch": target_branch, "head_branch": source_branch,
@@ -2488,17 +2547,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         else:
             diff_text, diff_trunc = "(Could not resolve one or both branches.)", False
         if selected_file:
-            file_diff_text, file_diff_trunc = await _git_diff_between(
-                repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES) if (merge_base or tgt_commit) and src_commit else ("(Could not render file diff.)", False)
-            marker = "\n" + ("diff --git a/" + selected_file + " b/" + selected_file)
-            start = file_diff_text.find(marker)
-            end = file_diff_text.find("\ndiff --git ", start + 1) if start >= 0 else -1
-            if start < 0:
-                selected_file = ""
-            else:
-                diff_text = file_diff_text[start:end if end > 0 else len(file_diff_text)]
-                diff_trunc = False
+            diff_text, diff_trunc = await _git_diff_between(repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES, path=selected_file)
 
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
         can_write = _has_write_scope(self)
         merge_box = safe_html("")
         ci_policy = await self.server.ci_manager.config(owner, repo)
@@ -2514,14 +2568,22 @@ document.addEventListener("DOMContentLoaded", function() {{
         elif status == "closed":
             merge_note = safe_html('<div class="warn" style="margin-top:10px">Closed.</div>')
 
-        conflicts = (await _git_merge_conflicts(repo_git, "refs/heads/" + tgt_branch, "refs/heads/" + src_branch)) if (
-            status == "open" and src_commit and tgt_commit and merge_base and merge_base != tgt_commit) else (None if status == "open" and src_commit and tgt_commit else [])
+        conflicts = None
+        if status == "open" and src_commit and tgt_commit:
+            if merge_base is None:
+                conflicts = None  # incompatible histories; simulate unavailable
+            elif merge_base != tgt_commit:
+                conflicts = await _git_merge_conflicts(repo_git, "refs/heads/" + tgt_branch, "refs/heads/" + src_branch)
+            else:
+                conflicts = []  # fast-forward possible; no conflict simulation needed
         conflict_html = safe_html("")
         if status == "open" and can_write:
             if conflicts is None:
                 conflict_html = safe_html('<div class="warn" style="margin-top:10px">Cannot simulate a merge (incompatible histories); a fast-forward merge will still verify the current commits.</div>')
+            elif merge_base == tgt_commit:
+                conflict_html = safe_html('<div class="muted" style="margin-top:10px">The target is an ancestor of this branch; a clean fast-forward merge is possible.</div>')
             elif conflicts:
-                conflict_html = safe_html(html_t(t'<div class="warn" style="margin-top:10px"><b>Merge conflict:</b> <code>{tgt_branch}</code> has advanced past the merge base, and merging this branch now would conflict. Update <code>{src_branch}</code> (for example, merge <code>{tgt_branch}</code> into it, or rebase), resolve, and push again.</div>'))
+                conflict_html = safe_html(html_t(t'<div class="warn" style="margin-top:10px"><b>Merge conflict:</b> <code>{tgt_branch}</code> has advanced past the merge base, and merging this branch now would conflict. <a class="pill" href="{base}/pulls/{pr_id}/resolve/ide">Resolve conflicts in the web IDE</a> creates a merge commit on <code>{src_branch}</code>, or update the branch with Git (merge/rebase, resolve, push).</div>'))
             else:
                 conflict_html = safe_html('<div class="muted" style="margin-top:10px">The target has advanced past the merge base, but the simulated merge reports no conflicts. Fast-forward merges still verify both commits at merge time.</div>')
         merge_disabled = safe_html(' disabled title="Successful CI for the current PR commits is required"' if ci_policy["require_ci"] and not ci_passed else "")
@@ -2552,17 +2614,22 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         commits_html = join_html(commit_rows) if commit_rows else safe_html('<tr><td class="muted">No commits (or branches not resolvable).</td></tr>')
         diff_html = _prism_diff_patch_html(diff_text, diff_trunc, "Diff")
+        if selected_file:
+            heading = safe_html(html_t(t'Diff — <code>{selected_file}</code> <a class="pill" href="{base}/pulls/{pr_id}#diff">All files</a>'))
+        else:
+            heading = safe_html("Diff")
         description = safe_html(html_t(t"{body}")) if (body or "").strip() else safe_html('<span class="muted">(no description)</span>')
         src_short = (src_commit or "")[:8]
         tgt_short = (tgt_commit or "")[:8]
         file_rows = []
         for f in changed_files:
             path, kind, adds, dels = f["path"], f["kind"], f["added"], f["deleted"]
-            badge = {"added": "+", "deleted": "−"}.get(str(kind), "~")
-            cls = {"added": "ok", "deleted": "warn"}.get(str(kind), "muted")
-            link = html_t(t'<a href="{base}/pulls/{pr_id}?file={q(path)}#diff">{path}</a>')
+            meta = {"added": ("A", "ok"), "deleted": ("D", "warn"), "modified": ("M", "muted"), "binary": ("B", "muted")}
+            badge, cls = meta.get(str(kind), meta["modified"])
+            link = safe_html(html_t(t'<a href="{base}/pulls/{pr_id}?file={q(path)}#diff">{path}</a>'))
+            selected = safe_html(" pr-file-selected") if path == selected_file else safe_html("")
             file_rows.append(html_t(
-                t'<tr><td style="width:20px"><span class="{cls}">{badge}</span></td><td>{link}</td><td class="muted" style="width:90px"><span class="add">+{adds}</span> <span class="del">−{dels}</span></td></tr>'
+                t'<tr{selected}><td style="width:26px"><span class="pull-file-badge pull-file-{kind}" title="{kind}">{badge}</span></td><td>{link}</td><td class="muted" style="width:110px"><span class="add">+{adds}</span> <span class="del">−{dels}</span></td></tr>'
             ))
         files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No changed files.</td></tr>')
         files_panel = safe_html(html_t(
@@ -2580,12 +2647,13 @@ document.addEventListener("DOMContentLoaded", function() {{
         for c in comments:
             cid, c_author, c_username, c_body, c_created, c_edited = c
             edited = " (edited)" if c_edited else ""
-            mine = viewer_id is not None and c_author == viewer_id
+            when = _relative_time(c_created) or c_created
+            can_manage = (not REQUIRE_AUTH and can_write) or (viewer_id is not None and c_author == viewer_id) or viewer_admin
             controls = safe_html("")
-            if mine or viewer_admin:
+            if can_manage:
                 controls = safe_html(html_t(t'<form method="POST" action="{base}/pulls/{pr_id}/comments/{cid}/delete" class="pr-comment-actions"><button class="danger" type="submit">Delete</button></form>'))
             comment_rows.append(html_t(
-                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted">{c_created}{edited}</span>{controls}</div><div class="pr-comment-body">{c_body}</div></div>'
+                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body">{c_body}</div></div>'
             ))
         comments_join = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
         comment_form = safe_html("")
@@ -2605,17 +2673,16 @@ document.addEventListener("DOMContentLoaded", function() {{
             ))
         body_html = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>PR #{pr_id}: {title}</h2>
-<div class="muted"><code>{src_branch}</code> → <code>{tgt_branch}</code> | Created: {created_at}</div></div>
+<div class="muted"><span class="pill pill-{status}">{status}</span> <code>{src_branch}</code> → <code>{tgt_branch}</code> | Created: {created_at}</div></div>
 <div><a class="pill" href="{base}/pulls">All PRs</a> <a class="pill" href="{base}">Repo</a> {_repo_code_menu(owner, repo, src_branch, can_edit=can_write and bool(src_commit))}</div></div>
 {notice_html}
-<div class="box" style="margin-bottom:14px"><span class="pill">{status}</span>{merge_note}
+<div class="box" style="margin-bottom:14px"><span class="pill pill-{status}">{status}</span>{merge_note}
 <div style="margin-top:10px">{description}</div>{title_form}
 <div class="muted" style="margin-top:10px">Source: <code>{src_branch}</code> @ <code>{src_short}</code><br>Target: <code>{tgt_branch}</code> @ <code>{tgt_short}</code></div></div>
-{ci_panel}{merge_box}
+{ci_panel}{merge_box}{comments_box}
 <div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table>{commits_pagination}</div>
 {files_panel}
-<div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Diff</h2>{summary}{diff_html}</div>
-{comments_box}"""
+<div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">{heading}</h2>{summary}{diff_html}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>'))))
 
@@ -2634,6 +2701,13 @@ document.addEventListener("DOMContentLoaded", function() {{
         await asyncio.to_thread(db_pr_comment_add, pr_id, self.remote_user_id, body[:50000])
         return await self._ui_pull_view(owner, repo, pr_id, "Comment added.", "ok")
 
+    def _can_manage_comment(self, author_id):
+        if not REQUIRE_AUTH and _has_write_scope(self):
+            return True  # auth disabled: IP allowlist is the trust boundary
+        if author_id is None or self.remote_user_id is None:
+            return False
+        return author_id == self.remote_user_id or getattr(self, "remote_is_admin", False)
+
     async def _ui_pull_comment_delete(self, owner: str, repo: str, pr_id: int, comment_id: int):
         owner = unquote(owner)
         repo = unquote(repo)
@@ -2642,8 +2716,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         row = await asyncio.to_thread(db_pr_comment_get, pr_id, comment_id)
         if not row:
             return await self._not_found()
-        mine_or_admin = row[2] is not None and row[2] == self.remote_user_id
-        if not (mine_or_admin or getattr(self, "remote_is_admin", False)):
+        if not self._can_manage_comment(row[2]):
             return await self._forbidden(b"403 Forbidden: only the comment author or an admin can delete.\n")
         await asyncio.to_thread(db_pr_comment_delete, comment_id)
         return await self._ui_pull_view(owner, repo, pr_id, "Comment deleted.", "ok")
@@ -2656,8 +2729,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         row = await asyncio.to_thread(db_pr_comment_get, pr_id, comment_id)
         if not row:
             return await self._not_found()
-        mine_or_admin = row[2] is not None and row[2] == self.remote_user_id
-        if not (mine_or_admin or getattr(self, "remote_is_admin", False)):
+        if not self._can_manage_comment(row[2]):
             return await self._forbidden(b"403 Forbidden: only the comment author or an admin can edit.\n")
         form = await self._read_form_urlencoded()
         body = (form.get("body") or "").strip()
@@ -2681,6 +2753,226 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._ui_pull_view(owner, repo, pr_id, "Title is required.", "warn")
         await asyncio.to_thread(db_pr_update_text, pr_id, title, body[:50000])
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request updated.", "ok")
+
+    def _repo_git_async(self, owner, repo):
+        return asyncio.to_thread(_repo_bare_path, owner, repo)
+
+    async def _ui_pull_resolve(self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        pr = await asyncio.to_thread(db_pr_get, pr_id)
+        if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
+            return await self._not_found()
+        _id, _owner, _repo, title, _body, src_branch, tgt_branch, _author, status, created_at, _closed_at, _merged_at, _method, _mcommit = pr
+        repo_git = _repo_bare_path(owner, repo)
+        src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
+        tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
+        merge_base = await _git_merge_base(repo_git, tgt, src) if (src and tgt) else None
+        if not (src and tgt and merge_base):
+            return await self._ui_pull_view(owner, repo, pr_id, "Unable to run conflict resolution in this state.", "warn")
+        conflicts = await asyncio.to_thread(pr_resolver.list_conflicts, repo_git, merge_base, src, tgt)
+        too_many = len(conflicts) > pr_resolver.MAX_CONFLICT_FILES
+        display = conflicts if too_many else conflicts[:pr_resolver.MAX_CONFLICT_FILES]
+        rows = []
+        if not too_many:
+            previews = await asyncio.to_thread(
+                lambda: [pr_resolver.preview(repo_git, item, src_branch, tgt_branch) for item in display])
+            for index, (item, (text, kind)) in enumerate(zip(display, previews)):
+                kind_note = {"deleted-here": "The file was deleted on this branch; the target content is shown.",
+                             "deleted-there": "The target deleted this file; keep the source content or delete it.",
+                             "nonmergeable": "Binary, too large or unmergeable; the source content is shown."}.get(kind, "")
+                delete_checked = safe_html(" checked") if kind == "deleted-here" else safe_html("")
+                escaped_text = text.decode("utf-8", "replace") if text else ""
+                rows.append(html_t(
+                    t'<fieldset class="pr-conflict-file"><legend><code>{item["path"]}</code></legend>'
+                    t'<input type="hidden" name="path_{index}" value="{item["path"]}">'
+                    t'<textarea name="content_{index}" spellcheck="false">{escaped_text}</textarea>'
+                    t'<label><input type="checkbox" name="delete_{index}" value="yes"{delete_checked}> Delete this file</label>'
+                    t'<p class="muted">{kind_note}</p></fieldset>'
+                ))
+        notice_html = safe_html("")
+        if notice:
+            notice_html = safe_html(html_t(t"<div class=\"{'warn' if notice_kind != 'ok' else 'ok'}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        overflow = safe_html('<p class="warn">More than 40 conflicted files. The web resolver cannot show this many; resolve with Git and push.</p>') if too_many else safe_html("")
+        empty = safe_html('<p class="ok">No conflicts remain between these branches. Reload the pull request; the merge button may be available.</p>') if not conflicts else safe_html("")
+        default_message = str_t(t"Merge branch '{tgt_branch}' into {src_branch}")
+        form_html = safe_html("")
+        if rows and not too_many and conflicts:
+            form_html = safe_html(html_t(
+                t'<form method="POST" action="{base}/pulls/{pr_id}/resolve" class="pr-resolve-form">'
+                t'<label>Merge commit message</label>'
+                t'<textarea name="message" required maxlength="4000">{default_message}</textarea>'
+                t'<p class="muted">Applying the resolution creates a merge commit on <code>{src_branch}</code>. Edit the marked sections (<<<<<<<, =======, >>>>>>>), then apply.</p>'
+                t'<button type="submit">Apply resolution</button></form>'
+            ))
+        rows_html = join_html(rows) if rows else safe_html("")
+        body_html = html_t(
+            t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>Resolve conflicts — PR #{pr_id}</h2>
+<div class="muted"><code>{src_branch}</code> ← <code>{tgt_branch}</code></div></div>
+<div><a class="pill" href="{base}/pulls/{pr_id}">Back to PR</a> <a class="pill" href="{base}/pulls/{pr_id}/resolve/ide">Open in Web IDE</a></div></div>
+{notice_html}{empty}{overflow}
+<div class="box pr-resolve-files">{rows_html}{form_html}</div>"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"Resolve conflicts · PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>'))))
+
+    async def _ui_pull_resolve_apply(self, owner: str, repo: str, pr_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        pr = await asyncio.to_thread(db_pr_get, pr_id)
+        if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
+            return await self._not_found()
+        _id, _owner, _repo, _title, _body, src_branch, tgt_branch, _author, _status, _created, _closed, _merged, _method, _mcommit = pr
+        repo_git = _repo_bare_path(owner, repo)
+        src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
+        tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
+        merge_base = await _git_merge_base(repo_git, tgt, src) if (src and tgt) else None
+        if not (src and tgt and merge_base):
+            return await self._ui_pull_resolve(owner, repo, pr_id, "Unable to apply a resolution now.", "warn")
+        form = await self._read_form_urlencoded()
+        try:
+            count = min(pr_resolver.MAX_CONFLICT_FILES, max(0, int(form.get("conflict_count") or 0)))
+        except ValueError:
+            count = 0
+        resolutions = []
+        for index in range(count):
+            path = form.get(f"path_{index}") or ""
+            delete = bool(form.get(f"delete_{index}"))
+            content = form.get(f"content_{index}") or ""
+            if path:
+                resolutions.append((path, content, delete))
+        message = form.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
+        user = getattr(self, "remote_user", None) or "Browser user"
+        try:
+            commit = await asyncio.to_thread(pr_resolver.apply_resolution, repo_git, merge_base, src, tgt, src_branch, resolutions, message, user)
+        except pr_resolver.ResolverError as exc:
+            return await self._ui_pull_resolve(owner, repo, pr_id, str(exc), "warn")
+        await asyncio.to_thread(db_pr_comment_add, pr_id, self.remote_user_id,
+                                f"Resolved merge conflicts with the target branch via the web UI ({len(resolutions)} file(s) changed).")
+        run = await self.server.ci_manager.enqueue(owner, repo, "pull_request", tgt_branch, tgt,
+            {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch,
+             "base_commit": tgt, "head_commit": commit})
+        return await self._ui_pull_view(owner, repo, pr_id,
+            "Merge conflicts resolved. The source branch now contains the target." +
+            (" A CI run was queued." if run else " No CI run was queued (no pipeline is configured or PR runs are disabled)."),
+            "ok")
+
+    async def _ui_pull_resolve_poststate(self, owner, repo, pr_id):
+        """Shared validation for the resolve flows: (pr row, branches, commits) or error page."""
+        pr = await asyncio.to_thread(db_pr_get, pr_id)
+        if not pr or pr[1] != unquote(owner) or pr[2] != unquote(repo) or pr[8] != "open":
+            return None
+        _id, _owner, _repo, _title, _body, src_branch, tgt_branch, _author, _status, _created, _closed, _merged, _method, _mcommit = pr
+        repo_git = _repo_bare_path(unquote(owner), unquote(repo))
+        src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
+        tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
+        merge_base = await _git_merge_base(repo_git, tgt, src) if (src and tgt) else None
+        if not (src and tgt and merge_base):
+            return None
+        return src_branch, tgt_branch, src, tgt, merge_base, repo_git
+
+    async def _ui_pull_resolve_commit(self, owner: str, repo: str, pr_id: int):
+        """JSON endpoint used by the Web IDE resolve mode (form-encoded csrf+payload)."""
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+
+        async def respond_json(status, value):
+            return await _send_response(self.request, status, json.dumps(value).encode(),
+                [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")])
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= 5 * 1024 * 1024:
+                return await respond_json(413, {"error": "Resolution request exceeds the size limit."})
+            form = await self._read_form_urlencoded()
+            if not secrets.compare_digest(form.get("csrf", "").encode(), self._email_csrf_token().encode()):
+                return await respond_json(403, {"error": "Invalid security token. Reload the editor."})
+            payload = json.loads(form.get("payload", "{}"))
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid resolution request.")
+            state = await self._ui_pull_resolve_poststate(owner, repo, pr_id)
+            if not state:
+                return await respond_json(409, {"error": "The pull request state changed. Reload the editor."})
+            src_branch, tgt_branch, src, tgt, merge_base, repo_git = state
+            if payload.get("branch") != src_branch:
+                return await respond_json(403, {"error": "Conflict resolution applies to the source branch only."})
+            changes = payload.get("changes")
+            if not isinstance(changes, dict) or not changes or len(changes) > pr_resolver.MAX_CONFLICT_FILES:
+                return await respond_json(400, {"error": f"Edit the conflicted files (up to {pr_resolver.MAX_CONFLICT_FILES})."})
+            resolutions = [(path, value if value is None else str(value), value is None)
+                           for path, value in changes.items()]
+            message = payload.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
+            # Serialize with pushes; the resolver CAS-protects the source branch itself.
+            lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
+            async with lock:
+                commit = await asyncio.to_thread(pr_resolver.apply_resolution, repo_git, merge_base,
+                    src, tgt, src_branch, resolutions, message, getattr(self, "remote_user", "Browser user"))
+        except pr_resolver.ResolverError as exc:
+            return await respond_json(409, {"error": str(exc)})
+        except (ValueError, TypeError) as exc:
+            return await respond_json(400, {"error": str(exc)})
+        await asyncio.to_thread(db_pr_comment_add, pr_id, getattr(self, "remote_user_id", None),
+                                f"Resolved merge conflicts with the target branch via the web IDE ({len(resolutions)} file(s) changed).")
+        run = await self.server.ci_manager.enqueue(owner, repo, "pull_request", tgt_branch, tgt,
+            {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch,
+             "base_commit": tgt, "head_commit": commit})
+        if run:
+            return await respond_json(200, {"commit": commit})
+        return await respond_json(200, {"commit": commit,
+            "warning": "No CI run was queued (no pipeline is configured or PR runs are disabled)."})
+
+    async def _ui_pull_resolve_ide(self, owner: str, repo: str, pr_id: int):
+        """Web IDE in resolve mode: the conflicted PR files with conflict markers."""
+        from . import webide
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._not_found()
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        state = await self._ui_pull_resolve_poststate(owner, repo, pr_id)
+        if not state:
+            return await self._not_found()
+        src_branch, tgt_branch, src, tgt, merge_base, repo_git = state
+        conflicts = await asyncio.to_thread(pr_resolver.list_conflicts, repo_git, merge_base, src, tgt)
+        too_many = len(conflicts) > pr_resolver.MAX_CONFLICT_FILES
+        if too_many or not conflicts:
+            return await self._ui_pull_resolve(owner, repo, pr_id,
+                "Conflict resolution in the web IDE is unavailable for this state.", "warn")
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        return_url = str_t(t"{base}/pulls/{pr_id}")
+        conflict_paths_json = json.dumps([item["path"] for item in conflicts])
+        token = self._email_csrf_token()
+        body = html_t(t'''<main class="repo-page webide-page">{_repo_tabs(base, "pulls")}
+<section id="webide" data-base="{base}/ide" data-csrf="{token}" data-mode="resolve"
+ data-commit-url="{base}/pulls/{pr_id}/resolve/ide" data-return="{return_url}"
+ data-pr="{pr_id}" data-branch="{src_branch}" data-commit="{src}" data-conflicts="{conflict_paths_json}">
+<header class="ide-titlebar"><a id="ide-exit" href="{return_url}" class="ide-back">← Back to pull request</a><strong>{owner} / {repo}</strong><span class="ide-mode-label">Resolve PR #{pr_id}</span>
+<button id="ide-quick-open" type="button" title="Go to file (Ctrl+P / ⌘P)">Go to file… <kbd>Ctrl/⌘ P</kbd></button>
+<span class="pill">source branch: {src_branch}</span></header>
+<div class="ide-toolbar"><div class="ide-write-tabs"><button id="ide-write" type="button" aria-pressed="true">Write</button><button id="ide-review" type="button" aria-pressed="false">Preview changes</button></div>
+<div class="ide-file-tools"><button id="ide-delete" type="button">Delete file</button><button id="ide-discard-file" type="button">Discard file changes</button><button id="ide-show-changes" type="button">Review &amp; apply <span id="ide-count">0</span></button></div></div>
+<div class="ide-workspace"><nav class="ide-activity" aria-label="Workspace views">
+<button id="ide-explorer-view" type="button" aria-pressed="true" title="Conflicted files (Ctrl+Shift+E)"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 3h12v15H8zM4 7v14h12"/></svg><span class="ide-sr-only">Explorer</span></button>
+<button id="ide-search-view" type="button" aria-pressed="false" title="Search (Ctrl+Shift+F)"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/></svg><span class="ide-sr-only">Search</span></button>
+<button id="ide-source-view" type="button" aria-pressed="false" title="Source Control (Ctrl+Shift+G)"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span class="ide-sr-only">Source Control</span><span id="ide-source-count">0</span></button></nav>
+<aside id="ide-sidebar" data-view="explorer"><section class="ide-explorer-pane"><div class="ide-pane-heading"><h2>Conflicted files</h2><button id="ide-collapse" type="button" title="Collapse all folders">Collapse all folders</button></div><label class="ide-sr-only" for="ide-filter">Filter files</label><input id="ide-filter" placeholder="Filter files…" autocomplete="off"><div id="ide-files" role="group" aria-label="Conflicted files"></div></section>
+<section class="ide-search-pane"><div class="ide-pane-heading"><h2>Search</h2></div><form id="ide-search-form"><label for="ide-search-input">Search file contents</label><input id="ide-search-input" maxlength="200" required placeholder="Search conflicted files…" autocomplete="off"><button type="submit">Search</button></form><p id="ide-search-status" class="ide-note" role="status" aria-live="polite"></p><div id="ide-search-results"></div></section>
+<section class="ide-source-pane"><div class="ide-pane-heading"><h2>Apply resolution</h2><span id="ide-change-summary">Resolving…</span></div>
+<form id="ide-commit"><label for="ide-message">Merge commit message</label><textarea id="ide-message" rows="3" maxlength="4000" required autocomplete="off">{str_t(t"Merge branch '{tgt_branch}' into {src_branch}")}</textarea><button id="ide-submit" type="submit">Apply resolution</button><a id="ide-cancel" href="{return_url}">Cancel</a></form>
+<div class="ide-changes-heading"><h3>Conflicted files</h3><button id="ide-discard" type="button">Discard all</button></div><div id="ide-changes"></div><p class="ide-note">Edit each conflicted file until the &lt;&lt;&lt;&lt;&lt;&lt;&lt;, ======= and &gt;&gt;&gt;&gt;&gt;&gt;&gt; markers are gone, then apply. Applying creates one merge commit on the source branch so it contains the target; the pull request page then offers the ff-only merge. Mark a file for deletion to remove it.</p></section></aside>
+<section class="ide-editor-pane" aria-label="Code editor"><div id="ide-tabs" role="tablist" aria-label="Open files"></div><h2 id="ide-filename">Select a file</h2><div class="ide-editor-container"><div id="ide-editor"></div><div id="ide-empty"><strong>Resolving a merge conflict.</strong><p>Open a conflicted file on the left, edit the marked sections, then apply the resolution.</p></div></div></section></div>
+<footer class="ide-statusbar"><label for="ide-branch">Branch</label><select id="ide-branch" disabled><option value="{src_branch}" selected>{src_branch}</option></select><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
+<dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close file search">×</button></div><input id="ide-picker-input" placeholder="Search conflicted files…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
+</section></main><link rel="stylesheet" href="/static/webide.css"><script src="/static/vendor/monaco/vs/loader.js"></script><script src="/static/webide.js" defer></script>''')
+        return await _send_response(self.request, 200, _html_page(f"Resolve conflicts · PR #{pr_id} · {owner}/{repo}", safe_html(body)),
+            [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
 
     async def _ui_pull_close(self, owner: str, repo: str, pr_id: int):
         owner = unquote(owner)
@@ -3527,6 +3819,31 @@ form.addEventListener("submit", event => {{
             if action == "search":
                 return await respond(200, await asyncio.to_thread(webide.search, repo_git, branch,
                     (params.get("commit") or [""])[0], (params.get("q") or [""])[0]))
+            if action == "conflict":
+                pr_id = int((params.get("pr") or ["0"])[0])
+                pr = await asyncio.to_thread(db_pr_get, pr_id)
+                if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
+                    raise webide.IDEError("The pull request is not open.")
+                if branch != pr[5]:
+                    raise webide.IDEError("Conflict resolution applies to the source branch only.")
+                state = await self._ui_pull_resolve_poststate(owner, repo, pr_id)
+                if not state:
+                    raise webide.IDEError("The pull request state changed. Reload the editor.")
+                _src_branch, tgt_branch, src, tgt, merge_base, repo_git_state = state
+                webide.path((params.get("path") or [""])[0])
+                conflicts = await asyncio.to_thread(pr_resolver.list_conflicts, repo_git_state, merge_base, src, tgt)
+                item = next((entry for entry in conflicts if entry["path"] == (params.get("path") or [""])[0]), None)
+                if item is None:
+                    raise webide.IDEError("No conflict information for this path. Reload the editor.")
+                text, kind = await asyncio.to_thread(pr_resolver.preview, repo_git_state, item,
+                    pr[5], pr[6])
+                content = None
+                if text and kind != "nonmergeable":
+                    try:
+                        content = text.decode("utf-8")
+                    except UnicodeDecodeError:
+                        content, kind = None, "nonmergeable"
+                return await respond(200, {"content": content, "kind": kind})
             branches = await _git_list_branches(repo_git)
             if not branches:
                 return await _send_text(self.request, 400, "Create a branch with an initial commit before opening the Web IDE.\n")
@@ -4200,7 +4517,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_admin_email()
         if p == "/admin/settings":
             return await self._ui_admin_settings()
-        m = re.match(r"^/r/([^/]+)/([^/]+)/ide(?:/(snapshot|file|search))?$", p)
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ide(?:/(snapshot|file|search|conflict))?$", p)
         if m:
             return await self._ui_ide(m.group(1), m.group(2), m.group(3) or "")
         m = re.match(r"^/r/([^/]+)/([^/]+)/edit$", p)
@@ -4246,9 +4563,18 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls$", p)
         if m:
             return await self._ui_pulls(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/new$", p)
+        if m:
+            return await self._ui_pulls_new(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)$", p)
         if m:
             return await self._ui_pull_view(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/resolve$", p)
+        if m:
+            return await self._ui_pull_resolve(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/resolve/ide$", p)
+        if m:
+            return await self._ui_pull_resolve_ide(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/commits$", p)
         if m:
             qs = parse_qs(parsed.query or "")
@@ -4314,6 +4640,12 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/close$", parsed.path)
         if m:
             return await self._ui_pull_close(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/resolve$", parsed.path)
+        if m:
+            return await self._ui_pull_resolve_apply(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/resolve/ide/commit$", parsed.path)
+        if m:
+            return await self._ui_pull_resolve_commit(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/reopen$", parsed.path)
         if m:
             return await self._ui_pull_reopen(m.group(1), m.group(2), int(m.group(3)))

@@ -23,6 +23,8 @@ class DocumentationPageTests(unittest.TestCase):
         self.assertIn("Collapse all folders", workflow)
         self.assertIn("Ctrl/⌘+S", workflow)
         self.assertIn("FOREIGN KEY constraint failed", workflow)
+        self.assertIn("Discussion", workflow)
+        self.assertIn("merge base", workflow)
         reference = str(manual_content("reference", "repository-reference", base))
         self.assertIn(".ci-config.json", reference)
         self.assertIn('class="language-json"', reference)

@@ -701,7 +701,7 @@ def db_pr_comment_list(pr_id: int):
     try:
         return conn.execute(
             """
-            SELECT c.id, c.author_user_id, u.username, c.body, c.created_at
+            SELECT c.id, c.author_user_id, u.username, c.body, c.created_at, c.edited_at
             FROM pr_comments c LEFT JOIN users u ON u.id=c.author_user_id
             WHERE c.pr_id=? ORDER BY c.id
             """,
@@ -737,6 +737,19 @@ def db_pr_comment_delete(comment_id: int) -> None:
     conn = _db_connect()
     try:
         conn.execute("DELETE FROM pr_comments WHERE id=?", (int(comment_id),))
+    finally:
+        conn.close()
+
+
+def db_pr_comment_counts(pr_ids) -> dict[int, int]:
+    ids = [int(value) for value in pr_ids if str(value).isdigit()]
+    if not ids:
+        return {}
+    conn = _db_connect()
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute(f"SELECT pr_id, COUNT(*) FROM pr_comments WHERE pr_id IN ({marks}) GROUP BY pr_id", ids).fetchall()
+        return {int(pr_id): int(count) for pr_id, count in rows}
     finally:
         conn.close()
 

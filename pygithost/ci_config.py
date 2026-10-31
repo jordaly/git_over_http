@@ -49,7 +49,7 @@ def _export_filters(raw):
 
 EXAMPLE = {
     "version": 1,
-    "defaults": {"events": {"push": True, "manual": True}, "timeout_seconds": 600},
+    "defaults": {"events": {"push": True}, "timeout_seconds": 600},
     "pipelines": {
         "tests": {"steps": [{"name": "Unit tests", "run": "python -m unittest discover -v"}]},
         "compile": {"steps": [{"name": "Compile sources", "run": "python -m compileall -q ."}]},
@@ -68,6 +68,19 @@ def _object(value, allowed, label):
 
 def compile_document(document):
     from .ci_schema import flatten_document, is_grouped, split_named_document, _email
+    if isinstance(document, dict) and "file" in document:
+        _object(document, {"version", "file"}, "Repository file reference")
+        if type(document.get("version", 1)) is not int or document.get("version", 1) != 1:
+            raise ValueError("Configuration version must be 1.")
+        result = compile_document({"version": 1, "pipelines": [{
+            "name": "ci", "file": document["file"],
+            "execution": {"runner": "docker", "image": "python:3.14-slim",
+                          "timeout_seconds": default_config()["timeout_seconds"]},
+            "triggers": {"push": {"enabled": True},
+                         "pull_request": {"enabled": True, "events": ["opened", "updated", "reopened"]}}
+        }], "deployments": []})
+        result["document"] = {"version": 1, "file": document["file"]}
+        return result
     if isinstance(document, dict) and isinstance(document.get("pipelines"), list):
         grouped, deployments = split_named_document(document)
         flat = flatten_document(grouped)
@@ -93,6 +106,8 @@ def compile_document(document):
 
 def editor_document(config):
     from .ci_schema import group_document
+    if "file" in config.get("document", {}):
+        return json.loads(json.dumps(config["document"]))
     return group_document(export_document(config))
 
 
@@ -152,6 +167,8 @@ def export_document(config):
     """Expose existing settings without dropping legacy commands or Git sources."""
     if "document" in config:
         document = json.loads(json.dumps(config["document"]))
+        if "file" in document:
+            return document
         if isinstance(document.get("pipelines"), list):
             return document
         if "defaults" in document:

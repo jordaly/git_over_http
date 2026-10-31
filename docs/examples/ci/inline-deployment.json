@@ -3,7 +3,7 @@
   "pipelines": [
     {
       "name": "release",
-      "triggers": {"push": {"enabled": true, "branches": ["main"]}, "manual": {"enabled": true}},
+      "triggers": {"push": {"enabled": true, "branches": ["main"]}},
       "steps": [{"name": "Tests", "run": "python -m unittest discover -v"}]
     }
   ],

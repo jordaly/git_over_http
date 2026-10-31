@@ -25,7 +25,7 @@ this complete example, adapting the test command for your project:
   "pipelines": [
     {
       "name": "release",
-      "triggers": {"push": {"enabled": true, "branches": ["main"]}, "manual": {"enabled": true}},
+      "triggers": {"push": {"enabled": true, "branches": ["main"]}},
       "steps": [
         {"name": "Tests", "run": "python -m unittest discover -v"}
       ]
@@ -35,7 +35,9 @@ this complete example, adapting the test command for your project:
 }
 ```
 
-Queue `release` manually to verify tests first. **Manual runs never deploy.** Push
+Omitted CI execution uses built-in defaults, initially Docker; prepare
+the image and dependencies first. Queue `release` manually to verify tests first;
+no manual-trigger flag is necessary. **Manual runs never deploy.** Push
 an actual update to `main` after saving to exercise deployment; inspect the run's
 deployment section and **CI → Deployments**. Only replace the harmless script with
 a real deployment tool after verifying the tested commit and target.

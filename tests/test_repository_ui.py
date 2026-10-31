@@ -55,6 +55,48 @@ class RepositoryUITests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_create_pull_request_without_authentication_has_nullable_author(self):
+        status, _ = self.request(self.base + "/pulls/create", {
+            "title": "Anonymous pull request", "body": "Created with authentication disabled",
+            "source_branch": "feature/api", "target_branch": "main"})
+        self.assertEqual(status, 303)
+        rows = database.db_pr_list(FLAT_OWNER_UI, "project")
+        self.assertEqual(len(rows), 1)
+        pr = database.db_pr_get(rows[0][0])
+        self.assertIsNone(pr[7])
+        status, page = self.request(self.base + f"/pulls/{pr[0]}")
+        self.assertEqual(status, 200)
+        self.assertIn("Anonymous pull request", page)
+        self.assertEqual(database.db_list_users(), [])  # No dummy author account.
+
+    def test_create_pull_request_with_session_preserves_author_and_foreign_key(self):
+        import sqlite3
+        user_id = self.fixture_user()
+        session = database.db_create_session(user_id)
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
+        try:
+            with mock.patch.object(application, "REQUIRE_AUTH", True):
+                connection.request("POST", self.base + "/pulls/create", body=urlencode({
+                    "title": "Authenticated pull request", "source_branch": "feature/api", "target_branch": "main"}),
+                    headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": application.SESSION_COOKIE_NAME + "=" + session})
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 303, body)
+        finally:
+            connection.close()
+        rows = database.db_pr_list(FLAT_OWNER_UI, "project")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(database.db_pr_get(rows[0][0])[7], user_id)
+        with self.assertRaises(sqlite3.IntegrityError):
+            database.db_pr_create(FLAT_OWNER_UI, "project", "Invalid author", "", "feature/api", "main", user_id + 1000)
+
+    def test_create_pull_request_rejects_read_only_access(self):
+        with mock.patch.object(application, "_has_write_scope", return_value=False):
+            status, _ = self.request(self.base + "/pulls/create", {
+                "title": "Not allowed", "source_branch": "feature/api", "target_branch": "main"})
+        self.assertEqual(status, 403)
+        self.assertEqual(database.db_pr_list(FLAT_OWNER_UI, "project"), [])
+
     def request(self, path, fields=None, *, binary=False):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
         try:
@@ -148,7 +190,8 @@ class RepositoryUITests(unittest.TestCase):
         self.assertEqual(saved["document"], document)
         _, page = self.request(self.base + "/ci/config")
         editor = page.split('name="configuration_json"', 1)[1].split(">", 1)[1].split("</textarea>", 1)[0]
-        self.assertEqual(json.loads(html.unescape(editor)), document)
+        from pygithost.ci_preferences import editor_document
+        self.assertEqual(json.loads(html.unescape(editor)), editor_document(document))
         document["pipelines"][0]["execution"]["working_directory"] = "."
         _, page = self.request(self.base + "/ci/config", {"configuration_json": json.dumps(document)})
         self.assertIn("unsupported fields: working_directory", page)
@@ -444,7 +487,7 @@ class RepositoryUITests(unittest.TestCase):
         self.assertEqual(saved["artifact_retention_count"], 12)
         self.assertEqual(saved["run_retention_count"], 0)
         self.assertIn("permanently delete existing data immediately", page)
-        self.assertIn('window.confirm("These retention limits may permanently delete', page)
+        self.assertIn('name="confirm_retention" value="yes" required', page)
 
     def test_pasted_deployment_script_with_blank_path_saves_in_json_mode(self):
         content = 'import sys\nprint("deploying", sys.argv[1])\n'

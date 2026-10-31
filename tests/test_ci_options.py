@@ -41,7 +41,7 @@ class ConfigurationOptionTests(unittest.TestCase):
             for enabled in (True, False):
                 document = self.document()
                 self.set_value(document, ("pipelines", 0, "triggers", trigger, "enabled"), enabled)
-                self.assertEqual(compile_document(document)["events"][trigger], enabled)
+                self.assertEqual(compile_document(document)["events"][trigger], True if trigger == "manual" else enabled)
 
     def test_each_pr_event_is_selected_individually(self):
         mapping = {"opened": "pr_opened", "updated": "pr_updated", "reopened": "pr_reopened", "merged": "pr_merged"}

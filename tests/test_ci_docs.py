@@ -7,6 +7,37 @@ from pygithost.ci_docs import EXAMPLES, GUIDES, manual_content, render_manual
 
 
 class DocumentationPageTests(unittest.TestCase):
+    def test_current_settings_workflow_and_file_reference_are_linked_in_page(self):
+        base = "/r/team/repo/ci/docs"
+        recipes = str(manual_content("examples", "", base))
+        self.assertIn(base + "?guide=settings", recipes)
+        self.assertIn(base + "?example=repository-pipeline", recipes)
+        settings = str(manual_content("settings", "", base))
+        self.assertIn("Use server default", settings)
+        self.assertIn("restart required", settings)
+        self.assertIn("omitted options", settings)
+        self.assertIn("built-in defaults", settings)
+        migration = str(manual_content("migration", "", base))
+        self.assertIn("Previously saved page execution overrides are ignored", migration)
+        workflow = str(manual_content("workflow", "", base))
+        self.assertIn("Collapse all folders", workflow)
+        self.assertIn("Ctrl/⌘+S", workflow)
+        self.assertIn("FOREIGN KEY constraint failed", workflow)
+        reference = str(manual_content("reference", "repository-reference", base))
+        self.assertIn(".ci-config.json", reference)
+        self.assertIn('class="language-json"', reference)
+
+    def test_current_json_examples_use_page_controls_for_variables_and_retention(self):
+        import json
+        from pathlib import Path
+        for _title, path in EXAMPLES.values():
+            document = json.loads(Path(path).read_text())
+            self.assertNotIn("env", document, path)
+            self.assertNotIn("retention", document, path)
+            for pipeline in document.get("pipelines", []):
+                self.assertNotIn("env", pipeline.get("execution", {}), path)
+                self.assertNotIn("manual", pipeline.get("triggers", {}), path)
+
     def test_every_manual_and_example_is_available(self):
         for guide in GUIDES:
             with self.subTest(guide=guide):
@@ -67,7 +98,7 @@ class DocumentationBrowserTests(unittest.TestCase):
         fixture.setUp()
         try:
             with tempfile.TemporaryDirectory(prefix="ci-browser-", dir="/tmp/opencode") as profile:
-                for path in ("/ci/docs?example=all-options", "/ci/config"):
+                for path in ("/ci/docs?example=all-options", "/ci/docs?example=repository-reference", "/ci/config"):
                     with self.subTest(path=path):
                         url = f"http://127.0.0.1:{fixture.server.port}{fixture.base}{path}"
                         result = subprocess.run([

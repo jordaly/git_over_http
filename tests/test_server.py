@@ -94,6 +94,7 @@ class ServerRunner:
             filter_ips=True,
         )
         app = srv.AsyncGitServer(srv.AppContext(config), allowlist=self.allow_ips)
+        self.app = app
 
         async def serve():
             self.loop = asyncio.get_running_loop()

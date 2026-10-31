@@ -17,10 +17,13 @@ GUIDES = {
     "migration": ("Migration", "docs/ci-migration.md"),
     "deployment": ("Deployment", "docs/automatic-deployment.md"),
     "retention": ("Retention", "docs/ci-retention.md"),
+    "settings": ("Server and repository settings", "docs/server-settings.md"),
+    "workflow": ("Editing and pull requests", "docs/repository-workflow.md"),
     "operations": ("Operations", "README.md"),
     "getting-started": ("Server setup", "docs/getting-started.md"),
 }
 EXAMPLES = {
+    "repository-reference": ("Default file reference (Settings)", "docs/examples/ci/repository-reference.json"),
     "all-options": ("All options", "docs/examples/ci/all-options.json"),
     "inline-deployment": ("Inline deployment", "docs/examples/ci/inline-deployment.json"),
     "git-managed": ("Git-managed configuration", "docs/examples/ci/git-managed.json"),

@@ -9,6 +9,8 @@ server's `pygithost.config.json` (network, authentication and storage).
 ## Contents
 
 - [Complete examples](#complete-examples)
+- [Automatic repository CI](#automatic-repository-ci)
+- [Page settings and inheritance](#page-settings-and-inheritance)
 - [Document structure](#document-structure)
 - [Independent configuration](#independent-configuration)
 - [Every execution option](#every-execution-option)
@@ -24,10 +26,11 @@ server's `pygithost.config.json` (network, authentication and storage).
 
 | Example | Purpose |
 | --- | --- |
-| [All options](examples/ci/all-options.json) | Independent checks/release pipelines and separately named deployments, cancellation, artifacts, notifications, policies and retention. |
+| [Default file reference](examples/ci/repository-reference.json) | Minimal **Settings** JSON. It references the separate repository file; do not commit this reference as the pipeline file. |
+| [All options](examples/ci/all-options.json) | Independent checks/release pipelines and separately named deployments, cancellation, artifacts, notifications and policies. Variables and retention use page controls. |
 | [Inline deployment](examples/ci/inline-deployment.json) | Python script content rather than a host script path. |
-| [Git-managed configuration](examples/ci/git-managed.json) | Administrator document for an existing Git-backed setup. |
-| [Repository pipeline](examples/ci/repository-pipeline.json) | **Not** an administrator document: commit this as `.pygithost-ci.json` for the previous example. |
+| [Git-managed configuration](examples/ci/git-managed.json) | Expanded Settings document for a named Git-backed pipeline with explicit execution and automatic triggers. |
+| [Repository pipeline](examples/ci/repository-pipeline.json) | Commit this as `.ci-config.json` at the repository root. Contains steps, artifacts and a timeout; it is **not** Settings JSON. |
 
 Example links display complete JSON in the application. Deployments in these files
 are disabled until you review and enable them. Replace example recipients and script
@@ -38,15 +41,111 @@ tools or execute the examples. A generic Python image may not include your build
 > entries and policies when adapting examples. Retention changes can delete existing
 > data immediately.
 
+## Automatic repository CI
+
+Repositories with **no saved CI settings** automatically use a pipeline named
+`ci` that reads **`.ci-config.json`** from the recorded commit. No settings save is
+required. Settings presents the compact reference below, which can also be saved
+explicitly. It expands to the same Docker pipeline and automatic triggers:
+
+```json
+{
+  "version": 1,
+  "file": ".ci-config.json"
+}
+```
+
+The shorthand accepts only `version` and `file`. Use the full named arrays for
+custom execution, automatic triggers, policies or deployments; do not
+mix shorthand and expanded fields. Manual runs are always available to users with
+write access for runnable pipelines, even if a legacy `manual.enabled` is false.
+Empty pipeline lists still disable all runs, and manual runs never deploy.
+
+The **repository file itself** contains steps, not the reference above. For example:
+
+```json
+{
+  "version": 1,
+  "timeout_seconds": 600,
+  "steps": [
+    {"name": "Python version", "run": "python --version"},
+    {"name": "Tests", "run": "python -m unittest discover -v"}
+  ]
+}
+```
+
+The preset enables pushes, PR opened/updated/reopened events and manual runs on
+all branches. The initial execution default is Docker image `python:3.14-slim`;
+per-pipeline execution JSON can change it. Prepare the image on the
+server (`docker pull python:3.14-slim`); tools/dependencies are not auto-installed.
+The file's timeout cannot exceed the effective pipeline timeout from explicit
+pipeline execution or built-in defaults. It may lower that limit.
+No deployments, notifications or protection policies are enabled automatically.
+PRs read the target/base commit's file, not the unreviewed source branch's file.
+
+Without `.ci-config.json`, the automatic preset creates **no run**. An existing
+but invalid file produces a configuration failure. Saved configurations always
+take precedence, including explicitly empty/disabled pipelines and legacy
+`.pygithost-ci.json` references. No existing settings or files are renamed.
+To disable discovery, save `{"version":1,"pipelines":[],"deployments":[]}`.
+Saving an explicit file-backed pipeline makes a missing file an error instead
+of silently skipping the run.
+
+The repository file uses the flat format above (`version`, `steps` or legacy
+`command`, `env`, `artifacts`, `timeout_seconds`). It cannot select a host runner,
+define deployments, change triggers or raise the server timeout ceiling. The
+complete named-array document below belongs to **CI → Settings**, not the file.
+Settings uses a Monaco JSON editor with formatting and syntax diagnostics, and
+falls back to a textarea if the editor cannot load. Server validation on Save is
+authoritative; syntax highlighting does not prove that every option is valid.
+
+## Page settings and inheritance
+
+**Admin → Settings** includes basic server configuration, appearance,
+environment variables, and run/artifact retention. Basic server changes
+are written atomically to the startup config file and take effect **after a
+restart**. The listener, authentication, database and storage paths do not change
+mid-request. Review allowed IPs, account access, cookie security and file paths
+before restarting; changing paths does not move repositories or migrate a database.
+Programmatic servers without a startup file display the basic fields read-only.
+External edits to the startup file are detected before a settings save overwrites it.
+
+**CI → Settings** provides repository variable and retention controls. For each
+retention limit, **Use server default** means inherit the server value. Clear it
+for a repository override; `0` means unlimited, not inheritance. Runner, image,
+timeout and cancellation belong to each pipeline's JSON; omitted options use
+built-in defaults, not saved page preferences. Settings changes affect future CI
+snapshots, not queued/running jobs or their reruns. Retention instead applies to
+current stored data immediately, and requires a deletion acknowledgement.
+
+Use the **Environment variables** table rather than embedding `env` in JSON.
+Add/remove rows and select **All pipelines** or one repository pipeline. Server
+variables are inherited by name; repository values override them, and
+pipeline-specific rows override repository-wide values. Removing a repository
+override restores the server value. A blank value is a real empty string.
+Variables remain plaintext in the database, hidden visually until **Show values**;
+logs are not secret-redacted. Built-in/reserved names are rejected. At most 64
+effective variables per pipeline and 8192 characters per value are supported.
+
+Legacy JSON environment and retention values remain accepted. They are shown in
+the page controls, not the Monaco document, and are preserved when pipeline JSON
+is saved. Saving the repository variables form makes those rows authoritative,
+including an empty form used to remove legacy variables; legacy `env` in a Git
+pipeline file no longer overrides those page-managed rows. Until that form is
+saved, legacy variables continue to work with server variables as defaults.
+Page-managed environment variables are CI job variables, not deployment host
+credentials. Repository-file configs cannot grant host access or modify retention.
+
 ## Document structure
 
 | Option | Default / type | Example and meaning |
 | --- | --- | --- |
 | `version` | Integer `1` | `"version": 1`; the only supported version. |
-| `pipelines` | Required array | `"pipelines": [{"name":"checks","steps":[{"name":"Tests","run":"python -m unittest discover -v"}]}]`. Every object requires its own name and independent configuration. |
+| `file` | Compact-reference form only | `"file":".ci-config.json"`; use only with `version`, not with named arrays or policies. |
+| `pipelines` | Required in the expanded form | `"pipelines": [{"name":"checks","steps":[{"name":"Tests","run":"python -m unittest discover -v"}]}]`. Every object requires its own name and independent configuration. |
 | `deployments` | Array, default `[]` | `"deployments":[{"name":"production","pipeline":"checks","enabled":false,"script":"/opt/deploy/app.sh"}]`; separately named targets linked to a pipeline. |
 | `policies` | Protection off | `"policies":{"require_ci":true}`; administrator-controlled, repository-wide. |
-| `retention` | Artifact age 7 days, unlimited artifact count, normally 100 completed runs | `"retention":{"artifacts":{"days":30,"max_count":50},"runs":{"max_count":100}}`; repository-wide. |
+| `retention` | Legacy compatibility only | Use the **Runs and artifacts** page controls for new settings. Old JSON values are preserved as repository overrides until changed there. |
 
 Up to 16 pipelines and 32 deployments. Each object requires `name`, using 1–64 ASCII
 letters, digits, underscores or hyphens, beginning alphanumeric. Names are unique
@@ -56,15 +155,15 @@ cancelling queued commands. Referenced pipelines must exist; remove/repoint thei
 deployments when deleting a pipeline.
 
 Pipeline-local groups: `execution`, `triggers`, `cancellation`, `artifacts`,
-`notifications`, `steps`, or compatibility `file` instead of steps. Deployment
+`notifications`, `steps`, or `file` instead of steps. Deployment
 configuration belongs only in the separate deployments list. Policies/retention
 remain repository-wide. There is no defaults object or root notifications object.
 
 ## Independent configuration
 
-No pipeline or deployment inherits configuration from another object. An omitted
-field uses only its built-in default. Set execution, triggers, cancellation, artifacts
-and notifications explicitly on every pipeline that needs them. Enabling email on
+No pipeline or deployment inherits configuration from another pipeline/deployment.
+Omitted execution and cancellation fields use built-in defaults. Other
+fields use their documented built-ins. Enabling email on
 one pipeline does not enable another pipeline's or a deployment's email.
 
 Empty branch arrays match **all** branches; disable a trigger with `enabled: false`
@@ -78,10 +177,10 @@ Table examples are **field fragments**; use the complete examples for surroundin
 
 | Option | Type / built-in default | Example | Behavior |
 | --- | --- | --- | --- |
-| `runner` | String `"host"` | `"runner":"docker"` | `host` runs as the server OS user, without a sandbox. `docker` uses local Linux containers. |
+| `runner` | `"docker"` | `"runner":"docker"` | `host` runs as the server OS user, without a sandbox. `docker` uses local Linux containers. Existing concrete legacy host settings remain intact. |
 | `image` | String `"python:3.14-slim"` | `"image":"registry.example.com/team/ci:2026-10"` | Docker image must already exist locally. Include tools/dependencies and preferably pin a digest. |
-| `timeout_seconds` | Positive integer `1800` | `"timeout_seconds":600` | One budget for checkout, PR merge preparation and all steps. Deployment has a separate timeout. |
-| `env` | String-valued object `{}` | `"env":{"PYTHONUNBUFFERED":"1","BUILD_MODE":"development"}` | Up to 64 effective entries; valid identifier keys, string values up to 8192 characters, no NUL. Built-in names are reserved. |
+| `timeout_seconds` | Built-in `1800` | `"timeout_seconds":600` | One budget for checkout, PR merge preparation and all steps. Deployment has a separate timeout. |
+| `env` | Legacy compatibility only | Use the **Environment variables** page table | Up to 64 effective entries; valid identifier keys, string values up to 8192 characters, no NUL. Built-in names are reserved. Legacy JSON remains readable; page-managed repository values are authoritative. |
 
 **Host** commands use `/bin/sh` on POSIX and `cmd.exe` on Windows. A restricted
 environment prevents accidental credential inheritance but does not restrict
@@ -113,8 +212,8 @@ Triggers belong in each pipeline object's `triggers` group.
 | `pull_request.enabled` | Boolean `false` | `"pull_request":{"enabled":true}` | Enables the PR-related events selected below. |
 | `pull_request.branches` | String array `[]` | `"pull_request":{"branches":["main","develop"]}` | Filters PR **target**, including merged events. |
 | `pull_request.events` | String array `["opened","updated","reopened"]` when omitted | `"pull_request":{"events":["opened","updated","reopened","merged"]}` | An empty selection queues no PR events, even if enabled. |
-| `manual.enabled` | Boolean `false` | `"manual":{"enabled":true}` | Allows a write-authorized user to select a branch under Runs. Push/PR filters do not restrict manual runs. Manual runs **never deploy**. |
-| `cancellation.superseded` | Boolean `false` | `"cancellation":{"superseded":true}` | Pipeline-local, not inside triggers. Cancels older matching event/branch/PR runs of the **same** pipeline. Manual runs are not superseded. |
+| `manual.enabled` | Always enabled | Optional legacy Boolean | Accepted for compatibility, but `false` does not disable manual runs. Write access, a runnable pipeline and an existing branch are required. Push/PR filters do not restrict manual runs. Manual runs **never deploy**. |
+| `cancellation.superseded` | Built-in `false` | `"cancellation":{"superseded":true}` | Pipeline-local, not inside triggers. Cancels older matching event/branch/PR runs of the **same** pipeline. Manual runs are not superseded. |
 
 Every PR event string is supported explicitly:
 
@@ -237,9 +336,9 @@ Policies and retention are repository-wide; never repeat them inside pipelines.
 | `policies.require_ci` | Boolean `false` | `"policies":{"require_ci":true}` | Each applicable PR-check pipeline needs a newest successful check for exact current base/head. Missing/stale/pending/unsuccessful checks block merging; push/manual jobs do not qualify. No qualifying checks means blocked. |
 | `policies.block_direct_pushes` | Boolean `false` | `"policies":{"block_direct_pushes":true}` | Blocks matching direct HTTP branch creations, force pushes and deletions; approved PR merges remain allowed. |
 | `policies.protected_branches` | String array `["main"]` | `"protected_branches":["main","release/*"]` | Case-sensitive globs; nonempty when blocking is enabled. Also prevents matching branch UI creation/deletion. |
-| `retention.artifacts.days` | Integer 0–36500, `7` | `"artifacts":{"days":30}` | Artifact age expiration; 0 disables it. |
-| `retention.artifacts.max_count` | Integer 0–1000000, `0` | `"artifacts":{"max_count":50}` | Repository-wide bundle count; oldest run IDs removed first. 0 disables it. |
-| `retention.runs.max_count` | Integer 0–1000000, server default normally `100` | `"runs":{"max_count":200}` | Repository-wide completed-run limit; 0 disables pruning. `PYGITHOST_CI_RETENTION` sets the omitted default. |
+| `retention.artifacts.days` (legacy alias) | Integer 0–36500, initially `7` | Page: Artifact retention | Artifact age expiration; 0 disables it. Use server default to inherit. |
+| `retention.artifacts.max_count` (legacy alias) | Integer 0–1000000, initially `0` | Page: Maximum artifact bundles | Repository-wide bundle count; oldest run IDs removed first. 0 disables it. |
+| `retention.runs.max_count` (legacy alias) | Integer 0–1000000, initially `100` | Page: Maximum completed runs | Repository-wide completed-run limit; 0 disables pruning. Server defaults override the initial `PYGITHOST_CI_RETENTION` fallback. |
 
 Both protection switches are independent; enable both to require PRs and passing
 CI. Initialize branches first. Existing pre-receive hooks are preserved; chaining
@@ -264,16 +363,19 @@ match those IDs to retain deduplication. Policies/scripts/disabled states surviv
 See the [migration guide](ci-migration.md) for every old-to-new field mapping and
 a comparison with the proposed configuration design.
 
-Pipeline-local `file` retains an existing Git-managed source instead of steps:
-`"file":".pygithost-ci.json"`. Use a regular root-level `.json` filename, not a
+Pipeline-local `file` selects a Git-managed source instead of steps:
+`"file":".ci-config.json"`. Existing `.pygithost-ci.json` references still work.
+Use a regular root-level `.json` filename, not a
 path/symlink. Do not commit the administrator document: repository code must not
 control trusted host deployment or policies.
 
 The separate Git file accepts version 1, named `steps`, optional `env`, `artifacts`
 and `timeout_seconds`; legacy `command` remains readable, mutually exclusive with
-steps. Its env replaces rather than merges the effective server env. Its timeout
-cannot exceed the pipeline's configured limit. A regular blob is limited to 64 KiB.
-Missing/invalid files fail closed. Push/manual runs read the recorded commit; PR
+steps. Prefer page-managed variables; legacy file `env` only applies until repository
+variables are page-managed, with server variables supplied as defaults. Its timeout
+cannot exceed the effective pipeline limit. A regular blob is limited to 64 KiB.
+Explicit missing/invalid references fail closed; automatic discovery with no file
+stays idle. Push/manual runs read the recorded commit; PR
 checks read the **recorded target/base commit's file**, not unreviewed PR-head changes.
 Snapshots retain effective settings and SHAs for reruns.
 

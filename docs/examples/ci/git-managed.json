@@ -4,8 +4,9 @@
     {
       "name": "checks",
       "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600},
-      "triggers": {"push": {"enabled": true}, "pull_request": {"enabled": true}, "manual": {"enabled": true}},
-      "file": ".pygithost-ci.json"
+      "cancellation": {"superseded": true},
+      "triggers": {"push": {"enabled": true}, "pull_request": {"enabled": true}},
+      "file": ".ci-config.json"
     }
   ],
   "deployments": []

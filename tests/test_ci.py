@@ -453,6 +453,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         handler = object.__new__(GitHTTPHandler)
         handler.path = "/r/owner/filtered/ci?status=failed&event=push&branch=main&q=exploded"
         handler.request = SimpleNamespace()
+        handler.server = SimpleNamespace(ci_manager=CIManager(lambda *_: self.temp.name))
 
         async def branches(_repo):
             return ["main", "release"]
@@ -470,8 +471,9 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ci_configuration_is_on_its_own_page(self):
         handler = object.__new__(GitHTTPHandler)
-        handler.server = SimpleNamespace(ci_manager=CIManager(lambda *_: ""))
-        handler.request = SimpleNamespace()
+        handler.server = SimpleNamespace(ci_manager=CIManager(lambda *_: ""), settings_csrf_secret=b"settings-test")
+        handler.request = SimpleNamespace(peer_ip="127.0.0.1")
+        handler.headers = {}
         handler.remote_is_admin = True
         with (
             mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),

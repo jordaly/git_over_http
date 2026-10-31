@@ -351,8 +351,9 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_settings_preserve_all_submitted_values(self):
         handler = object.__new__(GitHTTPHandler)
-        handler.server = SimpleNamespace(ci_manager=self.manager())
-        handler.request = SimpleNamespace()
+        handler.server = SimpleNamespace(ci_manager=self.manager(), settings_csrf_secret=b"settings-test", settings_lock=asyncio.Lock())
+        handler.request = SimpleNamespace(peer_ip="127.0.0.1")
+        handler.headers = {}
         handler.remote_is_admin = True
         handler._read_form_urlencoded = AsyncMock(return_value={"configuration_json": json.dumps({
             "defaults": {"runner": "docker", "image": "custom:tag", "env": "invalid entry"},

@@ -2,21 +2,15 @@
 
 ## Configure retention in the website
 
-Open **CI → Settings** as an administrator. Set limits once under `retention`
-in the configuration JSON, then click **Save configuration**. For example, merge
-this section into your existing document, keeping its `pipelines`:
+Set server defaults under **Admin → Settings → Runs and artifacts**. For one
+repository, open **CI → Settings → Runs and artifacts**. Each repository field has
+**Use server default**; clear it to override only that limit. Zero is an explicit
+unlimited value, not inheritance. Check the deletion acknowledgement and save.
 
-```json
-{
-  "retention": {
-    "artifacts": {"days": 30, "max_count": 50},
-    "runs": {"max_count": 100}
-  }
-}
-```
-
-Saving replaces the whole document, so do not replace your pipelines with this
-retention-only snippet. See the [JSON guide](pipelines.md) for the complete format.
+Retention is stored separately from pipeline JSON. Saving pipeline changes does
+not reset these settings. Older JSON retention values remain readable and appear
+as repository overrides; selecting **Use server default** replaces that legacy
+override. Saving a server default applies to repositories without an override.
 
 | Setting | Default | Zero means | Maximum |
 | --- | --- | --- | --- |

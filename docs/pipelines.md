@@ -5,6 +5,14 @@
 Open **CI → Settings → Configuration JSON** and **Save configuration**. The same
 manual and complete JSON examples appear directly in **CI → Documentation**.
 
+For a repository without saved settings, you can instead commit
+**`.ci-config.json`** with `version` and named `steps`: CI discovers it by default
+using the Docker runner. Without that file no automatic runs are created.
+See [Automatic repository CI](ci-options.md#automatic-repository-ci) for a complete
+example, enabled triggers and safety limits. Existing saved settings take priority.
+The Settings JSON editor uses Monaco; **Format JSON** formats the document before
+saving. Its syntax checks do not replace the server's configuration validation.
+
 ## Two lists, explicit names
 
 ```json
@@ -13,8 +21,8 @@ manual and complete JSON examples appear directly in **CI → Documentation**.
   "pipelines": [
     {
       "name": "checks",
-      "execution": {"runner": "host", "timeout_seconds": 600},
-      "triggers": {"push": {"enabled": true, "branches": ["main"]}, "manual": {"enabled": true}},
+      "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600},
+      "triggers": {"push": {"enabled": true, "branches": ["main"]}},
       "steps": [
         {"name": "Python version", "run": "python --version"},
         {"name": "Tests", "run": "python -m unittest discover -v"}
@@ -22,8 +30,7 @@ manual and complete JSON examples appear directly in **CI → Documentation**.
     },
     {
       "name": "compile",
-      "execution": {"runner": "host", "timeout_seconds": 120},
-      "triggers": {"manual": {"enabled": true}},
+      "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 120},
       "steps": [{"name": "Compile", "run": "python -m compileall -q ."}]
     }
   ],
@@ -33,17 +40,22 @@ manual and complete JSON examples appear directly in **CI → Documentation**.
 }
 ```
 
-Commands assume Python is installed. Host CI is trusted-code-only. Install the
+Prepare the Python Docker image locally. `checks` runs on pushes to `main`; `compile`
+has no automatic triggers, but both pipelines can always be queued manually with
+write access. Host CI is trusted-code-only if you explicitly select it. Install the
 trusted deployment script outside repositories before enabling the example target.
 Manual runs test CI only; deployment requires a qualifying successful branch update.
 
 ## No shared configuration
 
 Each pipeline independently defines its execution, triggers, cancellation,
-environment, artifacts and notifications. There is **no `defaults` object** or
-top-level notification policy. An omitted field uses the built-in default, never
+artifacts and notifications. There is **no `defaults` object** or
+top-level notification policy. An omitted field never uses
 another pipeline's value. Repeat values deliberately when pipelines need the same
-configuration. Changing one pipeline does not change any other pipeline.
+configuration. Changing one pipeline does not change any other pipeline. Omitted
+execution values use built-in defaults.
+Environment variables and retention are configured separately in page controls
+under **CI → Settings**, with server defaults under **Admin → Settings**.
 
 Each deployment is also a separate named object. `pipeline` references the CI
 pipeline whose passing branch update gates it; script, branch, timeout and email
@@ -51,9 +63,9 @@ settings belong to the deployment itself. Multiple deployment targets may refere
 the same pipeline. They have separate attempts, logs, results and notification state.
 Deployment notifications do not inherit pipeline email settings.
 
-Only repository-wide protection (`policies`) and storage limits (`retention`) stay
-at the document root. They are administrator/storage controls, not inherited execution
-configuration. Artifact retention applies across the repository, not per pipeline.
+Repository-wide protection (`policies`) stays at the document root. Variables and
+storage limits use separate page controls, with server defaults and repository
+overrides. Artifact retention applies across the repository, not per pipeline.
 
 ## Names and execution
 
@@ -70,9 +82,10 @@ independent configurations do not imply parallel execution or cross-pipeline dep
 
 ## Saving and compatibility
 
-Saving replaces the entire document. Invalid input is preserved but not saved.
-Retain existing policies/storage limits when adapting examples; omission restores
-built-in defaults and retention changes can delete existing data immediately.
+Saving replaces the pipeline/deployment document. Invalid input is preserved but
+not saved. Retain existing policies when adapting examples. Page-managed variables
+and retention persist independently; retention changes require confirmation on
+their own form and can permanently delete existing data.
 
 Existing keyed or shared-default configurations remain readable. Opening the editor
 converts them into named lists, materializes inherited values into each pipeline,

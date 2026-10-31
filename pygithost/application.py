@@ -222,17 +222,26 @@ def _language_panel(languages, branch):
     return safe_html(html_t(t'<section class="box repo-language-panel" aria-labelledby="repo-languages-title"><h2 id="repo-languages-title">Languages</h2>{content}<p class="muted repo-language-note">Estimated from tracked source bytes on <code>{branch}</code>. Common generated files and dependencies are excluded.</p></section>'))
 
 
-def _repo_code_menu(owner, repo, ref):
+def _repo_code_menu(owner, repo, ref, *, can_edit=False, path="", is_file=False):
     base = str_t(t"/r/{q(owner)}/{q(repo)}")
+    ide_query = urlencode({"branch": ref, "path" if is_file else "folder": path})
+    ide_link = safe_html(html_t(t'<a class="repo-zip-link repo-open-ide" href="{base}/ide?{ide_query}"><strong>Open in Web IDE</strong><small>Edit multiple files in a browser workspace <kbd>.</kbd></small></a>')) if can_edit else safe_html("")
     clone_path = str_t(t"{URL_PREFIX}/{q(repo)}.git") if owner == FLAT_OWNER_UI else str_t(t"{URL_PREFIX}/{q(owner)}/{q(repo)}.git")
     return safe_html(html_t(t'''<details class="repo-code-menu"><summary>〈〉 Code <span aria-hidden="true">▾</span></summary><div class="repo-code-popover">
 <div class="repo-panel-heading"><strong>Clone repository</strong><span class="repo-clone-protocol">HTTP(S)</span></div><div class="repo-clone-body">
 <label>Clone URL</label><div class="repo-copy-row"><input class="repo-clone-url" data-path="{clone_path}" value="{clone_path}" readonly aria-label="Repository clone URL"><button class="repo-copy-button" type="button">Copy</button></div><p class="muted repo-copy-status" role="status" aria-live="polite">Use Git to clone the full repository and its history.</p><p class="muted">If authentication is enabled, enter your username and password or access token when Git asks. Never share a URL containing credentials.</p></div>
-<a class="repo-zip-link" href="{base}/archive.zip?{urlencode({"ref": ref})}"><strong>↓ Download ZIP</strong><small>Source snapshot of <code>{ref}</code>; no Git history.</small></a></div></details>
+{ide_link}<a class="repo-zip-link" href="{base}/archive.zip?{urlencode({"ref": ref})}"><strong>↓ Download ZIP</strong><small>Source snapshot of <code>{ref}</code>; no Git history.</small></a></div></details>
 <script>(function() {{
  const script = document.currentScript; const menu = script.previousElementSibling;
  const input = menu.querySelector(".repo-clone-url");
- input.value = window.location.origin + input.dataset.path;
+  input.value = window.location.origin + input.dataset.path;
+  const ideLink = menu.querySelector(".repo-open-ide");
+  if (ideLink) document.addEventListener("keydown", event => {{
+    if (event.key === "." && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey &&
+        !event.target.closest("input, textarea, select, [contenteditable=true]") && !event.defaultPrevented) {{
+      event.preventDefault(); window.location.assign(ideLink.href);
+    }}
+  }});
  menu.querySelector(".repo-clone-protocol").textContent = window.location.protocol === "https:" ? "HTTPS" : "HTTP";
  input.addEventListener("click", () => input.select());
  menu.querySelector(".repo-copy-button").addEventListener("click", async function() {{
@@ -851,6 +860,61 @@ async def _git_diff_between(repo_git: str, base: str, head: str, max_bytes: int 
     if len(out) > max_bytes:
         return out[:max_bytes].decode("utf-8", "replace") + "\n\n[... truncated ...]\n", True
     return out.decode("utf-8", "replace"), False
+
+
+async def _git_diff_files(repo_git: str, base: str, head: str) -> list[dict[str, object]]:
+    """Return added/deleted line counts and change kinds per changed file."""
+    code, out, _err = await _run_git(repo_git, ["--literal-pathspecs", "diff", "--numstat", "--no-color", base + ".." + head])
+    if code != 0:
+        return []
+    files = []
+    for ln in out.decode("utf-8", "replace").splitlines():
+        if not ln.strip():
+            continue
+        parts = ln.split("\t")
+        if len(parts) < 3:
+            continue
+        adds, dels, name = parts[0], parts[1], parts[-1]
+        kind = "modified"
+        if adds == "-" and dels == "-":
+            kind = "binary"
+        elif adds == "0":
+            kind = "deleted"
+        elif dels == "0":
+            kind = "added"
+        files.append({
+            "path": name,
+            "added": 0 if adds == "-" else int(adds),
+            "deleted": 0 if dels == "-" else int(dels),
+            "kind": kind,
+        })
+    return files
+
+
+async def _git_merge_base(repo_git: str, a: str, b: str) -> str | None:
+    code, out, _err = await _run_git(repo_git, ["merge-base", a, b])
+    if code != 0:
+        return None
+    return out.decode("utf-8", "replace").strip() or None
+
+
+async def _git_merge_conflicts(repo_git: str, target_ref: str, source_ref: str) -> list[str]:
+    """Detect whether merging source into target would conflict."""
+    code, out, _err = await _run_git(repo_git, ["merge-tree", "--write-tree", target_ref, source_ref])
+    if code == 0:
+        return []
+    if code not in (1, 2):
+        # Unsupported git version or repository error; no reliable answer.
+        return []
+    # "tree-ish <tree> ... CONFLICT ..."-style output; conflict message includes "CONFLICT".
+    if out and b"CONFLICT" in out:
+        return [ln for ln in out.decode("utf-8", "replace").splitlines() if ln.strip()]
+    # Older merge-tree formats print conflicts as "changed in both" blocks
+    # followed by "+<<<<<<< .our" style lines.
+    text = out.decode("utf-8", "replace")
+    if "+<<<<<<<" in text or "<<<<<<<<" in text:
+        return [ln for ln in text.splitlines() if ln.strip()]
+    return []
 
 
 async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str, *, expected=None) -> tuple[bool, str, str | None]:
@@ -1812,23 +1876,86 @@ class GitHTTPHandler:
     # ========================================================
     async def _ui_admin_settings(self, *, save=False):
         from .database import db_display_name_set
+        from .database import db_ci_preferences_get, db_ci_preferences_set
+        from .settings_pages import preferences_forms, parse_preferences, basic_form, save_basic
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
         notice = safe_html("")
+        submitted_preferences = None
         value = await self.server.display_name()
         if save:
             form = await self._read_form_urlencoded()
-            value = form.get("display_name", "").strip() or "pygithost"
-            if len(value) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in value):
-                notice = safe_html('<p class="warn" role="alert">Display name must be at most 80 characters without control characters.</p>')
-            else:
-                await _call_in_thread(db_display_name_set, value)
-                self.server._display_name = value
-                _display_name.set(value)
-                notice = safe_html('<p class="ok" role="status">Settings saved.</p>')
-        body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><a class="pill" href="/">Home</a></div>{notice}
-<section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form></section></main>''')
+            action = form.get("action", "appearance")
+            if action != "appearance" and not self._valid_settings_csrf(form):
+                return await self._forbidden(b"403 Forbidden: invalid security token.\n")
+            try:
+                if action.startswith("ci_"):
+                    async with self.server.settings_lock:
+                        global_values, _repo = await _call_in_thread(db_ci_preferences_get)
+                        values = parse_preferences(form, global_values)
+                        await _call_in_thread(db_ci_preferences_set, values)
+                    message = "Server CI defaults saved. Repositories without an override inherit these values. New settings apply to future runs."
+                    if action == "ci_retention":
+                        message = "Server retention defaults saved and applied to stored runs and artifacts without a repository override."
+                elif action == "basic":
+                    async with self.server.settings_lock:
+                        await _call_in_thread(save_basic, self.server.config_path, form)
+                    message = "Server configuration saved. Restart the server to apply it; running settings are unchanged."
+                elif action == "appearance":
+                    value = form.get("display_name", "").strip() or "pygithost"
+                    if len(value) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+                        raise ValueError("Display name must be at most 80 characters without control characters.")
+                    await _call_in_thread(db_display_name_set, value)
+                    self.server._display_name = value
+                    _display_name.set(value)
+                    message = "Settings saved."
+                else:
+                    raise ValueError("Unknown settings action.")
+                notice = safe_html(html_t(t'<p class="ok" role="status">{message}</p>'))
+            except (ValueError, OSError) as exc:
+                notice = safe_html(html_t(t'<p class="warn" role="alert">{str(exc)}</p>'))
+                submitted_preferences = form if action.startswith("ci_") else None
+        global_values, _repo = await _call_in_thread(db_ci_preferences_get)
+        token = self._settings_csrf_token()
+        try:
+            basic = basic_form("/admin/settings", token, self.server.context.config.to_dict(), self.server.config_path)
+        except (ValueError, OSError) as exc:
+            basic = safe_html(html_t(t'<p class="warn">Could not read the startup configuration: {str(exc)}</p>{basic_form("/admin/settings", token, self.server.context.config.to_dict(), None)}'))
+        preferences = preferences_forms("/admin/settings", token, global_values, submitted=submitted_preferences)
+        body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><nav class="row"><a class="pill" href="/admin/email">Email delivery</a><a class="pill" href="/admin/users">Users</a><a class="pill" href="/">Home</a></nav></div>{notice}
+<section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form></section>{basic}{preferences}<script src="/static/settings-pages.js" defer></script></main>''')
         return await _send_html(self.request, 200, _html_page("Server settings", safe_html(body)))
+
+    def _settings_csrf_token(self):
+        import hashlib
+        import hmac
+        session = _parse_cookie_header(self.headers.get("Cookie")).get(SESSION_COOKIE_NAME, "")
+        identity = session if REQUIRE_AUTH else "ip:" + self._client_ip()
+        return hmac.new(self.server.settings_csrf_secret, identity.encode(), hashlib.sha256).hexdigest()
+
+    def _valid_settings_csrf(self, form):
+        return secrets.compare_digest(form.get("csrf", "").encode(), self._settings_csrf_token().encode())
+
+    async def _ui_ci_preferences_save(self, owner, repo):
+        from .database import db_ci_preferences_get, db_ci_preferences_set
+        from .settings_pages import parse_preferences
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if REQUIRE_AUTH and not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
+        form = await self._read_form_urlencoded()
+        if not self._valid_settings_csrf(form):
+            return await self._forbidden(b"403 Forbidden: invalid security token.\n")
+        try:
+            async with self.server.settings_lock:
+                _global, values = await _call_in_thread(db_ci_preferences_get, owner, repo)
+                values = parse_preferences(form, values, repository=True)
+                await _call_in_thread(db_ci_preferences_set, values, owner, repo)
+        except (ValueError, OSError) as exc:
+            return await self._ui_ci_config(owner, repo, notice=str(exc), error=True, preferences_submitted=form)
+        message = "Repository settings saved. Retention limits apply to stored runs and artifacts immediately." if form["action"] == "ci_retention" else "Repository settings saved. New runs use the updated settings."
+        return await self._ui_ci_config(owner, repo, notice=message)
 
     async def _ui_admin_users(self, notice: str = "", notice_kind: str = "ok"):
         if not _require_admin(self):
@@ -2081,7 +2208,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div>{ci_badge}</div>
 </div>
 <div class="box">
-<div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch)}</div>
+<div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch, can_edit=_has_write_scope(self))}</div>
 <script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
 </div>
 <div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div></div>
@@ -2290,6 +2417,8 @@ document.addEventListener("DOMContentLoaded", function() {{
     async def _ui_pulls_create(self, owner: str, repo: str):
         owner = unquote(owner)
         repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
         if not (_safe_seg(owner) and _safe_seg(repo)):
             return await self._forbidden(b"403 Forbidden\n")
         repo_git = _repo_bare_path(owner, repo)
@@ -2312,7 +2441,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._ui_pulls(owner, repo, str_t(t"Source branch not found: {source_branch}"), "warn")
         if not tgt:
             return await self._ui_pulls(owner, repo, str_t(t"Target branch not found: {target_branch}"), "warn")
-        pr_id = await asyncio.to_thread(db_pr_create, owner, repo, title, body, source_branch, target_branch, int(self.remote_user_id or 0))
+        pr_id = await asyncio.to_thread(db_pr_create, owner, repo, title, body, source_branch, target_branch, self.remote_user_id)
         await self.server.ci_manager.enqueue(owner, repo, "pull_request", target_branch, tgt,
             {"pr_number": pr_id, "base_branch": target_branch, "head_branch": source_branch,
              "base_commit": tgt, "head_commit": src})
@@ -2338,6 +2467,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         page = _page_number(params)
         size = _page_size(params)
         total = 0
+        merge_base = await _git_merge_base(repo_git, tgt_commit, src_commit) if (src_commit and tgt_commit) else None
         if src_commit and tgt_commit and src_commit != tgt_commit:
             total = await _git_commit_count(repo_git, tgt_commit + ".." + src_commit)
             if total is not None:
@@ -2345,23 +2475,29 @@ document.addEventListener("DOMContentLoaded", function() {{
             commits = await _git_list_commits(repo_git, tgt_commit + ".." + src_commit, limit=size + 1, skip=(page - 1) * size)
         commits_pagination = _pagination(base + f"/pulls/{pr_id}", {}, page, len(commits) > size, total=total, per_page=size)
         commits = commits[:size]
+        changed_files = await _git_diff_files(repo_git, merge_base, src_commit) if (merge_base and src_commit and merge_base != src_commit) else []
+        selected_file = (params.get("file") or [""])[0]
+        if selected_file and not any(f["path"] == selected_file for f in changed_files):
+            selected_file = ""
         if src_commit and tgt_commit and src_commit != tgt_commit:
-            diff_text, diff_trunc = await _git_diff_between(repo_git, tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES)
+            # Three-dot diff: show what this PR adds relative to the merge base,
+            # not unrelated target-branch changes.
+            diff_text, diff_trunc = await _git_diff_between(repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES)
         elif src_commit and tgt_commit and src_commit == tgt_commit:
             diff_text, diff_trunc = "(No changes; branches point to the same commit.)", False
         else:
             diff_text, diff_trunc = "(Could not resolve one or both branches.)", False
-
-        notice_html = safe_html("")
-        if notice:
-            cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
-        merge_note = safe_html("")
-        if status == "merged":
-            short_commit = (merge_commit or "")[:8]
-            merge_note = safe_html(html_t(t"<div class=\"ok\" style=\"margin-top:10px\">Merged ({merge_method or ''}). Target now at <code>{short_commit}</code>.</div>"))
-        elif status == "closed":
-            merge_note = safe_html('<div class="warn" style="margin-top:10px">Closed.</div>')
+        if selected_file:
+            file_diff_text, file_diff_trunc = await _git_diff_between(
+                repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES) if (merge_base or tgt_commit) and src_commit else ("(Could not render file diff.)", False)
+            marker = "\n" + ("diff --git a/" + selected_file + " b/" + selected_file)
+            start = file_diff_text.find(marker)
+            end = file_diff_text.find("\ndiff --git ", start + 1) if start >= 0 else -1
+            if start < 0:
+                selected_file = ""
+            else:
+                diff_text = file_diff_text[start:end if end > 0 else len(file_diff_text)]
+                diff_trunc = False
 
         can_write = _has_write_scope(self)
         merge_box = safe_html("")
@@ -2371,6 +2507,23 @@ document.addEventListener("DOMContentLoaded", function() {{
         ci_label = check[1].replace("_", " ") if check else "not run for current commits (missing or outdated)"
         ci_requirement = "required" if ci_policy["require_ci"] else "informational"
         ci_panel = safe_html(html_t(t'<div class="box" style="margin-bottom:14px"><h2>CI checks</h2><p>CI is {ci_requirement}: {ci_label}.</p><a href="{base}/ci">View CI runs</a></div>'))
+        merge_note = safe_html("")
+        if status == "merged":
+            short_commit = (merge_commit or "")[:8]
+            merge_note = safe_html(html_t(t"<div class=\"ok\" style=\"margin-top:10px\">Merged ({merge_method or ''}). Target now at <code>{short_commit}</code>.</div>"))
+        elif status == "closed":
+            merge_note = safe_html('<div class="warn" style="margin-top:10px">Closed.</div>')
+
+        conflicts = (await _git_merge_conflicts(repo_git, "refs/heads/" + tgt_branch, "refs/heads/" + src_branch)) if (
+            status == "open" and src_commit and tgt_commit and merge_base and merge_base != tgt_commit) else (None if status == "open" and src_commit and tgt_commit else [])
+        conflict_html = safe_html("")
+        if status == "open" and can_write:
+            if conflicts is None:
+                conflict_html = safe_html('<div class="warn" style="margin-top:10px">Cannot simulate a merge (incompatible histories); a fast-forward merge will still verify the current commits.</div>')
+            elif conflicts:
+                conflict_html = safe_html(html_t(t'<div class="warn" style="margin-top:10px"><b>Merge conflict:</b> <code>{tgt_branch}</code> has advanced past the merge base, and merging this branch now would conflict. Update <code>{src_branch}</code> (for example, merge <code>{tgt_branch}</code> into it, or rebase), resolve, and push again.</div>'))
+            else:
+                conflict_html = safe_html('<div class="muted" style="margin-top:10px">The target has advanced past the merge base, but the simulated merge reports no conflicts. Fast-forward merges still verify both commits at merge time.</div>')
         merge_disabled = safe_html(' disabled title="Successful CI for the current PR commits is required"' if ci_policy["require_ci"] and not ci_passed else "")
         if status == "open":
             if can_write:
@@ -2378,6 +2531,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                     html_t(
                         t"""<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Merge</h2>
 <div class="muted">This server supports <b>fast-forward only</b> merges.</div>
+{conflict_html}
 <form method="POST" action="{base}/pulls/{pr_id}/merge" style="margin-top:10px"><button type="submit"{merge_disabled}>Merge (ff-only)</button></form>
 <form method="POST" action="{base}/pulls/{pr_id}/close" style="margin-top:10px"><button class="danger" type="submit">Close PR</button></form></div>"""
                     )
@@ -2401,19 +2555,132 @@ document.addEventListener("DOMContentLoaded", function() {{
         description = safe_html(html_t(t"{body}")) if (body or "").strip() else safe_html('<span class="muted">(no description)</span>')
         src_short = (src_commit or "")[:8]
         tgt_short = (tgt_commit or "")[:8]
+        file_rows = []
+        for f in changed_files:
+            path, kind, adds, dels = f["path"], f["kind"], f["added"], f["deleted"]
+            badge = {"added": "+", "deleted": "−"}.get(str(kind), "~")
+            cls = {"added": "ok", "deleted": "warn"}.get(str(kind), "muted")
+            link = html_t(t'<a href="{base}/pulls/{pr_id}?file={q(path)}#diff">{path}</a>')
+            file_rows.append(html_t(
+                t'<tr><td style="width:20px"><span class="{cls}">{badge}</span></td><td>{link}</td><td class="muted" style="width:90px"><span class="add">+{adds}</span> <span class="del">−{dels}</span></td></tr>'
+            ))
+        files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No changed files.</td></tr>')
+        files_panel = safe_html(html_t(
+            t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Changed files ({len(changed_files)})</h2><table>{files_html}</table></div>'
+        )) if changed_files else safe_html("")
+        total_adds = sum(int(f["added"]) for f in changed_files)
+        total_dels = sum(int(f["deleted"]) for f in changed_files)
+        summary = safe_html(html_t(
+            t'<div class="muted" style="margin-bottom:10px">{len(commits)} commit(s), {len(changed_files)} file(s) changed: <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></div>'
+        )) if changed_files else safe_html("")
+        comments = await asyncio.to_thread(db_pr_comment_list, pr_id)
+        viewer_id = self.remote_user_id
+        viewer_admin = bool(getattr(self, "remote_is_admin", False))
+        comment_rows = []
+        for c in comments:
+            cid, c_author, c_username, c_body, c_created, c_edited = c
+            edited = " (edited)" if c_edited else ""
+            mine = viewer_id is not None and c_author == viewer_id
+            controls = safe_html("")
+            if mine or viewer_admin:
+                controls = safe_html(html_t(t'<form method="POST" action="{base}/pulls/{pr_id}/comments/{cid}/delete" class="pr-comment-actions"><button class="danger" type="submit">Delete</button></form>'))
+            comment_rows.append(html_t(
+                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted">{c_created}{edited}</span>{controls}</div><div class="pr-comment-body">{c_body}</div></div>'
+            ))
+        comments_join = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
+        comment_form = safe_html("")
+        if status == "open" and can_write:
+            comment_form = safe_html(html_t(
+                t'<form method="POST" action="{base}/pulls/{pr_id}/comments" class="pr-comment-form"><label>Add comment</label><textarea name="body" required maxlength="50000" placeholder="Write a comment…"></textarea><button type="submit">Comment</button></form>'
+            ))
+        else:
+            comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
+        comments_box = safe_html(html_t(
+            t'<div class="box" id="discussion" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Discussion ({len(comments)})</h2>{comments_join}{comment_form}</div>'
+        ))
+        title_form = safe_html("")
+        if status == "open" and can_write:
+            title_form = safe_html(html_t(
+                t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" maxlength="50000">{body}</textarea><button type="submit">Save</button></form></details>'
+            ))
         body_html = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>PR #{pr_id}: {title}</h2>
 <div class="muted"><code>{src_branch}</code> → <code>{tgt_branch}</code> | Created: {created_at}</div></div>
-<div><a class="pill" href="{base}/pulls">All PRs</a> <a class="pill" href="{base}">Repo</a></div></div>
+<div><a class="pill" href="{base}/pulls">All PRs</a> <a class="pill" href="{base}">Repo</a> {_repo_code_menu(owner, repo, src_branch, can_edit=can_write and bool(src_commit))}</div></div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><span class="pill">{status}</span>{merge_note}
-<div style="margin-top:10px">{description}</div>
+<div style="margin-top:10px">{description}</div>{title_form}
 <div class="muted" style="margin-top:10px">Source: <code>{src_branch}</code> @ <code>{src_short}</code><br>Target: <code>{tgt_branch}</code> @ <code>{tgt_short}</code></div></div>
 {ci_panel}{merge_box}
 <div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table>{commits_pagination}</div>
-<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Diff</h2>{diff_html}</div>"""
+{files_panel}
+<div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Diff</h2>{summary}{diff_html}</div>
+{comments_box}"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>'))))
+
+    async def _ui_pull_comment(self, owner: str, repo: str, pr_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        pr = await asyncio.to_thread(db_pr_get, pr_id)
+        if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
+            return await self._not_found()
+        form = await self._read_form_urlencoded()
+        body = (form.get("body") or "").strip()
+        if not body:
+            return await self._ui_pull_view(owner, repo, pr_id, "Comment text is required.", "warn")
+        await asyncio.to_thread(db_pr_comment_add, pr_id, self.remote_user_id, body[:50000])
+        return await self._ui_pull_view(owner, repo, pr_id, "Comment added.", "ok")
+
+    async def _ui_pull_comment_delete(self, owner: str, repo: str, pr_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        row = await asyncio.to_thread(db_pr_comment_get, pr_id, comment_id)
+        if not row:
+            return await self._not_found()
+        mine_or_admin = row[2] is not None and row[2] == self.remote_user_id
+        if not (mine_or_admin or getattr(self, "remote_is_admin", False)):
+            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can delete.\n")
+        await asyncio.to_thread(db_pr_comment_delete, comment_id)
+        return await self._ui_pull_view(owner, repo, pr_id, "Comment deleted.", "ok")
+
+    async def _ui_pull_comment_edit(self, owner: str, repo: str, pr_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        row = await asyncio.to_thread(db_pr_comment_get, pr_id, comment_id)
+        if not row:
+            return await self._not_found()
+        mine_or_admin = row[2] is not None and row[2] == self.remote_user_id
+        if not (mine_or_admin or getattr(self, "remote_is_admin", False)):
+            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can edit.\n")
+        form = await self._read_form_urlencoded()
+        body = (form.get("body") or "").strip()
+        if not body:
+            return await self._ui_pull_view(owner, repo, pr_id, "Comment text is required.", "warn")
+        await asyncio.to_thread(db_pr_comment_update, comment_id, body[:50000])
+        return await self._ui_pull_view(owner, repo, pr_id, "Comment updated.", "ok")
+
+    async def _ui_pull_update(self, owner: str, repo: str, pr_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        pr = await asyncio.to_thread(db_pr_get, pr_id)
+        if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
+            return await self._not_found()
+        form = await self._read_form_urlencoded()
+        title = (form.get("title") or "").strip()
+        body = (form.get("body") or "").strip()
+        if not title:
+            return await self._ui_pull_view(owner, repo, pr_id, "Title is required.", "warn")
+        await asyncio.to_thread(db_pr_update_text, pr_id, title, body[:50000])
+        return await self._ui_pull_view(owner, repo, pr_id, "Pull request updated.", "ok")
 
     async def _ui_pull_close(self, owner: str, repo: str, pr_id: int):
         owner = unquote(owner)
@@ -2674,13 +2941,12 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
-        config_raw = await _call_in_thread(db_ci_config_get, owner, repo)
-        config = json.loads(config_raw) if config_raw else ci_default_config()
+        config = await self.server.ci_manager.config(owner, repo)
         pipelines = CIManager.pipelines(config)
         pipeline_options = join_html([html_t(t'<option value="{item.get("pipeline_id", "default")}">{item.get("pipeline_id", "default")}</option>') for item in pipelines])
-        manual_enabled = bool(any((item.get("command") or item.get("steps") or item.get("repository_config")) and item.get("events", {}).get("manual") for item in pipelines) and branches and _has_write_scope(self))
+        manual_enabled = bool(any(item.get("command") or item.get("steps") or item.get("repository_config") for item in pipelines) and branches and _has_write_scope(self))
         disabled = safe_html("" if manual_enabled else " disabled")
-        manual_notice = "" if manual_enabled else "Manual runs require write access, a pipeline, the manual trigger, and an existing branch."
+        manual_notice = "" if manual_enabled else "Manual runs require write access, a runnable pipeline, and an existing branch."
         notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
         body = html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><h2>CI runs</h2></div>{notice_html}
 <div class="box"><h2>Run manually</h2><p>{manual_notice}</p><form method="POST" action="{base}/ci/run"><label>Pipeline</label><select name="pipeline">{pipeline_options}</select><select name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button></form></div>{filter_form}{results_html}
@@ -2795,7 +3061,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 <article id="ci-configuration-guide" class="box ci-guide">{content}</article></main><script src="/static/ci-docs.js" defer></script>'''))
         return await _send_html(self.request, 200, _html_page(str_t(t"CI documentation · {owner}/{repo}"), body))
 
-    async def _ui_ci_config(self, owner: str, repo: str, notice: str = "", submitted=None, error=False):
+    async def _ui_ci_config(self, owner: str, repo: str, notice: str = "", submitted=None, error=False, preferences_submitted=None):
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
             return await self._not_found()
@@ -2804,33 +3070,38 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         from .ci_config import EXAMPLE, editor_document
         config = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        document = editor_document(config)
+        from . import ci_preferences
+        from .database import db_ci_preferences_get
+        from .settings_pages import preferences_forms
+        document = ci_preferences.editor_document(editor_document(config))
         text = submitted if isinstance(submitted, str) else json.dumps(document, indent=2)
         from .ci_schema import group_document
-        example = json.dumps(group_document(EXAMPLE), indent=2)
+        example = json.dumps(ci_preferences.editor_document(group_document(EXAMPLE)), indent=2)
         notice_html = safe_html(html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')) if notice else safe_html("")
-        retention = json.dumps({key: config.get(key, ci_default_config()[key]) for key in
-            ("artifact_retention_days", "artifact_retention_count", "run_retention_count")})
-        body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><h2>CI configuration</h2><a class="pill" href="{base}/ci/docs">JSON reference and examples</a></div>{notice_html}
+        global_values, repository_values = await _call_in_thread(db_ci_preferences_get, owner, repo)
+        raw_config = await _call_in_thread(db_ci_config_get, owner, repo)
+        raw_config = json.loads(raw_config) if raw_config else {}
+        env = raw_config.get("env", {})
+        legacy = {**ci_preferences.legacy_retention(raw_config), "env": env,
+                  "pipeline_env": {item["pipeline_id"]: item["env"] for item in CIManager.pipelines(raw_config) if item.get("env") and item["env"] != env}} if raw_config else {}
+        preferences = preferences_forms(base + "/ci/preferences", self._settings_csrf_token(), global_values,
+            repository_values, legacy=legacy, pipelines=[item["pipeline_id"] for item in CIManager.pipelines(config)], submitted=preferences_submitted)
+        body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><h2>CI configuration</h2><nav class="row"><a class="pill" href="/admin/settings">Server defaults</a><a class="pill" href="{base}/ci/docs">JSON reference and examples</a></nav></div>{notice_html}
 <form id="ci-settings-form" class="ci-settings-form" method="POST" action="{base}/ci/config">
-<section class="box"><h2>Independent pipelines and deployments</h2><p>Use two arrays: pipelines and deployments. Every object has a name. Each pipeline defines its own execution, triggers, cancellation, artifacts and notifications; there are no shared defaults. Each deployment references its pipeline by name. Policies and retention remain repository-wide.</p>
-<label for="ci-config-json">Configuration JSON (maximum 256 KiB)</label><textarea id="ci-config-json" name="configuration_json" rows="32" spellcheck="false">{text}</textarea>
+<section class="box">
+<label id="ci-config-label" for="ci-config-json">Configuration JSON (maximum 256 KiB)</label><div class="ci-config-editor-tools"><button id="ci-format-json" type="button" hidden>Format JSON</button><span id="ci-editor-status" role="status" class="muted">Plain-text fallback; loading Monaco…</span></div><div id="ci-config-editor" aria-labelledby="ci-config-label" hidden></div><textarea id="ci-config-json" name="configuration_json" rows="32" spellcheck="false">{text}</textarea>
 <p class="warn">Host jobs and deployment scripts run as the server user. Use trusted code only. Environment values and scripts are stored in plaintext; logs are not secret-redacted.</p>
-<p class="warn">Saving replaces the complete configuration. Lower retention limits can permanently delete existing data immediately. Removing pipelines stops new runs and pending deployments, not already queued CI commands.</p>
+<p class="warn">Saving replaces pipeline configuration. Environment variables and retention are managed separately below. Removing pipelines stops new runs and pending deployments, not already queued CI commands.</p>
 <button type="submit">Save configuration</button><span id="ci-json-status" role="status" class="muted"></span></section></form>
 <details class="box ci-guide"><summary>Example: independent named pipelines</summary><pre class="language-json"><code class="language-json">{example}</code></pre></details>
+{preferences}<script src="/static/settings-pages.js" defer></script>
 <script src="/static/ci-docs.js" defer></script>
+<script src="/static/vendor/monaco/vs/loader.js" defer></script><script src="/static/ci-settings.js" defer></script>
 <script>(function() {{
 const form = document.getElementById("ci-settings-form");
-const original = {safe_html(retention)};
 form.addEventListener("submit", event => {{
  let config; try {{ config = JSON.parse(form.elements.configuration_json.value); }}
  catch (error) {{ event.preventDefault(); document.getElementById("ci-json-status").textContent = "Invalid JSON: " + error.message; return; }}
- const retention = config.retention || {{}};
- const settings = config.settings || {{artifact_retention_days:retention.artifacts?.days, artifact_retention_count:retention.artifacts?.max_count, run_retention_count:retention.runs?.max_count}};
- const defaults = {{artifact_retention_days:7, artifact_retention_count:0, run_retention_count:{ci_default_config()["run_retention_count"]}}};
- const stricter = Object.keys(original).some(key => {{const value = settings[key] ?? defaults[key]; return value > 0 && (original[key] === 0 || value < original[key]); }});
- if (stricter && !window.confirm("These retention limits may permanently delete existing CI artifacts and completed runs immediately. Save configuration?")) event.preventDefault();
 }});
 }})();</script>''')
         return await _send_html(self.request, 200,
@@ -2855,7 +3126,8 @@ form.addEventListener("submit", event => {{
                     result[key] = value
                 return result
             document = json.loads(text, object_pairs_hook=unique_keys)
-            await self.server.ci_manager.save_document(owner, repo, document)
+            async with self.server.settings_lock:
+                await self.server.ci_manager.save_document(owner, repo, document, preserve_page_settings=True)
         except (ValueError, RecursionError) as exc:
             return await self._ui_ci_config(owner, repo, notice=str(exc), submitted=text, error=True)
         return await self._ui_ci_config(owner, repo, notice="Configuration saved.")
@@ -2877,7 +3149,9 @@ form.addEventListener("submit", event => {{
             return await self._ui_ci(owner, repo, notice=str(exc))
         if run_id:
             return await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}"))
-        return await self._ui_ci(owner, repo, notice="Manual runs are disabled or no command is configured.")
+        if (await self.server.ci_manager.config(owner, repo)).get("_autodetect_repository_config"):
+            return await self._ui_ci(owner, repo, notice="No run queued. Add .ci-config.json to the selected branch to use automatic repository CI.")
+        return await self._ui_ci(owner, repo, notice="No run queued. Select a runnable pipeline with steps or a repository file.")
 
     async def _ui_ci_action(self, owner, repo, run_id, action):
         owner, repo = unquote(owner), unquote(repo)
@@ -3185,6 +3459,127 @@ form.addEventListener("submit", event => {{
                     process.kill()
                     await process.communicate()
 
+    async def _ui_ide(self, owner, repo, action=""):
+        from . import webide
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._not_found()
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return await self._not_found()
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+
+        async def respond(status, value):
+            return await _send_response(self.request, status, json.dumps(value).encode(),
+                [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")])
+
+        params = parse_qs(urlparse(self.path).query or "")
+        branch = (params.get("branch") or [""])[0]
+        try:
+            if action == "commit":
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= webide.MAX_REQUEST * 2:
+                    return await respond(413, {"error": "Commit request exceeds the size limit."})
+                form = await self._read_form_urlencoded()
+                if not secrets.compare_digest(form.get("csrf", "").encode(), self._email_csrf_token().encode()):
+                    return await respond(403, {"error": "Invalid security token. Reload the editor."})
+                payload = json.loads(form.get("payload", "{}"))
+                if not isinstance(payload, dict):
+                    raise webide.IDEError("Invalid commit request.")
+                branch = payload.get("branch", "")
+                # Validate the branch before policy matching.
+                await asyncio.to_thread(webide.head, repo_git, branch)
+                async def commit_transaction():
+                    lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
+                    async with lock:
+                        policy = await self.server.ci_manager.config(owner, repo)
+                        if policy["block_direct_pushes"] and protected_branch(policy, branch):
+                            return 403, {"error": "Direct commits to this protected branch are blocked. Create a branch and open a pull request."}
+                        before = await self.server._branch_refs(owner, repo)
+                        commit = await asyncio.to_thread(webide.commit_changes, repo_git, branch,
+                            payload.get("base"), payload.get("changes"), payload.get("message"),
+                            getattr(self, "remote_user", "Browser user"))
+                        result = {"commit": commit}
+                        try:
+                            await self.server._queue_push_changes(owner, repo, before)
+                        except Exception:
+                            # The ref was already committed. Never report it as a failed commit.
+                            result["warning"] = "Commit saved, but CI scheduling failed. Check CI runs."
+                        return 200, result
+
+                task = asyncio.create_task(commit_transaction())
+                self.server.push_finalizers.add(task)
+                task.add_done_callback(self.server.push_finalizers.discard)
+                try:
+                    status, result = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # Do not release the push lock while its Git thread is still writing.
+                    await asyncio.shield(task)
+                    raise
+                return await respond(status, result)
+            if action == "snapshot":
+                return await respond(200, await asyncio.to_thread(webide.snapshot, repo_git, branch))
+            if action == "file":
+                content = await asyncio.to_thread(webide.read_file, repo_git, branch,
+                    (params.get("commit") or [""])[0], (params.get("path") or [""])[0])
+                return await respond(200, {"content": content})
+            if action == "search":
+                return await respond(200, await asyncio.to_thread(webide.search, repo_git, branch,
+                    (params.get("commit") or [""])[0], (params.get("q") or [""])[0]))
+            branches = await _git_list_branches(repo_git)
+            if not branches:
+                return await _send_text(self.request, 400, "Create a branch with an initial commit before opening the Web IDE.\n")
+            if branch and branch not in branches:
+                return await _send_text(self.request, 400, "Choose an existing branch to edit. Tags and historical commits are read-only.\n")
+            if not branch:
+                default_branch = await _git_default_branch(repo_git)
+                branch = default_branch if default_branch in branches else branches[0]
+            base = str_t(t"/r/{q(owner)}/{q(repo)}")
+            filename = (params.get("path") or [""])[0]
+            folder = (params.get("folder") or [""])[0]
+            single = action == "edit"
+            if filename:
+                webide.path(filename)
+            if folder:
+                webide.path(folder)
+            if single and not filename:
+                raise webide.IDEError("Choose a file to edit from the repository browser.")
+            if single:
+                await asyncio.to_thread(webide.read_file, repo_git, branch,
+                    await asyncio.to_thread(webide.head, repo_git, branch), filename)
+            mode = "single" if single else "workspace"
+            options = join_html([html_t(t'<option value="{b}"{safe_html(" selected" if b == branch else "")}>{b}</option>') for b in branches])
+            token = self._email_csrf_token()
+            return_url = str_t(t"{base}/blob/{q(branch)}/{q(filename, safe='/')}") if filename else str_t(t"{base}/tree/{q(branch)}/")
+            body = html_t(t'''<main class="repo-page webide-page">{_repo_tabs(base, "code")}
+<section id="webide" data-base="{base}/ide" data-csrf="{token}" data-mode="{mode}" data-path="{filename}" data-folder="{folder}">
+<header class="ide-titlebar"><a id="ide-exit" href="{return_url}" class="ide-back">← Back to repository</a><strong>{owner} / {repo}</strong><span class="ide-mode-label">{'Edit single file' if single else 'Web IDE'}</span>
+<button id="ide-quick-open" class="ide-workspace-only" type="button" title="Go to file (Ctrl+P / ⌘P)">Go to file… <kbd>Ctrl/⌘ P</kbd></button>
+<a id="ide-expand" class="ide-single-only pill" href="{base}/ide?{urlencode({'branch': branch, 'path': filename})}">Open in Web IDE</a></header>
+<div class="ide-toolbar"><div class="ide-write-tabs"><button id="ide-write" type="button" aria-pressed="true">Write</button><button id="ide-review" type="button" aria-pressed="false">Preview changes</button></div>
+<div class="ide-file-tools"><button id="ide-new" class="ide-workspace-only" type="button">+ New file</button><button id="ide-delete" class="ide-workspace-only" type="button">Delete file</button><button id="ide-discard-file" type="button">Discard file changes</button><button id="ide-show-changes" class="ide-workspace-only" type="button">Review &amp; commit <span id="ide-count">0</span></button></div></div>
+<div class="ide-workspace"><nav class="ide-activity ide-workspace-only" aria-label="Workspace views">
+<button id="ide-explorer-view" type="button" aria-pressed="true" title="Explorer (Ctrl+Shift+E)"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 3h12v15H8zM4 7v14h12"/></svg><span class="ide-sr-only">Explorer</span></button>
+<button id="ide-search-view" type="button" aria-pressed="false" title="Search (Ctrl+Shift+F)"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/></svg><span class="ide-sr-only">Search</span></button>
+<button id="ide-source-view" type="button" aria-pressed="false" title="Source Control (Ctrl+Shift+G)"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span class="ide-sr-only">Source Control</span><span id="ide-source-count">0</span></button></nav>
+<aside id="ide-sidebar" data-view="explorer"><section class="ide-explorer-pane"><div class="ide-pane-heading"><h2>Explorer</h2><button id="ide-collapse" type="button" title="Collapse all folders">Collapse all folders</button></div><div class="ide-explorer-actions"><button id="ide-explorer-new" type="button">+ New file</button><button id="ide-new-folder" type="button">+ New folder</button></div><label class="ide-sr-only" for="ide-filter">Filter files</label><input id="ide-filter" placeholder="Filter files…" autocomplete="off"><div id="ide-files" role="group" aria-label="Repository files"></div></section>
+<section class="ide-search-pane"><div class="ide-pane-heading"><h2>Search</h2></div><form id="ide-search-form"><label for="ide-search-input">Search file contents</label><input id="ide-search-input" maxlength="200" required placeholder="Search workspace…" autocomplete="off"><button type="submit">Search</button></form><p class="ide-note">Literal, case-insensitive search across the branch snapshot and pending edits. Up to 200 matching lines; run again after editing.</p><p id="ide-search-status" class="ide-note" role="status" aria-live="polite"></p><div id="ide-search-results"></div></section>
+<section class="ide-source-pane"><div class="ide-pane-heading"><h2>Source Control</h2><span id="ide-change-summary">No changes</span></div>
+<form id="ide-commit"><label for="ide-message">Commit message</label><textarea id="ide-message" rows="3" maxlength="4000" required placeholder="Describe your changes" autocomplete="off"></textarea><button id="ide-submit" type="submit">Commit changes</button><a id="ide-cancel" class="ide-single-only" href="{return_url}">Cancel</a></form>
+<div class="ide-changes-heading"><h3>Changes</h3><button id="ide-discard" type="button">Discard all</button></div><div id="ide-changes"></div><p class="ide-note">Commits include all pending changes. Only UTF-8 text files up to 1 MiB; up to 100 changed files. Edits stay in this tab until committed or discarded.</p><a class="ide-workspace-only" href="{base}/branches">Create or manage branches</a><a id="ide-pull-request" class="ide-workspace-only" href="{base}/pulls">Create a pull request</a></section></aside>
+<section class="ide-editor-pane" aria-label="Code editor"><div id="ide-tabs" class="ide-workspace-only" role="tablist" aria-label="Open files"></div><h2 id="ide-filename">Select a file</h2><div class="ide-editor-container"><div id="ide-editor"></div><div id="ide-empty"><strong>Ready to make a change?</strong><p>Choose a file from Explorer, or press <kbd>Ctrl/⌘ P</kbd> to find one.</p><p>Changes are collected in Source Control before you commit.</p></div></div></section></div>
+<footer class="ide-statusbar"><label for="ide-branch"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span class="ide-sr-only">Branch</span></label><select id="ide-branch">{options}</select><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
+<dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close file search">×</button></div><input id="ide-picker-input" placeholder="Search files by name…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
+</section></main><link rel="stylesheet" href="/static/webide.css"><script src="/static/vendor/monaco/vs/loader.js"></script><script src="/static/webide.js" defer></script>''')
+            return await _send_response(self.request, 200, _html_page("Web IDE", safe_html(body)),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+        except (webide.IDEError, ValueError, TypeError) as exc:
+            if action in ("", "edit"):
+                body = html_t(t'<main class="repo-page"><h1>Editor unavailable</h1><p class="warn">{str(exc)}</p><a href="/r/{q(owner)}/{q(repo)}">Back to repository</a></main>')
+                return await _send_html(self.request, 400, _html_page("Editor unavailable", safe_html(body)))
+            return await respond(409 if action == "commit" else 400, {"error": str(exc)})
+
     async def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
         owner = unquote(owner)
         repo = unquote(repo)
@@ -3241,7 +3636,7 @@ form.addEventListener("submit", event => {{
         rows_html = join_html(rows) if rows else safe_html('<tr><td colspan="3" class="muted">Empty.</td></tr>')
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{_repo_breadcrumbs(owner, repo, ref, subpath)}<p class="muted">ref: <code>{ref}</code></p></div>
-<div>{_repo_code_menu(owner, repo, ref)}</div></div>
+<div>{_repo_code_menu(owner, repo, ref, can_edit=_has_write_scope(self) and ref in await _git_list_branches(repo_git), path=subpath)}</div></div>
 {up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
@@ -3295,9 +3690,19 @@ form.addEventListener("submit", event => {{
         file_view = safe_html(html_t(t'<div id="repo-file-horizontal" class="repo-file-horizontal" tabindex="0" role="region" aria-label="Scroll file horizontally" hidden><div></div></div><div id="repo-file-viewport" class="repo-file-code" tabindex="0" role="region" aria-label="Scrollable file contents"><div class="repo-line-numbers" aria-label="Line numbers">{numbers}</div><pre><code id="repo-file-source" class="language-{lang}">{text}</code></pre></div>')) if not binary else safe_html('<div class="repo-empty"><h2>Binary file</h2><p class="muted">This file cannot be displayed as text. Use Download to save the original file.</p></div>')
         copy_button = safe_html('<button id="repo-copy-file" type="button">Copy contents</button>') if not binary else safe_html("")
         highlight_button = safe_html('<button id="repo-highlight-file" type="button" aria-pressed="false">Highlight syntax</button>') if not binary and file_language != "none" else safe_html("")
+        can_edit_branch = _has_write_scope(self) and ref in await _git_list_branches(repo_git)
+        edit_query = urlencode({"branch": ref, "path": filepath})
+        edit_single = safe_html("")
+        if can_edit_branch and not binary and len(out) <= 1024 * 1024:
+            try:
+                out.decode("utf-8")
+                edit_single = safe_html(html_t(t'<a href="{base}/edit?{edit_query}"><strong>Edit single file</strong><small>Make a quick change to this file.</small></a>'))
+            except UnicodeDecodeError:
+                pass
+        edit_menu = safe_html(html_t(t'<details class="repo-edit-menu"><summary>Edit <span aria-hidden="true">▾</span></summary><div>{edit_single}<a href="{base}/ide?{edit_query}"><strong>Open in Web IDE</strong><small>Edit multiple files in a full workspace.</small></a></div></details>')) if can_edit_branch else safe_html("")
         body = html_t(
-            t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{breadcrumbs}<p class="muted">{ref} · {len(out):,} bytes</p></div>{_repo_code_menu(owner, repo, ref)}</div>
-<section class="box repo-file-panel"><div class="repo-file-toolbar"><a class="pill" href="{back}">Back to folder</a><div class="repo-file-actions"><a class="pill" href="{file_url}?raw=1">Raw</a><a class="pill" href="{file_url}?download=1">Download</a>{copy_button}{highlight_button}<a class="pill" href="{file_url}">Permalink</a><a class="pill" href="{base}/commits?{urlencode({"ref": commit, "path": filepath})}">History</a></div></div><span id="repo-file-feedback" class="muted" role="status" aria-live="polite"></span>{notice}{file_view}
+            t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{breadcrumbs}<p class="muted">{ref} · {len(out):,} bytes</p></div>{_repo_code_menu(owner, repo, ref, can_edit=can_edit_branch, path=filepath, is_file=True)}</div>
+<section class="box repo-file-panel"><div class="repo-file-toolbar"><a class="pill" href="{back}">Back to folder</a><div class="repo-file-actions"><a class="pill" href="{file_url}?raw=1">Raw</a><a class="pill" href="{file_url}?download=1">Download</a>{copy_button}{highlight_button}<a class="pill" href="{file_url}">Permalink</a><a class="pill" href="{base}/commits?{urlencode({"ref": commit, "path": filepath})}">History</a>{edit_menu}</div></div><span id="repo-file-feedback" class="muted" role="status" aria-live="polite"></span>{notice}{file_view}
 <script>
 const fileViewport = document.getElementById("repo-file-viewport");
 const horizontalScroll = document.getElementById("repo-file-horizontal");
@@ -3795,6 +4200,12 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_admin_email()
         if p == "/admin/settings":
             return await self._ui_admin_settings()
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ide(?:/(snapshot|file|search))?$", p)
+        if m:
+            return await self._ui_ide(m.group(1), m.group(2), m.group(3) or "")
+        m = re.match(r"^/r/([^/]+)/([^/]+)/edit$", p)
+        if m:
+            return await self._ui_ide(m.group(1), m.group(2), "edit")
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", p)
         if m:
             return await self._ui_ci_config(m.group(1), m.group(2))
@@ -3876,6 +4287,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         ctype = (self.headers.get("Content-Type") or "").lower()
         if "application/x-www-form-urlencoded" not in ctype:
             return await _send_text(self.request, 415, "Unsupported Media Type\n")
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ide/commit$", parsed.path)
+        if m:
+            return await self._ui_ide(m.group(1), m.group(2), "commit")
         if parsed.path == "/create-repo":
             return await self._ui_create_repo()
         if parsed.path in ("/tokens/create", "/admin/token"):
@@ -3906,9 +4320,24 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/merge$", parsed.path)
         if m:
             return await self._ui_pull_merge(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/comments$", parsed.path)
+        if m:
+            return await self._ui_pull_comment(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/comments/(\d+)/delete$", parsed.path)
+        if m:
+            return await self._ui_pull_comment_delete(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/comments/(\d+)/edit$", parsed.path)
+        if m:
+            return await self._ui_pull_comment_edit(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/update$", parsed.path)
+        if m:
+            return await self._ui_pull_update(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/config$", parsed.path)
         if m:
             return await self._ui_ci_config_save(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/preferences$", parsed.path)
+        if m:
+            return await self._ui_ci_preferences_save(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/run$", parsed.path)
         if m:
             return await self._ui_ci_run(m.group(1), m.group(2))
@@ -3950,7 +4379,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
 
 
 class AsyncGitServer:
-    def __init__(self, context: AppContext | None = None, allowlist: set[str] | None = None):
+    def __init__(self, context: AppContext | None = None, allowlist: set[str] | None = None, config_path=None):
         self.context = context or AppContext(AppConfig.from_mapping(default_config_for_platform()))
         apply_config(self.context.config)
         self.allowlist = allowlist if allowlist is not None else ALLOWED_CLIENT_IPS
@@ -3960,6 +4389,9 @@ class AsyncGitServer:
         self.push_finalizers: set[asyncio.Task] = set()
         self._display_name = None
         self._display_name_lock = asyncio.Lock()
+        self.config_path = Path(config_path).resolve() if config_path is not None else None
+        self.settings_lock = asyncio.Lock()
+        self.settings_csrf_secret = secrets.token_bytes(32)
 
     async def display_name(self):
         from .database import db_display_name_get
@@ -4068,7 +4500,7 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     os.environ["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
     os.environ["GIT_HTTP_EXPORT_ALL"] = "1"
 
-    app = AsyncGitServer(AppContext(config))
+    app = AsyncGitServer(AppContext(config), config_path=config_path)
     server = None
     try:
         await app.ci_manager.start()

@@ -3,10 +3,26 @@ import json
 import unittest
 
 from pygithost.ci import CIManager, validate_config
-from pygithost.ci_config import EXAMPLE, compile_document, export_document
+from pygithost.ci_config import EXAMPLE, compile_document, export_document, editor_document
 
 
 class JSONConfigurationTests(unittest.TestCase):
+    def test_compact_repository_reference_is_safe_and_round_trips(self):
+        document = {"version": 1, "file": ".ci-config.json"}
+        config = compile_document(document)
+        self.assertEqual(editor_document(config), document)
+        self.assertEqual(export_document(config), document)
+        self.assertEqual(CIManager.pipelines(config)[0]["pipeline_id"], "ci")
+        self.assertEqual(config["runner"], "docker")
+        self.assertTrue(config["events"]["push"])
+        self.assertTrue(config["events"]["pr_opened"])
+        self.assertTrue(config["events"]["manual"])
+        self.assertFalse(config["deploy_enabled"])
+        for invalid in ({"file": "../outside.json"}, {"file": ".ci-config.json", "pipelines": []},
+                        {"file": ".ci-config.json", "version": True}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                compile_document(invalid)
+
     def test_shared_defaults_and_mapping_overrides(self):
         document = copy.deepcopy(EXAMPLE)
         document["defaults"]["env"] = {"SHARED": "yes", "VALUE": "base"}
@@ -131,7 +147,7 @@ class JSONConfigurationTests(unittest.TestCase):
     def test_examples_in_docs_validate(self):
         import re
         from pathlib import Path
-        for path in ("docs/pipeline-examples.md", "docs/pipelines.md", "docs/ci-migration.md"):
+        for path in ("docs/pipeline-examples.md", "docs/pipelines.md", "docs/ci-migration.md", "docs/server-settings.md"):
             for block in re.findall(r"```json\n(.*?)\n```", Path(path).read_text(), re.S):
                 with self.subTest(path=path):
                     compile_document(json.loads(block))
@@ -150,6 +166,9 @@ class JSONConfigurationTests(unittest.TestCase):
                     pipeline_config(raw, default_config())
                     continue
                 compile_document(raw)
+                if "file" in raw:
+                    self.assertEqual(raw, {"version": 1, "file": ".ci-config.json"})
+                    continue
                 if isinstance(raw.get("pipelines"), list):
                     raw, targets = split_named_document(raw)
                     for target in targets.values():
@@ -164,8 +183,10 @@ class JSONConfigurationTests(unittest.TestCase):
                     seen_common.update(set(pipeline) & COMMON)
                     seen_pipeline.update(pipeline)
                     seen_deployment.update(pipeline.get("deployment", {}))
-        self.assertEqual(seen_common, COMMON)
-        self.assertEqual(seen_settings, SETTINGS)
+        # Variables and retention now have page controls, not JSON examples.
+        from pygithost.ci_preferences import RETENTION
+        self.assertEqual(seen_common, COMMON - {"env"})
+        self.assertEqual(seen_settings, SETTINGS - set(RETENTION))
         self.assertEqual(seen_deployment, set(DEPLOYMENT))
         self.assertTrue({"steps", "deployment", "file"} <= seen_pipeline)
 

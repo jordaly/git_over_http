@@ -42,6 +42,65 @@ def _db_connect() -> sqlite3.Connection:
     return conn
 
 
+def _db_migrate_pr_author_nullable(conn):
+    """Upgrade legacy NOT NULL authors without changing PR identities/data.
+
+    SQLite requires a table rebuild to relax NOT NULL. Keep the original DDL,
+    indexes, triggers, sequence high-water mark and incoming foreign keys.
+    """
+    columns = conn.execute("PRAGMA table_xinfo(pull_requests)").fetchall()
+    author = next((column for column in columns if column[1].lower() == "author_user_id"), None)
+    if not author or not author[3]:
+        return
+    foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    legacy_alter = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    # These pragmas must be set outside the transaction. Disabling FK actions
+    # during DROP avoids cascading into tables referencing the existing PRs.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = conn.execute("PRAGMA table_xinfo(pull_requests)").fetchall()
+        author = next(column for column in columns if column[1].lower() == "author_user_id")
+        if not author[3]:  # Another startup may already have migrated it.
+            conn.commit()
+            return
+        original_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='pull_requests' COLLATE NOCASE").fetchone()[0]
+        new_sql, changed = re.subn(
+            r'((?:"author_user_id"|`author_user_id`|\[author_user_id\]|\bauthor_user_id\b)\s+(?:INTEGER|INT|BIGINT)\s+)NOT\s+NULL\b',
+            r'\1', original_sql, count=1, flags=re.IGNORECASE)
+        if changed != 1:
+            raise ValueError("Unsupported legacy pull-request author definition; database was not modified.")
+        temporary = "__pull_requests_nullable_" + secrets.token_hex(8)
+        new_sql, renamed = re.subn(
+            r'^(\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?:"pull_requests"|`pull_requests`|\[pull_requests\]|pull_requests)(?=\s|\()',
+            lambda match: match[1] + '"' + temporary + '"', new_sql, count=1, flags=re.IGNORECASE)
+        if renamed != 1:
+            raise ValueError("Unsupported legacy pull-request table definition; database was not modified.")
+        objects = conn.execute("SELECT sql FROM sqlite_master WHERE tbl_name='pull_requests' COLLATE NOCASE AND type IN ('index','trigger') AND sql IS NOT NULL").fetchall()
+        sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='pull_requests' COLLATE NOCASE").fetchone()
+        existing_violations = set(conn.execute("PRAGMA foreign_key_check").fetchall())
+        names = ",".join('"' + column[1].replace('"', '""') + '"' for column in columns if not column[6])
+        conn.execute(new_sql)
+        conn.execute(f'INSERT INTO "{temporary}" ({names}) SELECT {names} FROM pull_requests')
+        conn.execute("DROP TABLE pull_requests")
+        conn.execute(f'ALTER TABLE "{temporary}" RENAME TO pull_requests')
+        for (sql,) in objects:
+            conn.execute(sql)
+        if sequence:
+            conn.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='pull_requests'", (sequence[0],))
+            conn.execute("INSERT INTO sqlite_sequence(name,seq) SELECT 'pull_requests',? WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='pull_requests')", (sequence[0],))
+        if set(conn.execute("PRAGMA foreign_key_check").fetchall()) - existing_violations:
+            raise sqlite3.IntegrityError("Pull-request author migration would introduce a foreign-key violation.")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table={int(legacy_alter)}")
+        conn.execute(f"PRAGMA foreign_keys={int(foreign_keys)}")
+
+
 def _db_init() -> None:
     conn = _db_connect()
     try:
@@ -123,7 +182,23 @@ def _db_init() -> None:
             )
             """
         )
+        _db_migrate_pr_author_nullable(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pr_repo ON pull_requests(owner, repo, status, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pr_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pr_id INTEGER NOT NULL,
+                author_user_id INTEGER,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                edited_at TEXT,
+                FOREIGN KEY(pr_id) REFERENCES pull_requests(id) ON DELETE CASCADE,
+                FOREIGN KEY(author_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pr_comments_pr ON pr_comments(pr_id, id)")
         conn.execute("""CREATE TABLE IF NOT EXISTS ci_configs (
             owner TEXT NOT NULL, repo TEXT NOT NULL, config_json TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(owner, repo))""")
@@ -166,6 +241,9 @@ def _db_init() -> None:
             conn.execute("ALTER TABLE ci_deployments_multi RENAME TO ci_deployments")
             conn.execute("COMMIT")
         conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS repository_ci_settings (
+            owner TEXT NOT NULL, repo TEXT NOT NULL, settings_json TEXT NOT NULL,
+            PRIMARY KEY(owner,repo))""")
         conn.execute("""CREATE TABLE IF NOT EXISTS repository_languages (
             owner TEXT NOT NULL, repo TEXT NOT NULL, commit_hash TEXT NOT NULL,
             languages_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -606,7 +684,80 @@ def db_ensure_default_admin() -> None:
 
 
 # ---------- PR DB helpers ----------
-def db_pr_create(owner: str, repo: str, title: str, body: str, source_branch: str, target_branch: str, author_user_id: int) -> int:
+def db_pr_comment_add(pr_id: int, author_user_id: int | None, body: str) -> int:
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO pr_comments(pr_id, author_user_id, body) VALUES(?,?,?)",
+            (int(pr_id), int(author_user_id) if author_user_id is not None else None, body),
+        )
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_pr_comment_list(pr_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            """
+            SELECT c.id, c.author_user_id, u.username, c.body, c.created_at
+            FROM pr_comments c LEFT JOIN users u ON u.id=c.author_user_id
+            WHERE c.pr_id=? ORDER BY c.id
+            """,
+            (int(pr_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_pr_comment_get(pr_id: int, comment_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            "SELECT id, pr_id, author_user_id, body FROM pr_comments WHERE id=? AND pr_id=?",
+            (int(comment_id), int(pr_id)),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def db_pr_comment_update(comment_id: int, body: str) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "UPDATE pr_comments SET body=?, edited_at=datetime('now') WHERE id=?",
+            (body, int(comment_id)),
+        )
+    finally:
+        conn.close()
+
+
+def db_pr_comment_delete(comment_id: int) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM pr_comments WHERE id=?", (int(comment_id),))
+    finally:
+        conn.close()
+
+
+def db_pr_update_text(pr_id: int, title: str, body: str) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE pull_requests SET title=?, body=? WHERE id=?", (title, body, int(pr_id)))
+    finally:
+        conn.close()
+
+
+def db_pr_comment_count(pr_id: int) -> int:
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM pr_comments WHERE pr_id=?", (int(pr_id),)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def db_pr_create(owner: str, repo: str, title: str, body: str, source_branch: str, target_branch: str, author_user_id: int | None) -> int:
     conn = _db_connect()
     try:
         cur = conn.execute(
@@ -614,7 +765,7 @@ def db_pr_create(owner: str, repo: str, title: str, body: str, source_branch: st
             INSERT INTO pull_requests(owner, repo, title, body, source_branch, target_branch, author_user_id, status)
             VALUES(?,?,?,?,?,?,?, 'open')
             """,
-            (owner, repo, title, body or "", source_branch, target_branch, int(author_user_id)),
+            (owner, repo, title, body or "", source_branch, target_branch, int(author_user_id) if author_user_id is not None else None),
         )
         return int(cur.lastrowid)
     finally:
@@ -900,14 +1051,52 @@ def db_email_settings_set(value: str):
         conn.close()
 
 
-def db_ci_config_set(owner: str, repo: str, config_json: str) -> None:
+def db_ci_config_set(owner: str, repo: str, config_json: str, *, preferences=None) -> None:
     conn = _db_connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        if preferences is not None:
+            conn.execute("INSERT INTO repository_ci_settings(owner,repo,settings_json) VALUES(?,?,?) ON CONFLICT(owner,repo) DO UPDATE SET settings_json=excluded.settings_json", (owner, repo, json.dumps(preferences)))
         conn.execute("""INSERT INTO ci_configs(owner,repo,config_json) VALUES(?,?,?)
             ON CONFLICT(owner,repo) DO UPDATE SET config_json=excluded.config_json, updated_at=datetime('now')""",
             (owner, repo, config_json))
         _db_ci_cleanup_artifacts(conn, owner, repo)
         _db_ci_prune_completed(conn, owner, repo)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def db_ci_preferences_get(owner=None, repo=None):
+    from .ci_preferences import read
+    conn = _db_connect()
+    try:
+        return read(conn, owner, repo)
+    finally:
+        conn.close()
+
+
+def db_ci_preferences_set(values, owner=None, repo=None):
+    from .ci_preferences import validate
+    values = validate(values)
+    conn = _db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if owner is None:
+            conn.execute("INSERT INTO server_settings(key,value) VALUES('ci_defaults',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(values),))
+        else:
+            conn.execute("INSERT INTO repository_ci_settings(owner,repo,settings_json) VALUES(?,?,?) ON CONFLICT(owner,repo) DO UPDATE SET settings_json=excluded.settings_json", (owner, repo, json.dumps(values)))
+        _db_ci_cleanup_artifacts(conn, owner, repo)
+        repositories = [(owner, repo)] if owner is not None else conn.execute("SELECT DISTINCT owner,repo FROM ci_runs").fetchall()
+        for item_owner, item_repo in repositories:
+            _db_ci_prune_completed(conn, item_owner, item_repo)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1048,8 +1237,10 @@ def db_ci_steps_get(run_id):
 
 
 def _db_ci_retention(conn, owner, repo):
+    from .ci_preferences import read, retention, legacy_retention
     row = conn.execute("SELECT config_json FROM ci_configs WHERE owner=? AND repo=?", (owner, repo)).fetchone()
-    return json.loads(row[0]) if row else {}
+    global_values, repository_values = read(conn, owner, repo)
+    return retention(global_values, repository_values, legacy_retention(json.loads(row[0]) if row else {}))
 
 
 def _db_ci_cleanup_artifacts(conn, owner=None, repo=None):

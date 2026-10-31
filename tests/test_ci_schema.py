@@ -56,7 +56,7 @@ class GroupedConfigurationTests(unittest.TestCase):
         self.assertEqual(first["runner"], "docker")
         self.assertEqual(second["runner"], "host")
         self.assertEqual(second["env"], {})
-        self.assertFalse(second["events"]["manual"])
+        self.assertTrue(second["events"]["manual"])
         self.assertEqual(second["email_mode"], "off")
         self.assertEqual(len(first["deployment_targets"]), 2)
         self.assertTrue(all(target["email_mode"] == "off" for target in first["deployment_targets"]))

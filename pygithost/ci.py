@@ -93,7 +93,7 @@ def default_config():
             "pr_updated": False,
             "pr_reopened": False,
             "pr_merged": False,
-            "manual": False,
+            "manual": True,
         },
         "push_branches": "",
         "pr_branches": "",
@@ -113,6 +113,16 @@ def default_config():
         "artifact_retention_count": 0,
         "run_retention_count": max(0, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100")))),
     }
+
+
+def unconfigured_repository_config():
+    """Safe discovery preset; never overrides a saved repository configuration."""
+    from .ci_config import compile_document
+    config = compile_document({"version": 1, "file": ".ci-config.json"})
+    # Ephemeral server-only marker. Saving settings makes the reference explicit,
+    # so missing files then produce configuration failures rather than idle CI.
+    config["_autodetect_repository_config"] = True
+    return config
 
 
 def validate_config(raw, *, nested=False):
@@ -201,7 +211,7 @@ def validate_config(raw, *, nested=False):
         command=command,
         timeout_seconds=timeout,
         env=env,
-        events={k: bool(events.get(k, False)) for k in defaults["events"]},
+        events={k: k == "manual" or bool(events.get(k, False)) for k in defaults["events"]},
         push_branches=raw.get("push_branches", ""),
         pr_branches=raw.get("pr_branches", ""),
         runner=runner, image=image, email_mode=mode,
@@ -543,17 +553,35 @@ class CIManager:
     async def config(self, owner, repo):
         raw = await _db_call(database.db_ci_config_get, owner, repo)
         if not raw:
-            return default_config()
-        parsed = json.loads(raw)
-        config = validate_config(parsed)
-        if "document" in parsed:
-            config["document"] = parsed["document"]
-        return config
+            config = unconfigured_repository_config()
+        else:
+            parsed = json.loads(raw)
+            config = validate_config(parsed)
+            if "document" in parsed:
+                config["document"] = parsed["document"]
+        from .ci_preferences import apply
+        preferences = await _db_call(database.db_ci_preferences_get, owner, repo)
+        return apply(config, *preferences)
 
-    async def save_document(self, owner, repo, document):
+    async def save_document(self, owner, repo, document, *, preserve_page_settings=False):
         from .ci_config import compile_document
         config = compile_document(document)
-        await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
+        preferences = None
+        if preserve_page_settings:
+            from .ci_preferences import legacy_retention
+            old = await _db_call(database.db_ci_config_get, owner, repo)
+            old = json.loads(old) if old else {}
+            _global, preferences = await _db_call(database.db_ci_preferences_get, owner, repo)
+            for key, value in legacy_retention(old).items():
+                if key not in legacy_retention(config):
+                    preferences.setdefault(key, value)
+            previous = self.pipelines(old) if old else []
+            if not any(item.get("env") for item in self.pipelines(config)) and "env" not in preferences:
+                env = old.get("env", {})
+                pipeline_env = {item.get("pipeline_id", "default"): item["env"] for item in previous if item.get("env") and item["env"] != env}
+                if env or pipeline_env:
+                    preferences.update(env=env, pipeline_env=pipeline_env)
+        await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config), preferences=preferences)
         return config
 
     async def save_config(self, owner, repo, config):
@@ -569,7 +597,7 @@ class CIManager:
         root["pipelines"] = []
         items = [root, *config.get("pipelines", [])]
         if "document" in config:
-            names = config["document"]["pipelines"]
+            names = config["document"].get("pipelines", [{"name": "ci"}])
             if isinstance(names, list):
                 names = {item["name"] for item in names}
             items = [item for item in items if item.get("pipeline_id", "default") in names]
@@ -616,7 +644,7 @@ class CIManager:
                 return ""
         return await asyncio.to_thread(read_script)
 
-    async def repository_pipeline(self, owner, repo, commit, config):
+    async def repository_pipeline(self, owner, repo, commit, config, *, missing_ok=False):
         """Read a bounded blob at an immutable SHA, never from the working tree."""
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
             raise ValueError("Repository pipeline requires an exact commit SHA.")
@@ -633,12 +661,14 @@ class CIManager:
                 await process.wait()
                 raise
             if process.returncode:
-                raise ValueError("Cannot read .pygithost-ci.json at the recorded commit.")
+                raise ValueError("Cannot read the repository pipeline at the recorded commit.")
             return stdout
         filename = config.get("repository_file", ".pygithost-ci.json")
         tree = (await git("ls-tree", commit, "--", filename)).decode().split()
+        if not tree and missing_ok:
+            return None
         if len(tree) < 3 or tree[0] not in ("100644", "100755") or tree[1] != "blob":
-            raise ValueError("Missing regular .pygithost-ci.json file.")
+            raise ValueError(f"Missing regular {filename} file.")
         blob = tree[2]
         if int((await git("cat-file", "-s", blob)).strip()) > 65536:
             raise ValueError("Repository pipeline exceeds 64 KiB.")
@@ -682,7 +712,7 @@ class CIManager:
             "pull_request_merged": "pr_merged",
             "manual": "manual",
         }.get(event, event)
-        if (not config["command"] and not config["steps"] and not config["repository_config"]) or (snapshot is None and not config["events"].get(key, False)):
+        if (not config["command"] and not config["steps"] and not config["repository_config"]) or (snapshot is None and event != "manual" and not config["events"].get(key, False)):
             return None
         if event == "push" and not self._matches(config["push_branches"], branch):
             return None
@@ -694,9 +724,20 @@ class CIManager:
         if snapshot is None and config["repository_config"]:
             try:
                 # PR code cannot change its own pipeline before review/merge.
-                config = await self.repository_pipeline(owner, repo, commit, config)
+                config = await self.repository_pipeline(owner, repo, commit, config,
+                    missing_ok=config.get("_autodetect_repository_config", False))
+                if config is None:
+                    return None
             except (ValueError, UnicodeError, OSError, RecursionError, asyncio.TimeoutError) as exc:
                 config_error = f"Repository pipeline configuration: {exc}"
+        if snapshot is None and not config_error:
+            from .ci_preferences import environment
+            global_values, repository_values = await _db_call(database.db_ci_preferences_get, owner, repo)
+            config["env"] = environment(global_values, repository_values, config.get("env", {}), config.get("pipeline_id", "default"))
+            try:
+                config = validate_config(config)
+            except ValueError as exc:
+                config_error = f"CI preferences: {exc}"
         if not self.started:
             await self.start()
         if self.stopping:

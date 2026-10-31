@@ -8,6 +8,10 @@ authentication, repository browsing, branches, tokens, users, and pull requests.
 - [Getting started](docs/getting-started.md): local setup, configuration, first
   login, Git access, and troubleshooting.
 - [Repository interface](#repository-interface): browsing files and managing branches.
+- [Server and repository settings](docs/server-settings.md): page controls, inheritance,
+  environment variables, retention and restart-required configuration.
+- [Browser editing and pull requests](docs/repository-workflow.md): single-file editing,
+  Web IDE, search, commit/discard, PR creation and permalinks.
 - [Continuous integration](#continuous-integration): runners, pipelines, protections,
   artifacts, and notifications.
 - [Pipeline guide](docs/pipelines.md): step-by-step setup, JSON examples, variables,
@@ -112,6 +116,101 @@ Windows, and SMTP/TLS delivery tests use mocks rather than sending real mail.
 
 ## Repository interface
 
+**Admin → Settings** now exposes basic network/security/storage configuration as
+well as appearance, server-wide CI variables and retention. Basic configuration saves target
+the startup JSON file and require a restart; they do not rebind the running server
+or switch its database. **CI → Settings** offers repository overrides for
+environment variables and retention, with **Use server default** on each
+retention field. Execution and cancellation belong to each pipeline's JSON;
+omitted options use built-in defaults. Variables and retention are page controls, separate
+from pipeline JSON. See [Page settings and inheritance](docs/ci-options.md#page-settings-and-inheritance).
+
+Repositories without saved CI settings automatically read **`.ci-config.json`**
+through the default `ci` pipeline (Docker `python:3.14-slim`, push, pull-request
+and manual triggers; deployments off). No file means no run; an invalid file
+produces a configuration failure. Saved settings, including disabled CI and
+legacy filenames, always take priority. See
+[Automatic repository CI](docs/ci-options.md#automatic-repository-ci) for the
+repository-file format and safety limits. **CI → Settings** uses locally bundled
+Monaco for editing/formatting the complete administrator JSON, with a textarea
+fallback when JavaScript or Monaco is unavailable.
+
+### Browser editing: single file or Web IDE
+
+The repository UI offers two GitLab-style entry points, both powered by locally
+bundled Monaco (no CDN):
+
+- From a file, choose **Edit → Edit single file** for a focused editor inside the
+  repository page. Use **Write** and **Preview changes**, then enter a message and
+  **Commit changes**, or **Cancel** to return to the file.
+- From a file, choose **Edit → Open in Web IDE**. From a repository, directory,
+  or pull request, choose **Code → Open in Web IDE**. The current branch and
+  file/folder are preserved; pull requests open their source branch. Pressing
+  **.** on those browsing pages also opens the IDE (except while typing).
+- In the single-file editor, **Open in Web IDE** expands the existing editor
+  without reloading: pending edits, the model and undo history are retained.
+
+The full-window workspace provides an **Explorer**, collapsible folders, filename
+filter, open-file tabs, a **Source Control** panel with change counts and per-file
+diff/discard actions, and a branch/cursor status bar. Closing a tab does **not**
+discard its changes: reopen it from Explorer or Source Control. Open tabs stay
+open after committing. The Explorer header offers **New file** and **New folder**;
+new folders include an empty `.gitkeep` file because Git does not track empty
+directories. Both remain pending until committed and can be discarded. The
+Explorer shows folders before files at every level, with folder, code-file and
+text-file icons. **Collapse all folders** closes the entire tree (and clears the
+filename filter). Add or delete files with the toolbar actions as well.
+
+The activity bar's **Search** tool (**Ctrl/⌘+Shift+F**) searches file contents in
+the branch snapshot, overlaid with pending edits/new files and excluding pending
+deletions. Matching results open their file at the matching line. Search is
+literal and case-insensitive, with a 200-line result limit, 256 KiB Git-output
+limit and 10-second timeout; narrow the query when results are limited. It does
+not execute external text converters. The Explorer's filename filter and
+**Go to file** remain available separately.
+
+Use **Ctrl/⌘+P** (or **Go to file**) to find files, **Ctrl/⌘+Shift+E** for Explorer,
+and **Ctrl/⌘+Shift+G** for Source Control. **Ctrl/⌘+S** keeps your current panel,
+file and focus; it does not create a commit. Use Source Control when you are
+ready to commit. **Preview changes**
+compares a file against its base; **Write** returns to editing.
+
+- **Commit changes** saves all pending changes in one commit on the selected
+  branch. Enter a commit message first. Commits use the signed-in username and
+  a generated `@users.pygithost.local` address, not a verified personal email.
+- **Discard file changes** restores one file. **Discard all** restores
+  the browser workspace without changing Git history or server-side files.
+- Edits live in browser memory, not on the server or in persistent browser
+  storage. Leaving/reloading the page warns about pending changes. Do not close
+  the tab before committing or copying work you want to keep.
+- Write scope, CSRF checks, direct-push branch protections and repository receive
+  hooks apply to commits. Successful commits use the same push/PR CI scheduling
+  as HTTP pushes. Create a feature branch under **Branches** when direct commits
+  to your target are blocked, then open a pull request.
+- If another push changes the branch, committing is rejected and your browser
+  edits remain available. Copy your edits before reloading; there is no automatic
+  merge/rebase. A failed CI scheduling attempt is reported separately from a
+  successful Git commit.
+
+The first version supports existing, nonempty branches and UTF-8 text files up
+to 1 MiB each, at most 100 changed files and 5 MiB of content per commit (the HTTP
+form also has a 10 MiB encoded limit). Repositories exceeding 10,000 files are
+not supported. Symlinks/submodules cannot be edited; binary files cannot be
+opened. Branches checked out in a server-side working tree cannot be committed
+through the IDE, avoiding a desynchronized checkout. Tags/historical commits
+are read-only; editing never silently switches them to the default branch. This
+is a Monaco-based workbench, not the full VS Code runtime: no extension
+marketplace, terminal, persistent drafts, staging, or automatic merge/rebase.
+Create/manage branches and pull requests through the linked repository pages.
+
+Backend regression tests run with the normal suite. To exercise actual Monaco
+editing, diff review, discard, single-to-multi-file expansion, tabs, quick file
+search, branch context and commits through Chromium:
+
+```sh
+PYGITHOST_TEST_BROWSER=chromium .venv/bin/python -m unittest tests.test_webide -v
+```
+
 Administrators can customize the name in the top-left header under
 **Home → Admin: Settings → Appearance → Display name**. It is stored in the
 database, applies to all pages immediately, and survives restart. Leave it blank
@@ -176,16 +275,26 @@ protects access to these settings, as with other administration pages.
 - **New pull request** on a branch prefills the source and default target branch.
   New branches can start from a branch, tag, or commit, with suggestions for existing
   branch names.
+- PR creation requires write access and two different existing branches. Signed-in
+  requests retain their author; with authentication disabled, author is empty rather
+  than a dummy user. See [Browser editing and pull requests](docs/repository-workflow.md)
+  for the complete workflow and permalink behavior.
 - Branch deletion requires write access, excludes default/protected branches,
   asks for browser confirmation, and rejects stale revisions rather than deleting
   work pushed since the page was loaded.
 
 ## Continuous integration
 
-Open **CI → Settings** as an administrator. All CI settings now use one JSON
-document: independent named `pipelines` and `deployments` arrays, plus repository-wide
-`policies` / `retention`. Execution, triggers and cancellation are grouped by purpose.
-Edit the document and click **Save configuration**. For example:
+Repositories without saved settings discover `.ci-config.json` automatically. The
+minimal Settings document is the [file reference](docs/examples/ci/repository-reference.json);
+commit the separate [pipeline file](docs/examples/ci/repository-pipeline.json) as
+`.ci-config.json`, not the reference. No file means no automatic run; saving an
+explicit reference makes a missing file a configuration error.
+
+Open **CI → Settings** as an administrator to edit pipeline/deployment JSON in
+Monaco. Environment variables and retention have separate page controls, with
+server defaults under **Admin → Settings**. For multiple named pipelines, use the
+expanded JSON form, plus optional repository-wide `policies`. For example:
 
 ```json
 {
@@ -193,7 +302,7 @@ Edit the document and click **Save configuration**. For example:
   "pipelines": [
     {
       "name": "tests",
-      "triggers": {"push": {"enabled": true}, "manual": {"enabled": true}},
+      "triggers": {"push": {"enabled": true}},
       "steps": [
         {"name": "Check Python", "run": "python --version"},
         {"name": "Tests", "run": "python -m unittest discover -v"}
@@ -210,14 +319,18 @@ does not. Add other independently configured objects to `pipelines`; every objec
 has its own `name`. There is no shared defaults object; see the
 [complete examples](docs/pipeline-examples.md).
 
-Enable the **manual** trigger to queue a branch from the CI page. Write access is required
+Manual runs are always available for runnable pipelines; no trigger flag is needed.
+Write access is required
 to queue, cancel, or rerun jobs; configuration and email retries require admin
 access when authentication is enabled. With authentication disabled, the IP
 allowlist is the security boundary, including for CI administration.
 
 ### Execution and security
 
-- **Host** is the backward-compatible default and is **trusted-code-only**. Jobs
+- Configure execution in each pipeline's JSON; omitted options use built-in
+  defaults, initially **Docker**. Explicit pipeline choices take priority; concrete
+  legacy host configurations remain unchanged.
+- **Host** is **trusted-code-only**. Jobs
   run as the server's OS user, not in a sandbox. A restricted environment prevents
   accidental credential inheritance, but does not prevent filesystem access or
   access to other processes. Use a dedicated unprivileged server account. Do not
@@ -253,7 +366,8 @@ Jobs expose `CI=true` and `PYGITHOST_OWNER`, `PYGITHOST_REPO`,
 `PYGITHOST_WORKTREE`, and `PYGITHOST_PIPELINE`. Built-in variable names cannot be overridden.
 
 Step `run` strings support dependency-free placeholders: `{{ env.NAME }}`.
-Put variables under each pipeline's `execution.env`; they are not shared with other pipelines.
+Set variables in the **Environment variables** page table: server defaults, repository
+overrides, or rows scoped to one named pipeline. Do not put new variables in JSON.
 Configured and built-in CI variables are available.
 Substitution occurs once immediately before command execution; missing variables
 fail the command's run/step. No Jinja filters, loops, function calls, or expression
@@ -273,13 +387,16 @@ The [pipeline guide](docs/pipelines.md) is the configuration reference; the
 Each pipeline independently defines execution, triggers, cancellation, artifacts and
 notifications. Each object in `deployments` has its own name, script and pipeline
 reference. Multiple targets can reference one pipeline without sharing results,
-logs or email state. Protection and retention remain repository-wide under
-`policies` and `retention`. No execution/email configuration is inherited.
+logs or email state. Protection stays repository-wide under `policies`; retention
+uses page controls. Omitted execution/cancellation options use built-in defaults,
+not another pipeline's configuration. Email policies are not inherited.
 
-The old mode selectors, separate forms and additional-pipeline array editor have
-been removed. Existing configurations open in the new JSON format, with commands
+The old command/pipeline editing modes and additional-pipeline array editor have
+been removed. Page controls now manage environment and retention, while
+pipeline structure remains JSON. Existing configurations open in the new format, with commands
 converted to a named step and Git-backed sources preserved as `file` entries.
-Saving replaces the complete document; invalid input never changes saved settings.
+Saving replaces the pipeline/deployment document, preserving page-managed settings;
+invalid input never changes saved settings.
 Jobs remain sequential per repository. See the guide for limits and migration.
 
 ### Optional merge and branch protections
@@ -329,11 +446,13 @@ Downloads also remain available on each CI run page.
   matched entries. Collection errors/limit violations fail the run explicitly.
 - Archives are stored in SQLite, not publicly served from the static directory.
   Downloads use the same access controls as CI logs, and are attachments only.
-- Configure `retention.artifacts.days`, `retention.artifacts.max_count`,
-  and `retention.runs.max_count` in **CI → Settings → Configuration JSON**:
+- Configure artifact age, maximum bundles and maximum completed runs in
+  **Admin → Settings → Runs and artifacts**, with repository overrides under
+  **CI → Settings → Runs and artifacts**:
   artifact expiration defaults to **7 days**, maximum bundles defaults to **0
   (unlimited)**, and completed-run retention defaults to **100** (or the server
-  environment default). Each field accepts **0** to disable that limit. Set both
+  environment fallback). Select **Use server default** to inherit. **0** explicitly
+  disables that limit; it does not mean inherit. Set both
   artifact limits to 0 to keep archives forever. A bundle is one run's ZIP.
 - Both artifact limits apply; the oldest bundles by run ID are removed when the
   count limit is exceeded. Retained artifacts protect their parent run from
@@ -396,7 +515,7 @@ The scheduler takes an OS lock beside the SQLite database; do not run multiple
 servers against the same database. Waiting jobs survive shutdown, running jobs
 are interrupted, and the queue is periodically reconciled with the database.
 After a hard process/host crash, the database is recovered, but OS processes,
-Docker containers (`pygithost-ci-<pid>-<run>`), and temporary checkouts may require
+Docker containers (`pygithost-ci-<pid>-<run>-<step>`), and temporary checkouts may require
 operator cleanup. Use a service supervisor that terminates the entire service
 process tree/cgroup (for example systemd's `KillMode=control-group`), not just the
 server's process group: CI subprocesses use separate sessions. Docker containers

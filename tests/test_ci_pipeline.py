@@ -35,20 +35,24 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         for manager in self.managers:
             await manager.stop()
+            # Tests that mock start() still schedule configuration-failure mail
+            # bookkeeping. Drain it before deleting its temporary database.
+            if manager.notification_tasks:
+                await asyncio.gather(*tuple(manager.notification_tasks), return_exceptions=True)
         database.DB_PATH = self.old_db
         self.temp.cleanup()
 
     def git(self, *args):
         return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.PIPE, text=True).strip()
 
-    def repository(self, pipeline=None):
+    def repository(self, pipeline=None, filename=".pygithost-ci.json"):
         source, bare = self.root / "source", self.root / "repo.git"
         self.git("init", "-b", "main", source)
         self.git("-C", source, "config", "user.name", "CI")
         self.git("-C", source, "config", "user.email", "ci@test")
         (source / "file.txt").write_text("fixture")
         if pipeline is not None:
-            (source / ".pygithost-ci.json").write_text(json.dumps(pipeline))
+            (source / filename).write_text(json.dumps(pipeline))
         self.git("-C", source, "add", ".")
         self.git("-C", source, "commit", "-m", "initial")
         self.git("clone", "--bare", source, bare)
@@ -79,12 +83,106 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_config(value)
 
+    async def test_unconfigured_repository_has_generic_docker_file_preset(self):
+        _source, bare, commit = self.repository()
+        manager = self.manager(bare)
+        config = await manager.config("owner", "repo")
+        self.assertEqual(config["pipeline_id"], "ci")
+        self.assertEqual(config["repository_file"], ".ci-config.json")
+        self.assertEqual(config["runner"], "docker")
+        self.assertTrue(config["repository_config"])
+        for key in ("push", "pr_opened", "pr_updated", "pr_reopened", "manual"):
+            self.assertTrue(config["events"][key], key)
+        self.assertFalse(config["deploy_enabled"])
+        self.assertEqual(config["deployment_targets"], [])
+        for event in ("push", "manual", "pull_request"):
+            self.assertIsNone(await manager.enqueue("owner", "repo", event, "main", commit))
+        self.assertEqual(database.db_ci_runs_list("owner", "repo"), [])
+        self.assertIsNone(database.db_ci_config_get("owner", "repo"))
+
+    async def test_generic_file_is_snapshotted_without_saving_settings(self):
+        pipeline = {"version": 1, "steps": [{"name": "Test", "run": "echo auto-ci"}],
+                    "env": {"MODE": "test"}, "timeout_seconds": 30,
+                    "artifacts": {"paths": ["results/*.log"], "when": "always"}}
+        _source, bare, commit = self.repository(pipeline, ".ci-config.json")
+        manager = self.manager(bare)
+        with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
+            run_id = await manager.enqueue("owner", "repo", "push", "main", commit)
+        self.assertIsNotNone(run_id)
+        metadata = database.db_ci_run_metadata("owner", "repo", run_id)
+        config = json.loads(metadata["config"])
+        self.assertEqual(config["steps"], pipeline["steps"])
+        self.assertEqual(config["env"], pipeline["env"])
+        self.assertEqual(config["timeout_seconds"], 30)
+        self.assertEqual(config["runner"], "docker")
+        self.assertEqual(config["pipeline_id"], "ci")
+        self.assertFalse(config["deploy_enabled"])
+        self.assertEqual(config["artifacts"], pipeline["artifacts"])
+        self.assertIsNone(database.db_ci_config_get("owner", "repo"))
+
+    async def test_saved_disabled_configuration_does_not_auto_discover(self):
+        _source, bare, commit = self.repository({"steps": [{"name": "Test", "run": "echo auto"}]}, ".ci-config.json")
+        manager = self.manager(bare)
+        await manager.save_document("owner", "repo", {"version": 1, "pipelines": [], "deployments": []})
+        config = await manager.config("owner", "repo")
+        self.assertNotIn("_autodetect_repository_config", config)
+        self.assertEqual(manager.pipelines(config), [])
+        self.assertIsNone(await manager.enqueue("owner", "repo", "push", "main", commit))
+
+    async def test_manual_runs_ignore_disabled_legacy_manual_trigger(self):
+        _source, bare, commit = self.repository()
+        manager = self.manager(bare)
+        raw = default_config()
+        raw.update(command="echo manual-only")
+        raw["events"] = {key: False for key in raw["events"]}
+        database.db_ci_config_set("owner", "repo", json.dumps(raw))
+        with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
+            self.assertIsNone(await manager.enqueue("owner", "repo", "push", "main", commit))
+            run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
+        self.assertIsNotNone(run_id)
+        config = json.loads(database.db_ci_run_metadata("owner", "repo", run_id)["config"])
+        self.assertTrue(config["events"]["manual"])
+
+    async def test_invalid_auto_file_fails_and_cannot_enable_deployment_or_host(self):
+        source, bare, commit = self.repository({"steps": [{"name": "Test", "run": "echo auto"}], "runner": "host"}, ".ci-config.json")
+        manager = self.manager(bare)
+        with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
+            run_id = await manager.enqueue("owner", "repo", "push", "main", commit)
+        run = database.db_ci_run_get("owner", "repo", run_id)
+        self.assertEqual(run[4], "failed")
+        self.assertIn("only command, steps", run[5])
+        self.assertEqual(manager.pending, {})
+
+    async def test_saving_the_preset_makes_missing_file_an_error(self):
+        _source, bare, commit = self.repository()
+        manager = self.manager(bare)
+        from pygithost.ci_config import editor_document
+        await manager.save_document("owner", "repo", editor_document(await manager.config("owner", "repo")))
+        with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
+            run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
+        run = database.db_ci_run_get("owner", "repo", run_id)
+        self.assertEqual(run[4], "failed")
+        self.assertIn(".ci-config.json", run[5])
+
+    @unittest.skipUnless(os.name == "posix" and os.environ.get("PYGITHOST_TEST_DOCKER_IMAGE") == "python:3.14-slim",
+                         "requires the default python:3.14-slim Docker test image")
+    async def test_automatic_repository_pipeline_executes_in_real_docker(self):
+        _source, bare, commit = self.repository({"version": 1, "timeout_seconds": 30,
+            "steps": [{"name": "Auto-discovered test", "run": "python -c \"print('auto-ci-ok')\""}]}, ".ci-config.json")
+        manager = self.manager(bare)
+        run_id = await manager.enqueue("owner", "repo", "push", "main", commit)
+        await manager.wait_idle()
+        run = database.db_ci_run_get("owner", "repo", run_id)
+        self.assertEqual(run[4], "success", run[5])
+        self.assertIn("auto-ci-ok", run[5])
+        self.assertIsNone(database.db_ci_config_get("owner", "repo"))
+
     def test_multiple_pipeline_validation(self):
         config = validate_config({"pipelines": [
             {"pipeline_id": "lint", "command": "echo lint", "events": {"push": True}}
         ]})
         self.assertEqual(config["pipelines"][0]["pipeline_id"], "lint")
-        self.assertFalse(config["pipelines"][0]["events"]["manual"])
+        self.assertTrue(config["pipelines"][0]["events"]["manual"])
         self.assertEqual(validate_config(config), config)
         for children in ([{"pipeline_id": "default"}],
                          [{"pipeline_id": "same"}, {"pipeline_id": "same"}],
@@ -569,7 +667,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config["steps"][0]["run"], "echo json")
             self.assertEqual(config["command"], "")
             self.assertEqual(config["env"], {"FROM_JSON": "yes"})
-            self.assertFalse(config["events"]["manual"])
+            self.assertTrue(config["events"]["manual"])
             status, body = await save('{"pipelines":{},"pipelines":{}}')
             self.assertNotIn(b"Configuration saved", body)
             self.assertIn(b"Duplicate JSON key: pipelines", body)

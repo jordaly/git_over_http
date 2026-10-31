@@ -142,7 +142,29 @@ Never embed credentials in a clone URL or commit them in scripts.
 | Git clone/push fails | Confirm `git_http_backend` exists, copy the repository's clone URL, and check credentials, token scope, filesystem permissions, and branch protection. |
 | Login does not persist | Check whether `session_cookie_secure` is enabled while accessing the site over plain HTTP. |
 | Styles or scripts are missing | Check that `static_root` points to this checkout's `static/` directory. |
+| PR creation fails with an author foreign-key or NOT NULL constraint | Back up the database and restart the updated server. Startup migrates legacy NOT NULL authors to nullable authors while preserving PR history. Do not create user ID 0 or disable foreign keys. |
 | CI command cannot find a tool | Host jobs have a restricted environment; Docker jobs require tools in the prepared image and have no network. |
+
+## Manage settings in the browser
+
+Open **Admin → Settings** to edit the display name, basic server configuration,
+and server-wide CI variables and retention. Unlike appearance/CI preference changes, basic server
+configuration is saved to the startup file for the **next restart**. Review allowed
+IPs, credentials, cookie security and storage paths before restarting; saving paths
+does not migrate data. Instances started programmatically without a config file
+show the basic fields read-only.
+
+Repository **CI → Settings** supplies per-pipeline execution JSON, environment variable
+rows and retention controls. Leave **Use server default** selected to inherit an
+individual retention limit. Execution and cancellation are per-pipeline JSON;
+omitted options use built-in defaults. See [Server and repository settings](server-settings.md)
+for a worked example and [Browser editing and pull requests](repository-workflow.md)
+for editing/committing from the web UI.
+
+An unconfigured repository automatically looks for `.ci-config.json`. Commit the
+[repository pipeline example](examples/ci/repository-pipeline.json) under that name,
+prepare the Python Docker image, and adapt its steps to your project. Manual runs
+always require write access and a runnable pipeline; they never deploy.
 
 ## Development checks
 

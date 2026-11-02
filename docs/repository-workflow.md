@@ -16,6 +16,9 @@ model, undo history and pending edits. Tags and commit permalinks are read-only.
 ## Explorer, Search and Source Control
 
 - Explorer sorts folders before files at every level and displays folder/file icons.
+  Folders load their contents lazily when opened, and wide folders are paged
+  (200 entries at a time, loading more as you scroll) so large repositories stay
+  responsive.
 - **New file** adds a pending file. **New folder** adds a `.gitkeep` placeholder
   because Git does not track empty directories. Commit or discard these like other changes.
 - **Collapse all folders** closes the tree and clears the filename filter.

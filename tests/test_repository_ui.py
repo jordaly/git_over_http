@@ -375,6 +375,43 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("file-29.txt", table)
         self.assertEqual(table.count('class="repo-entry-message"><a'), 32)
 
+    def test_wide_directories_are_paginated_per_page(self):
+        (self.source / "wide").mkdir()
+        for index in range(150):
+            (self.source / "wide" / f"wide-{index:03}.txt").write_text("wide")
+            (self.source / f"root-{index:03}.txt").write_text("root")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Wide folder")
+        self.git("-C", self.source, "push", self.bare, "main")
+        # The repository root also pages once it holds more than 100 entries
+        # (150 root files + the README and the wide folder).
+        _, first = self.request(self.base)
+        table = first.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(table.count('<td class="repo-entry-name">'), 100)
+        self.assertIn('aria-label="Pagination"', first)
+        self.assertIn("per_page=100", first)
+        _, second = self.request(self.base + "?page=2")
+        table = second.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertGreater(table.count('<td class="repo-entry-name">'), 0)
+        self.assertLess(table.count('<td class="repo-entry-name">'), 100)
+        self.assertIn('rel="prev"', second)
+        # Folder pages keep the ref and subpath in pagination links.
+        _, first = self.request(self.base + "/tree/main/wide/")
+        table = first.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(table.count('<td class="repo-entry-name">'), 100)
+        self.assertIn("/tree/main/wide/?page=2", first)
+        _, second = self.request(self.base + "/tree/main/wide/?page=2")
+        table = second.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(table.count('<td class="repo-entry-name">'), 50)
+        self.assertIn('rel="prev"', second)
+        _, small = self.request(self.base + "/tree/main/wide/?per_page=10&page=2")
+        table = small.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(table.count('<td class="repo-entry-name">'), 10)
+        # Out-of-range pages clamp to the last page instead of rendering empty.
+        _, clamped = self.request(self.base + "/tree/main/wide/?page=9999")
+        table = clamped.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(table.count('<td class="repo-entry-name">'), 50)
+
     def test_pull_requests_and_artifacts_are_paginated(self):
         database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0, "artifact_retention_days": 0}))
         user_id = self.fixture_user()

@@ -88,8 +88,10 @@ are preserved. Commit-history page controls appear above and below the table,
 near the Repo, Branches, and Pull requests navigation. Those navigation links
 open their own separately paginated lists, starting on their first page.
 Fixed-size documentation/reference tables are not paginated.
-Repository Code pages and folder explorers are also not paginated: they show the
-full directory listing, folders first, with last-commit information.
+Repository Code pages and folder explorers show the full directory listing, folders
+first, with last-commit information. Directories wider than 100 entries are paged
+100 at a time (the `per_page` parameter accepts 10/25/50/100), and last-commit
+metadata is resolved only for the visible page.
 
 Each list uses the same pagination controls:
 

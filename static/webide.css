@@ -53,6 +53,7 @@ body:has(#webide[data-mode="workspace"]), body:has(#webide[data-mode="resolve"])
 #ide-files .ide-icon-file { color:var(--muted); }
 #ide-files .ide-modified, .ide-tab.ide-modified { color:var(--link); }
 #ide-files .ide-deleted { text-decoration:line-through; opacity:.7; }
+#ide-files .ide-more { color:var(--muted); font-style:italic; }
 #ide-commit { display:grid; gap:10px; margin:0; padding:0 12px 15px; }
 #ide-commit label { font-size:12px; }
 #ide-message { width:100%; resize:vertical; min-height:70px; padding:8px; background:var(--box); color:var(--fg); border:1px solid var(--border-strong); border-radius:4px; }

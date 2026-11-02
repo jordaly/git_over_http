@@ -253,9 +253,15 @@ class WebIDEBrowserTests(unittest.TestCase):
  try {
   await wait(() => window.monaco && el("files").querySelector("button") && ready());
   checkExplorer(el("files"));
+  if (el("files").querySelectorAll("details details").length) throw Error("Collapsed folders rendered their children");
+  // Folders render their children lazily; open each newly revealed level too.
+  for (let round = 0; round < 8; round += 1) {
+   const closed = [...el("files").querySelectorAll("details:not([open])")];
+   if (!closed.length) break;
+   closed.forEach(folder => { folder.open = true; });
+   await sleep();
+  }
   if (!el("files").querySelector("svg.ide-icon-code")) throw Error("Missing code-file icon");
-  for (const folder of el("files").querySelectorAll("details")) folder.open = true;
-  await sleep();
   el("collapse").click();
   if (el("files").querySelector("details[open]")) throw Error("Collapse all left open folders");
   el("filter").value = "z-folder"; el("filter").dispatchEvent(new Event("input"));

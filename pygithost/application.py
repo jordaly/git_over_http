@@ -325,6 +325,11 @@ CURRENT_PLATFORM = platform.system()
 # image (the editor preview still looked fine because it had the full value).
 MARKDOWN_BODY_LIMIT = 1_000_000
 
+# Repository file listings show every entry in normal folders, but very wide
+# directories are paged (with last-commit metadata only for the visible page)
+# so opening a folder with thousands of files stays fast.
+REPO_FILES_PAGE_SIZE = 100
+
 
 CONFIG_GLOBAL_MAP = {
     "host": "HOST",
@@ -2193,6 +2198,9 @@ class GitHTTPHandler:
         if not os.path.isdir(repo_git):
             return await self._not_found()
 
+        query = parse_qs(urlparse(self.path).query or "")
+        query_params = {key: values[0] for key, values in query.items()}
+
         default_branch, branches = await asyncio.gather(
             _git_default_branch(repo_git), _git_list_branches(repo_git))
         default_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
@@ -2208,7 +2216,18 @@ class GitHTTPHandler:
                     parts = metadata.split()
                     entries.append((parts[1] if len(parts) >= 2 else "blob", name))
             entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
-            return entries, await repository_overview(owner, repo, repo_git, default_commit, entries)
+            total = len(entries)
+            page = 1
+            size = REPO_FILES_PAGE_SIZE
+            page_entries = entries
+            if total > REPO_FILES_PAGE_SIZE:
+                size = _page_size(query, default=REPO_FILES_PAGE_SIZE)
+                page = _clamp_page(_page_number(query), total, size)
+                page_entries = entries[(page - 1) * size:page * size]
+            overview = await repository_overview(
+                owner, repo, repo_git, default_commit, page_entries,
+                page=page if total > REPO_FILES_PAGE_SIZE else None, page_size=size)
+            return entries, page_entries, overview, page, total, size
 
         languages, readme, latest_ci, tags_result, files = await asyncio.gather(
             repository_languages(owner, repo, repo_git, default_commit),
@@ -2217,7 +2236,7 @@ class GitHTTPHandler:
             _run_git(repo_git, ["for-each-ref", "refs/tags", "--sort=-creatordate", "--format=%(refname:short)"]),
             load_files(),
         )
-        root_entries, overview = files
+        root_entries, page_entries, overview, files_page, files_total, files_size = files
         readme_code, readme_out, _ = readme
         tag_code, tag_output, _ = tags_result
         language_html = _language_panel(languages, default_branch)
@@ -2258,7 +2277,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             initials = "".join(part[0] for part in latest["author"].split()[:2]).upper() or "?"
             latest_html = safe_html(html_t(t'<div class="repo-latest-commit"><span class="repo-avatar" aria-hidden="true">{initials}</span><strong>{latest["author"]}</strong><a class="repo-latest-subject" href="{base}/commit/{latest["hash"]}">{latest["subject"]}</a><a href="{base}/commit/{latest["hash"]}"><code>{latest["hash"][:7]}</code></a><time class="muted" datetime="{latest["date"]}" title="{latest["date"]}">{_relative_time(latest["date"])}</time></div>'))
         file_rows = []
-        for kind, name in root_entries:
+        for kind, name in page_entries:
             if kind == "tree":
                 href = str_t(t"{base}/tree/{q(default_branch)}/{q(name, safe='/')}/")
                 icon = TREE_FOLDER_ICON
@@ -2270,6 +2289,8 @@ document.addEventListener("DOMContentLoaded", function() {{
             changed_at = safe_html(html_t(t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>')) if change else safe_html("—")
             file_rows.append(html_t(t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'))
         files_html = join_html(file_rows) if file_rows else safe_html('<tr><td colspan="3" class="muted">No files on the default branch.</td></tr>')
+        files_pagination = _pagination(base, query_params, files_page, files_page * files_size < files_total,
+                                       total=files_total, per_page=files_size) if files_total > REPO_FILES_PAGE_SIZE else safe_html("")
         tags = tag_output.decode("utf-8", "replace").splitlines() if tag_code == 0 else []
         tags_html = join_html([html_t(t'<li><a href="{base}/tree/{q(tag)}/">{tag}</a><a href="{base}/archive.zip?{urlencode({"ref": tag})}" aria-label="Download source for tag {tag}">ZIP ↓</a></li>') for tag in tags[:5]]) if tags else safe_html('<li class="muted">No tags yet.</li>')
         contributors = overview["contributors"]
@@ -2308,7 +2329,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch, can_edit=_has_write_scope(self))}</div>
 <script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
 </div>
-<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div></div>
+<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div>{files_pagination}</div>
 {document_nav}{readme_html}{license_html}</div><aside class="repo-sidebar">{about_html}{language_html}</aside></div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
@@ -4564,9 +4585,22 @@ form.addEventListener("submit", event => {{
         # Show folders first, then files. Keep alphabetical order inside each group.
         entries.sort(key=lambda item: (0 if item[0] == "tree" else 1, item[1].lower()))
 
-        overview = await repository_overview(owner, repo, repo_git, commit, entries, subpath=subpath)
+        query = parse_qs(urlparse(self.path).query or "")
+        query_params = {key: values[0] for key, values in query.items()}
+        total = len(entries)
+        page = 1
+        size = REPO_FILES_PAGE_SIZE
+        page_entries = entries
+        if total > REPO_FILES_PAGE_SIZE:
+            size = _page_size(query, default=REPO_FILES_PAGE_SIZE)
+            page = _clamp_page(_page_number(query), total, size)
+            page_entries = entries[(page - 1) * size:page * size]
+
+        overview = await repository_overview(owner, repo, repo_git, commit, page_entries, subpath=subpath,
+                                             page=page if total > REPO_FILES_PAGE_SIZE else None,
+                                             page_size=size, include_summary=False)
         rows = []
-        for kind, name in entries:
+        for kind, name in page_entries:
             if kind == "tree":
                 newpath = _join_repo_path(subpath, name)
                 href = str_t(t"{base}/tree/{q(ref)}/{q(newpath, safe='/')}/")
@@ -4585,10 +4619,13 @@ form.addEventListener("submit", event => {{
             parent_href = str_t(t"{base}/tree/{q(ref)}/{q(parent, safe='/')}/") if parent else str_t(t"{base}/tree/{q(ref)}/")
             up = safe_html(html_t(t"<p><a class=\"pill\" href=\"{parent_href}\">Up one level</a></p>"))
         rows_html = join_html(rows) if rows else safe_html('<tr><td colspan="3" class="muted">Empty.</td></tr>')
+        list_url = str_t(t"{base}/tree/{q(ref)}/{q(subpath, safe='/')}/") if subpath else str_t(t"{base}/tree/{q(ref)}/")
+        pagination = _pagination(list_url, query_params, page, page * size < total,
+                                total=total, per_page=size) if total > REPO_FILES_PAGE_SIZE else safe_html("")
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{_repo_breadcrumbs(owner, repo, ref, subpath)}<p class="muted">ref: <code>{ref}</code></p></div>
 <div>{_repo_code_menu(owner, repo, ref, can_edit=_has_write_scope(self) and ref in await _git_list_branches(repo_git), path=subpath)}</div></div>
-{up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div></div>"""
+{up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div>{pagination}</div>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 

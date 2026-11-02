@@ -197,50 +197,100 @@
     function fileIconKind(filename) {
         return /\.(py|js|jsx|ts|tsx|html|css|sh|sql|java|cs|c|cpp|go|rs|rb|php)$/i.test(filename) ? "code" : "file";
     }
-    function renderFiles() {
-        const query = el("filter").value.toLowerCase();
+    const EXPLORER_CHUNK = 200;
+    const compareEntries = (a, b) =>
+        Number(!!b.children) - Number(!!a.children) ||
+        a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: "base"}) ||
+        a.name.localeCompare(b.name);
+    // Sort each folder's children once per tree build; chunked rendering reads
+    // the same order repeatedly as the user scrolls.
+    function sortedEntries(entry) {
+        if (!entry.sorted) entry.sorted = [...entry.children.values()].sort(compareEntries);
+        return entry.sorted;
+    }
+    function fileEntry(entry) {
+        const filename = entry.filename;
+        const changed = changes.has(filename), deleted = changes.get(filename) === null;
+        const node = button(basename(filename) + (changed ? deleted ? " (deleted)" : " •" : ""),
+            () => run(() => open(filename)), {"aria-current": String(active === filename), title: filename, "data-path": filename});
+        node.prepend(explorerIcon(fileIconKind(filename)));
+        node.classList.toggle("ide-modified", changed);
+        node.classList.toggle("ide-deleted", deleted);
+        return node;
+    }
+    function appendChunk(container, entry, query, offset) {
+        const entries = sortedEntries(entry);
+        const end = Math.min(entries.length, offset + EXPLORER_CHUNK);
         const fragment = document.createDocumentFragment();
-        const tree = new Map();
-        allFiles().filter(filename => filename.toLowerCase().includes(query)).forEach(filename => {
+        for (let index = offset; index < end; index += 1) {
+            const child = entries[index];
+            fragment.append(child.children ? folderEntry(child, query) : fileEntry(child));
+        }
+        container.append(fragment);
+        if (end >= entries.length) return;
+        let loaded = false;
+        function load() {
+            if (loaded) return;
+            loaded = true;
+            more.remove();
+            appendChunk(container, entry, query, end);
+        }
+        const more = button("Show " + (entries.length - end) + " more…", load, {class: "ide-more"});
+        container.append(more);
+        // Large folders load the next chunk only when the placeholder scrolls
+        // into view, so thousands of rows never need DOM nodes up front.
+        if (typeof IntersectionObserver === "function") {
+            const observer = new IntersectionObserver(records => {
+                if (!records.some(record => record.isIntersecting)) return;
+                observer.disconnect();
+                load();
+            }, {rootMargin: "200px 0px"});
+            observer.observe(more);
+        }
+    }
+    function folderEntry(entry, query) {
+        const key = entry.key;
+        const details = document.createElement("details");
+        details.open = !!query || expanded.has(key);
+        const summary = document.createElement("summary");
+        summary.append(explorerIcon("folder"), document.createTextNode(entry.name));
+        details.append(summary);
+        let loaded = false;
+        function load() {
+            if (loaded) return;
+            loaded = true;
+            appendChunk(details, entry, query, 0);
+        }
+        // Build a folder's contents only when it is actually shown: a collapsed
+        // directory must not create thousands of detached nodes.
+        if (details.open) load();
+        details.addEventListener("toggle", () => {
+            if (!details.isConnected) return;
+            if (details.open) {
+                load();
+                if (!query) expanded.add(key);
+            } else if (!query) {
+                expanded.delete(key);
+            }
+        });
+        return details;
+    }
+    function renderFiles() {
+        const query = el("filter").value.trim().toLowerCase();
+        const tree = {children: new Map()};
+        allFiles().forEach(filename => {
+            if (query && !filename.toLowerCase().includes(query)) return;
             const parts = filename.split("/");
-            let children = tree, prefix = "";
+            let node = tree, prefix = "";
             parts.slice(0, -1).forEach(part => {
                 prefix += part + "/";
-                if (!children.has(part + "/")) children.set(part + "/", {name: part, key: prefix, children: new Map()});
-                children = children.get(part + "/").children;
+                if (!node.children.has(part + "/")) node.children.set(part + "/", {name: part, key: prefix, children: new Map()});
+                node = node.children.get(part + "/");
             });
-            children.set(basename(filename), {name: basename(filename), filename});
+            node.children.set(basename(filename), {name: basename(filename), filename});
         });
-        function appendEntries(children, parent) {
-            [...children.values()].sort((a, b) =>
-                Number(!!b.children) - Number(!!a.children) || a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: "base"}) || a.name.localeCompare(b.name)
-            ).forEach(entry => {
-                if (entry.children) {
-                    const key = entry.key;
-                    const details = document.createElement("details");
-                    details.open = !!query || expanded.has(key);
-                    const summary = document.createElement("summary");
-                    summary.append(explorerIcon("folder"), document.createTextNode(entry.name));
-                    details.append(summary); parent.append(details);
-                    details.addEventListener("toggle", () => {
-                        if (details.isConnected && !query) {
-                            if (details.open) expanded.add(key); else expanded.delete(key);
-                        }
-                    });
-                    appendEntries(entry.children, details);
-                    return;
-                }
-                const filename = entry.filename;
-                const changed = changes.has(filename), deleted = changes.get(filename) === null;
-                const node = button(basename(filename) + (changed ? deleted ? " (deleted)" : " •" : ""),
-                    () => run(() => open(filename)), {"aria-current": String(active === filename), title: filename, "data-path": filename});
-                node.prepend(explorerIcon(fileIconKind(filename)));
-                node.classList.toggle("ide-modified", changed);
-                node.classList.toggle("ide-deleted", deleted);
-                parent.append(node);
-            });
-        }
-        appendEntries(tree, fragment);
+        const fragment = document.createDocumentFragment();
+        appendChunk(fragment, tree, query, 0);
         el("files").replaceChildren(fragment);
     }
     function closeTab(filename) {
@@ -290,9 +340,18 @@
         el("source-count").textContent = changes.size;
         el("change-summary").textContent = changes.size ? changes.size + " changed file(s)" : "No changes";
     }
+    let explorerSignature = "";
     function render() {
         if (!snapshot) return;
-        renderFiles(); renderTabs(); renderChanges();
+        // Editing a file fires this on every keystroke; the explorer only needs
+        // rebuilding when the visible state (active file / changed set) changes.
+        const signature = active + "\u0000" + [...changes.keys()].sort()
+            .map(name => name + (changes.get(name) === null ? "\u0001D" : "\u0001M")).join("\u0000");
+        if (signature !== explorerSignature) {
+            explorerSignature = signature;
+            renderFiles();
+        }
+        renderTabs(); renderChanges();
     }
     async function open(filename) {
         if (changes.get(filename) !== null && !models.has(filename)) {
@@ -307,6 +366,7 @@
         if (editor) { editor.dispose(); editor = null; }
         models.forEach(value => value.dispose());
         models.clear(); originals.clear(); changes.clear(); viewStates.clear(); opened.length = 0; active = null;
+        explorerSignature = "";  // force the explorer to rebuild on the next render
     }
     async function load() {
         clear();

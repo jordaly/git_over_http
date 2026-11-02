@@ -158,7 +158,9 @@ open after committing. The Explorer header offers **New file** and **New folder*
 new folders include an empty `.gitkeep` file because Git does not track empty
 directories. Both remain pending until committed and can be discarded. The
 Explorer shows folders before files at every level, with folder, code-file and
-text-file icons. **Collapse all folders** closes the entire tree (and clears the
+text-file icons. Folders load their contents only when opened, and wide folders
+add entries in chunks as you scroll, keeping large repositories responsive.
+**Collapse all folders** closes the entire tree (and clears the
 filename filter). Add or delete files with the toolbar actions as well.
 
 The activity bar's **Search** tool (**Ctrl/⌘+Shift+F**) searches file contents in
@@ -235,8 +237,8 @@ protects access to these settings, as with other administration pages.
   relative date. File/folder rows include their last commit message and date;
   folder dates reflect changes to their contents. History metadata is cached by
   commit (10 recent snapshots per repository). Cold lookups use at most four Git
-  processes at once and cover the first 200 root entries; unavailable metadata is
-  shown as a dash rather than a fabricated date.
+  processes at once and cover only the entries on the current page; unavailable
+  metadata is shown as a dash rather than a fabricated date.
 - The sidebar includes a README-derived About summary, commit/branch/tag counts,
   recent tags with source ZIP links, Git contributors, and Languages. README and
   license navigation leads to a safe README preview and the license text. The
@@ -504,7 +506,9 @@ Growing lists default to **25 items per page** with consistent First/Previous/Ne
 controls, numbered pages, and result totals: repositories, CI runs, deployments,
 artifacts, tokens, users, branches,
 pull requests and their commits, and commit changed-file lists.
-Repository Code pages and folder explorers display full file listings without pagination.
+Repository Code pages and folder explorers show folders before files. Directories
+wider than 100 entries are paged 100 at a time (`per_page` accepts 10/25/50/100),
+and last-commit metadata is resolved only for the visible page.
 Full commit history retains 50-commit chunks and Load more, with page links too.
 Searches, filters, sorting, selected revisions, and paths are preserved across pages.
 New searches start on page 1. Pagination is a live view:

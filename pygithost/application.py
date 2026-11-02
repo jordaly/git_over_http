@@ -131,14 +131,17 @@ def _ci_elapsed(start, end=None):
 
 
 def _relative_time(value):
+    """Humanize Git ISO-8601 or SQLite UTC timestamps."""
     try:
-        stamp = datetime.fromisoformat(value)
+        # Git emits 2026-11-02T14:59:40-04:00; SQLite emits 2026-11-02 14:59:40.
+        stamp = datetime.fromisoformat(str(value).strip().replace(" ", "T", 1))
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         seconds = max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
     except (ValueError, TypeError):
-        return value or "—"
-    for unit, length in (("year", 31536000), ("month", 2592000), ("day", 86400), ("hour", 3600), ("minute", 60)):
+        return str(value) if value else "—"
+    for unit, length in (("year", 31536000), ("month", 2592000), ("week", 604800),
+                         ("day", 86400), ("hour", 3600), ("minute", 60)):
         if seconds >= length:
             count = seconds // length
             return f"{count} {unit}{'s' if count != 1 else ''} ago"
@@ -965,23 +968,6 @@ async def _git_merge_base(repo_git: str, a: str, b: str) -> str | None:
     if code != 0:
         return None
     return out.decode("utf-8", "replace").strip() or None
-
-
-def _relative_time(value: str) -> str:
-    """Humanize a SQLite UTC 'YYYY-MM-DD HH:MM:SS' timestamp."""
-    try:
-        from datetime import datetime, timezone
-        stamp = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        seconds = (datetime.now(timezone.utc) - stamp).total_seconds()
-    except (ValueError, TypeError):
-        return ""
-    if seconds < 0:
-        seconds = 0
-    for step, label in ((86400 * 30, "month"), (86400 * 7, "week"), (86400, "day"), (3600, "hour"), (60, "minute")):
-        if seconds >= step:
-            count = int(seconds // step)
-            return f"{count} {label}{'s' if count != 1 else ''} ago"
-    return "just now"
 
 
 async def _git_merge_conflicts(repo_git: str, target_ref: str, source_ref: str) -> list[str]:

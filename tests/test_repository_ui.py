@@ -3,6 +3,7 @@ import base64
 import http.client
 import io
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import shutil
@@ -248,6 +249,14 @@ class RepositoryUITests(unittest.TestCase):
                 status, _ = self.request("/admin/settings", fields)
                 self.assertEqual(status, 403)
         self.assertEqual(database.db_display_name_get(), "pygithost")
+
+    def test_relative_time_handles_git_and_database_timestamps(self):
+        now = datetime.now(timezone.utc)
+        git_date = (now - timedelta(days=3, hours=1)).isoformat()
+        database_date = (now - timedelta(days=4, hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertTrue(application._relative_time(git_date).startswith("3 days"))
+        self.assertTrue(application._relative_time(database_date).startswith("4 days"))
+        self.assertEqual(application._relative_time(""), "—")
 
     def test_favicon_is_served_and_editable_in_settings(self):
         _, page = self.request("/admin/settings")
@@ -922,6 +931,7 @@ class RepositoryUITests(unittest.TestCase):
         status, page = self.request(self.base)
         self.assertEqual(status, 200)
         self.assertIn('class="repo-latest-commit"', page)
+        self.assertRegex(page, r'<time class="muted" datetime="[^"]+"[^>]*>[^<]+</time>')
         self.assertIn("Last commit message", page)
         self.assertIn("Last commit date", page)
         self.assertIn("Add package and license", page)

@@ -609,13 +609,17 @@
         dirs.clear(); dirLoads.clear(); dirTruncated.clear(); fileIndex = null; indexLoad = null;
         explorerSignature = "";  // force the explorer to rebuild on the next render
     }
-    async function load() {
+    async function load(branchName = el("branch")?.dataset.branch || "") {
+        // Fetch the snapshot before clearing: a failed branch load leaves the
+        // current edits and open files untouched.
+        if (resolveMode()) { clear(); return loadResolve(); }
+        const next = await api("snapshot", {branch: branchName});
         clear();
-        if (resolveMode()) return loadResolve();
-        const next = await api("snapshot", {branch: el("branch").value});
         snapshot = next; expanded.clear();
+        setBranchLabel(next.branch);
         dirs.set("", next.root || []);
         if (next.root_truncated) dirTruncated.add(""); else dirTruncated.delete("");
+        updateLocation();
         if (root.dataset.folder) expandParents(root.dataset.folder + "/placeholder");
         const filename = root.dataset.path;
         if (filename) {
@@ -693,15 +697,47 @@
         el("review").setAttribute("aria-pressed", "true"); el("write").setAttribute("aria-pressed", "false");
         status("Previewing changes to " + active + ". Select Write to continue editing.");
     }
+    // Branch switching mirrors the language quick pick: the status-bar branch
+    // name opens the same searchable dialog instead of a long native <select>.
+    let branchList = null;
+    function branchNames() {
+        if (branchList) return branchList;
+        try { branchList = JSON.parse(el("branch")?.dataset.branches || "[]"); }
+        catch (error) { branchList = []; }
+        if (!Array.isArray(branchList)) branchList = [];
+        return branchList;
+    }
+    function setBranchLabel(branch) {
+        const control = el("branch");
+        if (!control) return;
+        control.dataset.branch = branch;
+        const name = el("branch-name");
+        if (name) name.textContent = branch;
+        control.title = "Switch branch (current: " + branch + ")";
+        control.setAttribute("aria-label", "Switch branch (currently " + branch + ")");
+    }
+    function switchBranch(name) {
+        if (!name || name === (snapshot?.branch || el("branch")?.dataset.branch)) return;
+        if (dirty() && !confirm("Discard all pending changes and switch branches?")) return;
+        run(() => load(name));
+    }
     let pickerMode = "files";
     function pickerHeadingLabels() {
         const heading = el("picker").querySelector("label");
-        if (heading) heading.textContent = pickerMode === "languages" ? "Select language" : "Go to file";
-        el("picker-input").placeholder = pickerMode === "languages" ? "Select a language…" : "Search files by name…";
+        const labels = {
+            files: ["Go to file", "Search files by name…"],
+            languages: ["Select language", "Select a language…"],
+            branches: ["Switch branch", "Search branches…"]
+        };
+        const [title, placeholder] = labels[pickerMode] || labels.files;
+        if (heading) heading.textContent = title;
+        el("picker-input").placeholder = placeholder;
     }
     function openPicker(mode = "files") {
         if (typeof mode !== "string") mode = "files";  // click handlers pass an event
-        if (busy || !snapshot || (single() && mode !== "languages")) return;
+        if (busy || (single() && mode === "files")) return;
+        if (mode === "files" && !snapshot) return;
+        if (mode === "branches" && (el("branch")?.disabled || !branchNames().length)) return;
         pickerMode = mode;
         pickerHeadingLabels();
         el("picker-input").value = "";
@@ -718,6 +754,7 @@
     function renderPicker() {
         const query = el("picker-input").value.toLowerCase();
         if (pickerMode === "languages") return renderLanguagePicker(query);
+        if (pickerMode === "branches") return renderBranchPicker(query);
         const results = [], seen = new Set();
         for (const filename of fileIndex || []) {
             if (!filename.toLowerCase().includes(query)) continue;
@@ -731,6 +768,26 @@
         el("picker-results").replaceChildren(...results.map(filename => button(filename, () => {
             el("picker").close(); run(() => open(filename));
         })));
+    }
+    function renderBranchPicker(query) {
+        const current = snapshot?.branch || el("branch")?.dataset.branch || "";
+        const matches = branchNames().filter(name => name.toLowerCase().includes(query));
+        // Prefix matches first, like a command palette, then other substrings.
+        const ranked = query
+            ? matches.filter(name => name.toLowerCase().startsWith(query)).concat(
+                matches.filter(name => !name.toLowerCase().startsWith(query)))
+            : matches;
+        if (!ranked.length) {
+            el("picker-results").replaceChildren(note("No matching branches."));
+            return;
+        }
+        el("picker-results").replaceChildren(...ranked.map(name => {
+            const node = button(name + (name === current ? " · current" : ""), () => {
+                el("picker").close(); switchBranch(name);
+            }, {"aria-current": String(name === current), "data-branch": name});
+            if (name === current) node.classList.add("ide-picker-selected");
+            return node;
+        }));
     }
     function renderLanguagePicker(query) {
         const current = effectiveLanguage(active);
@@ -751,12 +808,7 @@
             return node;
         }));
     }
-    el("branch").onchange = () => {
-        if (dirty() && !confirm("Discard all pending changes and switch branches?")) { el("branch").value = snapshot.branch; return; }
-        run(async () => {
-            try { await load(); } catch (error) { if (snapshot) el("branch").value = snapshot.branch; throw error; }
-        });
-    };
+    el("branch").onclick = () => openPicker("branches");
     el("explorer-view").onclick = () => setView("explorer");
     el("search-view").onclick = () => setView("search", true);
     el("source-view").onclick = el("show-changes").onclick = () => setView("source");

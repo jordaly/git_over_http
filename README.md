@@ -152,7 +152,9 @@ bundled Monaco (no CDN):
 
 The full-window workspace provides an **Explorer**, collapsible folders, filename
 filter, open-file tabs, a **Source Control** panel with change counts and per-file
-diff/discard actions, and a branch/cursor status bar. Closing a tab does **not**
+diff/discard actions, and a branch/cursor status bar. The branch name in the
+status bar opens a searchable branch picker, like the language selector; switching
+discards pending changes after a confirmation. Closing a tab does **not**
 discard its changes: reopen it from Explorer or Source Control. Open tabs stay
 open after committing. The Explorer header offers **New file** and **New folder**;
 new folders include an empty `.gitkeep` file because Git does not track empty

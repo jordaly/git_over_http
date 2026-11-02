@@ -133,7 +133,12 @@ class WebIDETests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('data-mode="single"', page)
         self.assertIn('data-path="README.md"', page)
-        self.assertIn('value="feature/api" selected', page)
+        # Branch switching is a searchable picker, not a native select.
+        self.assertIn('data-branch="feature/api"', page)
+        self.assertIn('id="ide-branch-name">feature/api<', page)
+        self.assertIn('data-branches=', page)
+        self.assertNotIn('<select id="ide-branch"', page)
+        self.assertIn('feature/api', unescape(page))
         status, page = self.fixture.request(self.base + query)
         self.assertEqual(status, 200)
         self.assertIn('data-mode="workspace"', page)
@@ -327,6 +332,20 @@ class WebIDEBrowserTests(unittest.TestCase):
  }
  try {
   await wait(() => window.monaco && el("files").querySelector("button") && ready());
+  // Branch switching is a searchable quick pick, like the language selector.
+  el("branch").click();
+  if (!el("picker").open) throw Error("Branch picker did not open");
+  await wait(() => el("picker-results").querySelector("button"));
+  if (el("picker").querySelector("label").textContent !== "Switch branch") throw Error("Wrong branch picker heading");
+  el("picker-input").value = "release"; el("picker-input").dispatchEvent(new Event("input"));
+  const releaseBranch = [...el("picker-results").querySelectorAll("button")].find(b => b.dataset.branch === "release/1");
+  if (!releaseBranch) throw Error("Branch search did not find release/1");
+  releaseBranch.click();
+  await wait(() => el("branch-name").textContent === "release/1" && ready());
+  el("branch").click(); await wait(() => el("picker-results").querySelector("button"));
+  el("picker-input").value = "main"; el("picker-input").dispatchEvent(new Event("input"));
+  [...el("picker-results").querySelectorAll("button")].find(b => b.dataset.branch === "main").click();
+  await wait(() => el("branch-name").textContent === "main" && ready());
   if (!document.getElementById("ide-resizer") || !document.getElementById("webide").style.getPropertyValue("--ide-sidebar-width")) throw Error("Missing Explorer resizer");
   checkExplorer(el("files"));
   if (el("files").querySelectorAll("details details").length) throw Error("Collapsed folders rendered their children");
@@ -446,7 +465,7 @@ class WebIDEBrowserTests(unittest.TestCase):
  window.confirm = () => true;
  try {
   await wait(() => window.monaco && model("README.md") && ready());
-  if (root.dataset.mode !== "single" || el("branch").value !== "feature/api") throw Error("Lost single-file context");
+  if (root.dataset.mode !== "single" || el("branch-name").textContent !== "feature/api") throw Error("Lost single-file context");
   if (el("files").getBoundingClientRect().height || !el("message").getBoundingClientRect().height) throw Error("Incorrect single-file layout");
   model("README.md").setValue("Single-file commit\n");
   el("review").click(); await wait(() => document.querySelector(".monaco-diff-editor") && ready());

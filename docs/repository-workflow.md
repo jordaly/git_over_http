@@ -24,6 +24,8 @@ model, undo history and pending edits. Tags and commit permalinks are read-only.
   because Git does not track empty directories. Commit or discard these like other changes.
 - **Collapse all folders** closes the tree and clears the filename filter.
 - **Go to file** / **Ctrl/⌘+P** searches filenames. The Explorer filter is filename-only.
+- The status-bar **branch** name opens the same searchable quick pick as the
+  language selector. Switching branches asks for confirmation when edits are pending.
 - **Search** / **Ctrl/⌘+Shift+F** searches contents, including pending edits/new files
   and excluding pending deletions. Results open their matching line. It is a literal,
   case-insensitive search capped at 200 lines, 256 KiB of Git output and 10 seconds.

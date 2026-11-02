@@ -87,12 +87,17 @@ body:has(#webide[data-mode="workspace"]), body:has(#webide[data-mode="resolve"])
 .ide-statusbar { display:flex; align-items:center; gap:10px; padding:5px 12px; background:var(--accent-bg); border-top:1px solid var(--accent-border); min-height:30px; font-size:11px; }
 .ide-statusbar label { display:flex; align-items:center; }
 .ide-statusbar svg { width:16px; height:16px; }
-#ide-branch { padding:2px 6px; font-size:11px; background:var(--box); color:var(--fg); border:1px solid var(--border); border-radius:4px; max-width:180px; margin-right:4px; }
+#ide-branch { display:flex; align-items:center; gap:4px; max-width:230px; padding:3px 6px; background:transparent; color:var(--fg); border:0; border-radius:3px; font-size:12px; cursor:pointer; }
+#ide-branch:hover:not(:disabled) { background:var(--accent-bg); }
+#ide-branch:focus-visible { outline:2px solid var(--link); outline-offset:-2px; }
+#ide-branch:disabled { cursor:default; color:var(--muted); }
+#ide-branch svg { width:15px; height:15px; flex:none; }
+#ide-branch .ide-chevron { width:10px; height:10px; opacity:.65; }
+#ide-branch-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #ide-language, #ide-wrap { background:transparent; border:0; color:var(--fg); font-size:11px; padding:3px 8px; cursor:pointer; border-radius:3px; white-space:nowrap; }
 #ide-language:hover, #ide-wrap:hover { background:var(--accent-bg); }
 #ide-wrap[aria-pressed="true"], #ide-language.ide-status-active { color:var(--link); }
 .ide-picker-selected { font-weight:700; color:var(--link); }
-#ide-branch { max-width:230px; padding:2px 5px; background:transparent; color:var(--fg); border:0; font-size:12px; }
 #ide-status { margin:0; min-width:0; overflow-wrap:anywhere; max-height:90px; overflow:auto; }
 #ide-cursor { margin-left:auto; white-space:nowrap; }
 .ide-sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }

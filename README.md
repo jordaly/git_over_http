@@ -281,8 +281,8 @@ protects access to these settings, as with other administration pages.
   temporary storage, and have a 256 MiB compressed-size / 60-second generation
   limit. Credentials are never embedded in the displayed clone URL.
 - **Branches** separates the default branch from other branches, displays latest
-  commit details, and supports name search, recently-updated/name sorting, and a
-  protected-branch filter. Protection labels reflect the server's configured policy.
+  commit details, and supports name search, recently-updated/name sorting, and
+  protected/merged filters. Protection labels reflect the server's configured policy.
   Branches whose commits are all in the default branch carry a purple **Merged**
   label, so leftover pull-request branches are easy to clean up.
 - **New pull request** on a branch prefills the source and default target branch.

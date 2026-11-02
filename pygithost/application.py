@@ -2348,7 +2348,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         params = parse_qs(urlparse(self.path).query or "")
         search = (params.get("q") or [""])[0].strip()[:128]
         view = (params.get("view") or ["all"])[0]
-        view = view if view in ("all", "protected") else "all"
+        view = view if view in ("all", "protected", "merged") else "all"
         sort = (params.get("sort") or ["updated"])[0]
         sort = sort if sort in ("updated", "name") else "updated"
         code, output, _ = await _run_git(repo_git, ["for-each-ref", "refs/heads",
@@ -2378,7 +2378,9 @@ document.addEventListener("DOMContentLoaded", function() {{
         rows, default_rows = [], []
         for b, sha, subject, author, updated in branch_data:
             is_protected = protected_branch(policy, b)
-            if search.casefold() not in b.casefold() or (view == "protected" and not is_protected):
+            is_merged = b != default_branch and b in merged_branches
+            if search.casefold() not in b.casefold() or (view == "protected" and not is_protected) \
+                    or (view == "merged" and not is_merged):
                 continue
             browse = str_t(t"{base}/tree/{q(b)}/")
             if can_write and b != default_branch and not is_protected:
@@ -2416,15 +2418,30 @@ document.addEventListener("DOMContentLoaded", function() {{
         else:
             create_box = safe_html('<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope, so branch create/delete is disabled.</div>')
         rows, pagination, _page = _paginate_items(rows, self.path, base + "/branches")
-        rows_html = join_html(rows) if rows else safe_html(html_t(t'<div class="repo-empty"><h2>{"No matching branches" if search or view != "all" else "No other branches yet"}</h2><p class="muted">{"Try a different search or filter." if search or view != "all" else "Create a branch to work on changes without updating the default branch."}</p></div>'))
+        if search:
+            rows_heading = "Matching branches"
+        elif view == "merged":
+            rows_heading = "Merged branches"
+        elif view == "protected":
+            rows_heading = "Protected branches"
+        else:
+            rows_heading = "Other branches"
+        if rows:
+            rows_html = join_html(rows)
+        elif view == "merged" and not search:
+            rows_html = safe_html('<div class="repo-empty"><h2>No merged branches</h2><p class="muted">Branches whose commits are all in the default branch appear here after a merge.</p></div>')
+        elif search or view != "all":
+            rows_html = safe_html('<div class="repo-empty"><h2>No matching branches</h2><p class="muted">Try a different search or filter.</p></div>')
+        else:
+            rows_html = safe_html('<div class="repo-empty"><h2>No other branches yet</h2><p class="muted">Create a branch to work on changes without updating the default branch.</p></div>')
         default_html = safe_html(html_t(t'<section class="box repo-list"><div class="repo-panel-heading"><h2>Default branch</h2></div>{join_html(default_rows)}</section>')) if default_rows else safe_html("")
         body = html_t(
             t"""<main class="repo-page">{_repo_tabs(base, "branches")}<div class="topbar"><div><h2>Branches</h2><p class="muted">Manage development branches and open pull requests.</p></div><span class="pill">{len(branches)} branches</span></div>
 {notice_html}
 <form class="repo-search" method="GET" action="{base}/branches" role="search"><input type="hidden" name="per_page" value="{_page_size(params)}"><label for="branch-search">Find a branch</label><div class="row"><input id="branch-search" type="search" name="q" value="{search}" placeholder="Search branches…" maxlength="128">
-<select name="view" aria-label="Branch filter"><option value="all"{safe_html(" selected" if view == "all" else "")}>All branches</option><option value="protected"{safe_html(" selected" if view == "protected" else "")}>Protected branches</option></select>
+<select name="view" aria-label="Branch filter"><option value="all"{safe_html(" selected" if view == "all" else "")}>All branches</option><option value="protected"{safe_html(" selected" if view == "protected" else "")}>Protected branches</option><option value="merged"{safe_html(" selected" if view == "merged" else "")}>Merged branches</option></select>
 <select name="sort" aria-label="Branch sort"><option value="updated"{safe_html(" selected" if sort == "updated" else "")}>Recently updated</option><option value="name"{safe_html(" selected" if sort == "name" else "")}>Name</option></select><button type="submit">Find branches</button><a class="pill" href="{base}/branches">Reset</a></div></form>
-{create_box}{default_html}<section class="box repo-list"><div class="repo-panel-heading"><h2>{"Matching branches" if search or view != "all" else "Other branches"}</h2><span class="muted">{len(rows)} shown</span></div>{rows_html}{pagination}</section></main>"""
+{create_box}{default_html}<section class="box repo-list"><div class="repo-panel-heading"><h2>{rows_heading}</h2><span class="muted">{len(rows)} shown</span></div>{rows_html}{pagination}</section></main>"""
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Branches · {owner}/{repo}"), safe_html(body)))
 

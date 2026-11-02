@@ -268,6 +268,7 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn('name="branch" value="main"', page)
         self.assertIn('onsubmit="return confirm(', page)
         self.assertIn("source=feature%2Fapi", page)
+        self.assertIn('<option value="merged">Merged branches</option>', page)
         _, page = self.request(self.base + "/branches?q=FEATURE&sort=name")
         articles = page.split('<article class="repo-branch-row">')[1:]
         self.assertEqual(len(articles), 1)
@@ -310,6 +311,14 @@ class RepositoryUITests(unittest.TestCase):
         articles = page.split('<article class="repo-branch-row">')[1:]
         self.assertEqual(len(articles), 1)
         self.assertNotIn("pill-merged", articles[0])
+
+        # The merged filter shows only branches contained in the default branch.
+        _, page = self.request(self.base + "/branches?view=merged&q=topic")
+        articles = page.split('<article class="repo-branch-row">')[1:]
+        self.assertEqual(len(articles), 1)
+        self.assertIn("topic/merged", articles[0])
+        self.assertNotIn("topic/open", "".join(articles))
+        self.assertIn("Merged branches", page)
 
         # The default branch is labelled Default, never Merged.
         _, page = self.request(self.base + "/branches")

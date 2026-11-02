@@ -1,3 +1,5 @@
+import gzip
+import http.client
 import json
 from html import unescape
 import os
@@ -40,11 +42,40 @@ class WebIDETests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(snapshot["commit"], self.fixture.sha)
         self.assertEqual(snapshot["files"][0]["path"], "README.md")
+        # The snapshot stays compact: the Explorer only needs paths.
+        self.assertEqual(set(snapshot["files"][0]), {"path"})
         status, result = self.api("file", {"branch": "main", "commit": self.fixture.sha, "path": "README.md"})
         self.assertEqual((status, result["content"]), (200, "Repository fixture\n"))
         status, source = self.fixture.request("/static/vendor/monaco/vs/loader.js")
         self.assertEqual(status, 200)
         self.assertIn("Copyright", source)
+
+    def test_large_snapshot_is_gzipped_for_browsers(self):
+        big = {"branch": "main", "commit": self.fixture.sha,
+               "files": [{"path": f"dir/file-{index}.txt"} for index in range(2000)]}
+        with mock.patch.object(webide, "snapshot", return_value=big):
+            connection = http.client.HTTPConnection("127.0.0.1", self.fixture.server.port, timeout=10)
+            try:
+                connection.request("GET", self.base + "/snapshot?branch=main",
+                                   headers={"Accept-Encoding": "gzip"})
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Encoding"), "gzip")
+                self.assertIn("Accept-Encoding", response.getheader("Vary") or "")
+                decoded = json.loads(gzip.decompress(body))
+                self.assertEqual(decoded["files"][1999]["path"], "dir/file-1999.txt")
+            finally:
+                connection.close()
+            # Clients that do not advertise gzip still receive plain JSON.
+            connection = http.client.HTTPConnection("127.0.0.1", self.fixture.server.port, timeout=10)
+            try:
+                connection.request("GET", self.base + "/snapshot?branch=main")
+                response = connection.getresponse()
+                self.assertIsNone(response.getheader("Content-Encoding"))
+                self.assertEqual(len(json.loads(response.read())["files"]), 2000)
+            finally:
+                connection.close()
 
     def test_gitlab_style_entry_points_keep_branch_and_file_context(self):
         for suffix in ("", "/tree/feature%2Fapi/"):

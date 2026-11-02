@@ -56,7 +56,10 @@ def tree(repo, commit):
 
 def snapshot(repo, branch):
     commit = head(repo, branch)
-    return {"branch": branch, "commit": commit, "files": list(tree(repo, commit).values())}
+    # The Explorer only needs paths. Mode/object ids are re-read server-side by
+    # the file and search actions, so keeping them out of this response makes
+    # the initial payload roughly three times smaller for large repositories.
+    return {"branch": branch, "commit": commit, "files": [{"path": path} for path in tree(repo, commit)]}
 
 
 def read_file(repo, branch, commit, filename):

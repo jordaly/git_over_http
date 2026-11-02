@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import gzip
 import json
 import base64
 import contextlib
@@ -2884,6 +2885,16 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         await _send_html(self.request, 200, _html_page(str_t(t"Issues · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
 
+    def _webide_assets(self):
+        """Web IDE assets with a cache-busting stamp for the workbench glue."""
+        static = Path(__file__).resolve().parent.parent / "static"
+        stamp = f"{int((static / 'webide.js').stat().st_mtime)}-{int((static / 'webide.css').stat().st_mtime)}"
+        return safe_html(html_t(
+            t'<link rel="stylesheet" href="/static/webide.css?v={stamp}">'
+            t'<script src="/static/vendor/monaco/vs/loader.js"></script>'
+            t'<script src="/static/webide.js?v={stamp}" defer></script>'
+        ))
+
     def _issue_editor_assets(self):
         """Editor assets with a cache-busting version stamp (mtime of the glue)."""
         glue = Path(__file__).resolve().parent.parent / "static" / "markdown.js"
@@ -3625,7 +3636,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <section class="ide-editor-pane" aria-label="Code editor"><div id="ide-tabs" role="tablist" aria-label="Open files"></div><h2 id="ide-filename">Select a file</h2><div class="ide-editor-container"><div id="ide-editor"></div><div id="ide-empty"><strong>Resolving a merge conflict.</strong><p>Open a conflicted file on the left, edit the marked sections, then apply the resolution.</p></div></div></section></div>
 <footer class="ide-statusbar"><label for="ide-branch">Branch</label><select id="ide-branch" disabled><option value="{src_branch}" selected>{src_branch}</option></select><button id="ide-language" type="button" title="Select language" aria-haspopup="listbox">Plain Text</button><button id="ide-wrap" type="button" title="Toggle word wrap (Alt+Z)" aria-pressed="false">Word wrap</button><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
 <dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close file search">×</button></div><input id="ide-picker-input" placeholder="Search conflicted files…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
-</section></main><link rel="stylesheet" href="/static/webide.css"><script src="/static/vendor/monaco/vs/loader.js"></script><script src="/static/webide.js" defer></script>''')
+</section></main>{self._webide_assets()}''')
         return await _send_response(self.request, 200, _html_page(f"Resolve conflicts · PR #{pr_id} · {owner}/{repo}", safe_html(body)),
             [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
 
@@ -4418,8 +4429,14 @@ form.addEventListener("submit", event => {{
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
 
         async def respond(status, value):
-            return await _send_response(self.request, status, json.dumps(value).encode(),
-                [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")])
+            body = json.dumps(value).encode()
+            headers = [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")]
+            # Branch snapshots and search results are large and downloaded on
+            # every IDE load; gzip cuts the file list by roughly 8-10x.
+            if len(body) > 16 * 1024 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+                body = gzip.compress(body, 6)
+                headers += [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
+            return await _send_response(self.request, status, body, headers)
 
         params = parse_qs(urlparse(self.path).query or "")
         branch = (params.get("branch") or [""])[0]
@@ -4543,7 +4560,7 @@ form.addEventListener("submit", event => {{
 <section class="ide-editor-pane" aria-label="Code editor"><div id="ide-tabs" class="ide-workspace-only" role="tablist" aria-label="Open files"></div><h2 id="ide-filename">Select a file</h2><div class="ide-editor-container"><div id="ide-editor"></div><div id="ide-empty"><strong>Ready to make a change?</strong><p>Choose a file from Explorer, or press <kbd>Ctrl/⌘ P</kbd> to find one.</p><p>Changes are collected in Source Control before you commit.</p></div></div></section></div>
 <footer class="ide-statusbar"><label for="ide-branch"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span class="ide-sr-only">Branch</span></label><select id="ide-branch">{options}</select><button id="ide-language" type="button" title="Select language" aria-haspopup="listbox">Plain Text</button><button id="ide-wrap" type="button" title="Toggle word wrap (Alt+Z)" aria-pressed="false">Word wrap</button><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
 <dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close file search">×</button></div><input id="ide-picker-input" placeholder="Search files by name…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
-</section></main><link rel="stylesheet" href="/static/webide.css"><script src="/static/vendor/monaco/vs/loader.js"></script><script src="/static/webide.js" defer></script>''')
+</section></main>{self._webide_assets()}''')
             return await _send_response(self.request, 200, _html_page("Web IDE", safe_html(body)),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         except (webide.IDEError, ValueError, TypeError) as exc:

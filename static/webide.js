@@ -13,6 +13,7 @@
     const languageById = new Map();
     function buildLanguages() {
         if (languageItems.length) return languageItems;
+        if (!window.monaco) return languageItems;  // explorer may render before the editor engine
         const seen = new Set();  // Monaco registers aliases; one entry per id.
         for (const lang of monaco.languages.getLanguages()) {
             if (seen.has(lang.id)) continue;
@@ -140,6 +141,9 @@
         el("filename").textContent = filename || "No file open";
         el("empty").hidden = !!filename;
         el("editor").replaceChildren();
+        // The snapshot/explorer can render before Monaco finishes loading; only
+        // create an editor when a file is actually shown.
+        if (!filename) { updateLocation(); render(); syncLanguage(); return; }
         editor = monaco.editor.create(el("editor"), {
             model: filename ? models.get(filename) || null : null,
             theme: document.documentElement.dataset.theme === "light" ? "vs" : "vs-dark",
@@ -354,6 +358,8 @@
         renderTabs(); renderChanges();
     }
     async function open(filename) {
+        if (!monacoLoaded) status("Loading the code editor…");
+        await ensureMonaco();
         if (changes.get(filename) !== null && !models.has(filename)) {
             const data = await api("file", {branch: snapshot.branch, commit: snapshot.commit, path: filename});
             originals.set(filename, data.content); model(filename, data.content);
@@ -375,12 +381,22 @@
         snapshot = next; expanded.clear();
         if (root.dataset.folder) expandParents(root.dataset.folder + "/placeholder");
         const filename = root.dataset.path;
-        if (filename && snapshot.files.some(file => file.path === filename)) await open(filename);
-        else if (single()) throw new Error("This file does not exist on the selected branch.");
-        else show(null);
+        if (filename && snapshot.files.some(file => file.path === filename)) {
+            // Render the explorer as soon as the snapshot arrives; the editor
+            // engine may still be loading in parallel. `open` waits for it.
+            render();
+            open(filename).catch(error => status(error.message));
+        } else if (single()) {
+            throw new Error("This file does not exist on the selected branch.");
+        } else {
+            show(null);
+        }
         if (!filename) status("Branch " + snapshot.branch + " at " + snapshot.commit.slice(0, 10) + ". Choose a file to edit.");
     }
     async function loadResolve() {
+        // Resolve mode builds models for every conflicted file, so it needs the
+        // editor engine before it can render.
+        await ensureMonaco();
         // Resolve mode rebuilds the workbench from the conflict list instead of
         // a branch snapshot; every conflicted file starts as a pending change.
         const pr = root.dataset.pr;
@@ -546,7 +562,8 @@
         // Switch layouts without navigating: the model, undo history and edits survive.
         history.replaceState(null, "", url); render(); editor?.layout(); diff?.layout();
     });
-    function addFile(filename) {
+    async function addFile(filename) {
+        await ensureMonaco();
         if (!validPath(filename)) throw new Error("Invalid path.");
         if (allFiles().some(existing => existing === filename || existing.startsWith(filename + "/") || filename.startsWith(existing + "/"))) {
             throw new Error("That path already exists or conflicts with an existing file or folder.");
@@ -556,7 +573,7 @@
     el("new") && (el("new").onclick = () => run(async () => {
         const filename = prompt("New file path (relative to repository root):", root.dataset.folder ? root.dataset.folder + "/" : "");
         if (!filename) return;
-        addFile(filename); status("New file added to pending changes.");
+        await addFile(filename); status("New file added to pending changes.");
     }));
     el("explorer-new") && (el("explorer-new").onclick = () => el("new").click());
     el("new-folder") && (el("new-folder").onclick = () => run(async () => {
@@ -565,7 +582,7 @@
         const folder = answer.replace(/\/$/, "");
         if (!validPath(folder)) throw new Error("Invalid folder path.");
         if (allFiles().some(existing => existing === folder || existing.startsWith(folder + "/"))) throw new Error("That file or folder already exists.");
-        addFile(folder + "/.gitkeep");
+        await addFile(folder + "/.gitkeep");
         status("New folder " + folder + " added with .gitkeep. Commit to save it, or discard its changes to remove it.");
     }));
     el("delete").onclick = () => run(async () => {
@@ -646,10 +663,26 @@
         if (window.monaco) monaco.editor.setTheme(document.documentElement.dataset.theme === "light" ? "vs" : "vs-dark");
     }).observe(document.documentElement, {attributes: true, attributeFilter: ["data-theme"]});
     if (!window.require) { status("Monaco failed to load. Reload this page."); return; }
-    lock(true);
+    let resolveMonaco, rejectMonaco;
+    let monacoLoaded = false;
+    const monacoReady = new Promise((resolve, reject) => { resolveMonaco = resolve; rejectMonaco = reject; });
+    // Keep the rejection handled: the Explorer still loads if the editor engine
+    // fails, and the next file open reports the failure through ensureMonaco.
+    monacoReady.catch(() => {});
+    async function ensureMonaco() {
+        try { await monacoReady; }
+        catch (error) { throw new Error("The code editor could not load. Reload this page."); }
+    }
     require.config({paths: {vs: new URL("/static/vendor/monaco/vs", location.origin).href}});
     require(["vs/editor/editor.main"], () => {
-        buildLanguages(); syncWrap();
-        lock(false); run(load);
-    }, error => { lock(false); status("Unable to load Monaco: " + error); });
+        monacoLoaded = true;
+        buildLanguages(); syncWrap(); syncLanguage();
+        resolveMonaco();
+    }, error => {
+        status("Unable to load the code editor: " + error);
+        rejectMonaco(new Error(String(error)));
+    });
+    // Fetch the snapshot and render the Explorer immediately; Monaco keeps
+    // loading in parallel and is only awaited when a file is opened.
+    run(load);
 })();

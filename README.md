@@ -159,7 +159,9 @@ new folders include an empty `.gitkeep` file because Git does not track empty
 directories. Both remain pending until committed and can be discarded. The
 Explorer shows folders before files at every level, with folder, code-file and
 text-file icons. Folders load their contents only when opened, and wide folders
-add entries in chunks as you scroll, keeping large repositories responsive.
+add entries in chunks as you scroll, keeping large repositories responsive. The
+Explorer is built from the branch snapshot without waiting for the editor engine,
+so the file list appears while Monaco is still starting.
 **Collapse all folders** closes the entire tree (and clears the
 filename filter). Add or delete files with the toolbar actions as well.
 

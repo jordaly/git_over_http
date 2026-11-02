@@ -6,6 +6,10 @@
     const el = id => document.getElementById("ide-" + id);
     const originals = new Map(), models = new Map(), changes = new Map();
     const viewStates = new Map(), expanded = new Set(), opened = [];
+    // Explorer data is loaded per directory; the flat index is optional and
+    // fetched only for "Go to file", the filename filter and name validation.
+    const dirs = new Map(), dirLoads = new Map(), dirTruncated = new Set();
+    let fileIndex = null, indexLoad = null;
     let snapshot, editor, diff, originalModel, deletedModel, active = null, busy = false, reviewing = false;
     const languageOverrides = new Map();
     // Language workbench (VS Code style): registry, auto detection, quick pick.
@@ -106,9 +110,93 @@
         el("search-view").setAttribute("aria-pressed", String(view === "search"));
         if (focus) el(view === "source" ? "message" : view === "search" ? "search-input" : "filter").focus();
     }
+    // Explorer panel resizing: drag the splitter, use arrow keys, or
+    // double-click to reset. The width is remembered per browser.
+    const SIDEBAR_WIDTH_KEY = "pygithost_ide_sidebar";
+    function storedSidebarWidth() {
+        try {
+            const value = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY), 10);
+            if (Number.isFinite(value)) return value;
+        } catch (error) { /* private mode */ }
+        return 270;
+    }
+    function sidebarMaxWidth() {
+        return Math.max(240, Math.min(720, innerWidth - 320));
+    }
+    function applySidebarWidth(value, persist = false) {
+        const width = Math.max(160, Math.min(sidebarMaxWidth(), Math.round(value)));
+        root.style.setProperty("--ide-sidebar-width", width + "px");
+        if (persist) {
+            try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width)); } catch (error) { /* private mode */ }
+        }
+        return width;
+    }
+    let layoutFrame = 0;
+    function layoutEditors() {
+        if (layoutFrame) return;
+        layoutFrame = requestAnimationFrame(() => { layoutFrame = 0; editor?.layout(); diff?.layout(); });
+    }
+    const sidebar = el("sidebar");
+    const workspace = sidebar && sidebar.parentElement;
+    if (workspace) {
+        const resizer = document.createElement("div");
+        resizer.id = "ide-resizer";
+        resizer.className = "ide-workspace-only";
+        resizer.setAttribute("role", "separator");
+        resizer.setAttribute("aria-orientation", "vertical");
+        resizer.setAttribute("aria-label", "Resize Explorer panel");
+        resizer.setAttribute("aria-valuemin", "160");
+        resizer.tabIndex = 0;
+        workspace.insertBefore(resizer, sidebar.nextSibling);
+        applySidebarWidth(storedSidebarWidth());
+        const syncResizerAria = () => {
+            const width = parseInt(root.style.getPropertyValue("--ide-sidebar-width"), 10) || storedSidebarWidth();
+            resizer.setAttribute("aria-valuenow", String(width));
+            resizer.setAttribute("aria-valuemax", String(sidebarMaxWidth()));
+        };
+        syncResizerAria();
+        window.addEventListener("resize", () => {
+            applySidebarWidth(parseInt(root.style.getPropertyValue("--ide-sidebar-width"), 10) || storedSidebarWidth());
+            syncResizerAria();
+            layoutEditors();
+        });
+        resizer.addEventListener("pointerdown", event => {
+            if (event.button !== 0) return;
+            event.preventDefault();
+            const left = sidebar.getBoundingClientRect().left;
+            resizer.dataset.dragging = "true";
+            resizer.setPointerCapture?.(event.pointerId);
+            const move = moveEvent => {
+                applySidebarWidth(moveEvent.clientX - left);
+                layoutEditors();
+            };
+            const stop = () => {
+                delete resizer.dataset.dragging;
+                applySidebarWidth(parseInt(root.style.getPropertyValue("--ide-sidebar-width"), 10) || storedSidebarWidth(), true);
+                syncResizerAria();
+                document.removeEventListener("pointermove", move);
+                document.removeEventListener("pointerup", stop);
+                document.removeEventListener("pointercancel", stop);
+            };
+            document.addEventListener("pointermove", move);
+            document.addEventListener("pointerup", stop);
+            document.addEventListener("pointercancel", stop);
+        });
+        resizer.addEventListener("dblclick", () => { applySidebarWidth(270, true); syncResizerAria(); layoutEditors(); });
+        resizer.addEventListener("keydown", event => {
+            const delta = event.key === "ArrowLeft" ? -16 : event.key === "ArrowRight" ? 16 : 0;
+            if (!delta) return;
+            event.preventDefault();
+            const current = parseInt(root.style.getPropertyValue("--ide-sidebar-width"), 10) || storedSidebarWidth();
+            applySidebarWidth(current + delta, true);
+            syncResizerAria();
+            layoutEditors();
+        });
+    }
     function expandParents(filename) {
         const parts = filename.split("/");
-        for (let i = 1; i < parts.length; i++) expanded.add(parts.slice(0, i).join("/") + "/");
+        // Directory keys carry no trailing slash (matching `tree` entry paths).
+        for (let i = 1; i < parts.length; i++) expanded.add(parts.slice(0, i).join("/"));
     }
     function closeDiff() {
         if (diff) { diff.dispose(); diff = null; }
@@ -180,8 +268,77 @@
         Object.entries(options).forEach(([key, value]) => node.setAttribute(key, value));
         return node;
     }
-    function allFiles() {
-        return [...new Set([...snapshot.files.map(file => file.path), ...changes.keys()])].sort((a, b) => a.localeCompare(b));
+    function note(text) {
+        const node = document.createElement("p");
+        node.className = "ide-note";
+        node.textContent = text;
+        return node;
+    }
+    function dirOf(filename) {
+        const index = filename.lastIndexOf("/");
+        return index === -1 ? "" : filename.slice(0, index);
+    }
+    function compareEntries(a, b) {
+        return (a.type === "tree" ? 0 : 1) - (b.type === "tree" ? 0 : 1) ||
+            a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: "base"}) ||
+            a.name.localeCompare(b.name);
+    }
+    function dirChildren(directory) {
+        const entries = new Map();
+        for (const item of dirs.get(directory) || []) entries.set(item.name, item);
+        // Pending changes must show even when their parent directory was never
+        // loaded: new files, implicit new folders, deletions and resolve mode.
+        const prefix = directory ? directory + "/" : "";
+        for (const filename of changes.keys()) {
+            if (!filename.startsWith(prefix)) continue;
+            const rest = filename.slice(prefix.length);
+            if (!rest) continue;
+            const slash = rest.indexOf("/");
+            const name = slash === -1 ? rest : rest.slice(0, slash);
+            if (entries.has(name)) continue;
+            entries.set(name, {name, path: prefix + name, type: slash === -1 ? "blob" : "tree", pending: true});
+        }
+        return [...entries.values()].sort(compareEntries);
+    }
+    function loadDir(directory, force = false) {
+        if (!force && dirs.has(directory)) return Promise.resolve(dirs.get(directory));
+        if (!force && dirLoads.has(directory)) return dirLoads.get(directory);
+        const request = api("tree", {branch: snapshot.branch, commit: snapshot.commit, path: directory})
+            .then(result => {
+                dirs.set(directory, result.entries);
+                if (result.truncated) dirTruncated.add(directory); else dirTruncated.delete(directory);
+                return result.entries;
+            })
+            .finally(() => { if (dirLoads.get(directory) === request) dirLoads.delete(directory); });
+        dirLoads.set(directory, request);
+        return request;
+    }
+    function ensureIndex() {
+        if (fileIndex) return Promise.resolve(fileIndex);
+        if (!indexLoad) {
+            indexLoad = api("index", {branch: snapshot.branch, commit: snapshot.commit})
+                .then(result => {
+                    fileIndex = result.files;
+                    return fileIndex;
+                })
+                .finally(() => { indexLoad = null; });
+        }
+        return indexLoad;
+    }
+    function repoFileExists(filename) {
+        if (fileIndex) return fileIndex.includes(filename);
+        const listing = dirs.get(dirOf(filename));
+        if (listing) return listing.some(item => item.name === basename(filename));
+        return !changes.has(filename);
+    }
+    async function reveal(filename) {
+        const parts = filename.split("/");
+        for (let index = 1; index < parts.length; index += 1) expanded.add(parts.slice(0, index).join("/"));
+        // Load every ancestor directory (never the root: it is part of the
+        // snapshot), so existence checks and expanded folders have real data.
+        const ancestors = parts.slice(0, -1).map((_part, index) => parts.slice(0, index + 1).join("/"));
+        await Promise.all(ancestors.map(directory => loadDir(directory).catch(() => null)));
+        return ancestors.every(directory => dirs.has(directory));
     }
     function explorerIcon(kind) {
         const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -202,33 +359,41 @@
         return /\.(py|js|jsx|ts|tsx|html|css|sh|sql|java|cs|c|cpp|go|rs|rb|php)$/i.test(filename) ? "code" : "file";
     }
     const EXPLORER_CHUNK = 200;
-    const compareEntries = (a, b) =>
-        Number(!!b.children) - Number(!!a.children) ||
-        a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: "base"}) ||
-        a.name.localeCompare(b.name);
-    // Sort each folder's children once per tree build; chunked rendering reads
-    // the same order repeatedly as the user scrolls.
-    function sortedEntries(entry) {
-        if (!entry.sorted) entry.sorted = [...entry.children.values()].sort(compareEntries);
-        return entry.sorted;
+    const EXPLORER_INDENT = 12;
+    function indentTo(node, path) {
+        // VS Code-like alignment: each path segment adds one indent step, with
+        // faint vertical guides marking the ancestor levels.
+        const depth = path.split("/").length - 1;
+        node.style.paddingLeft = (8 + depth * EXPLORER_INDENT) + "px";
+        if (depth > 0) {
+            const guides = [];
+            for (let level = 0; level < depth; level += 1) {
+                guides.push("linear-gradient(var(--border-strong), var(--border-strong)) " +
+                    (8 + level * EXPLORER_INDENT - 2) + "px 0 / 1px 100% no-repeat");
+            }
+            node.style.backgroundImage = guides.join(", ");
+        } else {
+            node.style.backgroundImage = "";
+        }
     }
     function fileEntry(entry) {
-        const filename = entry.filename;
+        const filename = entry.path;
         const changed = changes.has(filename), deleted = changes.get(filename) === null;
-        const node = button(basename(filename) + (changed ? deleted ? " (deleted)" : " •" : ""),
+        const node = button(entry.name + (changed ? deleted ? " (deleted)" : " •" : ""),
             () => run(() => open(filename)), {"aria-current": String(active === filename), title: filename, "data-path": filename});
         node.prepend(explorerIcon(fileIconKind(filename)));
         node.classList.toggle("ide-modified", changed);
         node.classList.toggle("ide-deleted", deleted);
+        indentTo(node, filename);
         return node;
     }
-    function appendChunk(container, entry, query, offset) {
-        const entries = sortedEntries(entry);
+    function appendChunk(container, directory, query, offset) {
+        const entries = dirChildren(directory);
         const end = Math.min(entries.length, offset + EXPLORER_CHUNK);
         const fragment = document.createDocumentFragment();
         for (let index = offset; index < end; index += 1) {
             const child = entries[index];
-            fragment.append(child.children ? folderEntry(child, query) : fileEntry(child));
+            fragment.append(child.type === "tree" ? folderEntry(child, query) : fileEntry(child));
         }
         container.append(fragment);
         if (end >= entries.length) return;
@@ -237,7 +402,7 @@
             if (loaded) return;
             loaded = true;
             more.remove();
-            appendChunk(container, entry, query, end);
+            appendChunk(container, directory, query, end);
         }
         const more = button("Show " + (entries.length - end) + " more…", load, {class: "ide-more"});
         container.append(more);
@@ -253,17 +418,34 @@
         }
     }
     function folderEntry(entry, query) {
-        const key = entry.key;
+        const directory = entry.path;
         const details = document.createElement("details");
-        details.open = !!query || expanded.has(key);
+        details.open = !!query || expanded.has(directory);
         const summary = document.createElement("summary");
         summary.append(explorerIcon("folder"), document.createTextNode(entry.name));
+        indentTo(summary, directory);
         details.append(summary);
-        let loaded = false;
-        function load() {
-            if (loaded) return;
-            loaded = true;
-            appendChunk(details, entry, query, 0);
+        let started = false;
+        async function load() {
+            if (started) return;
+            started = true;
+            if (!dirs.has(directory)) {
+                const waiting = note("Loading…");
+                details.append(waiting);
+                try {
+                    await loadDir(directory);
+                } catch (error) {
+                    // Folders that only exist in pending changes are not in the
+                    // branch yet; render their pending children anyway.
+                    dirs.set(directory, []);
+                }
+                waiting.remove();
+                if (!details.isConnected) { started = false; return; }
+            }
+            appendChunk(details, directory, query, 0);
+            if (dirTruncated.has(directory)) {
+                details.append(note("This folder has more than 20,000 entries; use Go to file (Ctrl/⌘+P) or the filename filter to narrow it down."));
+            }
         }
         // Build a folder's contents only when it is actually shown: a collapsed
         // directory must not create thousands of detached nodes.
@@ -272,29 +454,77 @@
             if (!details.isConnected) return;
             if (details.open) {
                 load();
-                if (!query) expanded.add(key);
+                if (!query) expanded.add(directory);
             } else if (!query) {
-                expanded.delete(key);
+                expanded.delete(directory);
             }
         });
         return details;
     }
     function renderFiles() {
         const query = el("filter").value.trim().toLowerCase();
-        const tree = {children: new Map()};
-        allFiles().forEach(filename => {
-            if (query && !filename.toLowerCase().includes(query)) return;
+        if (query) { renderFiltered(query); return; }
+        if (!dirs.has("")) {
+            el("files").replaceChildren(note("Loading files…"));
+            loadDir("").then(renderFiles).catch(error => status(error.message));
+            return;
+        }
+        const fragment = document.createDocumentFragment();
+        appendChunk(fragment, "", "", 0);
+        if (dirTruncated.has("")) {
+            fragment.append(note("The repository root has more than 20,000 entries; use Go to file (Ctrl/⌘+P) or the filename filter."));
+        }
+        el("files").replaceChildren(fragment);
+    }
+    function renderFiltered(query) {
+        if (!fileIndex) {
+            el("files").replaceChildren(note("Loading file index…"));
+            ensureIndex().then(() => {
+                if (el("filter").value.trim().toLowerCase() === query) renderFiles();
+            }).catch(error => status(error.message));
+            return;
+        }
+        const matches = [], seen = new Set();
+        for (const filename of fileIndex) {
+            if (!filename.toLowerCase().includes(query)) continue;
+            matches.push(filename); seen.add(filename);
+        }
+        for (const filename of changes.keys()) {
+            if (!seen.has(filename) && filename.toLowerCase().includes(query)) matches.push(filename);
+        }
+        const shown = matches.slice(0, 500);
+        const tree = new Map();
+        shown.forEach(filename => {
             const parts = filename.split("/");
             let node = tree, prefix = "";
             parts.slice(0, -1).forEach(part => {
                 prefix += part + "/";
-                if (!node.children.has(part + "/")) node.children.set(part + "/", {name: part, key: prefix, children: new Map()});
-                node = node.children.get(part + "/");
+                if (!node.has(part + "/")) node.set(part + "/", {name: part, path: prefix.slice(0, -1), type: "tree", children: new Map()});
+                node = node.get(part + "/").children;
             });
-            node.children.set(basename(filename), {name: basename(filename), filename});
+            node.set(basename(filename), {name: basename(filename), path: filename, type: "blob"});
         });
+        function walk(children, parent) {
+            [...children.values()].sort(compareEntries).forEach(node => {
+                if (node.children) {
+                    const details = document.createElement("details");
+                    details.open = true;
+                    const summary = document.createElement("summary");
+                    summary.append(explorerIcon("folder"), document.createTextNode(node.name));
+                    indentTo(summary, node.path);
+                    details.append(summary);
+                    walk(node.children, details);
+                    parent.append(details);
+                } else {
+                    parent.append(fileEntry(node));
+                }
+            });
+        }
         const fragment = document.createDocumentFragment();
-        appendChunk(fragment, tree, query, 0);
+        walk(tree, fragment);
+        if (matches.length > shown.length) {
+            fragment.append(note("Showing " + shown.length + " of " + matches.length + " matches; refine the filter."));
+        }
         el("files").replaceChildren(fragment);
     }
     function closeTab(filename) {
@@ -331,7 +561,7 @@
         const fragment = document.createDocumentFragment();
         changes.forEach((value, filename) => {
             const row = document.createElement("div"); row.className = "ide-change";
-            const kind = value === null ? "D" : snapshot.files.some(file => file.path === filename) ? "M" : "A";
+            const kind = value === null ? "D" : originals.has(filename) ? "M" : "A";
             const compare = button(kind + " " + filename, () => run(async () => { await open(filename); await review(); }), {title: "View changes to " + filename});
             const discard = button("↶", () => run(async () => {
                 if (!confirm("Discard changes to " + filename + "?")) return;
@@ -360,11 +590,15 @@
     async function open(filename) {
         if (!monacoLoaded) status("Loading the code editor…");
         await ensureMonaco();
+        const parentsLoaded = await reveal(filename);
+        if (!changes.has(filename) && !(parentsLoaded && repoFileExists(filename))) {
+            throw new Error("This file does not exist on the selected branch.");
+        }
         if (changes.get(filename) !== null && !models.has(filename)) {
             const data = await api("file", {branch: snapshot.branch, commit: snapshot.commit, path: filename});
             originals.set(filename, data.content); model(filename, data.content);
         }
-        expandParents(filename); show(filename);
+        show(filename);
         status(changes.get(filename) === null ? "File marked for deletion. Discard its changes to restore it." : changes.size + " pending change(s). Changes are not saved until committed.");
     }
     function clear() {
@@ -372,6 +606,7 @@
         if (editor) { editor.dispose(); editor = null; }
         models.forEach(value => value.dispose());
         models.clear(); originals.clear(); changes.clear(); viewStates.clear(); opened.length = 0; active = null;
+        dirs.clear(); dirLoads.clear(); dirTruncated.clear(); fileIndex = null; indexLoad = null;
         explorerSignature = "";  // force the explorer to rebuild on the next render
     }
     async function load() {
@@ -379,11 +614,13 @@
         if (resolveMode()) return loadResolve();
         const next = await api("snapshot", {branch: el("branch").value});
         snapshot = next; expanded.clear();
+        dirs.set("", next.root || []);
+        if (next.root_truncated) dirTruncated.add(""); else dirTruncated.delete("");
         if (root.dataset.folder) expandParents(root.dataset.folder + "/placeholder");
         const filename = root.dataset.path;
-        if (filename && snapshot.files.some(file => file.path === filename)) {
-            // Render the explorer as soon as the snapshot arrives; the editor
-            // engine may still be loading in parallel. `open` waits for it.
+        if (filename) {
+            // Render the explorer as soon as the root listing arrives; the
+            // editor engine may still be loading in parallel. `open` waits.
             render();
             open(filename).catch(error => status(error.message));
         } else if (single()) {
@@ -401,7 +638,8 @@
         // a branch snapshot; every conflicted file starts as a pending change.
         const pr = root.dataset.pr;
         const targets = JSON.parse(root.dataset.conflicts || "[]");
-        snapshot = {branch: root.dataset.branch, commit: root.dataset.commit, files: []};
+        snapshot = {branch: root.dataset.branch, commit: root.dataset.commit};
+        dirs.set("", []);
         for (const filename of targets) {
             const data = await api("conflict", {pr: pr, branch: snapshot.branch, path: filename});
             if (data.content === null) {
@@ -419,6 +657,7 @@
             : "No conflicted files remain. Back to the pull request to merge.");
     }
     function discardFile(filename) {
+        const tracked = repoFileExists(filename);
         changes.delete(filename);
         if (originals.has(filename)) {
             if (models.has(filename)) models.get(filename).setValue(originals.get(filename));
@@ -426,7 +665,7 @@
         } else if (models.has(filename)) {
             models.get(filename).dispose(); models.delete(filename);
         }
-        if (!snapshot.files.some(file => file.path === filename)) {
+        if (!tracked) {
             const index = opened.indexOf(filename);
             if (index >= 0) opened.splice(index, 1);
         }
@@ -461,16 +700,34 @@
         el("picker-input").placeholder = pickerMode === "languages" ? "Select a language…" : "Search files by name…";
     }
     function openPicker(mode = "files") {
+        if (typeof mode !== "string") mode = "files";  // click handlers pass an event
         if (busy || !snapshot || (single() && mode !== "languages")) return;
         pickerMode = mode;
         pickerHeadingLabels();
-        el("picker-input").value = ""; renderPicker();
+        el("picker-input").value = "";
+        if (mode === "files" && !fileIndex) {
+            el("picker-results").replaceChildren(note("Loading file index…"));
+            ensureIndex().then(renderPicker).catch(error => {
+                el("picker-results").replaceChildren(note(error.message));
+            });
+        } else {
+            renderPicker();
+        }
         el("picker").showModal(); el("picker-input").focus();
     }
     function renderPicker() {
         const query = el("picker-input").value.toLowerCase();
         if (pickerMode === "languages") return renderLanguagePicker(query);
-        const results = allFiles().filter(filename => filename.toLowerCase().includes(query)).slice(0, 100);
+        const results = [], seen = new Set();
+        for (const filename of fileIndex || []) {
+            if (!filename.toLowerCase().includes(query)) continue;
+            results.push(filename); seen.add(filename);
+            if (results.length === 100) break;
+        }
+        for (const filename of changes.keys()) {
+            if (results.length === 100) break;
+            if (!seen.has(filename) && filename.toLowerCase().includes(query)) results.push(filename);
+        }
         el("picker-results").replaceChildren(...results.map(filename => button(filename, () => {
             el("picker").close(); run(() => open(filename));
         })));
@@ -542,7 +799,7 @@
                 (response.truncated || pendingTruncated ? " Results limited; narrow your search." : "");
         });
     };
-    el("quick-open").onclick = openPicker;
+    el("quick-open").onclick = () => openPicker("files");
     el("picker-input").oninput = renderPicker;
     el("picker-input").onkeydown = event => {
         if (event.key === "Enter" || event.key === "ArrowDown") {
@@ -565,8 +822,12 @@
     async function addFile(filename) {
         await ensureMonaco();
         if (!validPath(filename)) throw new Error("Invalid path.");
-        if (allFiles().some(existing => existing === filename || existing.startsWith(filename + "/") || filename.startsWith(existing + "/"))) {
-            throw new Error("That path already exists or conflicts with an existing file or folder.");
+        const known = new Set(await ensureIndex());
+        changes.forEach((_value, name) => known.add(name));
+        for (const existing of known) {
+            if (existing === filename || existing.startsWith(filename + "/") || filename.startsWith(existing + "/")) {
+                throw new Error("That path already exists or conflicts with an existing file or folder.");
+            }
         }
         model(filename, ""); changes.set(filename, ""); expandParents(filename); show(filename);
     }
@@ -581,14 +842,18 @@
         if (!answer) return;
         const folder = answer.replace(/\/$/, "");
         if (!validPath(folder)) throw new Error("Invalid folder path.");
-        if (allFiles().some(existing => existing === folder || existing.startsWith(folder + "/"))) throw new Error("That file or folder already exists.");
+        const known = new Set(await ensureIndex());
+        changes.forEach((_value, name) => known.add(name));
+        for (const existing of known) {
+            if (existing === folder || existing.startsWith(folder + "/")) throw new Error("That file or folder already exists.");
+        }
         await addFile(folder + "/.gitkeep");
         status("New folder " + folder + " added with .gitkeep. Commit to save it, or discard its changes to remove it.");
     }));
     el("delete").onclick = () => run(async () => {
         if (!active || !confirm("Mark " + active + " for deletion?")) return;
         // Resolve mode keeps a model so the file stays visible and can be restored.
-        if (resolveMode() || snapshot.files.some(file => file.path === active)) changes.set(active, null);
+        if (resolveMode() || repoFileExists(active)) changes.set(active, null);
         else { discardFile(active); active = null; }
         show(active); status("Deletion is pending until committed.");
     });
@@ -630,13 +895,21 @@
             const result = await api("commit", {}, {branch: snapshot.branch, base: snapshot.commit,
                 message: el("message").value, changes: Object.fromEntries(changes)});
             // Only confirmed Git commits clear pending changes. Keep open tabs/models.
-            const committedFiles = new Map(snapshot.files.map(file => [file.path, file]));
             const deleted = [];
             changes.forEach((value, filename) => {
-                if (value === null) { committedFiles.delete(filename); deleted.push(filename); }
-                else { committedFiles.set(filename, {path: filename}); originals.set(filename, value); }
+                if (value === null) deleted.push(filename);
+                else originals.set(filename, value);
             });
-            changes.clear(); snapshot.commit = result.commit; snapshot.files = [...committedFiles.values()];
+            changes.clear(); snapshot.commit = result.commit;
+            // Directory caches and the optional flat index now describe the old
+            // commit; drop them and re-fetch the root listing for the new one.
+            dirs.clear(); dirLoads.clear(); dirTruncated.clear(); fileIndex = null; indexLoad = null;
+            explorerSignature = "";
+            try {
+                const root = await api("tree", {branch: snapshot.branch, commit: snapshot.commit, path: ""});
+                dirs.set("", root.entries);
+                if (root.truncated) dirTruncated.add(""); else dirTruncated.delete("");
+            } catch (error) { /* renderFiles retries the root listing */ }
             deleted.forEach(filename => {
                 models.get(filename)?.dispose(); models.delete(filename); originals.delete(filename);
                 const index = opened.indexOf(filename); if (index >= 0) opened.splice(index, 1);

@@ -158,12 +158,14 @@ open after committing. The Explorer header offers **New file** and **New folder*
 new folders include an empty `.gitkeep` file because Git does not track empty
 directories. Both remain pending until committed and can be discarded. The
 Explorer shows folders before files at every level, with folder, code-file and
-text-file icons. Folders load their contents only when opened, and wide folders
+text-file icons. Folders fetch their contents only when opened, and wide folders
 add entries in chunks as you scroll, keeping large repositories responsive. The
 Explorer is built from the branch snapshot without waiting for the editor engine,
-so the file list appears while Monaco is still starting.
-**Collapse all folders** closes the entire tree (and clears the
-filename filter). Add or delete files with the toolbar actions as well.
+so the file list appears while Monaco is still starting. Drag the splitter
+between the panel and editor to resize it (arrow keys work too; double-click
+resets), and the width is remembered. **Collapse all folders** closes the entire
+tree (and clears the filename filter). Add or delete files with the toolbar
+actions as well.
 
 The activity bar's **Search** tool (**Ctrl/⌘+Shift+F**) searches file contents in
 the branch snapshot, overlaid with pending edits/new files and excluding pending
@@ -198,8 +200,10 @@ compares a file against its base; **Write** returns to editing.
 
 The first version supports existing, nonempty branches and UTF-8 text files up
 to 1 MiB each, at most 100 changed files and 5 MiB of content per commit (the HTTP
-form also has a 10 MiB encoded limit). Repositories exceeding 10,000 files are
-not supported. Symlinks/submodules cannot be edited; binary files cannot be
+form also has a 10 MiB encoded limit). The Explorer loads directories on demand,
+so repository size is not limited by the file listing; **Go to file**, the
+filename filter and new-path validation use an optional flat index capped at
+200,000 files. Symlinks/submodules cannot be edited; binary files cannot be
 opened. Branches checked out in a server-side working tree cannot be committed
 through the IDE, avoiding a desynchronized checkout. Tags/historical commits
 are read-only; editing never silently switches them to the default branch. This

@@ -37,22 +37,62 @@ class WebIDETests(unittest.TestCase):
                     changes={"README.md": "Browser edit\n", "folder/new.py": "print('hi')\n"},
                     message="Edit from browser", **overrides)
 
-    def test_snapshot_file_and_local_vendor(self):
-        status, snapshot = self.api("snapshot", {"branch": "feature/api"})
+    def test_snapshot_tree_index_and_local_vendor(self):
+        (self.fixture.source / "src").mkdir()
+        (self.fixture.source / "src" / "app.py").write_text("print('x')\n")
+        self.fixture.git("-C", self.fixture.source, "add", ".")
+        self.fixture.git("-C", self.fixture.source, "commit", "-m", "Nested folder")
+        self.fixture.git("-C", self.fixture.source, "push", str(self.fixture.bare), "main")
+        head = webide.head(str(self.fixture.bare), "main")
+        status, snapshot = self.api("snapshot", {"branch": "main"})
         self.assertEqual(status, 200)
-        self.assertEqual(snapshot["commit"], self.fixture.sha)
-        self.assertEqual(snapshot["files"][0]["path"], "README.md")
-        # The snapshot stays compact: the Explorer only needs paths.
-        self.assertEqual(set(snapshot["files"][0]), {"path"})
-        status, result = self.api("file", {"branch": "main", "commit": self.fixture.sha, "path": "README.md"})
+        self.assertEqual(snapshot["commit"], head)
+        # The initial snapshot only carries the root listing; directories load
+        # on demand and the flat index is fetched only when needed.
+        self.assertTrue(any(item["path"] == "README.md" for item in snapshot["root"]))
+        self.assertTrue(any(item["path"] == "src" and item["type"] == "tree" for item in snapshot["root"]))
+        self.assertEqual(set(snapshot["root"][0]), {"name", "path", "type"})
+        status, tree = self.api("tree", {"branch": "main", "commit": head, "path": "src"})
+        self.assertEqual(status, 200)
+        self.assertEqual([item["path"] for item in tree["entries"]], ["src/app.py"])
+        status, index = self.api("index", {"branch": "main", "commit": head})
+        self.assertEqual(status, 200)
+        self.assertIn("src/app.py", index["files"])
+        status, _ = self.api("tree", {"branch": "main", "commit": "0" * 40, "path": ""})
+        self.assertEqual(status, 400)
+        status, result = self.api("file", {"branch": "main", "commit": head, "path": "README.md"})
         self.assertEqual((status, result["content"]), (200, "Repository fixture\n"))
         status, source = self.fixture.request("/static/vendor/monaco/vs/loader.js")
         self.assertEqual(status, 200)
         self.assertIn("Copyright", source)
 
-    def test_large_snapshot_is_gzipped_for_browsers(self):
+    def test_repositories_above_the_old_ten_thousand_file_limit(self):
+        folder = self.fixture.source / "many"
+        folder.mkdir()
+        for index in range(10050):
+            (folder / ("file-%05d.txt" % index)).write_text("value\n")
+        self.fixture.git("-C", self.fixture.source, "add", ".")
+        self.fixture.git("-C", self.fixture.source, "commit", "-m", "Many files")
+        self.fixture.git("-C", self.fixture.source, "push", str(self.fixture.bare), "main")
+        head = webide.head(str(self.fixture.bare), "main")
+        snapshot = webide.snapshot(str(self.fixture.bare), "main")
+        self.assertTrue(any(item["path"] == "many" for item in snapshot["root"]))
+        index = webide.index(str(self.fixture.bare), "main", head)["files"]
+        self.assertGreater(len(index), 10000)
+        children = webide.children(str(self.fixture.bare), "main", head, "many")["entries"]
+        self.assertEqual(len(children), 10050)
+        self.assertEqual(webide.read_file(str(self.fixture.bare), "main", head, "many/file-10049.txt"), "value\n")
+        status, result = self.api("search", {"branch": "main", "commit": head, "q": "value"})
+        self.assertEqual(status, 200)
+        self.assertTrue(any(item["path"] == "many/file-00000.txt" for item in result["results"]))
+        commit = webide.commit_changes(str(self.fixture.bare), "main", head,
+                                       {"many/file-00000.txt": "changed\n"}, "Edit one", "test")
+        self.assertEqual(webide.tree(str(self.fixture.bare), commit)["many/file-00000.txt"]["mode"], "100644")
+
+    def test_large_ide_response_is_gzipped_for_browsers(self):
         big = {"branch": "main", "commit": self.fixture.sha,
-               "files": [{"path": f"dir/file-{index}.txt"} for index in range(2000)]}
+               "root": [{"name": f"file-{index}.txt", "path": f"dir/file-{index}.txt", "type": "blob"}
+                        for index in range(2000)]}
         with mock.patch.object(webide, "snapshot", return_value=big):
             connection = http.client.HTTPConnection("127.0.0.1", self.fixture.server.port, timeout=10)
             try:
@@ -64,7 +104,7 @@ class WebIDETests(unittest.TestCase):
                 self.assertEqual(response.getheader("Content-Encoding"), "gzip")
                 self.assertIn("Accept-Encoding", response.getheader("Vary") or "")
                 decoded = json.loads(gzip.decompress(body))
-                self.assertEqual(decoded["files"][1999]["path"], "dir/file-1999.txt")
+                self.assertEqual(decoded["root"][1999]["path"], "dir/file-1999.txt")
             finally:
                 connection.close()
             # Clients that do not advertise gzip still receive plain JSON.
@@ -73,7 +113,7 @@ class WebIDETests(unittest.TestCase):
                 connection.request("GET", self.base + "/snapshot?branch=main")
                 response = connection.getresponse()
                 self.assertIsNone(response.getheader("Content-Encoding"))
-                self.assertEqual(len(json.loads(response.read())["files"]), 2000)
+                self.assertEqual(len(json.loads(response.read())["root"]), 2000)
             finally:
                 connection.close()
 
@@ -203,6 +243,10 @@ class WebIDETests(unittest.TestCase):
                 webide.read_file(str(self.fixture.bare), "main", base, filename)
             with self.assertRaises(webide.IDEError):
                 webide.commit_changes(str(self.fixture.bare), "main", base, {filename: "bad"}, "bad", "user")
+        # Search still excludes the symlink (120000) and binary entries.
+        status, result = self.api("search", {"branch": "main", "commit": base, "q": "Repository fixture"})
+        self.assertEqual(status, 200)
+        self.assertTrue(all(item["path"] != "link" for item in result["results"]))
         commit = webide.commit_changes(str(self.fixture.bare), "main", base, {"run.sh": "echo new\n"}, "Executable", "user")
         self.assertEqual(webide.tree(str(self.fixture.bare), commit)["run.sh"]["mode"], "100755")
 
@@ -283,21 +327,30 @@ class WebIDEBrowserTests(unittest.TestCase):
  }
  try {
   await wait(() => window.monaco && el("files").querySelector("button") && ready());
+  if (!document.getElementById("ide-resizer") || !document.getElementById("webide").style.getPropertyValue("--ide-sidebar-width")) throw Error("Missing Explorer resizer");
   checkExplorer(el("files"));
   if (el("files").querySelectorAll("details details").length) throw Error("Collapsed folders rendered their children");
-  // Folders render their children lazily; open each newly revealed level too.
-  for (let round = 0; round < 8; round += 1) {
+  // Folders fetch their children on demand; open each newly revealed level.
+  for (let round = 0; round < 10; round += 1) {
    const closed = [...el("files").querySelectorAll("details:not([open])")];
    if (!closed.length) break;
    closed.forEach(folder => { folder.open = true; });
-   await sleep();
+   await new Promise(resolve => setTimeout(resolve, 200));
   }
   if (!el("files").querySelector("svg.ide-icon-code")) throw Error("Missing code-file icon");
+  const rootButton = [...el("files").querySelectorAll("button")].find(b => b.dataset.path === "README.md");
+  const nestedButton = [...el("files").querySelectorAll("button")].find(b => b.dataset.path === "z-folder/a.txt");
+  if (!nestedButton || parseFloat(getComputedStyle(nestedButton).paddingLeft) <= parseFloat(getComputedStyle(rootButton).paddingLeft)) throw Error("Nested files are not indented");
+  const resizer = document.getElementById("ide-resizer");
+  resizer.dispatchEvent(new KeyboardEvent("keydown", {key:"ArrowRight", bubbles:true, cancelable:true}));
+  if (parseInt(document.getElementById("webide").style.getPropertyValue("--ide-sidebar-width"), 10) <= 270) throw Error("Explorer did not resize");
   el("collapse").click();
   if (el("files").querySelector("details[open]")) throw Error("Collapse all left open folders");
   el("filter").value = "z-folder"; el("filter").dispatchEvent(new Event("input"));
+  await wait(() => el("files").querySelector("details"));
   checkExplorer(el("files"));
   el("filter").value = ""; el("filter").dispatchEvent(new Event("input"));
+  await wait(() => [...el("files").querySelectorAll("button")].some(b => b.textContent === "README.md"));
   [...el("files").querySelectorAll("button")].find(b => b.textContent === "README.md").click();
   await wait(() => model() && ready());
   model().setValue("Discard me\n");
@@ -414,6 +467,7 @@ class WebIDEBrowserTests(unittest.TestCase):
   if (!el("changes").textContent.includes("README.md")) throw Error("Closing tab discarded work");
   el("quick-open").click();
   if (!el("picker").open) throw Error("Quick open did not appear");
+  await wait(() => el("picker-results").querySelector("button"));
   el("picker-input").value = "readme"; el("picker-input").dispatchEvent(new Event("input"));
   el("picker-input").dispatchEvent(new KeyboardEvent("keydown", {key:"Enter", bubbles:true, cancelable:true}));
   await wait(() => el("filename").textContent === "README.md" && ready());

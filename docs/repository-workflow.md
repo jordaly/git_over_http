@@ -40,8 +40,10 @@ Copy your work before reloading after a branch conflict; there is no automatic r
 This is a local-Monaco workbench, not full VS Code: no extensions, terminal or remote
 development container. Only UTF-8 regular text files up to 1 MiB can be opened;
 commits are capped at 100 changed files and 5 MiB content, with a 10 MiB encoded-form
-limit. Repositories over 10,000 files, symlink/submodule editing, and commits to
-server-side checked-out branches are not supported.
+limit. Repositories of any size can be browsed because the Explorer loads one
+directory at a time; **Go to file**, the filename filter and new-path validation
+use an optional flat index capped at 200,000 files. Symlink/submodule editing and
+commits to server-side checked-out branches are not supported.
 
 ## Create a pull request
 

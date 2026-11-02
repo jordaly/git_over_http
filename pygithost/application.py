@@ -4484,6 +4484,12 @@ form.addEventListener("submit", event => {{
                 return await respond(status, result)
             if action == "snapshot":
                 return await respond(200, await asyncio.to_thread(webide.snapshot, repo_git, branch))
+            if action == "tree":
+                return await respond(200, await asyncio.to_thread(webide.children, repo_git, branch,
+                    (params.get("commit") or [""])[0], (params.get("path") or [""])[0]))
+            if action == "index":
+                return await respond(200, await asyncio.to_thread(webide.index, repo_git, branch,
+                    (params.get("commit") or [""])[0]))
             if action == "file":
                 content = await asyncio.to_thread(webide.read_file, repo_git, branch,
                     (params.get("commit") or [""])[0], (params.get("path") or [""])[0])
@@ -5205,7 +5211,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_admin_email()
         if p == "/admin/settings":
             return await self._ui_admin_settings()
-        m = re.match(r"^/r/([^/]+)/([^/]+)/ide(?:/(snapshot|file|search|conflict))?$", p)
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ide(?:/(snapshot|tree|index|file|search|conflict))?$", p)
         if m:
             return await self._ui_ide(m.group(1), m.group(2), m.group(3) or "")
         m = re.match(r"^/r/([^/]+)/([^/]+)/edit$", p)

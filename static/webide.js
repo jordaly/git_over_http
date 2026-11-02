@@ -67,7 +67,14 @@
     }    const single = () => root.dataset.mode === "single";
     const resolveMode = () => root.dataset.mode === "resolve";
     const resolveState = () => resolveMode() && snapshot;
-    function wordWrapPref() { try { return localStorage.getItem("pygithost_ide_wrap") === "on" ? "on" : "off"; } catch { return "off"; } }
+    // Word wrap is on by default. The v2 key deliberately ignores the
+    // preference written by the earlier toggle bug, so existing users get the
+    // new default instead of a stale "off".
+    const WRAP_KEY = "pygithost_ide_wrap_v2";
+    function wordWrapPref() {
+        try { return localStorage.getItem(WRAP_KEY) === "off" ? "off" : "on"; }
+        catch { return "on"; }
+    }
     function syncWrap() {
         const on = wordWrapPref() === "on";
         el("wrap")?.setAttribute("aria-pressed", String(on));
@@ -922,8 +929,9 @@
     el("review").onclick = () => run(review);
     el("language") && (el("language").onclick = () => openPicker("languages"));
     el("wrap") && (el("wrap").onclick = async () => {
-        const on = wordWrapPref() ? "off" : "on";
-        try { localStorage.setItem("pygithost_ide_wrap", on); } catch { /* private mode */ }
+        // wordWrapPref() returns "on" or "off"; both are truthy, so compare it.
+        const on = wordWrapPref() === "on" ? "off" : "on";
+        try { localStorage.setItem(WRAP_KEY, on); } catch { /* private mode */ }
         if (editor) editor.updateOptions({wordWrap: on});
         if (diff) diff.updateOptions({wordWrap: on});
         syncWrap();

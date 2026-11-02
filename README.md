@@ -181,7 +181,8 @@ Use **Ctrl/⌘+P** (or **Go to file**) to find files, **Ctrl/⌘+Shift+E** for E
 and **Ctrl/⌘+Shift+G** for Source Control. **Ctrl/⌘+S** keeps your current panel,
 file and focus; it does not create a commit. Use Source Control when you are
 ready to commit. **Preview changes**
-compares a file against its base; **Write** returns to editing.
+compares a file against its base; **Write** returns to editing. Word wrap is
+enabled by default; toggle it with **Alt+Z** or the status-bar button.
 
 - **Commit changes** saves all pending changes in one commit on the selected
   branch. Enter a commit message first. Commits use the signed-in username and

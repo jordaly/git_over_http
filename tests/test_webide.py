@@ -372,6 +372,18 @@ class WebIDEBrowserTests(unittest.TestCase):
   await wait(() => [...el("files").querySelectorAll("button")].some(b => b.textContent === "README.md"));
   [...el("files").querySelectorAll("button")].find(b => b.textContent === "README.md").click();
   await wait(() => model() && ready());
+  // Word wrap is on by default, persists explicit changes and Alt+Z toggles it.
+  const wrapEditor = monaco.editor.getEditors().find(e => (e.getModel()?.uri.toString() || "").endsWith("/README.md"));
+  if (!wrapEditor) throw Error("No editor for the word-wrap test");
+  const wrapOn = () => wrapEditor.getOption(monaco.editor.EditorOption.wordWrap) === "on";
+  if (el("wrap").getAttribute("aria-pressed") !== "true" || !wrapOn()) throw Error("Word wrap is not on by default");
+  el("wrap").click();
+  if (el("wrap").getAttribute("aria-pressed") !== "false" || wrapOn()) throw Error("Word wrap did not disable");
+  if (localStorage.getItem("pygithost_ide_wrap_v2") !== "off") throw Error("Word wrap preference was not saved");
+  document.dispatchEvent(new KeyboardEvent("keydown", {key:"z", altKey:true, bubbles:true, cancelable:true}));
+  if (el("wrap").getAttribute("aria-pressed") !== "true" || !wrapOn()) throw Error("Alt+Z did not enable word wrap");
+  el("wrap").click();
+  if (el("wrap").getAttribute("aria-pressed") !== "false" || wrapOn()) throw Error("Word wrap did not disable again");
   model().setValue("Discard me\n");
   if (!el("changes").textContent.includes("README.md")) throw Error("Missing dirty file");
   el("search-view").click();

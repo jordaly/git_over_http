@@ -33,6 +33,8 @@ model, undo history and pending edits. Tags and commit permalinks are read-only.
   highlighted diffs, and offers per-file or all-change discard actions.
 - **Ctrl/⌘+Shift+E** opens Explorer. **Ctrl/⌘+S** keeps the current panel, file and
   focus; it does not commit. Use the explicit commit action when ready.
+- Word wrap is on by default. Toggle it with **Alt+Z** or the status-bar button;
+  the choice is remembered per browser.
 
 Closing a tab does not discard edits. Commits include all pending changes and keep
 open tabs; committing while viewing a diff does not switch to another editor view.

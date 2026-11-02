@@ -62,7 +62,8 @@ Do not disable foreign-key checks or create user ID `0` as a workaround.
 ## PR discussion, editing and merge readiness
 
 Open PRs support a **Discussion** panel: comments are listed in order with author
-and time, and write-authorized users can add comments (up to 50,000 characters).
+and time, and write-authorized users can add comments (up to 1,000,000 characters,
+enough to hold Markdown with inline data-URL images).
 Comment authors and administrators can delete comments; with authentication
 disabled, the IP-allowlist trust model also allows moderation. Open PRs also
 offer an inline **Edit title and description** form.
@@ -106,6 +107,22 @@ with a textarea containing Git conflict markers (`<<<<<<< HEAD (source branch)`,
 - Limits: 1 MiB per resolution, at most 40 conflicted files can be presented;
   more than that must be resolved with Git and pushed. Resolutions must cover
   every conflicted file before a commit is created.
+
+## Issues and Discussions
+
+The **Issues** tab mirrors the pull-request list (open/closed tabs with counts,
+comment counts, relative times). Issues are title + Markdown description, with
+GitHub-style first post, comments rendered through the Markdown pipeline
+(editor on forms, Toast UI viewer for stored text), close/reopen, and per-comment
+edit/delete with the same moderation rules as PR comments.
+
+The **Discussions** tab adds GitHub's category model — **Announcements, Ideas,
+Q&A, Show and tell, General** — with tabs and counts per category. New
+discussions pick a category; threads show the opening post and replies rendered
+with the same Markdown viewer. On **Q&A** threads, replies can be **marked as
+the answer** (highlighted row, "✓ Answered" status, unmark supported); other
+categories don't offer the action. Any discussion can be **locked**, which
+stops new replies while keeping management actions available.
 
 ## Permalinks
 

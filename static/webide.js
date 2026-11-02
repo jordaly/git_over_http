@@ -7,9 +7,67 @@
     const originals = new Map(), models = new Map(), changes = new Map();
     const viewStates = new Map(), expanded = new Set(), opened = [];
     let snapshot, editor, diff, originalModel, deletedModel, active = null, busy = false, reviewing = false;
-    const single = () => root.dataset.mode === "single";
+    const languageOverrides = new Map();
+    // Language workbench (VS Code style): registry, auto detection, quick pick.
+    const languageItems = [];  // unique {id, name, extensions}
+    const languageById = new Map();
+    function buildLanguages() {
+        if (languageItems.length) return languageItems;
+        const seen = new Set();  // Monaco registers aliases; one entry per id.
+        for (const lang of monaco.languages.getLanguages()) {
+            if (seen.has(lang.id)) continue;
+            seen.add(lang.id);
+            const item = {id: lang.id, name: lang.name || lang.id, extensions: [...(lang.extensions || [])]};
+            languageItems.push(item); languageById.set(lang.id, item);
+        }
+        return languageItems;
+    }
+    function detectLanguage(filename) {
+        const name = basename(filename).toLowerCase();
+        const ext = name.includes(".") ? name.split(".").pop() : "";
+        if (!ext) return "";
+        for (const item of buildLanguages()) {
+            if (item.extensions.some(value => value.toLowerCase() === "." + ext)) return item.id;
+        }
+        return "";
+    }
+    const effectiveLanguage = filename => languageOverrides.get(filename) ?? detectLanguage(filename);
+    function languageLabel(filename) {
+        if (!filename) return "Plain Text";
+        const choice = effectiveLanguage(filename);
+        const item = choice ? languageById.get(choice) : null;
+        return item ? item.name : "Plain Text";
+    }
+    function syncLanguage() {
+        const select = el("language");
+        if (!select) return;
+        select.textContent = languageLabel(active);
+        select.setAttribute("aria-label", "Language: " + select.textContent +
+            (active && languageOverrides.has(active) ? " (overridden)" : " (auto-detected)"));
+        select.disabled = busy || !active || changes.get(active) === null;
+    }
+    function applyLanguage(filename, choice) {
+        if (!choice) languageOverrides.delete(filename);
+        else languageOverrides.set(filename, choice);
+        // Recreate the model so the language applies from the first token.
+        const wasReviewing = reviewing;
+        closeDiff();
+        const value = models.has(filename) ? models.get(filename).getValue() : originals.get(filename) || "";
+        models.get(filename)?.dispose(); models.delete(filename);
+        model(filename, value);
+        if (wasReviewing) return review();
+        show(filename, true);
+        status(choice ? "Language mode changed to " + choice + "."
+                      : "Auto-detect restored" + (detectLanguage(filename) ? ": " + detectLanguage(filename) : "."));
+    }    const single = () => root.dataset.mode === "single";
     const resolveMode = () => root.dataset.mode === "resolve";
     const resolveState = () => resolveMode() && snapshot;
+    function wordWrapPref() { try { return localStorage.getItem("pygithost_ide_wrap") === "on" ? "on" : "off"; } catch { return "off"; } }
+    function syncWrap() {
+        const on = wordWrapPref() === "on";
+        el("wrap")?.setAttribute("aria-pressed", String(on));
+        el("wrap")?.classList.toggle("ide-status-active", on);
+    }
     const dirty = () => changes.size > 0;
     const status = text => { el("status").textContent = text; };
     const basename = filename => filename.split("/").at(-1);
@@ -86,6 +144,7 @@
             model: filename ? models.get(filename) || null : null,
             theme: document.documentElement.dataset.theme === "light" ? "vs" : "vs-dark",
             automaticLayout: true, minimap: {enabled: false}, fontSize: 14,
+            wordWrap: wordWrapPref(),
             scrollBeyondLastLine: false, readOnly: busy || !filename || changes.get(filename) === null
         });
         if (filename && viewStates.has(filename)) editor.restoreViewState(viewStates.get(filename));
@@ -95,10 +154,10 @@
         const position = editor.getPosition();
         el("cursor").textContent = position ? "Ln " + position.lineNumber + ", Col " + position.column + " · UTF-8" : "UTF-8";
         if (focus) editor.focus();
-        updateLocation(); render();
+        updateLocation(); render(); syncLanguage();
     }
     function model(filename, content) {
-        const result = monaco.editor.createModel(content, undefined,
+        const result = monaco.editor.createModel(content, effectiveLanguage(filename) || undefined,
             monaco.Uri.parse("inmemory://webide/" + filename.split("/").map(encodeURIComponent).join("/")));
         models.set(filename, result);
         result.onDidChangeContent(() => {
@@ -312,23 +371,52 @@
             monaco.Uri.parse("inmemory://webide-original/" + active.split("/").map(encodeURIComponent).join("/")));
         if (changes.get(active) === null) deletedModel = monaco.editor.createModel("", originalModel.getLanguageId());
         diff = monaco.editor.createDiffEditor(el("editor"), {automaticLayout: true, readOnly: true, originalEditable: false,
+            wordWrap: wordWrapPref(),
             renderSideBySide: !single() && innerWidth > 800, minimap: {enabled: false}, scrollBeyondLastLine: false});
         diff.setModel({original: originalModel, modified: deletedModel || models.get(active)});
         reviewing = true;
         el("review").setAttribute("aria-pressed", "true"); el("write").setAttribute("aria-pressed", "false");
         status("Previewing changes to " + active + ". Select Write to continue editing.");
     }
-    function openPicker() {
-        if (busy || !snapshot || single()) return;
+    let pickerMode = "files";
+    function pickerHeadingLabels() {
+        const heading = el("picker").querySelector("label");
+        if (heading) heading.textContent = pickerMode === "languages" ? "Select language" : "Go to file";
+        el("picker-input").placeholder = pickerMode === "languages" ? "Select a language…" : "Search files by name…";
+    }
+    function openPicker(mode = "files") {
+        if (busy || !snapshot || (single() && mode !== "languages")) return;
+        pickerMode = mode;
+        pickerHeadingLabels();
         el("picker-input").value = ""; renderPicker();
         el("picker").showModal(); el("picker-input").focus();
     }
     function renderPicker() {
         const query = el("picker-input").value.toLowerCase();
+        if (pickerMode === "languages") return renderLanguagePicker(query);
         const results = allFiles().filter(filename => filename.toLowerCase().includes(query)).slice(0, 100);
         el("picker-results").replaceChildren(...results.map(filename => button(filename, () => {
             el("picker").close(); run(() => open(filename));
         })));
+    }
+    function renderLanguagePicker(query) {
+        const current = effectiveLanguage(active);
+        const entries = [{id: "", name: "Auto Detect", extensions: [], detected: !languageOverrides.has(active) && !!current,
+                          override: false}].concat(
+            buildLanguages().map(item => ({...item, detected: !languageOverrides.has(active) && item.id === current,
+                                           override: languageOverrides.has(active) && item.id === current}))
+        ).filter(item => item.name.toLowerCase().includes(query) || item.id.toLowerCase().includes(query));
+        el("picker-results").replaceChildren(...entries.map(item => {
+            const label = item.name + (item.id ? " (" + item.id + ")" : "");
+            const node = button(label, () => {
+                el("picker").close(); run(() => applyLanguage(active, item.id));
+            }, {"aria-current": String((item.id || "") === current), title: item.extensions.slice(0, 6).join(" ") || undefined});
+            node.setAttribute("data-language", item.id || "auto");
+            if (item.detected || item.override) node.classList.add("ide-picker-selected");
+            if (item.detected) node.textContent += " · auto-detected";
+            if (item.override) node.textContent += " · manual";
+            return node;
+        }));
     }
     el("branch").onchange = () => {
         if (dirty() && !confirm("Discard all pending changes and switch branches?")) { el("branch").value = snapshot.branch; return; }
@@ -438,6 +526,15 @@
     });
     el("write").onclick = () => run(async () => { if (active) show(active, true); });
     el("review").onclick = () => run(review);
+    el("language") && (el("language").onclick = () => openPicker("languages"));
+    el("wrap") && (el("wrap").onclick = async () => {
+        const on = wordWrapPref() ? "off" : "on";
+        try { localStorage.setItem("pygithost_ide_wrap", on); } catch { /* private mode */ }
+        if (editor) editor.updateOptions({wordWrap: on});
+        if (diff) diff.updateOptions({wordWrap: on});
+        syncWrap();
+        status("Word wrap " + (on === "on" ? "enabled. Hard-wrapped lines are display-only; the saved text is unchanged." : "disabled."));
+    });
     el("commit").onsubmit = event => {
         event.preventDefault();
         run(async () => {
@@ -474,8 +571,10 @@
         });
     };
     document.addEventListener("keydown", event => {
-        if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+        if (!(event.ctrlKey || event.metaKey || event.altKey)) return;
         const key = event.key.toLowerCase();
+        if (key === "z" && event.altKey) { event.preventDefault(); event.stopPropagation(); el("wrap")?.click(); }
+        if ((event.ctrlKey || event.metaKey) && event.altKey) return;
         if (key === "p" && !event.shiftKey && !single()) { event.preventDefault(); event.stopPropagation(); openPicker(); }
         if (key === "s" && !event.shiftKey) { event.preventDefault(); event.stopPropagation(); status("Edits are held in this tab. Use Source Control to commit them to Git when ready."); }
         if (event.shiftKey && (key === "e" || key === "g" || key === "f") && !single()) { event.preventDefault(); setView(key === "e" ? "explorer" : key === "f" ? "search" : "source", true); }
@@ -489,5 +588,8 @@
     if (!window.require) { status("Monaco failed to load. Reload this page."); return; }
     lock(true);
     require.config({paths: {vs: new URL("/static/vendor/monaco/vs", location.origin).href}});
-    require(["vs/editor/editor.main"], () => { lock(false); run(load); }, error => { lock(false); status("Unable to load Monaco: " + error); });
+    require(["vs/editor/editor.main"], () => {
+        buildLanguages(); syncWrap();
+        lock(false); run(load);
+    }, error => { lock(false); status("Unable to load Monaco: " + error); });
 })();

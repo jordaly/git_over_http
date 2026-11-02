@@ -55,6 +55,33 @@ from .database import (
     db_pr_comment_update,
     db_pr_comment_delete,
     db_pr_update_text,
+    db_issue_create,
+    db_issue_get,
+    db_issue_list,
+    db_issue_count,
+    db_issue_close,
+    db_issue_reopen,
+    db_issue_update_text,
+    db_issue_comment_add,
+    db_issue_comment_list,
+    db_issue_comment_count,
+    db_issue_comment_get,
+    db_issue_comment_update,
+    db_issue_comment_delete,
+    db_discussion_create,
+    db_discussion_get,
+    db_discussion_list,
+    db_discussion_count,
+    db_discussion_update_text,
+    db_discussion_set_locked,
+    db_discussion_set_answer,
+    db_discussion_comment_add,
+    db_discussion_comment_list,
+    db_discussion_comment_counts,
+    db_discussion_comment_count,
+    db_discussion_comment_get,
+    db_discussion_comment_update,
+    db_discussion_comment_delete,
     db_ci_runs_list,
     db_ci_run_get,
     db_ci_latest_run,
@@ -192,7 +219,7 @@ def _pr_create_form_html(base, opt_src, opt_tgt, warn_merge):
 <div class="row"><div style="min-width:220px"><label>Source branch</label><select name="source_branch" required>{opt_src}</select></div>
 <div style="min-width:220px"><label>Target branch</label><select name="target_branch" required>{opt_tgt}</select></div></div>
 <div class="row" style="margin-top:10px"><div style="flex:1;min-width:260px"><label>Title</label><input name="title" placeholder="Add feature X" required style="width:100%"/></div></div>
-<div style="margin-top:10px"><label>Description</label><textarea name="body" placeholder="What does this change?"></textarea></div>
+<div style="margin-top:10px"><label>Description</label><textarea name="body" data-markdown placeholder="What does this change?"></textarea></div>
 <div style="margin-top:10px"><button type="submit">Create PR</button></div></form>{warn_merge}'''
     ))
 
@@ -201,7 +228,8 @@ def _repo_tabs(base, active):
     owner, repo = [unquote(part) for part in base.rstrip("/").split("/")[-2:]]
     links = []
     for key, suffix, label in (("code", "", "Code"), ("branches", "/branches", "Branches"),
-                              ("pulls", "/pulls", "Pull requests"), ("ci", "/ci", "CI"),
+                              ("issues", "/issues", "Issues"), ("pulls", "/pulls", "Pull requests"),
+                              ("discussions", "/discussions", "Discussions"), ("ci", "/ci", "CI"),
                               ("artifacts", "/artifacts", "Artifacts")):
         current = safe_html(' aria-current="page"' if key == active else "")
         links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
@@ -288,6 +316,14 @@ from .rendering import SafeHTML, html_t, join_html, q, safe_html, str_t
 CONFIG_SCHEMA_VERSION = 1
 DEFAULT_CONFIG_FILENAME = "pygithost.config.json"
 CURRENT_PLATFORM = platform.system()
+
+# Markdown bodies (issues, discussions, PR descriptions/comments) can embed
+# images as data URLs. Base64 inflates a file by ~4/3, so the editor's 512 KiB
+# inline-image budget becomes ~700k characters of Markdown. The stored-body cap
+# must stay above that: truncating a data URL midway leaves an unterminated
+# `![alt](data:…)` and the viewer renders the raw base64 text instead of the
+# image (the editor preview still looked fine because it had the full value).
+MARKDOWN_BODY_LIMIT = 1_000_000
 
 
 CONFIG_GLOBAL_MAP = {
@@ -1011,6 +1047,25 @@ def _ip_allowed(ip: str, allow: set[str]) -> bool:
     return False
 
 
+def _clip_markdown(body: str) -> str:
+    """Trim a Markdown body to the storage cap without splitting an image.
+
+    A partly-stored `![alt](data:…)` is worse than a missing image: the viewer
+    cannot parse it and shows the raw base64 as text. If the cut lands inside a
+    data-URL image, drop that unfinished image instead.
+    """
+    if len(body) <= MARKDOWN_BODY_LIMIT:
+        return body
+    clipped = body[:MARKDOWN_BODY_LIMIT]
+    marker = clipped.rfind("![")
+    if marker != -1:
+        tail = clipped[marker:]
+        open_paren = tail.find("](")
+        if open_paren != -1 and ")" not in tail[open_paren + 2:]:
+            clipped = clipped[:marker].rstrip()
+    return clipped
+
+
 def _html_page(title: str, body_html: str | SafeHTML, *, wide: bool = False) -> bytes:
     body = safe_html(body_html)
     body_class = "wide-page" if wide else ""
@@ -1337,7 +1392,9 @@ async def _send_response(req: Request, status: int, body: bytes = b"", headers: 
 
 
 async def _send_html(req: Request, status: int, body: bytes) -> None:
-    await _send_response(req, status, body, [("Content-Type", "text/html; charset=utf-8")])
+    # Rendered pages may embed fresh asset versions; never let the browser
+    # serve a stale page from heuristic caching.
+    await _send_response(req, status, body, [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
 
 
 async def _send_text(req: Request, status: int, text: str) -> None:
@@ -2471,7 +2528,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 {notice_html}
 <div class="box" style="margin-bottom:14px">{_pr_create_form_html(base, opt_src, opt_tgt, warn_merge)}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Open a pull request · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(self.request, 200, _html_page(str_t(t"Open a pull request · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}{self._issue_editor_assets()}</main>'))))
 
     async def _ui_pulls_create(self, owner: str, repo: str):
         owner = unquote(owner)
@@ -2618,7 +2675,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             heading = safe_html(html_t(t'Diff — <code>{selected_file}</code> <a class="pill" href="{base}/pulls/{pr_id}#diff">All files</a>'))
         else:
             heading = safe_html("Diff")
-        description = safe_html(html_t(t"{body}")) if (body or "").strip() else safe_html('<span class="muted">(no description)</span>')
+        description = safe_html(html_t(t'<div class="md-body">{body}</div>')) if (body or "").strip() else safe_html('<span class="muted">(no description)</span>')
         src_short = (src_commit or "")[:8]
         tgt_short = (tgt_commit or "")[:8]
         file_rows = []
@@ -2653,13 +2710,13 @@ document.addEventListener("DOMContentLoaded", function() {{
             if can_manage:
                 controls = safe_html(html_t(t'<form method="POST" action="{base}/pulls/{pr_id}/comments/{cid}/delete" class="pr-comment-actions"><button class="danger" type="submit">Delete</button></form>'))
             comment_rows.append(html_t(
-                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body">{c_body}</div></div>'
+                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
             ))
         comments_join = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
         comment_form = safe_html("")
         if status == "open" and can_write:
             comment_form = safe_html(html_t(
-                t'<form method="POST" action="{base}/pulls/{pr_id}/comments" class="pr-comment-form"><label>Add comment</label><textarea name="body" required maxlength="50000" placeholder="Write a comment…"></textarea><button type="submit">Comment</button></form>'
+                t'<form method="POST" action="{base}/pulls/{pr_id}/comments" class="pr-comment-form pr-md-form"><label>Add comment</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a comment… Markdown and image uploads supported"></textarea><button type="submit">Comment</button></form>'
             ))
         else:
             comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
@@ -2669,7 +2726,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         title_form = safe_html("")
         if status == "open" and can_write:
             title_form = safe_html(html_t(
-                t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" maxlength="50000">{body}</textarea><button type="submit">Save</button></form></details>'
+                t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form pr-md-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body}</textarea><button type="submit">Save</button></form></details>'
             ))
         body_html = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>PR #{pr_id}: {title}</h2>
@@ -2684,7 +2741,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 {files_panel}
 <div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">{heading}</h2>{summary}{diff_html}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>'))))
+        await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}{self._issue_editor_assets()}</main>'))))
 
     async def _ui_pull_comment(self, owner: str, repo: str, pr_id: int):
         owner = unquote(owner)
@@ -2698,7 +2755,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         body = (form.get("body") or "").strip()
         if not body:
             return await self._ui_pull_view(owner, repo, pr_id, "Comment text is required.", "warn")
-        await asyncio.to_thread(db_pr_comment_add, pr_id, self.remote_user_id, body[:50000])
+        await asyncio.to_thread(db_pr_comment_add, pr_id, self.remote_user_id, _clip_markdown(body))
         return await self._ui_pull_view(owner, repo, pr_id, "Comment added.", "ok")
 
     def _can_manage_comment(self, author_id):
@@ -2735,7 +2792,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         body = (form.get("body") or "").strip()
         if not body:
             return await self._ui_pull_view(owner, repo, pr_id, "Comment text is required.", "warn")
-        await asyncio.to_thread(db_pr_comment_update, comment_id, body[:50000])
+        await asyncio.to_thread(db_pr_comment_update, comment_id, _clip_markdown(body))
         return await self._ui_pull_view(owner, repo, pr_id, "Comment updated.", "ok")
 
     async def _ui_pull_update(self, owner: str, repo: str, pr_id: int):
@@ -2751,8 +2808,585 @@ document.addEventListener("DOMContentLoaded", function() {{
         body = (form.get("body") or "").strip()
         if not title:
             return await self._ui_pull_view(owner, repo, pr_id, "Title is required.", "warn")
-        await asyncio.to_thread(db_pr_update_text, pr_id, title, body[:50000])
+        await asyncio.to_thread(db_pr_update_text, pr_id, title, _clip_markdown(body))
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request updated.", "ok")
+
+    # ---------- Issues ----------
+    async def _ui_issues(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query or "")
+        status = (qs.get("status") or ["open"])[0]
+        if status not in ("open", "closed", "all"):
+            status = "open"
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        from .database import db_issue_count, db_issue_list, db_issue_comment_counts
+        size = _page_size(qs)
+        total = await asyncio.to_thread(db_issue_count, owner, repo, None if status == "all" else status)
+        page = _clamp_page(_page_number(qs), total, size)
+        rows_db = await asyncio.to_thread(db_issue_list, owner, repo, None if status == "all" else status,
+                                          limit=size, offset=(page - 1) * size)
+        comment_counts = await asyncio.to_thread(db_issue_comment_counts, [row[0] for row in rows_db])
+        rows = []
+        for issue_id, title, st, created_at, author_id, username in rows_db:
+            count = comment_counts.get(issue_id, 0)
+            count_suffix = safe_html(f'<small title="{count} comment(s)">💬 {count}</small>' if count else "")
+            comment_by = safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>')) if author_id else safe_html("")
+            rows.append(html_t(
+                t"""<tr class="issue-list-row">
+<td><span class="issue-status-icon issue-status-{st}" aria-hidden="true">{("🞅" if st == "open" else "✓")}</span> <a href="{base}/issues/{issue_id}">Issue #{issue_id}: {title}</a></td>
+<td>{count_suffix}{comment_by}</td>
+<td><span class="pill pill-{st}">{st}</span></td>
+<td class="muted"><small title="{created_at}">{_relative_time(created_at)}</small></td></tr>"""
+            ))
+        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No issues.</td><td></td><td></td><td></td></tr>')
+        pagination = _pagination(str_t(t"/r/{q(owner)}/{q(repo)}/issues"),
+                                 {key: values[0] for key, values in qs.items() if key != "page"},
+                                 page, page * size < total, total=total, per_page=size)
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        can_write = _has_write_scope(self)
+        new_pill = safe_html('<a class="pill pull-tab-active" href="{0}/issues/new">+ New issue</a>'.format(base)) if can_write else safe_html("")
+        body = html_t(
+            t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>Issues</h2>
+<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/pulls">Pull requests</a> <a class="pill" href="/">Home</a></div></div>
+{notice_html}
+<div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>
+<a class="pill pull-tab{' pull-tab-active' if status == 'open' else ''}" href="{base}/issues?status=open" id="issues-tab-open">Open</a> <a class="pill pull-tab{' pull-tab-active' if status == 'closed' else ''}" href="{base}/issues?status=closed" id="issues-tab-closed">Closed</a> <a class="pill pull-tab{' pull-tab-active' if status == 'all' else ''}" href="{base}/issues?status=all" id="issues-tab-all">All</a>
+</div><div>{new_pill}</div></div></div>
+<div class="box"><table>{rows_html}</table>{pagination}</div>"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"Issues · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    def _issue_editor_assets(self):
+        """Editor assets with a cache-busting version stamp (mtime of the glue)."""
+        glue = Path(__file__).resolve().parent.parent / "static" / "markdown.js"
+        bundle = Path(__file__).resolve().parent.parent / "static" / "vendor" / "tui-editor" / "toastui-editor-all.min.js"
+        stamp = f"{int(glue.stat().st_mtime)}-{int(bundle.stat().st_mtime)}"
+        return safe_html(html_t(
+            t'<link rel="stylesheet" href="/static/vendor/tui-editor/toastui-editor.css?v={stamp}">'
+            t'<link rel="stylesheet" href="/static/vendor/tui-editor/toastui-editor-viewer.css?v={stamp}">'
+            t'<link rel="stylesheet" href="/static/vendor/tui-editor/theme/toastui-editor-dark.css?v={stamp}">'
+            t'<script src="/static/vendor/tui-editor/toastui-editor-all.min.js?v={stamp}"></script>'
+            t'<script src="/static/markdown.js?v={stamp}" defer></script>'
+        ))
+
+    async def _ui_issues_new(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        body = html_t(
+            t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>New issue</h2>
+<div><a class="pill" href="{base}/issues">All issues</a> <a class="pill" href="{base}">Repo</a></div></div>
+{notice_html}
+<div class="box" style="margin-bottom:14px"><form method="POST" action="{base}/issues/create">
+<label>Title</label><input name="title" required maxlength="300" placeholder="Describe the problem or request" style="width:100%">
+<label style="margin-top:10px">Description</label>
+<textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Explain the issue. Markdown is supported."></textarea>
+<button type="submit" style="margin-top:10px">Submit new issue</button></form></div>{self._issue_editor_assets()}"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"New issue · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    async def _ui_issues_create(self, owner: str, repo: str):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._forbidden(b"403 Forbidden\n")
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        if not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        form = await self._read_form_urlencoded()
+        title = (form.get("title") or "").strip()
+        body_md = (form.get("body") or "").strip()
+        if not title:
+            return await self._ui_issues_new(owner, repo, "Title is required.", "warn")
+        issue_id = await asyncio.to_thread(db_issue_create, owner, repo, title, _clip_markdown(body_md),
+                                          getattr(self, "remote_user_id", None))
+        await _send_redirect(self.request, f"/r/{owner}/{repo}/issues/{issue_id}")
+
+    async def _ui_issue_view(self, owner: str, repo: str, issue_id: int, notice: str = "", notice_kind: str = "ok"):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        issue = await asyncio.to_thread(db_issue_get, issue_id)
+        if not issue or issue[1] != owner or issue[2] != repo:
+            return await self._not_found()
+        _iid, _owner, _repo_db, title, body_md, author_id, username, status, created_at, updated_at, closed_at = issue
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        comments = await asyncio.to_thread(db_issue_comment_list, issue_id)
+        can_write = _has_write_scope(self)
+        viewer_admin = getattr(self, "remote_is_admin", False)
+        viewer_id = getattr(self, "remote_user_id", None)
+        author_label = safe_html(html_t(t'{username or "anonymous"}')) if author_id else safe_html("anonymous")
+        # GitHub-style: the issue first post is a bordered comment block.
+        comment_rows = []
+        for cid, c_author, c_username, c_body, c_created, c_edited in comments:
+            when = _relative_time(c_created) or c_created
+            edited = " (edited)" if c_edited else ""
+            can_manage = self._can_manage_comment(c_author)
+            controls = safe_html("")
+            if can_manage:
+                controls = safe_html(html_t(
+                    t'<form method="POST" action="{base}/issues/{issue_id}/comments/{cid}/delete" class="issue-comment-actions"><button class="danger" type="submit">Delete</button></form>'
+                ))
+            comment_rows.append(html_t(
+                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
+            ))
+        comments_inner = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
+        comments_box = safe_html(html_t(
+            t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Comments ({len(comments)})</h2>{comments_inner}</div>'
+        ))
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        controls_area = safe_html("")
+        if can_write:
+            action = "Close issue" if status == "open" else "Reopen issue"
+            route = "close" if status == "open" else "reopen"
+            controls_area = safe_html(html_t(
+                t'<form method="POST" action="{base}/issues/{issue_id}/{route}" style="margin-top:10px"><button type="submit">{action}</button></form>'
+            ))
+        title_form = safe_html("")
+        if can_write:
+            title_form = safe_html(html_t(
+                t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/issues/{issue_id}/update"><label>Title</label><input name="title" value="{title}" required maxlength="300"><label style="margin-top:10px">Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body_md}</textarea><button type="submit" style="margin-top:10px">Save</button></form></details>'
+            ))
+        comment_form = safe_html("")
+        if can_write:
+            comment_form = safe_html(html_t(
+                t'<form method="POST" action="{base}/issues/{issue_id}/comments" class="pr-md-form"><label>Add comment</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a comment… Markdown and image uploads supported"></textarea><button type="submit" style="margin-top:10px">Comment</button></form>'
+            ))
+        else:
+            comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
+        body = html_t(
+            t"""{_repo_tabs(base, "issues")}<div class="topbar"><div><h2>Issue #{issue_id}: {title}</h2>
+<div class="muted"><span class="pill pill-{status}">{status}</span> {author_label} opened this issue <time title="{created_at}">{_relative_time(created_at)}</time> · by {username or "anonymous"}</div></div>
+<div><a class="pill" href="{base}/issues">All issues</a> <a class="pill" href="{base}">Repo</a></div></div>
+{notice_html}
+<div class="box" style="margin-bottom:14px"><div class="pr-comment issue-first-post"><div class="pr-comment-head"><b>Opened by {author_label}</b> <span class="muted"><time title="{created_at}">{_relative_time(created_at)}</time></span></div><div class="pr-comment-body md-body">{body_md}</div></div>{title_form}</div>
+{controls_area}{comments_box}{comment_form}{self._issue_editor_assets()}"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"Issue #{issue_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    async def _ui_issue_comment(self, owner: str, repo: str, issue_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        issue = await asyncio.to_thread(db_issue_get, issue_id)
+        if not issue or issue[1] != owner or issue[2] != repo:
+            return await self._not_found()
+        form = await self._read_form_urlencoded()
+        body_md = (form.get("body") or "").strip()
+        if not body_md:
+            return await self._ui_issue_view(owner, repo, issue_id, "Comment text is required.", "warn")
+        await asyncio.to_thread(db_issue_comment_add, issue_id, getattr(self, "remote_user_id", None), _clip_markdown(body_md))
+        return await self._ui_issue_view(owner, repo, issue_id, "Comment added.", "ok")
+
+    async def _issue_and_comment(self, owner, repo, issue_id, comment_id):
+        issue = await asyncio.to_thread(db_issue_get, issue_id)
+        if not issue or issue[1] != unquote(owner) or issue[2] != unquote(repo):
+            return None, None
+        comment = await asyncio.to_thread(db_issue_comment_get, issue_id, comment_id)
+        return issue, comment
+
+    async def _ui_issue_comment_delete(self, owner: str, repo: str, issue_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        issue, comment = await self._issue_and_comment(owner, repo, issue_id, comment_id)
+        if not comment:
+            return await self._not_found()
+        if not self._can_manage_comment(comment[2]):
+            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can delete.\n")
+        await asyncio.to_thread(db_issue_comment_delete, comment_id)
+        return await self._ui_issue_view(owner, repo, issue_id, "Comment deleted.", "ok")
+
+    async def _ui_issue_comment_edit(self, owner: str, repo: str, issue_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        issue, comment = await self._issue_and_comment(owner, repo, issue_id, comment_id)
+        if not comment:
+            return await self._not_found()
+        if not self._can_manage_comment(comment[2]):
+            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can edit.\n")
+        form = await self._read_form_urlencoded()
+        body_md = (form.get("body") or "").strip()
+        if not body_md:
+            return await self._ui_issue_view(owner, repo, issue_id, "Comment text is required.", "warn")
+        await asyncio.to_thread(db_issue_comment_update, comment_id, _clip_markdown(body_md))
+        return await self._ui_issue_view(owner, repo, issue_id, "Comment updated.", "ok")
+
+    async def _ui_issue_close(self, owner: str, repo: str, issue_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        issue = await asyncio.to_thread(db_issue_get, issue_id)
+        if not issue or issue[1] != owner or issue[2] != repo:
+            return await self._not_found()
+        if issue[7] == "closed":
+            return await self._ui_issue_view(owner, repo, issue_id, "Issue is already closed.", "warn")
+        await asyncio.to_thread(db_issue_close, issue_id)
+        return await self._ui_issue_view(owner, repo, issue_id, "Issue closed.", "ok")
+
+    async def _ui_issue_reopen(self, owner: str, repo: str, issue_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        issue = await asyncio.to_thread(db_issue_get, issue_id)
+        if not issue or issue[1] != owner or issue[2] != repo:
+            return await self._not_found()
+        if issue[7] == "open":
+            return await self._ui_issue_view(owner, repo, issue_id, "Issue is already open.", "warn")
+        await asyncio.to_thread(db_issue_reopen, issue_id)
+        return await self._ui_issue_view(owner, repo, issue_id, "Issue reopened.", "ok")
+
+    async def _ui_issue_update(self, owner: str, repo: str, issue_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        issue = await asyncio.to_thread(db_issue_get, issue_id)
+        if not issue or issue[1] != owner or issue[2] != repo:
+            return await self._not_found()
+        form = await self._read_form_urlencoded()
+        title = (form.get("title") or "").strip()
+        body_md = (form.get("body") or "").strip()
+        if not title:
+            return await self._ui_issue_view(owner, repo, issue_id, "Title is required.", "warn")
+        await asyncio.to_thread(db_issue_update_text, issue_id, title, _clip_markdown(body_md))
+        return await self._ui_issue_view(owner, repo, issue_id, "Issue updated.", "ok")
+
+    # ---------- Discussions ----------
+    def _discussion_categories(self):
+        return ("Announcements", "Ideas", "Q&A", "Show and tell", "General")
+
+    async def _ui_discussions(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        qs = parse_qs(urlparse(self.path).query or "")
+        category = (qs.get("category") or [""])[0]
+        if category not in self._discussion_categories():
+            category = ""
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        size = _page_size(qs)
+        total = await asyncio.to_thread(db_discussion_count, owner, repo, category or None)
+        page = _clamp_page(_page_number(qs), total, size)
+        rows_db = await asyncio.to_thread(db_discussion_list, owner, repo, category or None,
+                                          limit=size, offset=(page - 1) * size)
+        comment_counts = await asyncio.to_thread(db_discussion_comment_counts, [row[0] for row in rows_db])
+        rows = []
+        for discussion_id, title, cat, created_at, author_id, username, answered_id in rows_db:
+            count = comment_counts.get(discussion_id, 0)
+            suffixes = safe_html(f'<small title="{count} comment(s)">💬 {count}</small>' if count else "")
+            if answered_id:
+                suffixes = safe_html(' <small class="ok" title="Answered">✓ Answered</small>') + suffixes
+            by = safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>')) if author_id else safe_html("")
+            rows.append(html_t(
+                t"""<tr class="discussion-list-row">
+<td><span class="issue-status-icon discussion-cat" aria-hidden="true">💬</span> <a href="{base}/discussions/{discussion_id}">{title}</a></td>
+<td><span class="pill">{cat}</span></td>
+<td>{suffixes}{by}</td>
+<td class="muted"><small title="{created_at}">{_relative_time(created_at)}</small></td></tr>"""
+            ))
+        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No discussions.</td><td></td><td></td><td></td></tr>')
+        pagination = _pagination(str_t(t"/r/{q(owner)}/{q(repo)}/discussions"),
+                                 {key: values[0] for key, values in qs.items() if key != "page"},
+                                 page, page * size < total, total=total, per_page=size)
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        new_pill = safe_html(html_t(t'<a class="pill pull-tab-active" href="{base}/discussions/new">+ New discussion</a>')) if _has_write_scope(self) else safe_html("")
+        counts = {}
+        for cat in self._discussion_categories():
+            counts[cat] = await asyncio.to_thread(db_discussion_count, owner, repo, cat)
+        counts["all"] = total
+        tab_links = [safe_html(html_t(
+            t'<a class="pill pull-tab{" pull-tab-active" if category == "" else ""}" href="{base}/discussions?category=" id="discussions-tab-all">All {counts["all"]}</a>'
+        ))]
+        for cat in self._discussion_categories():
+            tab_links.append(safe_html(html_t(
+                t'<a class="pill pull-tab{" pull-tab-active" if category == cat else ""}" href="{base}/discussions?category={q(cat)}" id="discussions-tab-{q(cat)}">{cat} {counts[cat]}</a>'
+            )))
+        body = html_t(
+            t"""{_repo_tabs(base, "discussions")}<div class="topbar"><h2>Discussions</h2>
+<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/issues">Issues</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
+{notice_html}
+<div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>{join_html(tab_links)}</div><div>{new_pill}</div></div></div>
+<div class="box"><table>{rows_html}</table>{pagination}</div>"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"Discussions · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    async def _ui_discussions_new(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        category_options = join_html([html_t(t'<option value="{cat}"{safe_html(" selected" if cat == "General" else "")}>{cat}</option>') for cat in self._discussion_categories()])
+        body = html_t(
+            t"""{_repo_tabs(base, "discussions")}<div class="topbar"><h2>New discussion</h2>
+<div><a class="pill" href="{base}/discussions">All discussions</a> <a class="pill" href="{base}">Repo</a></div></div>
+{notice_html}
+<div class="box" style="margin-bottom:14px"><form method="POST" action="{base}/discussions/create">
+<label>Category</label><select name="category" required>{category_options}</select>
+<label style="margin-top:10px">Title</label><input name="title" required maxlength="300" placeholder="Start the conversation" style="width:100%">
+<label style="margin-top:10px">Description</label>
+<textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Explain your idea or question. Markdown is supported."></textarea>
+<button type="submit" style="margin-top:10px">Start discussion</button></form></div>{self._issue_editor_assets()}"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"New discussion · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    async def _ui_discussions_create(self, owner: str, repo: str):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._forbidden(b"403 Forbidden\n")
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        if not os.path.isdir(_repo_bare_path(owner, repo)):
+            return await self._not_found()
+        form = await self._read_form_urlencoded()
+        title = (form.get("title") or "").strip()
+        category = (form.get("category") or "General").strip()
+        body_md = (form.get("body") or "").strip()
+        if category not in self._discussion_categories():
+            category = "General"
+        if not title:
+            return await self._ui_discussions_new(owner, repo, "Title is required.", "warn")
+        discussion_id = await asyncio.to_thread(db_discussion_create, owner, repo, category, title,
+                                                _clip_markdown(body_md), getattr(self, "remote_user_id", None))
+        await _send_redirect(self.request, f"/r/{owner}/{repo}/discussions/{discussion_id}")
+
+    async def _ui_discussion_view(self, owner: str, repo: str, discussion_id: int, notice: str = "", notice_kind: str = "ok"):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
+        if not discussion or discussion[1] != owner or discussion[2] != repo:
+            return await self._not_found()
+        _id, _own, _rep, category, title, body_md, author_id, username, locked, _locked_by, answered_id, created_at, updated_at = discussion
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        comments = await asyncio.to_thread(db_discussion_comment_list, discussion_id)
+        can_write = _has_write_scope(self)
+        answered = bool(answered_id)
+        comment_rows = []
+        for cid, c_author, c_username, c_body, c_created, c_edited in comments:
+            when = _relative_time(c_created) or c_created
+            edited = " (edited)" if c_edited else ""
+            answer_badge = safe_html(' <span class="pill pill-open">✓ Answer</span>') if cid == answered_id else safe_html("")
+            controls = safe_html("")
+            if self._can_manage_comment(c_author):
+                controls = safe_html(html_t(
+                    t'<form method="POST" action="{base}/discussions/{discussion_id}/comments/{cid}/delete" class="issue-comment-actions"><button class="danger" type="submit">Delete</button></form>'
+                ))
+            answer_toggle = safe_html("")
+            if can_write and category == "Q&A":
+                if cid == answered_id:
+                    answer_toggle = safe_html(html_t(
+                        t'<form method="POST" action="{base}/discussions/{discussion_id}/unanswer/{cid}" class="issue-comment-actions"><button type="submit">Unmark answer</button></form>'
+                    ))
+                else:
+                    answer_toggle = safe_html(html_t(
+                        t'<form method="POST" action="{base}/discussions/{discussion_id}/answer/{cid}" class="issue-comment-actions"><button type="submit">Mark as answer</button></form>'
+                    ))
+            highlight = safe_html(" discussion-answered") if cid == answered_id else safe_html("")
+            comment_rows.append(html_t(
+                t'<div class="pr-comment{highlight}"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b>{answer_badge} <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}{answer_toggle}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
+            ))
+        comments_inner = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
+        comments_box = safe_html(html_t(
+            t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Replies ({len(comments)})</h2>{comments_inner}</div>'
+        ))
+        notice_html = safe_html("")
+        if notice:
+            cls = "ok" if notice_kind == "ok" else "warn"
+            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+        answered_pill = safe_html(' <span class="pill pill-open">✓ Answered</span>') if answered else safe_html("")
+        locked_pill = safe_html(' <span class="muted">· 🔒 Locked</span>') if locked else safe_html("")
+        state_bits = safe_html(html_t(
+            t'<span class="pill">{category}</span>{answered_pill} <span class="muted">· asked by {username or "anonymous"} <time title="{created_at}">{_relative_time(created_at)}</time></span>'
+        ))
+        lock_note = safe_html('<div class="warn" style="margin-top:10px">This discussion is locked; new replies are disabled.</div>') if locked else safe_html("")
+        controls_area = safe_html("")
+        if can_write:
+            lock_action = "Lock" if not locked else "Unlock"
+            lock_route = "lock" if not locked else "unlock"
+            controls_area = safe_html(html_t(
+                t'<form method="POST" action="{base}/discussions/{discussion_id}/{lock_route}" style="margin-top:10px"><button type="submit">{lock_action}</button></form>'
+            ))
+        title_form = safe_html("")
+        if can_write:
+            category_options = join_html([html_t(t'<option value="{cat}"{safe_html(" selected" if cat == category else "")}>{cat}</option>') for cat in self._discussion_categories()])
+            title_form = safe_html(html_t(
+                t'<details style="margin-top:10px"><summary>Edit discussion</summary><form method="POST" action="{base}/discussions/{discussion_id}/update"><label>Category</label><select name="category">{category_options}</select><label style="margin-top:10px">Title</label><input name="title" value="{title}" required maxlength="300"><label style="margin-top:10px">Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body_md}</textarea><button type="submit" style="margin-top:10px">Save</button></form></details>'
+            ))
+        comment_form = safe_html("")
+        if can_write and not locked:
+            comment_form = safe_html(html_t(
+                t'<form method="POST" action="{base}/discussions/{discussion_id}/comments" class="pr-md-form"><label>Reply</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a reply… (Markdown supported)"></textarea><button type="submit" style="margin-top:10px">Reply</button></form>'
+            ))
+        elif not locked:
+            comment_form = safe_html('<p class="muted">Write scope is required to reply.</p>')
+        body = html_t(
+            t"""{_repo_tabs(base, "discussions")}<div class="topbar"><div><h2>{title}</h2>
+<div class="muted">{state_bits}{locked_pill}</div></div>
+<div><a class="pill" href="{base}/discussions">All discussions</a> <a class="pill" href="{base}">Repo</a></div></div>
+{notice_html}{lock_note}
+<div class="box" style="margin-bottom:14px"><div class="pr-comment issue-first-post"><div class="pr-comment-head"><b>Opened by {username or "anonymous"}</b> <span class="muted"><time title="{created_at}">{_relative_time(created_at)}</time></span></div><div class="pr-comment-body md-body">{body_md}</div></div>{title_form}</div>
+{controls_area}{comments_box}{comment_form}{self._issue_editor_assets()}"""
+        )
+        await _send_html(self.request, 200, _html_page(str_t(t"Discussion #{discussion_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+
+    async def _discussion_and_comment(self, owner, repo, discussion_id, comment_id):
+        discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
+        if not discussion or discussion[1] != unquote(owner) or discussion[2] != unquote(repo):
+            return None, None
+        comment = await asyncio.to_thread(db_discussion_comment_get, discussion_id, comment_id)
+        return discussion, comment
+
+    async def _ui_discussion_comment(self, owner: str, repo: str, discussion_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
+        if not discussion or discussion[1] != owner or discussion[2] != repo:
+            return await self._not_found()
+        if discussion[8]:
+            return await self._ui_discussion_view(owner, repo, discussion_id, "This discussion is locked; replies are disabled.", "warn")
+        form = await self._read_form_urlencoded()
+        body_md = (form.get("body") or "").strip()
+        if not body_md:
+            return await self._ui_discussion_view(owner, repo, discussion_id, "Reply text is required.", "warn")
+        await asyncio.to_thread(db_discussion_comment_add, discussion_id, getattr(self, "remote_user_id", None), _clip_markdown(body_md))
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Reply added.", "ok")
+
+    async def _ui_discussion_comment_delete(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
+        if not comment:
+            return await self._not_found()
+        if not self._can_manage_comment(comment[2]):
+            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can delete.\n")
+        await asyncio.to_thread(db_discussion_comment_delete, comment_id)
+        if discussion[10] == comment_id:
+            await asyncio.to_thread(db_discussion_set_answer, discussion_id, None)
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Reply deleted.", "ok")
+
+    async def _ui_discussion_comment_edit(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
+        if not comment:
+            return await self._not_found()
+        if not self._can_manage_comment(comment[2]):
+            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can edit.\n")
+        form = await self._read_form_urlencoded()
+        body_md = (form.get("body") or "").strip()
+        if not body_md:
+            return await self._ui_discussion_view(owner, repo, discussion_id, "Reply text is required.", "warn")
+        await asyncio.to_thread(db_discussion_comment_update, comment_id, _clip_markdown(body_md))
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Reply updated.", "ok")
+
+    async def _ui_discussion_lock(self, owner: str, repo: str, discussion_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
+        if not discussion or discussion[1] != owner or discussion[2] != repo:
+            return await self._not_found()
+        if not discussion[8]:
+            await asyncio.to_thread(db_discussion_set_locked, discussion_id, True, getattr(self, "remote_user_id", None))
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Discussion locked.", "ok")
+
+    async def _ui_discussion_unlock(self, owner: str, repo: str, discussion_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
+        if not discussion or discussion[1] != owner or discussion[2] != repo:
+            return await self._not_found()
+        if discussion[8]:
+            await asyncio.to_thread(db_discussion_set_locked, discussion_id, False, None)
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Discussion unlocked.", "ok")
+
+    async def _ui_discussion_answer(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
+        if not comment:
+            return await self._not_found()
+        if discussion[3] != "Q&A":
+            return await self._ui_discussion_view(owner, repo, discussion_id, "Only Q&A discussions can have a marked answer.", "warn")
+        await asyncio.to_thread(db_discussion_set_answer, discussion_id, comment_id)
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Answer marked.", "ok")
+
+    async def _ui_discussion_unanswer(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
+        if not comment:
+            return await self._not_found()
+        await asyncio.to_thread(db_discussion_set_answer, discussion_id, None)
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Answer unmarked.", "ok")
+
+    async def _ui_discussion_update(self, owner: str, repo: str, discussion_id: int):
+        owner = unquote(owner)
+        repo = unquote(repo)
+        if not _has_write_scope(self):
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
+        discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
+        if not discussion or discussion[1] != owner or discussion[2] != repo:
+            return await self._not_found()
+        form = await self._read_form_urlencoded()
+        title = (form.get("title") or "").strip()
+        category = (form.get("category") or discussion[3]).strip()
+        body_md = (form.get("body") or "").strip()
+        if category not in self._discussion_categories():
+            category = discussion[3]
+        if not title:
+            return await self._ui_discussion_view(owner, repo, discussion_id, "Title is required.", "warn")
+        await asyncio.to_thread(db_discussion_update_text, discussion_id, category, title, _clip_markdown(body_md))
+        return await self._ui_discussion_view(owner, repo, discussion_id, "Discussion updated.", "ok")
 
     def _repo_git_async(self, owner, repo):
         return asyncio.to_thread(_repo_bare_path, owner, repo)
@@ -2968,7 +3602,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <form id="ide-commit"><label for="ide-message">Merge commit message</label><textarea id="ide-message" rows="3" maxlength="4000" required autocomplete="off">{str_t(t"Merge branch '{tgt_branch}' into {src_branch}")}</textarea><button id="ide-submit" type="submit">Apply resolution</button><a id="ide-cancel" href="{return_url}">Cancel</a></form>
 <div class="ide-changes-heading"><h3>Conflicted files</h3><button id="ide-discard" type="button">Discard all</button></div><div id="ide-changes"></div><p class="ide-note">Edit each conflicted file until the &lt;&lt;&lt;&lt;&lt;&lt;&lt;, ======= and &gt;&gt;&gt;&gt;&gt;&gt;&gt; markers are gone, then apply. Applying creates one merge commit on the source branch so it contains the target; the pull request page then offers the ff-only merge. Mark a file for deletion to remove it.</p></section></aside>
 <section class="ide-editor-pane" aria-label="Code editor"><div id="ide-tabs" role="tablist" aria-label="Open files"></div><h2 id="ide-filename">Select a file</h2><div class="ide-editor-container"><div id="ide-editor"></div><div id="ide-empty"><strong>Resolving a merge conflict.</strong><p>Open a conflicted file on the left, edit the marked sections, then apply the resolution.</p></div></div></section></div>
-<footer class="ide-statusbar"><label for="ide-branch">Branch</label><select id="ide-branch" disabled><option value="{src_branch}" selected>{src_branch}</option></select><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
+<footer class="ide-statusbar"><label for="ide-branch">Branch</label><select id="ide-branch" disabled><option value="{src_branch}" selected>{src_branch}</option></select><button id="ide-language" type="button" title="Select language" aria-haspopup="listbox">Plain Text</button><button id="ide-wrap" type="button" title="Toggle word wrap (Alt+Z)" aria-pressed="false">Word wrap</button><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
 <dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close file search">×</button></div><input id="ide-picker-input" placeholder="Search conflicted files…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
 </section></main><link rel="stylesheet" href="/static/webide.css"><script src="/static/vendor/monaco/vs/loader.js"></script><script src="/static/webide.js" defer></script>''')
         return await _send_response(self.request, 200, _html_page(f"Resolve conflicts · PR #{pr_id} · {owner}/{repo}", safe_html(body)),
@@ -3886,7 +4520,7 @@ form.addEventListener("submit", event => {{
 <form id="ide-commit"><label for="ide-message">Commit message</label><textarea id="ide-message" rows="3" maxlength="4000" required placeholder="Describe your changes" autocomplete="off"></textarea><button id="ide-submit" type="submit">Commit changes</button><a id="ide-cancel" class="ide-single-only" href="{return_url}">Cancel</a></form>
 <div class="ide-changes-heading"><h3>Changes</h3><button id="ide-discard" type="button">Discard all</button></div><div id="ide-changes"></div><p class="ide-note">Commits include all pending changes. Only UTF-8 text files up to 1 MiB; up to 100 changed files. Edits stay in this tab until committed or discarded.</p><a class="ide-workspace-only" href="{base}/branches">Create or manage branches</a><a id="ide-pull-request" class="ide-workspace-only" href="{base}/pulls">Create a pull request</a></section></aside>
 <section class="ide-editor-pane" aria-label="Code editor"><div id="ide-tabs" class="ide-workspace-only" role="tablist" aria-label="Open files"></div><h2 id="ide-filename">Select a file</h2><div class="ide-editor-container"><div id="ide-editor"></div><div id="ide-empty"><strong>Ready to make a change?</strong><p>Choose a file from Explorer, or press <kbd>Ctrl/⌘ P</kbd> to find one.</p><p>Changes are collected in Source Control before you commit.</p></div></div></section></div>
-<footer class="ide-statusbar"><label for="ide-branch"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span class="ide-sr-only">Branch</span></label><select id="ide-branch">{options}</select><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
+<footer class="ide-statusbar"><label for="ide-branch"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span class="ide-sr-only">Branch</span></label><select id="ide-branch">{options}</select><button id="ide-language" type="button" title="Select language" aria-haspopup="listbox">Plain Text</button><button id="ide-wrap" type="button" title="Toggle word wrap (Alt+Z)" aria-pressed="false">Word wrap</button><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
 <dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close file search">×</button></div><input id="ide-picker-input" placeholder="Search files by name…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
 </section></main><link rel="stylesheet" href="/static/webide.css"><script src="/static/vendor/monaco/vs/loader.js"></script><script src="/static/webide.js" defer></script>''')
             return await _send_response(self.request, 200, _html_page("Web IDE", safe_html(body)),
@@ -4566,6 +5200,24 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/new$", p)
         if m:
             return await self._ui_pulls_new(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/new$", p)
+        if m:
+            return await self._ui_issues_new(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues$", p)
+        if m:
+            return await self._ui_issues(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)$", p)
+        if m:
+            return await self._ui_issue_view(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/new$", p)
+        if m:
+            return await self._ui_discussions_new(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions$", p)
+        if m:
+            return await self._ui_discussions(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)$", p)
+        if m:
+            return await self._ui_discussion_view(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)$", p)
         if m:
             return await self._ui_pull_view(m.group(1), m.group(2), int(m.group(3)))
@@ -4637,6 +5289,54 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/create$", parsed.path)
         if m:
             return await self._ui_pulls_create(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/create$", parsed.path)
+        if m:
+            return await self._ui_issues_create(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/comments$", parsed.path)
+        if m:
+            return await self._ui_issue_comment(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/comments/(\d+)/delete$", parsed.path)
+        if m:
+            return await self._ui_issue_comment_delete(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/comments/(\d+)/edit$", parsed.path)
+        if m:
+            return await self._ui_issue_comment_edit(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/close$", parsed.path)
+        if m:
+            return await self._ui_issue_close(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/reopen$", parsed.path)
+        if m:
+            return await self._ui_issue_reopen(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/update$", parsed.path)
+        if m:
+            return await self._ui_issue_update(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/create$", parsed.path)
+        if m:
+            return await self._ui_discussions_create(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/comments$", parsed.path)
+        if m:
+            return await self._ui_discussion_comment(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/comments/(\d+)/delete$", parsed.path)
+        if m:
+            return await self._ui_discussion_comment_delete(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/comments/(\d+)/edit$", parsed.path)
+        if m:
+            return await self._ui_discussion_comment_edit(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/lock$", parsed.path)
+        if m:
+            return await self._ui_discussion_lock(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/unlock$", parsed.path)
+        if m:
+            return await self._ui_discussion_unlock(m.group(1), m.group(2), int(m.group(3)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/answer/(\d+)$", parsed.path)
+        if m:
+            return await self._ui_discussion_answer(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/unanswer/(\d+)$", parsed.path)
+        if m:
+            return await self._ui_discussion_unanswer(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/update$", parsed.path)
+        if m:
+            return await self._ui_discussion_update(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/close$", parsed.path)
         if m:
             return await self._ui_pull_close(m.group(1), m.group(2), int(m.group(3)))

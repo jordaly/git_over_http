@@ -169,6 +169,34 @@
 .add { color: var(--ok-fg, #1a7f37); }
 .del { color: var(--error-fg, #cf222e); }
 
+/* Markdown bodies and issue posts */
+.md-body { padding: 4px 0; }
+.md-body table { margin: 8px 0; }
+/* Comment bodies render in the same surface as the editor's md preview. */
+.md-body .markdown-render-target {
+  background: var(--md-body-bg, #fff);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 16px;
+}
+html[data-theme="dark"] .md-body .markdown-render-target { background: var(--pre-bg, #161b22); }
+.issue-first-post { border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--box); }
+.issue-status-icon { display: inline-block; min-width: 1.2em; font-weight: 700; }
+.issue-status-open { color: var(--ok-fg, #1a7f37); }
+.issue-status-closed { color: var(--error-fg, #cf222e); }
+.markdown-editor-holder { margin-top: 6px; }
+.markdown-editor-holder .toastui-editor-defaultUI { border-radius: 8px; }
+.md-body li > p, .md-body li { margin: 2px 0; }
+.md-body ol, .md-body ul, .md-body h1, .md-body h2, .md-body h3 { margin: 10px 0; }
+.pill.discussion-cat { background: var(--accent-bg); color: var(--link); }
+.discussion-answered { border: 1px solid var(--ok-border, currentColor); background: var(--ok-bg, rgba(26,127,55,.06)); border-radius: 8px; }
+.discussion-answered .pr-comment-head b::after { content: ""; }
+.discussion-answered .pr-comment-body { opacity: 1; }
+.discussion-answered > .pr-comment-head .pill.pill-open { font-weight: 600; }
+tr.discussion-list-row td small { font-size: 12px; }
+
+tr.issue-list-row td small { font-size: 12px; }
+
 /* Pull request status and listing UX */
 .pill.pill-open { color: var(--ok-fg, #1a7f37); border-color: var(--ok-border, currentColor); background: var(--ok-bg, rgba(26,127,55,.08)); }
 .pill.pill-merged { color: #8250df; border-color: #8250df; background: rgba(130,80,223,.08); }

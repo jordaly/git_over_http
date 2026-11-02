@@ -199,6 +199,75 @@ def _db_init() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pr_comments_pr ON pr_comments(pr_id, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS issues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                author_user_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT,
+                closed_at TEXT,
+                FOREIGN KEY(author_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_issue_repo ON issues(owner, repo, status, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS issue_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL,
+                author_user_id INTEGER,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                edited_at TEXT,
+                FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+                FOREIGN KEY(author_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_issue_comments_issue ON issue_comments(issue_id, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS discussions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'General',
+                title TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                author_user_id INTEGER,
+                locked INTEGER NOT NULL DEFAULT 0,
+                locked_by INTEGER,
+                locked_at TEXT,
+                answered_comment_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT,
+                FOREIGN KEY(author_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_discussion_repo ON discussions(owner, repo, category, id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS discussion_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discussion_id INTEGER NOT NULL,
+                author_user_id INTEGER,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                edited_at TEXT,
+                FOREIGN KEY(discussion_id) REFERENCES discussions(id) ON DELETE CASCADE,
+                FOREIGN KEY(author_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_discussion_comments_discussion ON discussion_comments(discussion_id, id)")
         conn.execute("""CREATE TABLE IF NOT EXISTS ci_configs (
             owner TEXT NOT NULL, repo TEXT NOT NULL, config_json TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(owner, repo))""")
@@ -766,6 +835,348 @@ def db_pr_comment_count(pr_id: int) -> int:
     conn = _db_connect()
     try:
         return conn.execute("SELECT COUNT(*) FROM pr_comments WHERE pr_id=?", (int(pr_id),)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+# ---------- Issue DB helpers ----------
+def db_issue_create(owner: str, repo: str, title: str, body: str, author_user_id: int | None) -> int:
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO issues(owner, repo, title, body, author_user_id, status) VALUES(?,?,?,?,?, 'open')",
+            (owner, repo, title, body, int(author_user_id) if author_user_id is not None else None),
+        )
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_issue_get(issue_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            """
+            SELECT i.id, i.owner, i.repo, i.title, i.body, i.author_user_id, u.username,
+                   i.status, i.created_at, i.updated_at, i.closed_at
+            FROM issues i LEFT JOIN users u ON u.id=i.author_user_id
+            WHERE i.id=?
+            """,
+            (int(issue_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def db_issue_list(owner: str, repo: str, status: str | None = "open", limit: int = 50, offset: int = 0):
+    conn = _db_connect()
+    try:
+        if status is None:
+            where, params = "", [owner, repo]
+        else:
+            where, params = "AND i.status=?", [owner, repo, status]
+        return conn.execute(
+            f"""
+            SELECT i.id, i.title, i.status, i.created_at, i.author_user_id, u.username
+            FROM issues i LEFT JOIN users u ON u.id=i.author_user_id
+            WHERE i.owner=? AND i.repo=? {where}
+            ORDER BY i.id DESC LIMIT ? OFFSET ?
+            """,
+            [*params, int(limit), int(offset)],
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_issue_count(owner: str, repo: str, status: str | None = None) -> int:
+    conn = _db_connect()
+    try:
+        if status is None:
+            row = conn.execute("SELECT COUNT(*) FROM issues WHERE owner=? AND repo=?", (owner, repo)).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM issues WHERE owner=? AND repo=? AND status=?",
+                               (owner, repo, status)).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def db_issue_close(issue_id: int) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE issues SET status='closed', closed_at=datetime('now'), updated_at=datetime('now') WHERE id=?",
+                     (int(issue_id),))
+    finally:
+        conn.close()
+
+
+def db_issue_reopen(issue_id: int) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE issues SET status='open', closed_at=NULL, updated_at=datetime('now') WHERE id=?",
+                     (int(issue_id),))
+    finally:
+        conn.close()
+
+
+def db_issue_update_text(issue_id: int, title: str, body: str) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE issues SET title=?, body=?, updated_at=datetime('now') WHERE id=?",
+                     (title, body, int(issue_id)))
+    finally:
+        conn.close()
+
+
+def db_issue_comment_add(issue_id: int, author_user_id: int | None, body: str) -> int:
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO issue_comments(issue_id, author_user_id, body) VALUES(?,?,?)",
+            (int(issue_id), int(author_user_id) if author_user_id is not None else None, body),
+        )
+        conn.execute("UPDATE issues SET updated_at=datetime('now') WHERE id=?", (int(issue_id),))
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_issue_comment_list(issue_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            """
+            SELECT c.id, c.author_user_id, u.username, c.body, c.created_at, c.edited_at
+            FROM issue_comments c LEFT JOIN users u ON u.id=c.author_user_id
+            WHERE c.issue_id=? ORDER BY c.id
+            """,
+            (int(issue_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_issue_comment_get(issue_id: int, comment_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            "SELECT id, issue_id, author_user_id, body FROM issue_comments WHERE id=? AND issue_id=?",
+            (int(comment_id), int(issue_id)),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def db_issue_comment_update(comment_id: int, body: str) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "UPDATE issue_comments SET body=?, edited_at=datetime('now') WHERE id=?",
+            (body, int(comment_id)),
+        )
+    finally:
+        conn.close()
+
+
+def db_issue_comment_delete(comment_id: int) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM issue_comments WHERE id=?", (int(comment_id),))
+    finally:
+        conn.close()
+
+
+def db_issue_comment_counts(issue_ids) -> dict[int, int]:
+    ids = [int(value) for value in issue_ids if str(value).isdigit()]
+    if not ids:
+        return {}
+    conn = _db_connect()
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute(f"SELECT issue_id, COUNT(*) FROM issue_comments WHERE issue_id IN ({marks}) GROUP BY issue_id", ids).fetchall()
+        return {int(issue_id): int(count) for issue_id, count in rows}
+    finally:
+        conn.close()
+
+
+def db_issue_comment_count(issue_id: int) -> int:
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM issue_comments WHERE issue_id=?", (int(issue_id),)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+# ---------- Discussion DB helpers ----------
+def db_discussion_create(owner: str, repo: str, category: str, title: str, body: str, author_user_id: int | None) -> int:
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO discussions(owner, repo, category, title, body, author_user_id) VALUES(?,?,?,?,?,?)",
+            (owner, repo, category, title, body, int(author_user_id) if author_user_id is not None else None),
+        )
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_discussion_get(discussion_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            """
+            SELECT d.id, d.owner, d.repo, d.category, d.title, d.body, d.author_user_id, u.username,
+                   d.locked, d.locked_by, d.answered_comment_id, d.created_at, d.updated_at
+            FROM discussions d LEFT JOIN users u ON u.id=d.author_user_id
+            WHERE d.id=?
+            """,
+            (int(discussion_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def db_discussion_list(owner: str, repo: str, category: str | None = None, limit: int = 50, offset: int = 0):
+    conn = _db_connect()
+    try:
+        if category:
+            params = [owner, repo, category]
+            where = "AND d.category=?"
+        else:
+            params = [owner, repo]
+            where = ""
+        return conn.execute(
+            f"""
+            SELECT d.id, d.title, d.category, d.created_at, d.author_user_id, u.username, d.answered_comment_id
+            FROM discussions d LEFT JOIN users u ON u.id=d.author_user_id
+            WHERE d.owner=? AND d.repo=? {where}
+            ORDER BY d.id DESC LIMIT ? OFFSET ?
+            """,
+            [*params, int(limit), int(offset)],
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_discussion_count(owner: str, repo: str, category: str | None = None) -> int:
+    conn = _db_connect()
+    try:
+        if category:
+            row = conn.execute("SELECT COUNT(*) FROM discussions WHERE owner=? AND repo=? AND category=?",
+                               (owner, repo, category)).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM discussions WHERE owner=? AND repo=?", (owner, repo)).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def db_discussion_update_text(discussion_id: int, category: str, title: str, body: str) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE discussions SET category=?, title=?, body=?, updated_at=datetime('now') WHERE id=?",
+                     (category, title, body, int(discussion_id)))
+    finally:
+        conn.close()
+
+
+def db_discussion_set_locked(discussion_id: int, locked: bool, locked_by: int | None) -> None:
+    conn = _db_connect()
+    try:
+        if locked:
+            conn.execute("UPDATE discussions SET locked=1, locked_by=?, locked_at=datetime('now'), updated_at=datetime('now') WHERE id=?",
+                         (int(locked_by) if locked_by is not None else None, int(discussion_id)))
+        else:
+            conn.execute("UPDATE discussions SET locked=0, locked_by=NULL, locked_at=NULL, updated_at=datetime('now') WHERE id=?",
+                         (int(discussion_id),))
+    finally:
+        conn.close()
+
+
+def db_discussion_set_answer(discussion_id: int, comment_id: int | None) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE discussions SET answered_comment_id=?, updated_at=datetime('now') WHERE id=?",
+                     (int(comment_id) if comment_id is not None else None, int(discussion_id)))
+    finally:
+        conn.close()
+
+
+def db_discussion_comment_add(discussion_id: int, author_user_id: int | None, body: str) -> int:
+    conn = _db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO discussion_comments(discussion_id, author_user_id, body) VALUES(?,?,?)",
+            (int(discussion_id), int(author_user_id) if author_user_id is not None else None, body),
+        )
+        conn.execute("UPDATE discussions SET updated_at=datetime('now') WHERE id=?", (int(discussion_id),))
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_discussion_comment_list(discussion_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            """
+            SELECT c.id, c.author_user_id, u.username, c.body, c.created_at, c.edited_at
+            FROM discussion_comments c LEFT JOIN users u ON u.id=c.author_user_id
+            WHERE c.discussion_id=? ORDER BY c.id
+            """,
+            (int(discussion_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def db_discussion_comment_get(discussion_id: int, comment_id: int):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            "SELECT id, discussion_id, author_user_id, body FROM discussion_comments WHERE id=? AND discussion_id=?",
+            (int(comment_id), int(discussion_id)),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def db_discussion_comment_update(comment_id: int, body: str) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "UPDATE discussion_comments SET body=?, edited_at=datetime('now') WHERE id=?",
+            (body, int(comment_id)),
+        )
+    finally:
+        conn.close()
+
+
+def db_discussion_comment_delete(comment_id: int) -> None:
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM discussion_comments WHERE id=?", (int(comment_id),))
+    finally:
+        conn.close()
+
+
+def db_discussion_comment_counts(discussion_ids) -> dict[int, int]:
+    ids = [int(value) for value in discussion_ids if str(value).isdigit()]
+    if not ids:
+        return {}
+    conn = _db_connect()
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = conn.execute(f"SELECT discussion_id, COUNT(*) FROM discussion_comments WHERE discussion_id IN ({marks}) GROUP BY discussion_id", ids).fetchall()
+        return {int(discussion_id): int(count) for discussion_id, count in rows}
+    finally:
+        conn.close()
+
+
+def db_discussion_comment_count(discussion_id: int) -> int:
+    conn = _db_connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM discussion_comments WHERE discussion_id=?", (int(discussion_id),)).fetchone()[0]
     finally:
         conn.close()
 

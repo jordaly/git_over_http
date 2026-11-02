@@ -2360,6 +2360,13 @@ document.addEventListener("DOMContentLoaded", function() {{
             if len(fields) == 5:
                 branch_data.append(fields)
         branches = [fields[0] for fields in branch_data]
+        # GitHub marks branches whose commits are all contained in the default
+        # branch with a purple "Merged" label, so leftover head branches are
+        # easy to spot and delete after their pull request lands.
+        code, merged_output, _ = await _run_git(repo_git, ["for-each-ref",
+            "--merged=" + default_branch, "--format=%(refname:strip=2)", "refs/heads"])
+        merged_branches = {line.strip() for line in merged_output.decode("utf-8", "replace").splitlines()
+                           if line.strip()} if code == 0 else set()
         policy = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html("")
@@ -2387,8 +2394,10 @@ document.addEventListener("DOMContentLoaded", function() {{
                 del_html = safe_html('<span class="muted repo-lock">Read only</span>')
             default_pill = safe_html(' <span class="pill repo-default">Default</span>' if b == default_branch else "")
             protected_pill = safe_html(' <span class="pill">Protected</span>' if is_protected else "")
+            merged_pill = safe_html(html_t(t' <span class="pill pill-merged" title="Every commit is contained in {default_branch}">Merged</span>')
+                                    if b != default_branch and b in merged_branches else "")
             compare_link = safe_html(html_t(t'<a class="pill" href="{base}/pulls/new?{urlencode({"source": b, "target": default_branch})}">New pull request</a>')) if b != default_branch else safe_html("")
-            row = html_t(t'''<article class="repo-branch-row"><div class="repo-branch-info"><div class="repo-branch-name"><a href="{browse}"><code>{b}</code></a>{default_pill}{protected_pill}</div>
+            row = html_t(t'''<article class="repo-branch-row"><div class="repo-branch-info"><div class="repo-branch-name"><a href="{browse}"><code>{b}</code></a>{default_pill}{protected_pill}{merged_pill}</div>
 <p class="repo-commit-subject"><a href="{base}/commit/{sha}" title="{subject}">{subject or "Untitled commit"}</a></p><p class="muted"><a href="{base}/commit/{sha}"><code>{sha[:8]}</code></a> · {author} · <time datetime="{updated}">{updated.replace("T", " ")}</time></p></div>
 <div class="repo-branch-actions"><a class="pill" href="{base}/commits?ref={q(b)}">Commits</a>{compare_link}{del_html}</div></article>''')
             (default_rows if b == default_branch else rows).append(row)

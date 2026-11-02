@@ -52,7 +52,9 @@ commits to server-side checked-out branches are not supported.
 ## Create a pull request
 
 1. Create/select a source branch under **Branches**. Edit and commit your changes
-   there; protected targets may reject direct commits.
+   there; protected targets may reject direct commits. Branches whose commits are
+   all contained in the default branch show a purple **Merged** label and are safe
+   to delete once the pull request lands.
 2. Choose **New pull request** from the branch, or open **Pull requests** and fill in
    the title, optional description, source branch and target branch.
 3. Submit. Both branches must exist and must be different; creating a PR requires

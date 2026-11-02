@@ -283,6 +283,40 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn('action="' + self.base + '/branches/delete"', page)
         self.assertNotIn('action="' + self.base + '/branches/create"', page)
 
+    def test_branches_merged_into_default_are_marked(self):
+        # Fast-forward the default branch through one topic branch, then leave
+        # another topic branch with commits that never reached the default.
+        self.git("-C", self.source, "checkout", "-b", "topic/merged")
+        (self.source / "merged.txt").write_text("merged\n")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Merged topic")
+        self.git("-C", self.source, "push", str(self.bare), "topic/merged")
+        merged_sha = self.git("--git-dir", self.bare, "rev-parse", "topic/merged")
+        self.git("--git-dir", self.bare, "update-ref", "refs/heads/main", merged_sha)
+
+        self.git("-C", self.source, "checkout", "-b", "topic/open", "main")
+        (self.source / "open.txt").write_text("open\n")
+        self.git("-C", self.source, "add", ".")
+        self.git("-C", self.source, "commit", "-m", "Open topic")
+        self.git("-C", self.source, "push", str(self.bare), "topic/open")
+
+        _, page = self.request(self.base + "/branches?q=topic%2Fmerged")
+        articles = page.split('<article class="repo-branch-row">')[1:]
+        self.assertEqual(len(articles), 1)
+        self.assertIn("pill-merged", articles[0])
+        self.assertIn("Merged", articles[0])
+
+        _, page = self.request(self.base + "/branches?q=topic%2Fopen")
+        articles = page.split('<article class="repo-branch-row">')[1:]
+        self.assertEqual(len(articles), 1)
+        self.assertNotIn("pill-merged", articles[0])
+
+        # The default branch is labelled Default, never Merged.
+        _, page = self.request(self.base + "/branches")
+        default_section = page.split("<h2>Default branch</h2>", 1)[1].split("</article>", 1)[0]
+        self.assertIn("repo-default", default_section)
+        self.assertNotIn("pill-merged", default_section)
+
     def test_home_pagination_preserves_search(self):
         repos = [("owner", f"app-{index:02}", f"app-{index:02}.git") for index in range(30)]
         with mock.patch("pygithost.application._scan_repos", return_value=repos):

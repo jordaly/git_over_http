@@ -4,6 +4,7 @@ import gzip
 import json
 import base64
 import contextlib
+import hashlib
 from contextvars import ContextVar
 import ipaddress
 import mimetypes
@@ -95,6 +96,9 @@ from .database import (
     db_ci_artifacts_list,
     db_ci_merge_check,
     db_email_settings_set,
+    db_favicon_get,
+    db_favicon_set,
+    db_favicon_clear,
     db_reset_password,
     db_revoke_session,
     db_revoke_token,
@@ -1078,6 +1082,7 @@ def _html_page(title: str, body_html: str | SafeHTML, *, wide: bool = False) -> 
     rendered = html_t(
         t"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
 <title>{title}</title>
 <style>
 *{{box-sizing:border-box}}
@@ -1474,6 +1479,54 @@ def _static_root() -> Path:
     return Path(STATIC_ROOT).resolve()
 
 
+FAVICON_URL = "/favicon.ico"
+MAX_FAVICON_BYTES = 512 * 1024
+_FAVICON_TYPES = {
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+}
+
+
+def _default_favicon_path() -> Path | None:
+    """Prefer favicon.ico next to static/, then static/, then the package root."""
+    root = _static_root()
+    for path in (root.parent / "favicon.ico", root / "favicon.ico",
+                 Path(__file__).resolve().parent.parent / "favicon.ico"):
+        if path.is_file():
+            return path
+    return None
+
+
+def _favicon_content_type(filename: str, data: bytes) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    content_type = _FAVICON_TYPES.get(suffix)
+    if not content_type:
+        raise ValueError("Choose an ICO, PNG, GIF, JPEG, WebP or SVG image.")
+    if not data:
+        raise ValueError("The selected favicon file is empty.")
+    if len(data) > MAX_FAVICON_BYTES:
+        raise ValueError(f"Favicon images must be at most {MAX_FAVICON_BYTES // 1024} KiB.")
+    signatures = {
+        ".ico": data.startswith(b"\x00\x00\x01\x00"),
+        ".png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+        ".gif": data.startswith((b"GIF87a", b"GIF89a")),
+        ".jpg": data.startswith(b"\xff\xd8\xff"),
+        ".jpeg": data.startswith(b"\xff\xd8\xff"),
+        ".webp": data[:4] == b"RIFF" and data[8:12] == b"WEBP",
+    }
+    if suffix == ".svg":
+        if b"<svg" not in data.lstrip()[:2048].lower():
+            raise ValueError("That file does not look like an SVG image.")
+    elif not signatures.get(suffix, False):
+        raise ValueError("That file does not look like the selected image type.")
+    return content_type
+
+
 def _static_path_from_url(path: str) -> Path | None:
     """Map /static/... to STATIC_ROOT safely. Prevents path traversal."""
     if not _is_static_request_path(path):
@@ -1748,6 +1801,31 @@ class GitHTTPHandler:
 
         return await _send_response(self.request, 200, body, _static_headers(static_path), include_body=include_body)
 
+    async def _serve_favicon(self, include_body: bool = True):
+        custom = await _call_in_thread(db_favicon_get)
+        if custom:
+            content_type, body = custom
+        else:
+            path = _default_favicon_path()
+            if path is None:
+                return await self._not_found()
+            try:
+                body = await asyncio.to_thread(path.read_bytes)
+            except OSError:
+                return await self._not_found()
+            content_type = _FAVICON_TYPES.get(path.suffix.lower(), "image/x-icon")
+        headers = [("Content-Type", content_type), ("Cache-Control", "no-cache"),
+                   ("X-Content-Type-Options", "nosniff")]
+        etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+        headers.append(("ETag", etag))
+        if content_type == "image/svg+xml":
+            # An SVG opened directly must not be able to run scripts.
+            headers.append(("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'"))
+        if self.headers.get("If-None-Match") == etag:
+            return await _send_response(self.request, 304, b"",
+                [("ETag", etag), ("Cache-Control", "no-cache")], include_body=False)
+        return await _send_response(self.request, 200, body, headers, include_body=include_body)
+
     async def _read_form_urlencoded(self) -> dict[str, str]:
         clen = int(self.headers.get("Content-Length") or 0)
         if clen <= 0:
@@ -1756,6 +1834,40 @@ class GitHTTPHandler:
         text = raw.decode("utf-8", "replace")
         qs = parse_qs(text, keep_blank_values=True)
         return {k: (v[0] if v else "") for k, v in qs.items()}
+
+    async def _read_multipart_form(self, *, max_bytes: int) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+        """Read one small multipart form without the removed cgi module."""
+        from email.parser import BytesParser
+        from email.policy import default as email_policy
+        content_type = self.headers.get("Content-Type") or ""
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise ValueError("Expected a multipart form.")
+        clen = int(self.headers.get("Content-Length") or 0)
+        if clen <= 0:
+            raise ValueError("The upload is empty.")
+        if clen > max_bytes:
+            raise ValueError(f"Favicon images must be at most {MAX_FAVICON_BYTES // 1024} KiB.")
+        body = await self.request.reader.readexactly(clen)
+        try:
+            message = BytesParser(policy=email_policy).parsebytes(
+                f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1", "replace") + body)
+        except Exception as exc:
+            raise ValueError("Malformed multipart form.") from exc
+        if not message.is_multipart():
+            raise ValueError("Malformed multipart form.")
+        fields: dict[str, str] = {}
+        files: dict[str, tuple[str, bytes]] = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            filename = part.get_filename()
+            if filename is not None:
+                files[name] = (filename, payload)
+            else:
+                fields[name] = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        return fields, files
 
     # ========================================================
     # UI: Home / Tokens / Create Repo
@@ -1977,13 +2089,18 @@ class GitHTTPHandler:
     # ========================================================
     # UI: Admin Users
     # ========================================================
-    async def _ui_admin_settings(self, *, save=False):
+    async def _ui_admin_settings(self, *, save=False, notice_message: str = "", notice_kind: str = "ok"):
         from .database import db_display_name_set
         from .database import db_ci_preferences_get, db_ci_preferences_set
         from .settings_pages import preferences_forms, parse_preferences, basic_form, save_basic
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
-        notice = safe_html("")
+        params = parse_qs(urlparse(self.path).query or "")
+        favicon_flash = (params.get("favicon") or [""])[0]
+        if not notice_message:
+            notice_message = {"updated": "Favicon updated.",
+                              "reset": "Default favicon restored."}.get(favicon_flash, "")
+        notice = safe_html(html_t(t'<p class="{notice_kind}" role="status">{notice_message}</p>')) if notice_message else safe_html("")
         submitted_preferences = None
         value = await self.server.display_name()
         if save:
@@ -2020,14 +2137,53 @@ class GitHTTPHandler:
                 submitted_preferences = form if action.startswith("ci_") else None
         global_values, _repo = await _call_in_thread(db_ci_preferences_get)
         token = self._settings_csrf_token()
+        custom_favicon = await _call_in_thread(db_favicon_get)
+        if custom_favicon:
+            favicon_type, favicon_data = custom_favicon
+            favicon_digest = hashlib.sha256(favicon_data).hexdigest()[:12]
+            favicon_status = safe_html(html_t(t'<p class="muted">Current: uploaded {favicon_type}, {len(favicon_data)} bytes.</p><p><img src="/favicon.ico?v={favicon_digest}" alt="Current favicon" width="32" height="32"></p>'))
+        else:
+            has_default = _default_favicon_path() is not None
+            favicon_status = safe_html(
+                '<p class="muted">Current: the bundled default favicon.</p>'
+                + ('<p><img src="/favicon.ico" alt="Current favicon" width="32" height="32"></p>' if has_default else ""))
+        favicon_html = safe_html(html_t(t'''<form method="POST" action="/admin/settings/favicon" enctype="multipart/form-data" style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px">
+<input type="hidden" name="csrf" value="{token}">
+<label for="favicon-file">Favicon image</label><input id="favicon-file" type="file" name="favicon" accept=".ico,.png,.gif,.jpg,.jpeg,.webp,.svg,image/x-icon,image/png,image/gif,image/jpeg,image/webp,image/svg+xml">
+{favicon_status}<p class="muted">Shown in browser tabs and bookmarks on every page. ICO, PNG, GIF, JPEG, WebP or SVG up to 512 KiB. <strong>Use default</strong> restores the bundled favicon.ico.</p>
+<div class="row"><button type="submit" name="action" value="upload">Upload favicon</button><button type="submit" name="action" value="reset" formnovalidate>Use default</button></div></form>'''))
         try:
             basic = basic_form("/admin/settings", token, self.server.context.config.to_dict(), self.server.config_path)
         except (ValueError, OSError) as exc:
             basic = safe_html(html_t(t'<p class="warn">Could not read the startup configuration: {str(exc)}</p>{basic_form("/admin/settings", token, self.server.context.config.to_dict(), None)}'))
         preferences = preferences_forms("/admin/settings", token, global_values, submitted=submitted_preferences)
         body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><nav class="row"><a class="pill" href="/admin/email">Email delivery</a><a class="pill" href="/admin/users">Users</a><a class="pill" href="/">Home</a></nav></div>{notice}
-<section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form></section>{basic}{preferences}<script src="/static/settings-pages.js" defer></script></main>''')
+<section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form>{favicon_html}</section>{basic}{preferences}<script src="/static/settings-pages.js" defer></script></main>''')
         return await _send_html(self.request, 200, _html_page("Server settings", safe_html(body)))
+
+    async def _ui_favicon_save(self):
+        if REQUIRE_AUTH and not _require_admin(self):
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
+        try:
+            form, files = await self._read_multipart_form(max_bytes=MAX_FAVICON_BYTES + 64 * 1024)
+        except ValueError as exc:
+            return await self._ui_admin_settings(notice_message=str(exc), notice_kind="warn")
+        if not self._valid_settings_csrf(form):
+            return await self._forbidden(b"403 Forbidden: invalid security token.\n")
+        action = form.get("action", "upload")
+        try:
+            if action == "reset":
+                await _call_in_thread(db_favicon_clear)
+            elif action == "upload":
+                filename, data = files.get("favicon", ("", b""))
+                content_type = _favicon_content_type(filename, data)
+                await _call_in_thread(db_favicon_set, content_type, data)
+            else:
+                raise ValueError("Unknown favicon action.")
+        except ValueError as exc:
+            return await self._ui_admin_settings(notice_message=str(exc), notice_kind="warn")
+        return await _send_redirect(self.request,
+            "/admin/settings?favicon=" + ("reset" if action == "reset" else "updated"))
 
     def _settings_csrf_token(self):
         import hashlib
@@ -5213,6 +5369,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                 return
             return await self._serve_static()
 
+        if p == FAVICON_URL:
+            return await self._serve_favicon()
+
         if p == LOGIN_PATH:
             cookies = _parse_cookie_header(self.headers.get("Cookie"))
             info = await asyncio.to_thread(db_verify_session, cookies.get(SESSION_COOKIE_NAME))
@@ -5351,6 +5510,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         if not await self._require_session_auth():
             return
 
+        if parsed.path == "/admin/settings/favicon":
+            return await self._ui_favicon_save()
+
         ctype = (self.headers.get("Content-Type") or "").lower()
         if "application/x-www-form-urlencoded" not in ctype:
             return await _send_text(self.request, 415, "Unsupported Media Type\n")
@@ -5483,6 +5645,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             if STATIC_REQUIRES_AUTH and not await self._require_session_auth():
                 return
             return await self._serve_static(include_body=False)
+
+        if parsed.path == FAVICON_URL:
+            return await self._serve_favicon(include_body=False)
 
         return await _send_text(self.request, 400, "HEAD is only implemented for static files.\n")
 

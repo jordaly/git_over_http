@@ -222,12 +222,15 @@ search, branch context and commits through Chromium:
 PYGITHOST_TEST_BROWSER=chromium .venv/bin/python -m unittest tests.test_webide -v
 ```
 
-Administrators can customize the name in the top-left header under
-**Home → Admin: Settings → Appearance → Display name**. It is stored in the
-database, applies to all pages immediately, and survives restart. Leave it blank
-to restore `pygithost`. The limit is 80 characters; repository URLs and email
-sender settings are unchanged. With authentication disabled, the IP allowlist
-protects access to these settings, as with other administration pages.
+Administrators can customize the browser favicon and the name in the top-left
+header under **Home → Admin: Settings → Appearance**. Both are stored in the
+database, apply to all pages immediately, and survive restart. The favicon
+defaults to the bundled `favicon.ico` (looked up next to the `static/` directory)
+and can be replaced with an ICO, PNG, GIF, JPEG, WebP or SVG file up to 512 KiB;
+**Use default** restores the bundled icon. Leave the display name blank to restore
+`pygithost`. The limit is 80 characters; repository URLs and email sender settings
+are unchanged. With authentication disabled, the IP allowlist protects access to
+these settings, as with other administration pages.
 
 - The home page searches repository names, owners, and paths with the search box.
   Search is case-insensitive and works without JavaScript; its URL can be bookmarked.

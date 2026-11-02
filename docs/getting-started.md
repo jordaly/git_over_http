@@ -147,7 +147,7 @@ Never embed credentials in a clone URL or commit them in scripts.
 
 ## Manage settings in the browser
 
-Open **Admin → Settings** to edit the display name, basic server configuration,
+Open **Admin → Settings** to edit the display name and browser favicon, basic server configuration,
 and server-wide CI variables and retention. Unlike appearance/CI preference changes, basic server
 configuration is saved to the startup file for the **next restart**. Review allowed
 IPs, credentials, cookie security and storage paths before restarting; saving paths

@@ -310,6 +310,11 @@ def _db_init() -> None:
             conn.execute("ALTER TABLE ci_deployments_multi RENAME TO ci_deployments")
             conn.execute("COMMIT")
         conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS server_favicon (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            content_type TEXT NOT NULL,
+            data BLOB NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')))""")
         conn.execute("""CREATE TABLE IF NOT EXISTS repository_ci_settings (
             owner TEXT NOT NULL, repo TEXT NOT NULL, settings_json TEXT NOT NULL,
             PRIMARY KEY(owner,repo))""")
@@ -1454,6 +1459,37 @@ def db_display_name_set(value):
     conn = _db_connect()
     try:
         conn.execute("INSERT INTO server_settings(key,value) VALUES('display_name',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (value,))
+    finally:
+        conn.close()
+
+
+def db_favicon_get():
+    """Return (content_type, bytes) for the uploaded favicon, or None."""
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT content_type, data FROM server_favicon WHERE id=1").fetchone()
+        return (str(row[0]), bytes(row[1])) if row else None
+    finally:
+        conn.close()
+
+
+def db_favicon_set(content_type: str, data: bytes):
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO server_favicon(id, content_type, data) VALUES(1,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET content_type=excluded.content_type, data=excluded.data, "
+            "updated_at=datetime('now')",
+            (content_type, sqlite3.Binary(data)),
+        )
+    finally:
+        conn.close()
+
+
+def db_favicon_clear():
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM server_favicon WHERE id=1")
     finally:
         conn.close()
 

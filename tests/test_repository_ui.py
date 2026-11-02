@@ -1,8 +1,10 @@
 import asyncio
+import base64
 import http.client
 import io
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -106,6 +108,26 @@ class RepositoryUITests(unittest.TestCase):
             response = connection.getresponse()
             body = response.read()
             return response.status, body if binary else body.decode()
+        finally:
+            connection.close()
+
+    def post_multipart(self, path, fields, files):
+        boundary = "----pygithost-test-boundary"
+        chunks = []
+        for name, value in fields.items():
+            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+        for name, filename, content_type, data in files:
+            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'.encode())
+            chunks.append(data)
+            chunks.append(b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(chunks)
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
+        try:
+            connection.request("POST", path, body=body,
+                headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+            response = connection.getresponse()
+            return response.status, response.read().decode()
         finally:
             connection.close()
 
@@ -226,6 +248,48 @@ class RepositoryUITests(unittest.TestCase):
                 status, _ = self.request("/admin/settings", fields)
                 self.assertEqual(status, 403)
         self.assertEqual(database.db_display_name_get(), "pygithost")
+
+    def test_favicon_is_served_and_editable_in_settings(self):
+        _, page = self.request("/admin/settings")
+        self.assertIn('<link rel="icon" href="/favicon.ico">', page)
+        self.assertIn('action="/admin/settings/favicon"', page)
+        self.assertIn("Upload favicon", page)
+        token = re.search(r'name="csrf" value="([^"]+)"', page)[1]
+
+        status, default_icon = self.request("/favicon.ico", binary=True)
+        self.assertEqual(status, 200)
+        self.assertTrue(default_icon)
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        status, _ = self.post_multipart("/admin/settings/favicon",
+            {"csrf": token, "action": "upload"},
+            [("favicon", "icon.png", "image/png", png)])
+        self.assertEqual(status, 303)
+        _, page = self.request("/admin/settings?favicon=updated")
+        self.assertIn("Favicon updated", page)
+        self.assertEqual(database.db_favicon_get(), ("image/png", png))
+        status, served = self.request("/favicon.ico", binary=True)
+        self.assertEqual((status, served), (200, png))
+        self.assertIn("Current: uploaded image/png", page)
+
+        # Reject a mismatched file without replacing the uploaded icon.
+        status, page = self.post_multipart("/admin/settings/favicon",
+            {"csrf": token, "action": "upload"},
+            [("favicon", "fake.png", "image/png", b"<html>not an image</html>")])
+        self.assertEqual(status, 200)
+        self.assertIn("does not look like", page)
+        self.assertEqual(database.db_favicon_get(), ("image/png", png))
+
+        status, _ = self.post_multipart("/admin/settings/favicon",
+            {"csrf": token, "action": "reset"}, [])
+        self.assertEqual(status, 303)
+        _, page = self.request("/admin/settings?favicon=reset")
+        self.assertIn("Default favicon restored", page)
+        self.assertIsNone(database.db_favicon_get())
+        status, served = self.request("/favicon.ico", binary=True)
+        self.assertEqual((status, served), (200, default_icon))
 
     def test_home_filesystem_scan_does_not_block_the_request_loop(self):
         def scan(_root):

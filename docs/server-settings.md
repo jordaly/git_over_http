@@ -6,7 +6,7 @@
 
 | Page | Controls | When changes apply |
 | --- | --- | --- |
-| **Admin → Settings → Appearance** | Display name | Immediately. |
+| **Admin → Settings → Appearance** | Display name and browser favicon | Immediately. |
 | **Admin → Settings → Basic server configuration** | Bind address/port, Git URLs/backend, repository/database/static paths, authentication, allowed IPs, cookies and request limits | Saved to the startup file; restart required. |
 | **Admin → Settings → Environment variables** | Server-wide CI variables | Future runs; repository values can override names. |
 | **Admin → Settings → Runs and artifacts** | Default artifact age/count and completed-run count | Existing stored data, immediately after acknowledgement. |
@@ -16,6 +16,11 @@
 These pages require an administrator when authentication is enabled. With
 authentication disabled, access is governed by the IP allowlist. CI actions still
 require write access when authentication is enabled; manual runs never deploy.
+
+The favicon is served publicly at `/favicon.ico`, defaults to the bundled
+`favicon.ico` next to the `static/` directory, and can be replaced from
+**Appearance** with an ICO, PNG, GIF, JPEG, WebP or SVG file up to 512 KiB.
+**Use default** removes the uploaded image.
 
 ## Worked inheritance example
 

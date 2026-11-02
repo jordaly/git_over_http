@@ -166,8 +166,10 @@ Explorer is built from the branch snapshot without waiting for the editor engine
 so the file list appears while Monaco is still starting. Drag the splitter
 between the panel and editor to resize it (arrow keys work too; double-click
 resets), and the width is remembered. **Collapse all folders** closes the entire
-tree (and clears the filename filter). Add or delete files with the toolbar
-actions as well.
+tree (and clears the filename filter). Add files with the toolbar, select a file
+and use **Delete file** (also available in single-file mode), or hover a folder
+and use its trash action to mark every file under it for deletion. Deleting is
+pending until committed.
 
 The activity bar's **Search** tool (**Ctrl/⌘+Shift+F**) searches file contents in
 the branch snapshot, overlaid with pending edits/new files and excluding pending

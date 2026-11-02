@@ -47,7 +47,11 @@ body:has(#webide[data-mode="workspace"]), body:has(#webide[data-mode="resolve"])
 #ide-search-results span { color:var(--muted); font-family:ui-monospace,monospace; white-space:pre-wrap; }
 #ide-files button { display:block; width:100%; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; background:transparent; color:var(--fg); border:0; border-radius:0; padding:5px 10px; font:12px ui-monospace, monospace; }
 #ide-files button:hover, #ide-files button[aria-current="true"] { background:var(--accent-bg); color:var(--link); }
-#ide-files summary { cursor:pointer; padding:5px 10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+#ide-files summary { cursor:pointer; padding:5px 10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; position:relative; padding-right:26px; }
+#ide-files summary .ide-folder-delete { display:none; position:absolute; right:4px; top:50%; transform:translateY(-50%); width:20px; height:20px; padding:2px; border:0; border-radius:3px; background:transparent; color:var(--muted); cursor:pointer; }
+#ide-files summary:hover .ide-folder-delete, #ide-files summary:focus-within .ide-folder-delete { display:block; }
+#ide-files summary .ide-folder-delete:hover { color:var(--error-fg, #cf222e); background:var(--accent-bg); }
+#ide-files summary .ide-trash-icon { width:14px; height:14px; display:block; }
 #ide-files details { margin-left:0; }
 #ide-files button, #ide-files summary { box-sizing:border-box; }
 #ide-files .ide-note { padding:6px 12px; }

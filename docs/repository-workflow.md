@@ -22,6 +22,9 @@ model, undo history and pending edits. Tags and commit permalinks are read-only.
   independently of the editor engine.
 - **New file** adds a pending file. **New folder** adds a `.gitkeep` placeholder
   because Git does not track empty directories. Commit or discard these like other changes.
+- Select a file and use **Delete file** (available in both the workspace and the
+  single-file editor) or hover a folder in Explorer and use its trash action to
+  mark every file under it for deletion. Deletions stay pending until committed.
 - **Collapse all folders** closes the tree and clears the filename filter.
 - **Go to file** / **Ctrl/⌘+P** searches filenames. The Explorer filter is filename-only.
 - The status-bar **branch** name opens the same searchable quick pick as the

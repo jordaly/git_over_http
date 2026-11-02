@@ -362,6 +362,21 @@
         svg.append(path);
         return svg;
     }
+    function trashIcon() {
+        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.setAttribute("viewBox", "0 0 16 16");
+        svg.setAttribute("aria-hidden", "true");
+        svg.setAttribute("class", "ide-trash-icon");
+        svg.setAttribute("fill", "none");
+        svg.setAttribute("stroke", "currentColor");
+        svg.setAttribute("stroke-width", "1.4");
+        svg.setAttribute("stroke-linecap", "round");
+        svg.setAttribute("stroke-linejoin", "round");
+        const path = document.createElementNS(svg.namespaceURI, "path");
+        path.setAttribute("d", "M3 4.5h10M6 4.5v-2h4v2M4.6 4.5l.8 9h5.2l.8-9M6.8 7v4M9.2 7v4");
+        svg.append(path);
+        return svg;
+    }
     function fileIconKind(filename) {
         return /\.(py|js|jsx|ts|tsx|html|css|sh|sql|java|cs|c|cpp|go|rs|rb|php)$/i.test(filename) ? "code" : "file";
     }
@@ -430,6 +445,13 @@
         details.open = !!query || expanded.has(directory);
         const summary = document.createElement("summary");
         summary.append(explorerIcon("folder"), document.createTextNode(entry.name));
+        const remove = button("", event => {
+            event.preventDefault(); event.stopPropagation();
+            run(() => deleteFolder(directory));
+        }, {"class": "ide-folder-delete", "data-folder": directory,
+            title: "Delete folder " + directory, "aria-label": "Delete folder " + directory});
+        remove.append(trashIcon());
+        summary.append(remove);
         indentTo(summary, directory);
         details.append(summary);
         let started = false;
@@ -680,6 +702,27 @@
             const index = opened.indexOf(filename);
             if (index >= 0) opened.splice(index, 1);
         }
+    }
+    async function deleteFolder(folder) {
+        const prefix = folder + "/";
+        const tracked = new Set((await ensureIndex()).filter(name => name.startsWith(prefix)));
+        const pending = [...changes.keys()].filter(name => name.startsWith(prefix) && !tracked.has(name));
+        if (!tracked.size && !pending.length) {
+            status("That folder has no files to delete.");
+            return;
+        }
+        const added = [...tracked].filter(name => !changes.has(name)).length;
+        if (changes.size + added - pending.length > 100) {
+            throw new Error("That folder would change more than 100 files; delete fewer files at once.");
+        }
+        if (!confirm("Mark " + folder + " for deletion?\n" + tracked.size + " tracked file(s) will be deleted and "
+                + pending.length + " pending file(s) discarded. Nothing is saved until you commit.")) return;
+        pending.forEach(discardFile);
+        tracked.forEach(name => changes.set(name, null));
+        expanded.delete(folder);
+        if (active && active.startsWith(prefix) && !models.has(active) && !changes.has(active)) active = null;
+        show(active);
+        status("Deletion of " + folder + " is pending until committed (" + tracked.size + " tracked file(s)).");
     }
     async function review() {
         if (!active) { status("Select a file to preview changes."); return; }

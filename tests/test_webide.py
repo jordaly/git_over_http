@@ -442,6 +442,17 @@ class WebIDEBrowserTests(unittest.TestCase):
   el("discard").click(); await wait(() => !el("changes").textContent && ready());
   if (el("files").textContent.includes("browser.js")) throw Error("Discard left new file");
   if (el("files").textContent.includes("z-new-folder")) throw Error("Discard left new folder");
+  // Explorer folder rows expose a delete action that marks every tracked file.
+  const zFolder = [...el("files").querySelectorAll("details")].find(d => d.querySelector(":scope > summary")?.textContent.trim() === "z-folder");
+  if (!zFolder) throw Error("Missing z-folder row");
+  zFolder.open = true;
+  await wait(() => [...el("files").querySelectorAll("button")].some(b => b.dataset.path === "z-folder/a.txt"));
+  const folderDelete = zFolder.querySelector(":scope > summary .ide-folder-delete");
+  if (!folderDelete) throw Error("Missing folder delete action");
+  folderDelete.click();
+  await wait(() => el("changes").textContent.includes("D z-folder/a.txt") &&
+    el("changes").textContent.includes("D z-folder/z-nested/code.py") && ready());
+  el("discard").click(); await wait(() => !el("changes").textContent && ready());
   [...el("files").querySelectorAll("button")].find(b => b.textContent === "README.md").click();
   await wait(() => model() && ready());
   el("delete").click(); await wait(() => el("changes").textContent.includes("D README.md") && ready());
@@ -478,6 +489,9 @@ class WebIDEBrowserTests(unittest.TestCase):
  try {
   await wait(() => window.monaco && model("README.md") && ready());
   if (root.dataset.mode !== "single" || el("branch-name").textContent !== "feature/api") throw Error("Lost single-file context");
+  if (!el("delete").getBoundingClientRect().height) throw Error("Delete is missing in single-file mode");
+  el("delete").click(); await wait(() => el("changes").textContent.includes("D README.md") && ready());
+  el("discard-file").click(); await wait(() => !el("changes").textContent && ready());
   if (el("files").getBoundingClientRect().height || !el("message").getBoundingClientRect().height) throw Error("Incorrect single-file layout");
   model("README.md").setValue("Single-file commit\n");
   el("review").click(); await wait(() => document.querySelector(".monaco-diff-editor") && ready());

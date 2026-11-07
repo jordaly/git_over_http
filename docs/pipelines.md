@@ -2,6 +2,9 @@
 
 [Every option](ci-options.md) · [Recipes](pipeline-examples.md) · [Migration](ci-migration.md)
 
+AI assistants: see [Guidance for AI agents](ci-options.md#guidance-for-ai-agents)
+before editing configuration or triggering runs.
+
 Open **CI → Settings → Configuration JSON** and **Save configuration**. The same
 manual and complete JSON examples appear directly in **CI → Documentation**.
 
@@ -62,6 +65,15 @@ pipeline whose passing branch update gates it; script, branch, timeout and email
 settings belong to the deployment itself. Multiple deployment targets may reference
 the same pipeline. They have separate attempts, logs, results and notification state.
 Deployment notifications do not inherit pipeline email settings.
+
+Deployments can use [named host steps](automatic-deployment.md#named-deployment-steps)
+instead of a script. Their individual status and output, plus combined output,
+refresh every two seconds on **CI → Deployments**. These are host steps in a fresh
+temporary directory, not CI steps in the checkout or Docker image.
+
+The **CI → Runs** page has compact, wrapping filter and manual-run toolbars.
+Choose a pipeline and branch to queue a manual CI run; filters narrow run history
+without affecting execution. Run results refresh every five seconds.
 
 Repository-wide protection (`policies`) stays at the document root. Variables and
 storage limits use separate page controls, with server defaults and repository

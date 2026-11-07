@@ -83,6 +83,7 @@ def default_config():
         "deploy_enabled": False,
         "deploy_branch": "main",
         "deploy_script": "",
+        "deploy_steps": [],
         "deploy_interpreter": "direct",
         "deploy_timeout": 600,
         "timeout_seconds": JOB_TIMEOUT,
@@ -175,7 +176,16 @@ def validate_config(raw, *, nested=False):
         deploy_timeout = int(deploy_timeout)
     if type(deploy_timeout) is not int or not 1 <= deploy_timeout <= 86400:
         raise ValueError("Deployment timeout must be 1–86400 seconds.")
-    if raw.get("deploy_enabled", False) and not script and not content:
+    deploy_steps = raw.get("deploy_steps", [])
+    if not isinstance(deploy_steps, list) or len(deploy_steps) > 64:
+        raise ValueError("Deployment steps must be an array of at most 64 steps.")
+    for step in deploy_steps:
+        if not isinstance(step, dict) or set(step) - {"name", "run"} or any(not isinstance(step.get(key), str) or not step[key].strip() or "\0" in step[key] for key in ("name", "run")):
+            raise ValueError("Each deployment step requires a name and run command.")
+    if deploy_steps and (script or content):
+        raise ValueError("Use deployment steps or a deployment script, not both.")
+    defaults["deploy_steps"] = deploy_steps
+    if raw.get("deploy_enabled", False) and not script and not content and not deploy_steps:
         raise ValueError("Automatic deployment requires a script path or new script contents.")
     defaults.update(deploy_enabled=raw.get("deploy_enabled", False), deploy_branch=branch,
                     deploy_script=script, deploy_timeout=deploy_timeout, deploy_interpreter=interpreter)
@@ -288,7 +298,7 @@ def validate_config(raw, *, nested=False):
         seen.add(child["pipeline_id"])
         defaults["pipelines"].append(child)
     targets = raw.get("deployment_targets", [])
-    target_fields = {"deployment_name", "deploy_enabled", "deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter", "email_mode", "email_recipients"}
+    target_fields = {"deployment_name", "deploy_enabled", "deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter", "deploy_steps", "email_mode", "email_recipients"}
     if not isinstance(targets, list) or len(targets) > 32:
         raise ValueError("Use at most 32 deployment targets.")
     seen_targets = set()
@@ -925,7 +935,7 @@ class CIManager:
         if branch != config["deploy_branch"]:
             await skip(f"branch {branch!r} does not match deployment branch {config['deploy_branch']!r}.")
             return
-        if any(config.get(k, "") != snapshot.get(k, "direct" if k == "deploy_interpreter" else "") for k in ("deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter")):
+        if any(config.get(k, "") != snapshot.get(k, "direct" if k == "deploy_interpreter" else "") for k in ("deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter", "deploy_steps")):
             await skip("deployment settings changed since this run was queued; push a new commit with the saved settings.")
             return
         output, truncated = bytearray(), [False]
@@ -945,7 +955,9 @@ class CIManager:
                 if not claimed:
                     await skip("this repository/deployment/commit already has a deployment attempt; see Deployments.")
                     return
-                if config.get("deploy_script_content"):
+                if config.get("deploy_steps"):
+                    script = None
+                elif config.get("deploy_script_content"):
                     prefix = deployment_prefix(config["deploy_interpreter"])
                     runtime = Path(prefix[0]).stem.lower() if prefix else ""
                     suffix = ".py" if "python" in runtime else ".ps1" if runtime in ("pwsh", "powershell") else ".js" if runtime in ("node", "nodejs") else ".sh"
@@ -960,10 +972,39 @@ class CIManager:
                 env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
                     PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, PYGITHOST_PIPELINE=identity,
                     PYGITHOST_DEPLOYMENT=deployment_key, CI="true")
-                command = deployment_prefix(config["deploy_interpreter"]) + [str(script), commit]
-                rc = await self._capture_process(command, shell=False,
-                    cwd=home, env=env, output=output, truncated=truncated,
-                    timeout=config["deploy_timeout"])
+                steps = [{"name": step["name"], "run": step["run"], "status": "queued", "output": ""}
+                         for step in config.get("deploy_steps", [])]
+                if not steps:
+                    steps = [{"name": "Deploy", "status": "queued", "output": ""}]
+                async def publish():
+                    await _db_call(database.db_deployment_progress, run_id, deployment_key,
+                                   output.decode("utf-8", "replace"), json.dumps(steps))
+                deadline = asyncio.get_running_loop().time() + config["deploy_timeout"]
+                await publish()
+                for step in steps:
+                    step["status"] = "running"
+                    start = len(output)
+                    async def progress():
+                        step["output"] = output[start:].decode("utf-8", "replace")
+                        await publish()
+                    await progress()
+                    command = step.get("run") or deployment_prefix(config["deploy_interpreter"]) + [str(script), commit]
+                    try:
+                        rc = await self._capture_process(command, shell="run" in step,
+                            cwd=home, env=env, output=output, truncated=truncated,
+                            timeout=deadline - asyncio.get_running_loop().time(), on_output=progress)
+                        step["status"] = "success" if rc == 0 else "failed"
+                    except BaseException as exc:
+                        step["status"] = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed"
+                        raise
+                    finally:
+                        if step["status"] != "success":
+                            for pending in steps:
+                                if pending["status"] == "queued":
+                                    pending["status"] = "skipped"
+                        await progress()
+                    if rc:
+                        break
                 status = "success" if rc == 0 else "failed"
         except asyncio.CancelledError:
             if claimed:
@@ -1041,7 +1082,7 @@ class CIManager:
                 await _db_call(database.db_ci_run_update, row[0], notification=f"failed ({error_type}; check server SMTP settings)")
 
     async def _capture_process(
-        self, command, *, shell, cwd, env, output, truncated, timeout
+        self, command, *, shell, cwd, env, output, truncated, timeout, on_output=None
     ):
         if timeout <= 0:
             raise asyncio.TimeoutError
@@ -1089,6 +1130,8 @@ class CIManager:
                     output.extend(chunk[:available])
                 if len(chunk) > available:
                     truncated[0] = True
+                if on_output:
+                    await on_output()
             return await process.wait()
 
         try:

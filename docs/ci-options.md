@@ -18,6 +18,7 @@ server's `pygithost.config.json` (network, authentication and storage).
 - [Steps](#steps)
 - [Artifacts and notifications](#artifacts-and-notifications)
 - [Every deployment option](#every-deployment-option)
+- [Guidance for AI agents](#guidance-for-ai-agents)
 - [Every repository setting](#every-repository-setting)
 - [Compatibility](#compatibility)
 - [Variables, limits and troubleshooting](#variables-limits-and-troubleshooting)
@@ -302,16 +303,25 @@ still execute trusted host scripts, even when CI execution uses Docker.
 | `branch` | One valid branch name, `"main"` | `"branch":"develop"` | Exact branch, not a glob/array; add another deployment object for another target. |
 | `script` | Absolute host path, none | `"script":"/opt/deploy/staging.sh"` | Must exist outside repositories; server user needs access. |
 | `script_content` | UTF-8 text, none | `"script_content":"import sys\nprint(sys.argv[1])\n"` | Alternative to script; use this example with `run_with: "python"`. Written privately during execution, then removed. |
+| `steps` | Array, default `[]`, at most 64 | `"steps":[{"name":"Release","run":"/opt/deploy/release.sh"}]` | Named host-shell commands with individual status/output. Each requires nonempty `name` and `run`; no other step fields are supported. Alternative to either script option. |
 | `run_with` | String `"direct"` | `"run_with":"python"` | Uses the server's interpreter and virtual environment, not the CI image. |
 | `run_with` | — | `"run_with":"bash -e"` | Other installed interpreters include `node` or `pwsh -NoProfile -File`; no shell expansion/pipes/chaining. |
 | `run_with` | — | `"run_with":"direct"` | Blank/direct executes the script itself; POSIX needs an executable script with a shebang. |
 | `timeout_seconds` | Integer 1–86400, `600` | `"timeout_seconds":900` | Separate deployment budget, not the CI timeout. |
 
-Supply script or script_content, not both. An enabled block requires one; a
+Supply nonempty steps, script or script_content, without combining execution forms.
+An enabled block requires one; a
 disabled draft may omit it. Windows path example: `C:/deploy/release.py` with
 `run_with: "python"`. Dependencies belong on the host. Quote interpreter paths
 containing spaces. The exact invocation is interpreter arguments + script path +
 tested SHA; there is no configurable script args array.
+
+Deployment steps use fresh host shells in a shared temporary directory, not the CI
+checkout. Files persist between steps; shell state does not. `run_with` does not
+select their shell. All steps share `timeout_seconds`; failure skips later steps.
+Read the tested SHA from `PYGITHOST_COMMIT` in step commands. The Deployments list
+and detail pages refresh live logs and statuses every two seconds, with per-step
+and combined output. Existing script targets are displayed as a single Deploy step.
 
 Deployment follows only its **own** successful push/merged run, while the tested
 commit is still the branch tip. It does not wait for another pipeline. Manual and
@@ -326,6 +336,44 @@ retry or rollback. Restarts mark unfinished attempts interrupted rather than rep
 them. Verify the real target after interruption. Protect scripts/credentials from
 CI job writes; same-user processes are not isolated by owner-only permissions.
 Read the [deployment walkthrough](automatic-deployment.md) before enabling it.
+
+## Guidance for AI agents
+
+When generating or modifying CI/deployment configuration:
+
+1. **Identify the document first.** `.ci-config.json` in Git describes repository
+   CI steps. The Settings document uses named `pipelines` and `deployments` arrays
+   (or the compact file reference). Never put deployments or host-runner settings
+   in the repository file, and do not confuse either with `pygithost.config.json`.
+2. **Preserve unrelated settings.** Read the current document before proposing a
+   replacement. Keep existing names, pipeline references, notifications and
+   policies. Saving replaces the document, not a JSON patch. Use page controls
+   for environment variables and retention; do not change retention incidentally.
+3. **Use only supported fields.** Deployment steps contain `name` and `run`, not
+   CI-provider-specific `uses`, `needs`, retries, approvals or per-step timeouts.
+   Use one execution form per target and one target-wide timeout. Validate using
+   server-side Save validation; editor syntax checks alone are insufficient.
+4. **Do not grant host execution implicitly.** Deployment scripts and steps run
+   as the Git server user outside Docker. Propose new targets with `enabled:false`
+   until reviewed. Do not enable deployment, push a release branch, change branch
+   protections or access credentials without explicit authorization.
+5. **Deploy the tested SHA.** Use the script's first argument or
+   `PYGITHOST_COMMIT` in step commands. Do not deploy the latest branch tip instead.
+   Do not assume CI checkout, artifacts or CI variables exist on the deployment
+   host. Never embed credentials in JSON, commands or logs; output is not redacted.
+6. **Verify without triggering a release.** A manual run checks CI and never
+   deploys. Deployment requires a qualifying successful push or merged-PR run.
+   Inspect CI results separately from deployment results and live step output;
+   a successful CI run does not prove a successful release or healthy service.
+7. **Handle uncertainty safely.** Each repository/target/commit gets one attempt.
+   After timeout or interruption, inspect the real target before proposing recovery.
+   Do not rename targets to evade duplicate protection or assume automatic rollback.
+
+For code changes to this feature, update the option reference, deployment guide
+and applicable JSON examples together. Test validation, failure/skipped steps,
+live output persistence, HTML escaping, and independent target results. Report
+which checks actually ran and any failures; do not claim browser verification
+from backend tests alone.
 
 ## Every repository setting
 

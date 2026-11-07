@@ -8,7 +8,7 @@ EXECUTION = {"runner", "image", "timeout_seconds", "env"}
 PR_EVENTS = {"opened": "pr_opened", "updated": "pr_updated", "reopened": "pr_reopened", "merged": "pr_merged"}
 POLICIES = {"require_ci", "block_direct_pushes", "protected_branches"}
 GROUPS = {"execution", "triggers", "cancellation", "artifacts"}
-DEPLOYMENT_FIELDS = {"enabled", "branch", "script", "script_content", "run_with", "timeout_seconds"}
+DEPLOYMENT_FIELDS = {"enabled", "branch", "script", "script_content", "run_with", "timeout_seconds", "steps"}
 
 
 def _named(items, path):

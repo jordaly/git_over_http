@@ -309,6 +309,8 @@ def _db_init() -> None:
             conn.execute("DROP TABLE ci_deployments")
             conn.execute("ALTER TABLE ci_deployments_multi RENAME TO ci_deployments")
             conn.execute("COMMIT")
+        if "steps_json" not in {row[1] for row in conn.execute("PRAGMA table_info(ci_deployments)")}:
+            conn.execute("ALTER TABLE ci_deployments ADD COLUMN steps_json TEXT NOT NULL DEFAULT '[]'")
         conn.execute("CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("""CREATE TABLE IF NOT EXISTS server_favicon (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1328,6 +1330,15 @@ def db_deployment_claim(run_id, owner, repo, commit, config_json=""):
         conn.close()
 
 
+def db_deployment_progress(run_id, deployment_key, output, steps_json):
+    conn = _db_connect()
+    try:
+        conn.execute("UPDATE ci_deployments SET output=?,steps_json=? WHERE run_id=? AND pipeline_id=? AND status='running'",
+                     (output, steps_json, run_id, deployment_key))
+    finally:
+        conn.close()
+
+
 def db_deployment_finish(run_id, status, output, deployment_key=None):
     conn = _db_connect()
     try:
@@ -1379,7 +1390,7 @@ def db_deployments_list(owner, repo, before=0, limit=25, offset=0):
     conn = _db_connect()
     try:
         return conn.execute("""SELECT d.id,d.run_id,d.commit_hash,d.status,d.started_at,
-            d.finished_at,d.notification,d.config_json,r.id
+            d.finished_at,d.notification,d.config_json,r.id,d.output,d.steps_json
             FROM ci_deployments d LEFT JOIN ci_runs r ON r.id=d.run_id
             WHERE d.owner=? AND d.repo=? AND (?=0 OR d.id<?)
             ORDER BY d.id DESC LIMIT ? OFFSET ?""", (owner, repo, before, before, limit, max(0, offset))).fetchall()
@@ -1391,7 +1402,7 @@ def db_deployment_detail(owner, repo, deployment_id):
     conn = _db_connect()
     try:
         return conn.execute("""SELECT d.id,d.run_id,d.commit_hash,d.status,d.started_at,
-            d.finished_at,d.notification,d.config_json,r.id,d.output
+            d.finished_at,d.notification,d.config_json,r.id,d.output,d.steps_json
             FROM ci_deployments d LEFT JOIN ci_runs r ON r.id=d.run_id
             WHERE d.owner=? AND d.repo=? AND d.id=?""", (owner, repo, deployment_id)).fetchone()
     finally:

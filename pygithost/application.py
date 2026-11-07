@@ -3976,15 +3976,22 @@ document.addEventListener("DOMContentLoaded", function() {{
             config = json.loads(raw or "{}")
             branch = config.get("deploy_branch", "—")
             run_link = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}">CI run #{run_id}</a>')) if retained else safe_html(html_t(t'<span class="muted">CI run #{run_id} no longer retained</span>'))
-            logs = safe_html(html_t(t'<pre tabindex="0" aria-label="Deployment output">{row[9] or "No output yet. Logs are available when deployment finishes."}</pre>')) if deployment_id is not None else safe_html("")
+            steps = json.loads(row[10] or "[]")
+            step_html = join_html([html_t(t'<details class="ci-step" open><summary><span class="ci-status" data-status="{step["status"]}">{step["status"]}</span> <strong>{step["name"]}</strong></summary><pre tabindex="0">{step["output"] or "No output yet."}</pre></details>') for step in steps])
+            logs = safe_html(html_t(t'{step_html}<details><summary>Combined output</summary><div class="ci-log-toolbar"><button type="button" data-copy-deployment="deployment-output-{identity}">Copy output</button><span class="muted" role="status" data-copy-feedback></span></div><pre id="deployment-output-{identity}" tabindex="0" aria-label="Deployment output">{row[9] or "No output yet."}</pre></details>'))
             entries.append(html_t(t'''<section class="box"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2>
 <p>Deployment: <code>{config.get("deployment_name") or config.get("pipeline_id", "default")}</code> · Pipeline: <code>{config.get("pipeline_id", "default")}</code> · Branch: <code>{branch}</code> · Commit: <a href="{base}/commit/{q(commit)}"><code>{commit}</code></a></p>
 <p class="muted">Started: {started} · Finished: {finished or "—"} · Duration: {_ci_elapsed(started, finished)} · Email: {notification or "not queued"}</p>{run_link}{logs}</section>'''))
         listing = join_html(entries) if entries else safe_html('<section class="box"><h2>No deployments yet</h2><p>Deployment attempts appear here after matching CI succeeds. Skipped deployments are not recorded.</p></section>')
         older = _pagination(base + "/ci/deployments", {"before": before} if before else {}, page, page * size < total, total=total, per_page=size) if deployment_id is None else safe_html("")
+        results = safe_html(html_t(t'<div id="deployment-results">{listing}{older}</div>'))
+        if (parse_qs(urlparse(self.path).query or "").get("partial") or [""])[0] == "1":
+            return await _send_response(self.request, 200, str(results).encode("utf-8"), [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         body = html_t(t'''{_ci_tabs(base, "deployments")}<div class="topbar"><h2>Deployment history</h2><a class="pill" href="{base}/ci/deployments">Latest deployments</a></div>
-<p class="muted">Deployment results are separate from CI results. Open a deployment for output. Refresh to update running attempts and email delivery.</p>
-<p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs?guide=deployment">Deployment documentation</a></p>{listing}{older}''')
+<p class="muted">Deployment results are separate from CI results. Output and status refresh every 2 seconds.</p>
+<script>document.addEventListener("click", async function(event) {{ const button = event.target.closest("[data-copy-deployment]"); if (!button) return; const log = document.getElementById(button.dataset.copyDeployment); const feedback = button.parentElement.querySelector("[data-copy-feedback]"); if (!log) return; try {{ await navigator.clipboard.writeText(log.textContent); feedback.textContent = "Copied."; }} catch (_) {{ feedback.textContent = "Could not copy. Select the output and copy it manually."; }} }});</script>
+<p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs?guide=deployment">Deployment documentation</a></p>{results}
+<script>(function() {{ let busy = false; const timer = setInterval(async function() {{ if (busy) return; busy = true; try {{ const url = new URL(location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (!response.ok || response.redirected) {{ clearInterval(timer); return; }} const text = await response.text(); const current = document.getElementById("deployment-results"); const states = Array.from(current.querySelectorAll("details")).map(el => el.open); const scrolls = Array.from(current.querySelectorAll("pre")).map(el => [el.scrollTop, el.scrollHeight - el.clientHeight - el.scrollTop < 24]); current.outerHTML = text; const updated = document.getElementById("deployment-results"); updated.querySelectorAll("details").forEach((el, i) => {{ if (i < states.length) el.open = states[i]; }}); updated.querySelectorAll("pre").forEach((el, i) => {{ if (scrolls[i]) el.scrollTop = scrolls[i][1] ? el.scrollHeight : scrolls[i][0]; }}); }} catch (_) {{ }} finally {{ busy = false; }} }}, 2000); }})();</script>''')
         return await _send_html(self.request, 200, _html_page(str_t(t"Deployments · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
 
     async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = "", partial: bool = False):
@@ -4053,7 +4060,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             html_t(t'<option value="{value}"{safe_html(" selected" if value == filters["branch"] else "")}>{label}</option>')
             for value, label in branch_values
         ])
-        filter_form = safe_html(html_t(t'''<div class="box"><h2>Find runs</h2><form method="GET" action="{base}/ci" class="row">
+        filter_form = safe_html(html_t(t'''<div class="box ci-compact"><form method="GET" action="{base}/ci" class="ci-toolbar">
 <input type="hidden" name="per_page" value="{size}">
 <input aria-label="Search runs" name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
 <select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
@@ -4075,7 +4082,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         manual_notice = "" if manual_enabled else "Manual runs require write access, a runnable pipeline, and an existing branch."
         notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
         body = html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><h2>CI runs</h2></div>{notice_html}
-<div class="box"><h2>Run manually</h2><p>{manual_notice}</p><form method="POST" action="{base}/ci/run"><label>Pipeline</label><select name="pipeline">{pipeline_options}</select><select name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button></form></div>{filter_form}{results_html}
+<div class="box ci-compact"><form class="ci-toolbar" method="POST" action="{base}/ci/run"><strong>Run manually</strong><select aria-label="Pipeline" name="pipeline">{pipeline_options}</select><select aria-label="Branch to run" name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button><small class="muted">{manual_notice}</small></form></div>{filter_form}{results_html}
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
         await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
 

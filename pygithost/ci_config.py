@@ -13,7 +13,7 @@ COMMON = {"runner", "image", "env", "events", "push_branches", "pr_branches",
           "artifacts"}
 DEPLOYMENT = {"enabled": "deploy_enabled", "branch": "deploy_branch",
               "script": "deploy_script", "script_content": "deploy_script_content",
-              "run_with": "deploy_interpreter", "timeout_seconds": "deploy_timeout"}
+              "run_with": "deploy_interpreter", "timeout_seconds": "deploy_timeout", "steps": "deploy_steps"}
 BRANCH_FILTERS = ("push_branches", "pr_branches")
 STRING_LISTS = (*BRANCH_FILTERS, "protected_branches", "email_recipients")
 

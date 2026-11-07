@@ -65,6 +65,57 @@ a real deployment tool after verifying the tested commit and target.
   There is no automatic retry or rollback. Existing history remains under its
   original identity. Multiple targets linked to one run retain separate results and logs.
 
+## Named deployment steps
+
+Instead of a single script, insert a target like this into the top-level
+`deployments` array in Settings (the referenced `release` pipeline must exist):
+
+```json
+{
+  "name": "production",
+  "pipeline": "release",
+  "enabled": false,
+  "branch": "main",
+  "timeout_seconds": 600,
+  "steps": [
+    {"name": "Release tested commit", "run": "/opt/deploy/release.sh \"$PYGITHOST_COMMIT\""},
+    {"name": "Health check", "run": "curl --fail http://localhost:8080/health"}
+  ]
+}
+```
+
+Review commands and target addresses before enabling. Use `steps`, `script`, or
+`script_content`, not steps together with either script option. A target accepts
+up to 64 steps, each containing a nonempty `name` and `run` string. Commands execute
+sequentially in fresh host shells, sharing the deployment's temporary working
+directory and files, but not shell state, exported variables or `cd` changes.
+`run_with` applies to script execution, not step commands. The example uses POSIX
+shell syntax; adapt commands and environment-variable syntax for Windows hosts.
+
+All steps share one deployment timeout, independent of CI's timeout. A failed step
+stops the target and skips its remaining steps. Each step receives the deployment
+environment described above; use `PYGITHOST_COMMIT` explicitly, since step commands
+do not receive the script's automatic SHA argument. CI checkout files, artifacts
+and page-managed CI variables are not automatically supplied to deployment steps.
+
+## Live output and status
+
+**CI → Deployments** and individual deployment pages refresh output, target status
+and email delivery state every two seconds without a manual refresh. Expand a
+step for its output or **Combined output** for the target's complete captured log.
+Use **Copy output** inside **Combined output** to copy that deployment's captured
+log to the clipboard. Clipboard access requires browser permission and usually
+HTTPS or localhost; if copying fails, select the output and copy it manually.
+Existing single-script targets appear as one step named **Deploy**. Previously
+recorded attempts may have only combined output, with no step history.
+
+Step states include queued, running, success, failed, timed_out, interrupted and
+skipped. Overall deployment results remain separate from CI results. Output is
+bounded to 1 MiB per target; the page cannot display output that a program has not
+flushed. Use unbuffered output where needed (for example `python -u` in a command).
+After a server crash, historical step state may show the last saved progress;
+the interrupted overall deployment result is authoritative.
+
 ## Scripts and interpreters
 
 Use `script` for an absolute host path. Alternatively, put UTF-8 text in

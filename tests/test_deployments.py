@@ -51,6 +51,29 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             return code
         self.manager._capture_process = AsyncMock(side_effect=execute)
 
+    async def test_steps_publish_live_output_and_stop_on_failure(self):
+        self.config.update(deploy_script="", deploy_steps=[
+            {"name": "Prepare", "run": "echo prepare"},
+            {"name": "Release", "run": "exit 1"},
+            {"name": "Verify", "run": "echo verify"}])
+        row = await self.run_record()
+        async def capture(command, **kwargs):
+            if command[0] == "git":
+                kwargs["output"].extend((self.commit + "\n").encode())
+                return 0
+            kwargs["output"].extend(command.encode())
+            await kwargs["on_output"]()
+            current = database.db_deployment_get(row[0])
+            self.assertEqual(current[0], "running")
+            self.assertIn(command, current[1])
+            return int(command == "exit 1")
+        self.manager._capture_process = AsyncMock(side_effect=capture)
+        await self.manager._deploy(row)
+        attempt = database.db_deployments_list("owner", "repo")[0]
+        steps = json.loads(attempt[10])
+        self.assertEqual([step["status"] for step in steps], ["success", "failed", "skipped"])
+        self.assertEqual(attempt[3], "failed")
+
     async def test_success_and_duplicate_protection(self):
         row = await self.run_record()
         self.capture()

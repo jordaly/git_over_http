@@ -161,7 +161,7 @@ omitted options use built-in defaults. See [Server and repository settings](serv
 for a worked example and [Browser editing and pull requests](repository-workflow.md)
 for editing/committing from the web UI.
 
-An unconfigured repository automatically looks for `.ci-config.json`. Commit the
+An unconfigured repository automatically looks for `ci/config.json`. Commit the
 [repository pipeline example](examples/ci/repository-pipeline.json) under that name,
 prepare the Python Docker image, and adapt its steps to your project. Manual runs
 always require write access and a runnable pipeline; they never deploy.

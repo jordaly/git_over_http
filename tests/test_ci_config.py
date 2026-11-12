@@ -7,6 +7,15 @@ from pygithost.ci_config import EXAMPLE, compile_document, export_document, edit
 
 
 class JSONConfigurationTests(unittest.TestCase):
+    def test_ci_directory_references_round_trip(self):
+        for filename in ("ci/config.json", "ci/pipelines/tests.json"):
+            with self.subTest(filename=filename):
+                document = {"version": 1, "file": filename}
+                config = compile_document(document)
+                self.assertEqual(config["repository_file"], filename)
+                self.assertEqual(editor_document(config), document)
+                self.assertEqual(export_document(config), document)
+
     def test_compact_repository_reference_is_safe_and_round_trips(self):
         document = {"version": 1, "file": ".ci-config.json"}
         config = compile_document(document)
@@ -167,7 +176,7 @@ class JSONConfigurationTests(unittest.TestCase):
                     continue
                 compile_document(raw)
                 if "file" in raw:
-                    self.assertEqual(raw, {"version": 1, "file": ".ci-config.json"})
+                    self.assertEqual(raw, {"version": 1, "file": "ci/config.json"})
                     continue
                 if isinstance(raw.get("pipelines"), list):
                     raw, targets = split_named_document(raw)

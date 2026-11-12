@@ -50,19 +50,19 @@ For omitted execution options, the built-ins are Docker, image `python:3.14-slim
 a 1800-second timeout and superseded-run cancellation off. To customize a file-backed
 pipeline, use the [expanded Git-managed example](examples/ci/git-managed.json):
 its `execution` and `cancellation` objects belong inside the named pipeline,
-alongside `file`. The committed `.ci-config.json` remains the separate steps file.
+alongside `file`. The committed `ci/config.json` remains the separate steps file.
 
 For the default file-backed pipeline, the Settings editor only needs:
 
 ```json
 {
   "version": 1,
-  "file": ".ci-config.json"
+  "file": "ci/config.json"
 }
 ```
 
 Commit the separate [pipeline file](examples/ci/repository-pipeline.json) as
-`.ci-config.json`. Use the [expanded example](examples/ci/all-options.json) if you
+`ci/config.json`. Use the [expanded example](examples/ci/all-options.json) if you
 need multiple named pipelines, deployment targets or protection policies.
 Do not put environment variables or retention into new pipeline JSON examples.
 Pipeline saves do not reset page-managed values or rewrite historical run snapshots.

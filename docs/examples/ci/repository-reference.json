@@ -1,4 +1,4 @@
 {
   "version": 1,
-  "file": ".ci-config.json"
+  "file": "ci/config.json"
 }

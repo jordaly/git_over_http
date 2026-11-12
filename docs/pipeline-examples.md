@@ -9,18 +9,18 @@ All examples are displayed directly inside **CI → Documentation**.
 
 ## Default repository file
 
-Unconfigured repositories discover `.ci-config.json` automatically. If you want to
+Unconfigured repositories discover `ci/config.json` automatically. If you want to
 save an explicit reference in Settings, use:
 
 ```json
 {
   "version": 1,
-  "file": ".ci-config.json"
+  "file": "ci/config.json"
 }
 ```
 
 Commit the separate [repository pipeline example](examples/ci/repository-pipeline.json)
-as `.ci-config.json`; do not commit the reference above as the pipeline file.
+as `ci/config.json`; do not commit the reference above as the pipeline file.
 Prepare the Docker image before running. Set variables under **Environment variables**
 and storage limits under **Runs and artifacts**. See
 [Server and repository settings](server-settings.md) for a worked inheritance example.
@@ -34,6 +34,41 @@ objects. There is no execution-defaults form in Admin or repository settings.
 Omitting an option uses its built-in default; it does not inherit a saved page
 override or another pipeline's value. The inline deployment example intentionally
 omits execution and cancellation to demonstrate this behavior.
+
+## Multiple Git-managed pipelines
+
+Only `ci/config.json` is discovered automatically. To use separate files, commit
+`ci/tests.json` and `ci/build.json`, each using the
+[repository pipeline format](examples/ci/repository-pipeline.json), then save this
+document in **CI → Settings → Configuration JSON**:
+
+```json
+{
+  "version": 1,
+  "pipelines": [
+    {
+      "name": "tests",
+      "file": "ci/tests.json",
+      "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600},
+      "triggers": {"push": {"enabled": true, "branches": ["main"]}}
+    },
+    {
+      "name": "build",
+      "file": "ci/build.json",
+      "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600},
+      "triggers": {"push": {"enabled": true, "branches": ["main"]}}
+    }
+  ],
+  "deployments": []
+}
+```
+
+Replace each file's steps with the appropriate tests or build commands and prepare
+the Docker image first. Retain any existing policies and deployment targets when
+adapting the Settings document. Saved Settings take priority over automatic discovery:
+this document runs the two named pipelines, not an additional `ci/config.json` job.
+Do not commit this Settings document as either pipeline file. References and step
+commands are checkout-root-relative, even when the JSON lives in a nested directory.
 
 ## Two independent checks
 

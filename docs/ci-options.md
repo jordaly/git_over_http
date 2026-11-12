@@ -31,7 +31,7 @@ server's `pygithost.config.json` (network, authentication and storage).
 | [All options](examples/ci/all-options.json) | Independent checks/release pipelines and separately named deployments, cancellation, artifacts, notifications and policies. Variables and retention use page controls. |
 | [Inline deployment](examples/ci/inline-deployment.json) | Python script content rather than a host script path. |
 | [Git-managed configuration](examples/ci/git-managed.json) | Expanded Settings document for a named Git-backed pipeline with explicit execution and automatic triggers. |
-| [Repository pipeline](examples/ci/repository-pipeline.json) | Commit this as `.ci-config.json` at the repository root. Contains steps, artifacts and a timeout; it is **not** Settings JSON. |
+| [Repository pipeline](examples/ci/repository-pipeline.json) | Commit this as `ci/config.json` inside the repository's `ci/` directory. Contains steps, artifacts and a timeout; it is **not** Settings JSON. |
 
 Example links display complete JSON in the application. Deployments in these files
 are disabled until you review and enable them. Replace example recipients and script
@@ -45,14 +45,14 @@ tools or execute the examples. A generic Python image may not include your build
 ## Automatic repository CI
 
 Repositories with **no saved CI settings** automatically use a pipeline named
-`ci` that reads **`.ci-config.json`** from the recorded commit. No settings save is
+`ci` that reads **`ci/config.json`** from the recorded commit. No settings save is
 required. Settings presents the compact reference below, which can also be saved
 explicitly. It expands to the same Docker pipeline and automatic triggers:
 
 ```json
 {
   "version": 1,
-  "file": ".ci-config.json"
+  "file": "ci/config.json"
 }
 ```
 
@@ -84,7 +84,7 @@ pipeline execution or built-in defaults. It may lower that limit.
 No deployments, notifications or protection policies are enabled automatically.
 PRs read the target/base commit's file, not the unreviewed source branch's file.
 
-Without `.ci-config.json`, the automatic preset creates **no run**. An existing
+Without `ci/config.json`, the automatic preset creates **no run**. An existing
 but invalid file produces a configuration failure. Saved configurations always
 take precedence, including explicitly empty/disabled pipelines and legacy
 `.pygithost-ci.json` references. No existing settings or files are renamed.
@@ -142,7 +142,7 @@ credentials. Repository-file configs cannot grant host access or modify retentio
 | Option | Default / type | Example and meaning |
 | --- | --- | --- |
 | `version` | Integer `1` | `"version": 1`; the only supported version. |
-| `file` | Compact-reference form only | `"file":".ci-config.json"`; use only with `version`, not with named arrays or policies. |
+| `file` | Compact-reference form only | `"file":"ci/config.json"`; use only with `version`, not with named arrays or policies. |
 | `pipelines` | Required in the expanded form | `"pipelines": [{"name":"checks","steps":[{"name":"Tests","run":"python -m unittest discover -v"}]}]`. Every object requires its own name and independent configuration. |
 | `deployments` | Array, default `[]` | `"deployments":[{"name":"production","pipeline":"checks","enabled":false,"script":"/opt/deploy/app.sh"}]`; separately named targets linked to a pipeline. |
 | `policies` | Protection off | `"policies":{"require_ci":true}`; administrator-controlled, repository-wide. |
@@ -341,7 +341,7 @@ Read the [deployment walkthrough](automatic-deployment.md) before enabling it.
 
 When generating or modifying CI/deployment configuration:
 
-1. **Identify the document first.** `.ci-config.json` in Git describes repository
+1. **Identify the document first.** `ci/config.json` in Git describes repository
    CI steps. The Settings document uses named `pipelines` and `deployments` arrays
    (or the compact file reference). Never put deployments or host-runner settings
    in the repository file, and do not confuse either with `pygithost.config.json`.
@@ -412,9 +412,11 @@ See the [migration guide](ci-migration.md) for every old-to-new field mapping an
 a comparison with the proposed configuration design.
 
 Pipeline-local `file` selects a Git-managed source instead of steps:
-`"file":".ci-config.json"`. Existing `.pygithost-ci.json` references still work.
-Use a regular root-level `.json` filename, not a
-path/symlink. Do not commit the administrator document: repository code must not
+`"file":"ci/config.json"`. Existing `.ci-config.json` and `.pygithost-ci.json` references still work.
+Use a regular `.json` file under `ci/`, for example `ci/tests.json`.
+Paths are checkout-relative; absolute paths, traversal, `.git` components and
+symlink files are rejected. Existing explicit root filenames remain supported.
+Do not commit the administrator document: repository code must not
 control trusted host deployment or policies.
 
 The separate Git file accepts version 1, named `steps`, optional `env`, `artifacts`

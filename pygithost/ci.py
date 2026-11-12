@@ -119,7 +119,7 @@ def default_config():
 def unconfigured_repository_config():
     """Safe discovery preset; never overrides a saved repository configuration."""
     from .ci_config import compile_document
-    config = compile_document({"version": 1, "file": ".ci-config.json"})
+    config = compile_document({"version": 1, "file": "ci/config.json"})
     # Ephemeral server-only marker. Saving settings makes the reference explicit,
     # so missing files then produce configuration failures rather than idle CI.
     config["_autodetect_repository_config"] = True
@@ -277,8 +277,11 @@ def validate_config(raw, *, nested=False):
         raise ValueError("Invalid deployment name.")
     defaults["deployment_name"] = deployment_name
     filename = raw.get("repository_file", ".pygithost-ci.json")
-    if not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}\.json", filename) or ".." in filename:
-        raise ValueError("Repository pipeline file must be a root-level JSON filename.")
+    if (not isinstance(filename, str) or len(filename) > 256
+            or not re.fullmatch(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]{1,128}\.json", filename)
+            or any(part in (".", "..", ".git") for part in filename.split("/"))
+            or ".." in filename):
+        raise ValueError("Repository pipeline file must be a checkout-relative JSON path without traversal or .git components.")
     defaults["repository_file"] = filename
     pipelines = raw.get("pipelines", [])
     if not isinstance(pipelines, list) or len(pipelines) > 15 or (nested and pipelines):
@@ -674,7 +677,7 @@ class CIManager:
                 raise ValueError("Cannot read the repository pipeline at the recorded commit.")
             return stdout
         filename = config.get("repository_file", ".pygithost-ci.json")
-        tree = (await git("ls-tree", commit, "--", filename)).decode().split()
+        tree = (await git("ls-tree", "--full-tree", commit, "--", filename)).decode().split()
         if not tree and missing_ok:
             return None
         if len(tree) < 3 or tree[0] not in ("100644", "100755") or tree[1] != "blob":

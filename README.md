@@ -16,6 +16,8 @@ authentication, repository browsing, branches, tokens, users, and pull requests.
   artifacts, and notifications.
 - [Pipeline guide](docs/pipelines.md): step-by-step setup, JSON examples, variables,
   artifacts, and troubleshooting.
+- [Repository CI directory](docs/pipelines.md#repository-ci-directory): `ci/config.json`,
+  helper scripts, multiple Git-managed files and migration from root-level files.
 - [Every CI option](docs/ci-options.md): types, built-in defaults, examples, independence,
   limits, and complete downloadable JSON configurations.
 - [Grouped-configuration migration](docs/ci-migration.md): old-to-new field mapping,
@@ -125,7 +127,7 @@ retention field. Execution and cancellation belong to each pipeline's JSON;
 omitted options use built-in defaults. Variables and retention are page controls, separate
 from pipeline JSON. See [Page settings and inheritance](docs/ci-options.md#page-settings-and-inheritance).
 
-Repositories without saved CI settings automatically read **`.ci-config.json`**
+Repositories without saved CI settings automatically read **`ci/config.json`**
 through the default `ci` pipeline (Docker `python:3.14-slim`, push, pull-request
 and manual triggers; deployments off). No file means no run; an invalid file
 produces a configuration failure. Saved settings, including disabled CI and
@@ -303,10 +305,10 @@ these settings, as with other administration pages.
 
 ## Continuous integration
 
-Repositories without saved settings discover `.ci-config.json` automatically. The
+Repositories without saved settings discover `ci/config.json` automatically. The
 minimal Settings document is the [file reference](docs/examples/ci/repository-reference.json);
 commit the separate [pipeline file](docs/examples/ci/repository-pipeline.json) as
-`.ci-config.json`, not the reference. No file means no automatic run; saving an
+`ci/config.json`, not the reference. No file means no automatic run; saving an
 explicit reference makes a missing file a configuration error.
 
 Open **CI → Settings** as an administrator to edit pipeline/deployment JSON in

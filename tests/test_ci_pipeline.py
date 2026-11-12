@@ -52,6 +52,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.git("-C", source, "config", "user.email", "ci@test")
         (source / "file.txt").write_text("fixture")
         if pipeline is not None:
+            (source / filename).parent.mkdir(parents=True, exist_ok=True)
             (source / filename).write_text(json.dumps(pipeline))
         self.git("-C", source, "add", ".")
         self.git("-C", source, "commit", "-m", "initial")
@@ -88,7 +89,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         manager = self.manager(bare)
         config = await manager.config("owner", "repo")
         self.assertEqual(config["pipeline_id"], "ci")
-        self.assertEqual(config["repository_file"], ".ci-config.json")
+        self.assertEqual(config["repository_file"], "ci/config.json")
         self.assertEqual(config["runner"], "docker")
         self.assertTrue(config["repository_config"])
         for key in ("push", "pr_opened", "pr_updated", "pr_reopened", "manual"):
@@ -100,11 +101,41 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.db_ci_runs_list("owner", "repo"), [])
         self.assertIsNone(database.db_ci_config_get("owner", "repo"))
 
+    def test_repository_paths_are_relative_and_safe(self):
+        for filename in ("ci/config.json", "ci/pipelines/tests.json", ".ci-config.json", ".pygithost-ci.json"):
+            with self.subTest(filename=filename):
+                self.assertEqual(validate_config({"repository_file": filename})["repository_file"], filename)
+        for filename in ("/ci/config.json", "../config.json", "ci/../config.json",
+                         "ci/./config.json", "ci/.git/config.json", "ci//config.json",
+                         "ci\\config.json", "ci/config.json\0", "ci/*.json", "ci/config.txt"):
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                validate_config({"repository_file": filename})
+
+    async def test_nested_pipeline_is_read_at_exact_commit(self):
+        pipeline = {"version": 1, "steps": [{"name": "Checks", "run": "echo committed"}]}
+        source, bare, commit = self.repository(pipeline, "ci/pipelines/tests.json")
+        (source / "ci/pipelines/tests.json").write_text("not json")
+        config = validate_config({"repository_config": True, "repository_file": "ci/pipelines/tests.json"})
+        result = await self.manager(bare).repository_pipeline("owner", "repo", commit, config)
+        self.assertEqual(result["steps"], pipeline["steps"])
+
+    async def test_nested_pipeline_symlink_is_rejected(self):
+        source, bare, _commit = self.repository()
+        (source / "ci").mkdir()
+        (source / "ci/config.json").symlink_to("../file.txt")
+        self.git("-C", source, "add", ".")
+        self.git("-C", source, "commit", "-m", "symlink")
+        commit = self.git("-C", source, "rev-parse", "HEAD")
+        self.git("-C", source, "push", bare, "main")
+        config = validate_config({"repository_config": True, "repository_file": "ci/config.json"})
+        with self.assertRaisesRegex(ValueError, "Missing regular"):
+            await self.manager(bare).repository_pipeline("owner", "repo", commit, config)
+
     async def test_generic_file_is_snapshotted_without_saving_settings(self):
         pipeline = {"version": 1, "steps": [{"name": "Test", "run": "echo auto-ci"}],
                     "env": {"MODE": "test"}, "timeout_seconds": 30,
                     "artifacts": {"paths": ["results/*.log"], "when": "always"}}
-        _source, bare, commit = self.repository(pipeline, ".ci-config.json")
+        _source, bare, commit = self.repository(pipeline, "ci/config.json")
         manager = self.manager(bare)
         with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
             run_id = await manager.enqueue("owner", "repo", "push", "main", commit)
@@ -121,7 +152,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(database.db_ci_config_get("owner", "repo"))
 
     async def test_saved_disabled_configuration_does_not_auto_discover(self):
-        _source, bare, commit = self.repository({"steps": [{"name": "Test", "run": "echo auto"}]}, ".ci-config.json")
+        _source, bare, commit = self.repository({"steps": [{"name": "Test", "run": "echo auto"}]}, "ci/config.json")
         manager = self.manager(bare)
         await manager.save_document("owner", "repo", {"version": 1, "pipelines": [], "deployments": []})
         config = await manager.config("owner", "repo")
@@ -144,7 +175,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(config["events"]["manual"])
 
     async def test_invalid_auto_file_fails_and_cannot_enable_deployment_or_host(self):
-        source, bare, commit = self.repository({"steps": [{"name": "Test", "run": "echo auto"}], "runner": "host"}, ".ci-config.json")
+        source, bare, commit = self.repository({"steps": [{"name": "Test", "run": "echo auto"}], "runner": "host"}, "ci/config.json")
         manager = self.manager(bare)
         with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
             run_id = await manager.enqueue("owner", "repo", "push", "main", commit)
@@ -162,13 +193,13 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
         run = database.db_ci_run_get("owner", "repo", run_id)
         self.assertEqual(run[4], "failed")
-        self.assertIn(".ci-config.json", run[5])
+        self.assertIn("ci/config.json", run[5])
 
     @unittest.skipUnless(os.name == "posix" and os.environ.get("PYGITHOST_TEST_DOCKER_IMAGE") == "python:3.14-slim",
                          "requires the default python:3.14-slim Docker test image")
     async def test_automatic_repository_pipeline_executes_in_real_docker(self):
         _source, bare, commit = self.repository({"version": 1, "timeout_seconds": 30,
-            "steps": [{"name": "Auto-discovered test", "run": "python -c \"print('auto-ci-ok')\""}]}, ".ci-config.json")
+            "steps": [{"name": "Auto-discovered test", "run": "python -c \"print('auto-ci-ok')\""}]}, "ci/config.json")
         manager = self.manager(bare)
         run_id = await manager.enqueue("owner", "repo", "push", "main", commit)
         await manager.wait_idle()

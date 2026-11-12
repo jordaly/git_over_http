@@ -4190,6 +4190,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         guide_links = join_html([html_t(t'<a class="pill" href="{base}/ci/docs?guide={key}"{safe_html(" aria-current=\"page\"" if key == guide and not example else "")}>{title}</a>') for key, (title, _path) in GUIDES.items()])
         example_links = join_html([html_t(t'<a class="pill" href="{base}/ci/docs?example={key}">{title}</a>') for key, (title, _path) in EXAMPLES.items()])
         body = safe_html(html_t(t'''<main class="ci-page">{_ci_tabs(base, "docs")}<div class="topbar"><h2>CI documentation</h2></div>
+<section class="box"><h2>Repository CI files</h2><p>Keep repository-owned pipeline JSON and helper scripts under <code>ci/</code>. Repositories without saved settings automatically discover <code>ci/config.json</code>; other files require explicit Settings references. Commands and file references remain relative to the checkout root.</p><p>Commit a pipeline containing named steps, not the Settings reference document. Variables, secrets and retention remain in the settings controls. Existing saved root-file references still work; automatically discovered root files must move to <code>ci/config.json</code>.</p><nav class="row" aria-label="Repository CI setup"><a href="{base}/ci/docs?guide=start#repository-ci-directory">Directory layout</a><a href="{base}/ci/docs?guide=examples#multiple-git-managed-pipelines">Multiple pipeline files</a><a href="{base}/ci/docs?guide=migration#move-root-files-into-ci">Move existing CI files</a><a href="{base}/ci/docs?example=repository-pipeline">Repository pipeline example</a></nav></section>
 <nav class="row" aria-label="Documentation sections">{guide_links}</nav><section class="box"><h2>Complete JSON examples</h2><nav class="row" aria-label="Configuration examples">{example_links}</nav></section>
 <article id="ci-configuration-guide" class="box ci-guide">{content}</article></main><script src="/static/ci-docs.js" defer></script>'''))
         return await _send_html(self.request, 200, _html_page(str_t(t"CI documentation · {owner}/{repo}"), body))
@@ -4283,7 +4284,7 @@ form.addEventListener("submit", event => {{
         if run_id:
             return await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}"))
         if (await self.server.ci_manager.config(owner, repo)).get("_autodetect_repository_config"):
-            return await self._ui_ci(owner, repo, notice="No run queued. Add .ci-config.json to the selected branch to use automatic repository CI.")
+            return await self._ui_ci(owner, repo, notice="No run queued. Add ci/config.json to the selected branch to use automatic repository CI.")
         return await self._ui_ci(owner, repo, notice="No run queued. Select a runnable pipeline with steps or a repository file.")
 
     async def _ui_ci_action(self, owner, repo, run_id, action):

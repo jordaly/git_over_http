@@ -6,7 +6,7 @@
       "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600},
       "cancellation": {"superseded": true},
       "triggers": {"push": {"enabled": true}, "pull_request": {"enabled": true}},
-      "file": ".ci-config.json"
+      "file": "ci/config.json"
     }
   ],
   "deployments": []

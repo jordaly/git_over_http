@@ -166,7 +166,7 @@ def manual_content(guide, example, base):
             return None
         title, path = EXAMPLES[example]
         text = (ROOT / path).read_text(encoding="utf-8")
-        warning = "Commit this as .pygithost-ci.json; it is not an administrator document." if example == "repository-pipeline" else "Copy this complete document into CI → Settings → Configuration JSON and adapt it before saving."
+        warning = "Commit this as ci/config.json; it is not an administrator document." if example == "repository-pipeline" else "Copy this complete document into CI → Settings → Configuration JSON and adapt it before saving."
         return safe_html('<h2>' + escape(title) + '</h2><p>' + escape(warning) +
             '</p>' + _code_block(text, "json"))
     if guide not in GUIDES:

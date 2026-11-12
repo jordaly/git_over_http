@@ -7,6 +7,21 @@ from pygithost.ci_docs import EXAMPLES, GUIDES, manual_content, render_manual
 
 
 class DocumentationPageTests(unittest.TestCase):
+    def test_ci_directory_guidance_and_links_are_rendered_in_page(self):
+        base = "/r/team/repo/ci/docs"
+        start = str(manual_content("start", "", base))
+        self.assertIn('id="repository-ci-directory"', start)
+        self.assertIn("ci/config.json", start)
+        self.assertIn("sh ci/test.sh", start)
+        self.assertIn(base + "?guide=examples#multiple-git-managed-pipelines", start)
+        self.assertIn(base + "?guide=migration#move-root-files-into-ci", start)
+        recipes = str(manual_content("examples", "", base))
+        self.assertIn('id="multiple-git-managed-pipelines"', recipes)
+        self.assertIn("ci/tests.json", recipes)
+        migration = str(manual_content("migration", "", base))
+        self.assertIn('id="move-root-files-into-ci"', migration)
+        self.assertIn("git mv .ci-config.json ci/config.json", migration)
+
     def test_current_settings_workflow_and_file_reference_are_linked_in_page(self):
         base = "/r/team/repo/ci/docs"
         recipes = str(manual_content("examples", "", base))
@@ -26,7 +41,7 @@ class DocumentationPageTests(unittest.TestCase):
         self.assertIn("Discussion", workflow)
         self.assertIn("merge base", workflow)
         reference = str(manual_content("reference", "repository-reference", base))
-        self.assertIn(".ci-config.json", reference)
+        self.assertIn("ci/config.json", reference)
         self.assertIn('class="language-json"', reference)
 
     def test_current_json_examples_use_page_controls_for_variables_and_retention(self):

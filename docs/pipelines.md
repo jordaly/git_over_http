@@ -9,12 +9,40 @@ Open **CI → Settings → Configuration JSON** and **Save configuration**. The 
 manual and complete JSON examples appear directly in **CI → Documentation**.
 
 For a repository without saved settings, you can instead commit
-**`.ci-config.json`** with `version` and named `steps`: CI discovers it by default
+**`ci/config.json`** with `version` and named `steps`: CI discovers it by default
 using the Docker runner. Without that file no automatic runs are created.
 See [Automatic repository CI](ci-options.md#automatic-repository-ci) for a complete
 example, enabled triggers and safety limits. Existing saved settings take priority.
 The Settings JSON editor uses Monaco; **Format JSON** formats the document before
 saving. Its syntax checks do not replace the server's configuration validation.
+
+## Repository CI directory
+
+Keep repository-owned pipeline JSON and helper scripts together under `ci/`:
+
+```text
+ci/
+  config.json       # automatically discovered pipeline
+  tests.json        # optional additional pipeline, explicitly referenced in Settings
+  test.sh           # optional helper script
+```
+
+Create the directory with `mkdir -p ci`, then save the
+[repository pipeline example](examples/ci/repository-pipeline.json) as
+`ci/config.json` and commit it. The file contains steps, not the Settings reference
+`{"version":1,"file":"ci/config.json"}`. No `ci/config.json` means no automatic run
+for a repository without saved settings. Other JSON files are not auto-discovered.
+
+All file references are relative to the **repository root**. Steps also start at
+the checkout root, so invoke a helper with `sh ci/test.sh`, not `sh test.sh`.
+Putting the JSON under `ci/` does not change the command's working directory.
+See [multiple Git-managed pipelines](pipeline-examples.md#multiple-git-managed-pipelines)
+for separate checks and [migration](ci-migration.md#move-root-files-into-ci)
+for existing root files.
+
+This layout covers repository-owned files only. Execution settings, triggers and
+policies remain in Settings JSON; variables, secrets and retention remain in their
+page controls. Do not commit secrets or trusted host deployment scripts under `ci/`.
 
 ## Two lists, explicit names
 

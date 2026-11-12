@@ -6,10 +6,41 @@ Open **CI → Settings** to see existing configuration converted for editing. Th
 expanded format has two arrays: `pipelines` and `deployments`. Every object explicitly
 defines its `name`. Pipelines do not inherit from one another; omitted execution
 settings use built-in defaults. The compact default reference is
-`{"version":1,"file":".ci-config.json"}`. Existing saved configurations take priority
+`{"version":1,"file":"ci/config.json"}`. Existing saved configurations take priority
 over automatic discovery and are not silently replaced by that reference.
 
+## Move root files into ci
+
+For an existing automatically discovered `.ci-config.json`, move and commit it:
+
+```sh
+mkdir -p ci
+git mv .ci-config.json ci/config.json
+git commit -m "Move repository CI configuration into ci"
+```
+
+If you have saved Settings, update the compact `file` reference or each named
+pipeline's `file` to the new committed path and save. For `.pygithost-ci.json`, use
+that filename as the source of `git mv` instead. Explicit saved root-file references
+remain supported, but stop working if you move their files without updating Settings.
+For an unsaved auto-discovered root file, migrate before upgrading: automatic
+discovery now checks only `ci/config.json`.
+
+Move helper scripts under `ci/` if desired and update step commands to match, for
+example `sh ci/test.sh`. Do not change paths assuming the working directory moved:
+steps still start at the checkout root. Queue a new manual run after saving; reruns
+use the old snapshot and will not verify the new file reference.
+
 ## Current shape
+
+Repository-owned CI files now live under `ci/`: use `ci/config.json` for automatic
+discovery and, for multiple pipelines, references such as `ci/tests.json` and
+`ci/build.json`. Paths are relative to the repository root, not the config file.
+Commands still start at the checkout root; use `sh ci/test.sh` for a script there.
+Existing saved references to `.ci-config.json` or `.pygithost-ci.json` still work.
+For an unsaved automatically discovered root file, move it to `ci/config.json`,
+or save an explicit reference to its old location before upgrading. There is no
+root-file discovery fallback. Variables, secrets and retention remain page-managed.
 
 Execution and cancellation are configured inside each pipeline. The removed
 **CI execution defaults** settings form has no replacement outside the pipeline

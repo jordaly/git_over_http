@@ -236,7 +236,8 @@ class SettingsPagesTests(unittest.TestCase):
         self.variables([("PAGE_VALUE", "global", "")])
         self.variables([("PAGE_VALUE", "repository", "")], repository=True)
         source = self.fixture.source
-        (source / ".ci-config.json").write_text(json.dumps({"version": 1, "steps": [{"name": "Environment", "run": "python -c \"import os; print('page-env=' + os.environ['PAGE_VALUE'])\""}]}))
+        (source / "ci").mkdir(exist_ok=True)
+        (source / "ci/config.json").write_text(json.dumps({"version": 1, "steps": [{"name": "Environment", "run": "python -c \"import os; print('page-env=' + os.environ['PAGE_VALUE'])\""}]}))
         self.fixture.git("-C", source, "add", ".")
         self.fixture.git("-C", source, "commit", "-m", "Page environment integration")
         self.fixture.git("-C", source, "push", str(self.fixture.bare), "main")

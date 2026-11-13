@@ -5,6 +5,13 @@ authentication, repository browsing, branches, tokens, users, and pull requests.
 
 ## Documentation
 
+- [REST API](docs/api.md): authenticated `/api/v1` reads and safe writes, permissions,
+  repository browsing/search/diffs, discussions, CI automation/logs/artifacts,
+  pagination, idempotency and OpenAPI.
+  Also available at **`/api/docs`**. Webhooks are deferred.
+  See [CI API safety and tests](docs/api.md#ci-api-safety-and-test-coverage)
+  for regression coverage and local test commands.
+
 - [Getting started](docs/getting-started.md): local setup, configuration, first
   login, Git access, and troubleshooting.
 - [Repository interface](#repository-interface): browsing files and managing branches.

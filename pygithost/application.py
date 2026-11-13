@@ -1011,8 +1011,13 @@ async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str, *
     # Lock and verify both refs in one transaction, preventing a stale CI decision.
     process = await asyncio.create_subprocess_exec("git", "--git-dir=" + repo_git, "update-ref", "--stdin",
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    _out, err = await process.communicate(
-        f"start\nverify {src_ref} {src}\nupdate {tgt_ref} {src} {tgt}\nprepare\ncommit\n".encode())
+    try:
+        _out, err = await asyncio.wait_for(process.communicate(
+            f"start\nverify {src_ref} {src}\nupdate {tgt_ref} {src} {tgt}\nprepare\ncommit\n".encode()), 10)
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
     code = process.returncode
     if code != 0:
         return False, err.decode("utf-8", "replace").strip() or "git update-ref failed.", None
@@ -1891,7 +1896,7 @@ class GitHTTPHandler:
         body = html_t(
             t"""<main class="repo-page"><div class="topbar">
 <div><div class="repo-eyebrow">YOUR WORKSPACE</div><h1>Repositories</h1><p class="muted">Browse your projects and keep your work moving.</p></div>
-<div>{admin_link} <a class="pill" href="/tokens">Tokens</a> <span class="pill">User: <code>{self.remote_user or "?"}</code></span> <a class="pill" href="/logout">Logout</a></div>
+<div>{admin_link} <a class="pill" href="/tokens">Tokens</a> <a class="pill" href="/api/docs">API documentation</a> <span class="pill">User: <code>{self.remote_user or "?"}</code></span> <a class="pill" href="/logout">Logout</a></div>
 </div>
 {notice_html}
 <form class="repo-search" method="GET" action="/" role="search"><input type="hidden" name="per_page" value="{size}"><label for="repo-search">Find a repository</label><div class="row"><input id="repo-search" type="search" name="q" value="{search}" placeholder="Search by repository, owner, or path…" maxlength="128"><button type="submit">Search</button>{clear}</div></form>
@@ -3278,7 +3283,8 @@ document.addEventListener("DOMContentLoaded", function() {{
 
     # ---------- Discussions ----------
     def _discussion_categories(self):
-        return ("Announcements", "Ideas", "Q&A", "Show and tell", "General")
+        from .discussion_rules import CATEGORIES
+        return CATEGORIES
 
     async def _ui_discussions(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
         owner = unquote(owner)
@@ -4171,6 +4177,25 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 }} catch (_error) {{ /* Retry on the next interval. */ }} finally {{ polling = false; }} }}, 3000); }})();</script>'''))
         return await _send_html(self.request, 200,
             _html_page(str_t(t"CI run #{run[0]} · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{body}</main>'))))
+
+    async def _ui_api_docs(self):
+        if not _ip_allowed(self._client_ip(), self._allowlist()):
+            return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
+        if not await self._require_session_auth():
+            return
+        from .ci_docs import render_manual
+        path = Path(__file__).resolve().parent.parent / "docs" / "api.md"
+        try:
+            text = await asyncio.to_thread(path.read_text, encoding="utf-8")
+            content = render_manual(text, "docs/api.md", "/api/docs")
+        except OSError:
+            content = safe_html("<p>The full API manual is unavailable in this installation. "
+                                "Use GET /api/v1/openapi.json with a read-scoped bearer token "
+                                "for the implemented API contract. Writes require write scope "
+                                "and an Idempotency-Key header. Tokens are "
+                                "required even when web authentication is disabled.</p>")
+        body = safe_html(html_t(t'<main class="ci-page"><div class="topbar"><h1>API documentation</h1><a href="/">Home</a></div><nav class="row" aria-label="API documentation sections"><a href="#repository-browsing-and-comparisons">Repository browsing</a><a href="#discussions">Discussions</a><a href="#ci-automation">CI automation</a><a href="#ci-api-safety-and-test-coverage">CI safety and tests</a><a href="#responses-pagination-and-errors">Responses and errors</a><a href="#remaining-api-coverage-gaps">Remaining API gaps</a></nav><article class="box ci-guide">{content}</article></main>'))
+        return await _send_html(self.request, 200, _html_page("API documentation", body))
 
     async def _ui_ci_docs(self, owner: str, repo: str):
         owner, repo = unquote(owner), unquote(repo)
@@ -5647,6 +5672,11 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
 
     async def dispatch(self):
         path = urlparse(self.path).path
+        if path == "/api" or path.startswith("/api/"):
+            if path == "/api/docs" and self.command == "GET":
+                return await self._ui_api_docs()
+            from .api.router import API
+            return await API(self).dispatch()
         if not _is_static_request_path(path) and not path.startswith(URL_PREFIX + "/"):
             _display_name.set(await self.server.display_name())
         if self.command == "GET":
@@ -5672,6 +5702,10 @@ class AsyncGitServer:
         self.config_path = Path(config_path).resolve() if config_path is not None else None
         self.settings_lock = asyncio.Lock()
         self.settings_csrf_secret = secrets.token_bytes(32)
+        from .api.policy import RateLimiter
+        self.api_limiter = RateLimiter()
+        self.api_slots = asyncio.Semaphore(8)
+        self.api_download_slots = asyncio.Semaphore(2)
 
     async def display_name(self):
         from .database import db_display_name_get

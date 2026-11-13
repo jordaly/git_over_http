@@ -139,6 +139,21 @@ def _db_init() -> None:
         if "revoked_at" not in token_cols:
             conn.execute("ALTER TABLE tokens ADD COLUMN revoked_at TEXT")
 
+        conn.execute("""CREATE TABLE IF NOT EXISTS api_mutations (
+            user_id INTEGER NOT NULL,
+            key_hash TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            status INTEGER,
+            response_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            finished_at TEXT,
+            PRIMARY KEY(user_id,key_hash)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_api_mutations_created ON api_mutations(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_status ON tokens(user_id, is_active, expires_at, revoked_at)")

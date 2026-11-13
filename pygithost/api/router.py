@@ -322,6 +322,9 @@ class API:
         owner, repo = unquote(match[1]), unquote(match[2])
         tail = match[3] or ""
         path = await self.repository(owner, repo)
+        if tail == "ci/settings":
+            from . import settings
+            return await settings.read(self, owner, repo)
         if not tail:
             self.parameters()
             return {**self.repo_object(owner, repo), "default_branch": await git.default_branch(path)}

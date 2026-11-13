@@ -92,6 +92,7 @@ a body. Supported mutations are listed separately below.
 | `/repos/{owner}/{repo}/commits/{ref}/files` | Commit's changed files and line counts |
 | `/repos/{owner}/{repo}/commits/{ref}/diff` | Commit's first-parent patch (root commits supported) |
 | `/repos/{owner}/{repo}/archive` | Source ZIP for optional `ref` |
+| `/repos/{owner}/{repo}/ci/settings` | Administrator-only CI/deployment configuration and revision |
 | `/repos/{owner}/{repo}/issues` | Issues; `state=open` (default), `closed`, or `all` |
 | `/repos/{owner}/{repo}/issues/{id}` | One issue |
 | `/repos/{owner}/{repo}/issues/{id}/comments` | Comments, ordered oldest first |
@@ -165,6 +166,7 @@ The authenticated token owner is always recorded as the author.
 | `POST` | `/repos/{owner}/{repo}/ci/runs` | `branch`, `pipeline`; optional `sha` to verify the branch tip |
 | `POST` | `/repos/{owner}/{repo}/ci/runs/{id}/cancel` | Empty JSON object `{}` |
 | `POST` | `/repos/{owner}/{repo}/ci/runs/{id}/rerun` | Empty JSON object `{}` |
+| `PUT` | `/repos/{owner}/{repo}/ci/settings` | Administrator only; `configuration`, `expected_revision` |
 | `POST` | `/repos/{owner}/{repo}/discussions` | `title`; optional `body`, `category` |
 | `PATCH` | `/repos/{owner}/{repo}/discussions/{id}` | `expected_revision`; one or more discussion fields |
 | `POST` | `/repos/{owner}/{repo}/discussions/{id}/comments` | `body` |
@@ -371,6 +373,50 @@ membership and transactional cleanup.
 ```sh
 python -m unittest tests.test_api_browsing tests.test_api_discussions -v
 ```
+
+## CI and deployment settings API
+
+`GET /api/v1/repos/{owner}/{repo}/ci/settings` returns `configuration` and
+`revision`. This endpoint is **administrator-only**, even for repository owners:
+configuration can contain plaintext secrets and code executed as the server user.
+Bearer `read` scope is mandatory; administrator status does not bypass scopes.
+
+`PUT` on the same URL replaces the CI/deployment configuration using the same
+JSON format and validation as the CI settings page. Supply `configuration`,
+`expected_revision` from GET, bearer `write` scope and `Idempotency-Key`:
+
+```json
+{
+  "expected_revision": "<revision from GET>",
+  "configuration": {
+    "version": 1,
+    "pipelines": {
+      "tests": {"steps": [{"name": "Tests", "run": "python -m unittest discover"}]}
+    }
+  }
+}
+```
+
+This is replacement, not merge: include every pipeline and deployment to retain.
+Use the configuration JSON reference at the repository's `/ci/docs` page for
+deployment definitions. Separately managed environment and retention preferences
+are preserved; this API does not edit those preferences or server-wide defaults.
+Configuration is limited to 256 KiB, also subject to the API request-body limit.
+Invalid configurations return `422`; stale revisions return `409`. Configuration
+and preference changes invalidate the revision. Saves share the settings page lock.
+
+Successful PUT returns only the new `revision`; GET again to inspect configuration.
+Mutations use the existing durable idempotency and audit records (actor, request
+ID, method/path, request fingerprint, status and time). Configuration bodies and
+secrets are not copied into cached mutation responses. Restrict access to database
+files, which still store settings in plaintext. Replays recheck administrator access.
+
+Saving does **not** start a deployment, grant trust to repository scripts, bypass
+approvals/branch-tip checks, or perform host deployment preflight. This removes
+manual configuration copying, not configuration duplication: repository-managed
+deployment scripts and deployment history/log/retry APIs remain separate work.
+
+Tests: `python -m unittest tests.test_api_settings -v`.
 
 ## CI automation
 
@@ -641,7 +687,7 @@ HTTP error format, rather than the API error envelope.
 | --- | --- |
 | File mutations | Multi-file commits, rename/move operations, binary writes and creating an initial commit in an empty repository |
 | Pull requests | Conflict inspection/resolution and frozen historical PR diff snapshots |
-| CI settings | Read/update configuration, variables, retention, notification and protection controls |
+| CI settings | Separate variables/retention preferences and server defaults; CI/deployment document reads/replacements are now available to administrators |
 | CI details | Individual step results and email-delivery retry |
 | Deployments | History, results and logs |
 | Repository administration | Settings updates and deletion |

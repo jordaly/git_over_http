@@ -81,6 +81,9 @@ async def authorize(api):
         raise APIError(405, "method_not_allowed", "Mutation endpoint is not supported.")
     owner, repo, tail = unquote(match[1]), unquote(match[2]), match[3] or ""
     path = await api.repository(owner, repo)
+    if tail == "ci/settings":
+        from . import settings
+        settings.authorize(api)
     return owner, repo, path, tail
 
 
@@ -97,6 +100,9 @@ async def route(api, target):
     async with lock:
         # Validate the current path again after waiting for the repository lock.
         path = await api.repository(owner, repo)
+        if tail == "ci/settings":
+            from . import settings
+            return await settings.update(api, owner, repo)
         if tail == "discussions" or tail.startswith("discussions/"):
             from . import discussions
             return await asyncio.to_thread(discussions.mutate, owner, repo, tail, method, doc, api.identity)

@@ -186,6 +186,8 @@ def specification():
     endpoint(base + "/tree", "listTree", ref("TreeEntry"), listing=True, filters=[
         parameter("ref", string), parameter("path", string),
         parameter("recursive", {"type": "boolean", "default": False})])
+    endpoint(base + "/ci/settings", "getCISettings",
+             obj({"configuration": {"type": "object"}, "revision": string}))
     endpoint(base + "/search", "searchRepository", ref("SearchMatch"), listing=True, filters=[
         parameter("q", {"type": "string", "minLength": 1, "maxLength": 256}, required=True),
         parameter("ref", string), parameter("path", string),
@@ -289,6 +291,15 @@ def specification():
               "sha": commit_sha}, {"branch", "pipeline"}, ref("Run"), 202)
     mutation(base + "/ci/runs/{id}/cancel", "post", "cancelRun", {}, set(), ref("Run"))
     mutation(base + "/ci/runs/{id}/rerun", "post", "rerunRun", {}, set(), ref("Run"), 202)
+    mutation(base + "/ci/settings", "put", "replaceCISettings",
+             {"configuration": {"type": "object"}, "expected_revision": revision},
+             {"configuration", "expected_revision"}, obj({"revision": revision}))
+    for operation in ("get", "put"):
+        paths[base + "/ci/settings"][operation]["description"] = (
+            "Administrator-only CI/deployment configuration. Reads require read scope; "
+            "replacement additionally requires write scope and Idempotency-Key. "
+            "Uses the CI settings page JSON format and preserves separate environment/retention preferences. "
+            "Does not execute a deployment or provide deployment preflight.")
     mutation(base + "/discussions", "post", "createDiscussion",
              {"title": title, "body": body, "category": {"enum": list(CATEGORIES), "default": "General"}},
              {"title"}, ref("Discussion"), 201)

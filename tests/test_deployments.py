@@ -101,7 +101,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         second = await self.run_record()
         await self.manager._deploy(second)
         self.assertIsNone(database.db_deployment_get(second[0]))
-        self.assertEqual(self.manager._capture_process.await_count, 3)
+        self.assertEqual(self.manager._capture_process.await_count, 6)
 
     async def test_two_named_targets_keep_results_logs_and_email_independent(self):
         document = {"pipelines": [{"name": "checks", "steps": [{"name": "Test", "run": "echo test"}]}],
@@ -148,7 +148,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             rows.append(row)
             await self.manager._deploy(row)
             self.assertEqual(database.db_deployment_get(run_id)[0], "success")
-        self.assertEqual(self.manager._capture_process.await_count, 4)
+        self.assertEqual(self.manager._capture_process.await_count, 10)
         # A removed pipeline's pending snapshot must never use default's script.
         await self.manager.save_config("owner", "repo", {**self.config, "pipelines": []})
         self.manager._capture_process.reset_mock()
@@ -254,6 +254,8 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         paths = []
         async def capture(command, **kwargs):
             if command[0] == "git":
+                if "clone" in command:
+                    Path(command[-1]).mkdir(parents=True, exist_ok=True)
                 kwargs["output"].extend((self.commit + "\n").encode())
                 return 0
             self.assertEqual(command[0], sys.executable)
@@ -300,6 +302,55 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("deploy_script_content", config)
         finally:
             await self.manager.stop()
+
+    async def test_deployment_checkout_exposes_pinned_files_and_is_removed(self):
+        bare = Path(self.temp.name) / "repo.git"
+        source = Path(self.temp.name) / "source"
+        source.mkdir()
+        def git(*args):
+            return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.DEVNULL).decode().strip()
+        git("init", "-b", "main", source)
+        (source / "deploy").mkdir()
+        (source / "deploy/artifact.txt").write_text("from-repo\n")
+        git("-C", source, "-c", "user.name=Test", "-c", "user.email=test@example.com", "add", ".")
+        git("-C", source, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "Initial")
+        self.commit = git("-C", source, "rev-parse", "HEAD")
+        git("clone", "--bare", source, bare)
+        await self.manager.save_config("owner", "repo", {
+            **self.config, "command": "true", "events": {"push": True},
+            "deploy_script": "", "deploy_script_content": "",
+            "deploy_steps": [
+                {"name": "Read repository file", "run": "cat deploy/artifact.txt"},
+                {"name": "Show checkout", "run": 'printf "%s\\n" "$PYGITHOST_WORKTREE"'},
+                {"name": "Verify pinned checkout",
+                 "run": 'test -d .git && test -f deploy/artifact.txt && test -z "$(git remote)"'},
+            ]})
+        run_id = await self.manager.enqueue("owner", "repo", "push", "main", self.commit)
+        try:
+            await asyncio.wait_for(self.manager.wait_idle(), timeout=20)
+            self.assertEqual(database.db_deployment_get(run_id)[0], "success")
+            output = database.db_deployment_get(run_id)[1]
+            self.assertIn("from-repo", output)
+            worktree = next(line for line in output.splitlines() if "pygithost-deploy-" in line)
+            self.assertFalse(Path(worktree).exists(), "deployment checkout must be removed")
+            steps = json.loads(database.db_deployments_list("owner", "repo")[0][10])
+            self.assertEqual([step["status"] for step in steps], ["success"] * 3)
+        finally:
+            await self.manager.stop()
+
+    async def test_checkout_failure_does_not_consume_the_deployment_attempt(self):
+        row = await self.run_record()
+        async def execute(command, **kwargs):
+            if command[0] == "git" and "clone" in command:
+                return 128
+            kwargs["output"].extend((self.commit + "\n").encode())
+            return 0
+        self.manager._capture_process = AsyncMock(side_effect=execute)
+        await self.manager._deploy(row)
+        self.assertIsNone(database.db_deployment_get(row[0]))
+        self.assertIn("did not start", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
+        self.assertTrue(database.db_deployment_claim(row[0], "owner", "repo", self.commit))
 
     def test_repository_pipeline_cannot_configure_deployment(self):
         with self.assertRaises(ValueError):

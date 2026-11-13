@@ -316,18 +316,21 @@ disabled draft may omit it. Windows path example: `C:/deploy/release.py` with
 containing spaces. The exact invocation is interpreter arguments + script path +
 tested SHA; there is no configurable script args array.
 
-Deployment steps use fresh host shells in a shared temporary directory, not the CI
-checkout. Files persist between steps; shell state does not. `run_with` does not
-select their shell. All steps share `timeout_seconds`; failure skips later steps.
-Read the tested SHA from `PYGITHOST_COMMIT` in step commands. The Deployments list
-and detail pages refresh live logs and statuses every two seconds, with per-step
-and combined output. Existing script targets are displayed as a single Deploy step.
+Deployment steps use fresh host shells in a checkout of the tested commit, not the
+CI job's checkout. Files persist between steps; shell state does not. `run_with` does
+not select their shell. All steps share `timeout_seconds`; failure skips later steps.
+Read the tested SHA from `PYGITHOST_COMMIT` in step commands and resolve repository
+files against the checkout at `PYGITHOST_WORKTREE`, which is also the working
+directory. The Deployments list and detail pages refresh live logs and statuses every
+two seconds, with per-step and combined output. Existing script targets are displayed
+as a single Deploy step.
 
 Deployment follows only its **own** successful push/merged run, while the tested
 commit is still the branch tip. It does not wait for another pipeline. Manual and
 PR-check runs never deploy. Scripts receive the SHA as argument 1 and
-`PYGITHOST_COMMIT`, plus owner/repo/branch/pipeline variables. They run in a separate
-temporary directory, with network, without CI checkout or automatic artifact handoff.
+`PYGITHOST_COMMIT`, plus owner/repo/branch/pipeline variables. They run in a detached
+checkout of that commit with its `origin` removed, with network, without the CI job's
+working tree or automatic artifact handoff. Submodules are not initialized.
 Retrieve/deploy that exact SHA, not a later fetched branch tip.
 
 Removing/changing/disabling deployment prevents old snapshots from deploying.
@@ -452,7 +455,7 @@ repository-wide retention for the behavior currently available.
 | `PYGITHOST_PR_NUMBER` | PR number string or empty. |
 | `PYGITHOST_BASE_BRANCH`, `PYGITHOST_HEAD_BRANCH` | PR target/source; head branch falls back to recorded branch for non-PR runs. |
 | `PYGITHOST_BASE_COMMIT` | Recorded PR base or empty. |
-| `PYGITHOST_WORKTREE` | Independent checkout path, `/workspace` inside Docker. |
+| `PYGITHOST_WORKTREE` | Checkout path; `/workspace` inside Docker. Also set for deployment, where it is the working directory. |
 
 Only the documented subset reaches deployment; do not assume every CI variable
 exists there. No documented `PYGITHOST_HEAD_COMMIT` is provided.

@@ -1345,6 +1345,16 @@ def db_deployment_claim(run_id, owner, repo, commit, config_json=""):
         conn.close()
 
 
+def db_deployment_attempted(owner, repo, commit, deployment_key):
+    conn = _db_connect()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM ci_deployments WHERE owner=? AND repo=? AND commit_hash=? AND pipeline_id=? LIMIT 1",
+            (owner, repo, commit, deployment_key)).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def db_deployment_progress(run_id, deployment_key, output, steps_json):
     conn = _db_connect()
     try:

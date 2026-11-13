@@ -53,9 +53,13 @@ a real deployment tool after verifying the tested commit and target.
 - Scripts receive the tested SHA as argument 1 and `PYGITHOST_COMMIT`, plus
   `PYGITHOST_OWNER`, `PYGITHOST_REPO`, `PYGITHOST_BRANCH`, `PYGITHOST_PIPELINE`
   and the target's `PYGITHOST_DEPLOYMENT` name.
-- They run in a fresh temporary directory on the Git server, **outside Docker**,
-  as the server user, with network access. They must fetch/retrieve the desired
-  build themselves; the CI checkout and artifacts are not automatically passed.
+- They run in a fresh checkout of the **tested commit** on the Git server, outside
+  Docker, as the server user, with network access. The checkout is a detached
+  clone with its `origin` remote removed, so commands can read repository files at
+  that exact SHA but cannot fetch a newer tip. Its path is `PYGITHOST_WORKTREE`
+  and it is the working directory for script and step execution. Temporary
+  uncommitted changes made by deployment code stay in that checkout and are
+  deleted afterwards. Submodule contents are not initialized.
 - One repository runner slot covers CI and deployment. Runs and deployments in
   that repository cannot overlap. Different repositories can proceed concurrently.
 - A deployment object enables its target by default. Set `enabled` to false or remove
@@ -84,19 +88,22 @@ Instead of a single script, insert a target like this into the top-level
 }
 ```
 
-Review commands and target addresses before enabling. Use `steps`, `script`, or
-`script_content`, not steps together with either script option. A target accepts
-up to 64 steps, each containing a nonempty `name` and `run` string. Commands execute
-sequentially in fresh host shells, sharing the deployment's temporary working
-directory and files, but not shell state, exported variables or `cd` changes.
-`run_with` applies to script execution, not step commands. The example uses POSIX
-shell syntax; adapt commands and environment-variable syntax for Windows hosts.
+Review commands and target addresses before enabling. `steps` uses the same
+checkout, timeout and credentials as a script target. A target accepts up to 64
+steps, each containing a nonempty `name` and `run` string. Commands execute
+sequentially in fresh host shells in the tested commit's checkout, sharing that
+working directory and its files, but not shell state, exported variables or `cd`
+changes. `run_with` applies to script execution, not step commands. The example
+uses POSIX shell syntax; adapt commands and environment-variable syntax for
+Windows hosts.
 
 All steps share one deployment timeout, independent of CI's timeout. A failed step
 stops the target and skips its remaining steps. Each step receives the deployment
-environment described above; use `PYGITHOST_COMMIT` explicitly, since step commands
-do not receive the script's automatic SHA argument. CI checkout files, artifacts
-and page-managed CI variables are not automatically supplied to deployment steps.
+environment described above, including `PYGITHOST_WORKTREE`; use
+`PYGITHOST_COMMIT` explicitly, since step commands do not receive the script's
+automatic SHA argument. Page-managed CI variables and CI artifacts are not
+automatically supplied to deployment steps; commit required files to the
+repository or fetch artifacts with an authenticated API call.
 
 ## Live output and status
 
@@ -185,6 +192,7 @@ Unfinished attempts become interrupted rather than replayed. Use a supervisor
 that terminates the service's complete process tree/cgroup; Docker containers
 can need separate crash cleanup. There are no environment approvals, secret
 manager, remote runner protocol or built-in rollback.
+
 ## Shared helpers and named steps
 
 Administrator-managed deployment `script_content` or `script` may be combined

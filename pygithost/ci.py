@@ -421,6 +421,20 @@ def runner_environment(home):
     return env
 
 
+@contextlib.contextmanager
+def deployment_workspace():
+    """Create the deployment home, removing Git's read-only objects reliably."""
+    path = tempfile.mkdtemp(prefix="pygithost-deploy-")
+    try:
+        yield path
+    finally:
+        try:
+            remove_checkout(path)
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Cannot remove deployment directory %s (%s)", path, type(exc).__name__)
+
+
 def docker_command(name, worktree, env_file, config):
     command = ["docker", "run", "--name", name, "--init", "--network=none", "--pull=never", "--log-driver=none",
                "--cap-drop=ALL", "--security-opt=no-new-privileges", "--memory=1g",
@@ -918,7 +932,7 @@ class CIManager:
             await self._deploy_target(row, {**config, **current}, snapshot)
 
     async def _deploy_target(self, row, config, snapshot):
-        """Run one trusted host script with isolated attempt/result bookkeeping."""
+        """Run one trusted host script in a pinned checkout of the tested commit."""
         run_id, owner, repo, event, branch, commit, _payload = row
         identity = snapshot.get("pipeline_id", "default")
         deployment_key = snapshot.get("deployment_name") or identity
@@ -942,7 +956,7 @@ class CIManager:
         output, truncated = bytearray(), [False]
         claimed = False
         try:
-            with tempfile.TemporaryDirectory(prefix="pygithost-deploy-") as home:
+            with deployment_workspace() as home:
                 env = runner_environment(home)
                 bare = str(Path(self.repo_path(owner, repo)).resolve())
                 rc = await self._capture_process(
@@ -952,6 +966,29 @@ class CIManager:
                     await skip("the tested commit is no longer the branch tip, or the branch cannot be resolved.")
                     return
                 output.clear()
+                if await _db_call(database.db_deployment_attempted, owner, repo, commit, deployment_key):
+                    await skip("this repository/deployment/commit already has a deployment attempt; see Deployments.")
+                    return
+                deadline = asyncio.get_running_loop().time() + config["deploy_timeout"]
+                worktree = str(Path(home) / "checkout")
+                checkout_log, checkout_truncated = bytearray(), [False]
+
+                async def checkout(*args):
+                    return await self._capture_process(
+                        ["git", *args], shell=False, cwd=None, env=env,
+                        output=checkout_log, truncated=checkout_truncated,
+                        timeout=deadline - asyncio.get_running_loop().time())
+
+                # Mirror the CI checkout: clone the local bare repository, pin the
+                # tested commit, then remove the origin so deployment code cannot
+                # fetch a newer tip. Checkout output stays out of the deployment log.
+                rc = await checkout("clone", "--no-hardlinks", "--no-checkout", "--", bare, worktree)
+                if rc == 0:
+                    rc = await checkout("-C", worktree, "checkout", "--detach", commit)
+                if rc == 0:
+                    rc = await checkout("-C", worktree, "remote", "remove", "origin")
+                if rc:
+                    raise ValueError("Cannot check out the tested commit for deployment; Git data or the deployment timeout is insufficient.")
                 claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
                 if not claimed:
                     await skip("this repository/deployment/commit already has a deployment attempt; see Deployments.")
@@ -972,7 +1009,7 @@ class CIManager:
                     script = None
                 env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
                     PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, PYGITHOST_PIPELINE=identity,
-                    PYGITHOST_DEPLOYMENT=deployment_key, CI="true")
+                    PYGITHOST_DEPLOYMENT=deployment_key, PYGITHOST_WORKTREE=worktree, CI="true")
                 if script is not None:
                     # Named commands explicitly invoke the shared helper. Do not
                     # also execute it implicitly before/after the named steps.
@@ -984,7 +1021,6 @@ class CIManager:
                 async def publish():
                     await _db_call(database.db_deployment_progress, run_id, deployment_key,
                                    output.decode("utf-8", "replace"), json.dumps(steps))
-                deadline = asyncio.get_running_loop().time() + config["deploy_timeout"]
                 await publish()
                 for step in steps:
                     step["status"] = "running"
@@ -996,7 +1032,7 @@ class CIManager:
                     command = step.get("run") or deployment_prefix(config["deploy_interpreter"]) + [str(script), commit]
                     try:
                         rc = await self._capture_process(command, shell="run" in step,
-                            cwd=home, env=env, output=output, truncated=truncated,
+                            cwd=worktree, env=env, output=output, truncated=truncated,
                             timeout=deadline - asyncio.get_running_loop().time(), on_output=progress)
                         step["status"] = "success" if rc == 0 else "failed"
                     except BaseException as exc:
@@ -1019,7 +1055,10 @@ class CIManager:
             status = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed"
             output.extend((f"\nDeployment error: {exc}\n").encode()[:MAX_OUTPUT - len(output)])
             if not claimed:
-                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
+                # A checkout/staging failure before the claim must not consume the
+                # one attempt for this commit; leave the failure visible on the run.
+                await _db_call(database.db_ci_run_update, run_id,
+                    reason="Deployment did not start: " + deployment_key + ": checkout or staging failed.")
         if claimed:
             await _db_call(database.db_deployment_finish, run_id, status, output.decode("utf-8", "replace"), deployment_key)
 

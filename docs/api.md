@@ -482,6 +482,17 @@ in order with the existing shared timeout and stop-on-failure behavior. They use
 separate processes, so shell variables do not carry over. This does not trust
 repository-managed scripts or grant ordinary users host execution privileges.
 
+### Deployment checkout
+
+Every deployment starts a detached clone of the tested commit, removes its
+`origin` remote, and uses it as the working directory for scripts and steps. The
+path is `PYGITHOST_WORKTREE`. Deployment code can therefore read committed files
+at exactly that SHA but cannot fetch a later tip. The checkout omits submodule
+contents, starts without CI artifacts, and is deleted afterwards, including
+uncommitted changes. A checkout that exceeds the deployment timeout or cannot be
+created fails with `Deployment did not start` and does **not** consume the
+one-attempt-per-commit record.
+
 Tests: `python -m unittest tests.test_api_deployments tests.test_deployments -v`.
 
 ## CI automation

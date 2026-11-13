@@ -223,3 +223,58 @@ tr.pr-file-selected td:first-child { border-left: 3px solid var(--warn-border, c
 .pr-resolve-files label { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; }
 .pr-resolve-form { margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border-strong); }
 .pr-resolve-form textarea { width: 100%; min-height: 60px; }
+.review-page {
+    --review-accent: #7759c2;
+    gap: 16px;
+    font-size: 14px;
+    line-height: 1.5;
+}
+.review-page .topbar h2 { font-size: 24px; font-weight: 600; letter-spacing: -.4px; overflow-wrap: anywhere; }
+.review-breadcrumb { display: flex; flex-wrap: wrap; gap: 10px; color: var(--muted); font-size: 12px; padding-top: 4px; }
+.review-breadcrumb a { color: inherit; text-decoration: none; }
+.review-breadcrumb a:hover { text-decoration: underline; }
+.review-page .box { border-radius: 6px; box-shadow: none; padding: 16px; }
+.review-page .pill { border-radius: 4px; font-size: 12px; }
+.review-page .pill-open { background: #e1f3e8; color: #17663b; border-color: #91d4a8; }
+.review-page .pill-merged { background: #eee6fc; color: #5943a0; border-color: #c6b5ed; }
+.review-page .pill-closed { background: #fce7e7; color: #a42b28; border-color: #efaaaa; }
+.review-page .pull-tab { display: inline-flex; padding: 9px 12px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--fg); }
+.review-page .pull-tab-active { border-bottom-color: var(--review-accent); font-weight: 650; }
+.review-page a[href$="/pulls/new"] { background: var(--review-accent); color: #fff; border: 1px solid var(--review-accent); border-radius: 4px; }
+.review-page table { width: 100%; border-collapse: collapse; }
+.review-page td { padding: 14px 12px; vertical-align: middle; border-bottom: 1px solid var(--border); }
+.review-page tr:last-child td { border-bottom: 0; }
+.review-list .box:has(table) { padding: 0; overflow-x: auto; }
+.review-list .box > .topbar, .review-list #loadMoreStatus { padding: 12px 16px; }
+.review-row-title { font-weight: 600; color: var(--fg); text-decoration: none; }
+.review-row-title:hover { text-decoration: underline; }
+.review-row-meta { margin: 4px 0 0 26px; color: var(--muted); font-size: 12px; }
+.review-section-nav { display: flex; gap: 24px; overflow-x: auto; border-bottom: 1px solid var(--border); }
+.review-section-nav a { white-space: nowrap; padding: 10px 2px; color: var(--fg); text-decoration: none; border-bottom: 3px solid transparent; }
+.review-section-nav a:first-child { border-color: var(--review-accent); font-weight: 600; }
+.review-section-nav a:hover { border-color: var(--review-accent); }
+.review-section-nav span { border-radius: 12px; padding: 1px 7px; margin-left: 4px; background: var(--pre-bg); font-size: 12px; }
+.review-layout { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 24px; align-items: start; }
+.review-main { min-width: 0; }
+.review-sidebar { border-left: 1px solid var(--border); padding: 4px 0 12px 22px; position: sticky; top: 20px; overflow-wrap: anywhere; }
+.review-sidebar h3 { font-size: 13px; margin: 0 0 20px; }
+.review-sidebar dt { font-size: 12px; font-weight: 600; color: var(--muted); margin-top: 20px; }
+.review-sidebar dd { margin: 5px 0 0; font-size: 13px; }
+.review-sidebar code { white-space: normal; overflow-wrap: anywhere; }
+.review-page .pr-comment { border: 1px solid var(--border); border-radius: 6px; margin: 16px 0; overflow: hidden; }
+.review-page .pr-comment-head { background: var(--pre-bg); padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.review-page .pr-comment-body { padding: 14px; }
+.review-page #diff, .review-page #commit-patch { border-top: 3px solid var(--review-accent); }
+.review-page pre { overflow-x: auto; max-width: 100%; }
+.review-page [id] { scroll-margin-top: 20px; }
+.review-commits .repo-commit-date th { background: var(--pre-bg); text-align: left; padding: 12px 16px; font-size: 13px; border-bottom: 1px solid var(--border); }
+.review-commits #commitRows td:nth-child(2) { font-weight: 600; }
+.review-commits #commitRows td:first-child { width: 90px; }
+.review-page a:focus-visible { outline: 2px solid var(--review-accent); outline-offset: 3px; }
+@media (max-width: 900px) {
+    .review-layout { grid-template-columns: minmax(0, 1fr); }
+    .review-sidebar { position: static; border-left: 0; border-top: 1px solid var(--border); padding: 16px 0; }
+    .review-sidebar dl { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; }
+    .review-sidebar dt, .review-sidebar dd { margin: 0; }
+    .review-section-nav { gap: 16px; }
+}

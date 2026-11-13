@@ -58,6 +58,31 @@ class RepositoryUITests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_review_pages_have_gitlab_style_layout_and_working_navigation(self):
+        identity = database.db_pr_create(FLAT_OWNER_UI, "project", "Review layout",
+                                        "Description", "feature/api", "main", None)
+        for suffix, marker in (("/pulls", "review-list"), ("/commits?ref=main", "review-commits"),
+                               (f"/pulls/{identity}", 'aria-label="Pull request details"'),
+                               (f"/commit/{self.sha}", 'aria-label="Commit details"')):
+            status, page = self.request(self.base + suffix)
+            self.assertEqual(status, 200, page)
+            self.assertIn("review-page", page)
+            self.assertIn(marker, page)
+        status, page = self.request(self.base + f"/pulls/{identity}")
+        for anchor in ("overview", "discussion", "pr-commits", "diff"):
+            self.assertIn(f'href="#{anchor}"', page)
+            self.assertIn(f'id="{anchor}"', page)
+        self.assertIn(f'action="{self.base}/pulls/{identity}/comments"', page)
+
+    def test_review_titles_and_branch_names_remain_escaped(self):
+        identity = database.db_pr_create(FLAT_OWNER_UI, "project", "<script>alert(1)</script>",
+                                        "", "feature/api", "main", None)
+        for suffix in ("/pulls", f"/pulls/{identity}"):
+            status, page = self.request(self.base + suffix)
+            self.assertEqual(status, 200)
+            self.assertNotIn("<script>alert(1)</script>", page)
+            self.assertIn("&lt;script&gt;", page)
+
     def test_create_pull_request_without_authentication_has_nullable_author(self):
         status, _ = self.request(self.base + "/pulls/create", {
             "title": "Anonymous pull request", "body": "Created with authentication disabled",

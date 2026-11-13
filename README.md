@@ -694,3 +694,10 @@ and timeout cleanup using an existing local Linux image:
 ```sh
 PYGITHOST_TEST_DOCKER_IMAGE=python:3.14-slim .venv/bin/python -m unittest discover -v
 ```
+# PR and commit review pages
+
+Pull-request and commit lists/details use a GitLab-inspired review layout with
+compact list rows, status badges, section navigation, metadata sidebars and framed
+diffs. On narrow screens the sidebar moves below the content. Section navigation
+uses ordinary links and works without JavaScript; existing merge permissions,
+comment actions and commit pagination are unchanged.

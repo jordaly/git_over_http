@@ -2673,7 +2673,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             rows.append(
                 html_t(
                     t"""<tr class="pr-list-row">
-<td><a href="{base}/pulls/{pr_id}"><span class="pull-status-icon pull-status-{st}" aria-hidden="true">{icon}</span> PR #{pr_id}: {title}</a></td>
+<td><a class="review-row-title" href="{base}/pulls/{pr_id}"><span class="pull-status-icon pull-status-{st}" aria-hidden="true">{icon}</span> {title}</a><div class="review-row-meta">!{pr_id} · Pull request</div></td>
 <td class="muted"><code>{src}</code> → <code>{tgt}</code> {count_suffix}</td>
 <td><span class="pill pill-{st}">{st}</span></td><td class="muted"><small title="{created_at}">{when}</small></td></tr>"""
                 )
@@ -2688,7 +2688,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 </div><div><a class="pill pull-tab-active" href="{base}/pulls/new">+ New pull request</a></div></div></div>
 <div class="box"><table>{rows_html}</table>{pagination}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Pull requests · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(self.request, 200, _html_page(str_t(t"Pull requests · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-list">{safe_html(body)}</main>'))))
 
     async def _ui_pulls_new(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
         """Dedicated pull-request creation page (linked from '+ New pull request')."""
@@ -2924,19 +2924,22 @@ document.addEventListener("DOMContentLoaded", function() {{
                 t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form pr-md-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body}</textarea><button type="submit">Save</button></form></details>'
             ))
         body_html = html_t(
-            t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>PR #{pr_id}: {title}</h2>
+            t"""{_repo_tabs(base, "pulls")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> <a href="{base}/pulls">Pull requests</a> <span>/</span> !{pr_id}</div><div class="topbar"><div><h2>{title}</h2>
 <div class="muted"><span class="pill pill-{status}">{status}</span> <code>{src_branch}</code> → <code>{tgt_branch}</code> | Created: {created_at}</div></div>
 <div><a class="pill" href="{base}/pulls">All PRs</a> <a class="pill" href="{base}">Repo</a> {_repo_code_menu(owner, repo, src_branch, can_edit=can_write and bool(src_commit))}</div></div>
 {notice_html}
+<nav class="review-section-nav" aria-label="Pull request sections"><a href="#overview">Overview</a><a href="#discussion">Discussion <span>{len(comments)}</span></a><a href="#pr-commits">Commits <span>{len(commits)}</span></a><a href="#diff">Changes <span>{len(changed_files)}</span></a></nav>
+<div class="review-layout"><div class="review-main" id="overview">
 <div class="box" style="margin-bottom:14px"><span class="pill pill-{status}">{status}</span>{merge_note}
 <div style="margin-top:10px">{description}</div>{title_form}
 <div class="muted" style="margin-top:10px">Source: <code>{src_branch}</code> @ <code>{src_short}</code><br>Target: <code>{tgt_branch}</code> @ <code>{tgt_short}</code></div></div>
 {ci_panel}{merge_box}{comments_box}
-<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table>{commits_pagination}</div>
+<div class="box" id="pr-commits" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table>{commits_pagination}</div>
 {files_panel}
-<div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">{heading}</h2>{summary}{diff_html}</div>"""
+<div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">{heading}</h2>{summary}{diff_html}</div></div>
+<aside class="review-sidebar" aria-label="Pull request details"><h3>Pull request details</h3><dl><dt>Status</dt><dd><span class="pill pill-{status}">{status}</span></dd><dt>Source branch</dt><dd><code>{src_branch}</code><br><code>{src_short}</code></dd><dt>Target branch</dt><dd><code>{tgt_branch}</code><br><code>{tgt_short}</code></dd><dt>Created</dt><dd>{created_at}</dd><dt>Changes</dt><dd>{len(changed_files)} files <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></dd></dl></aside></div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}{self._issue_editor_assets()}</main>'))))
+        await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-detail">{safe_html(body_html)}{self._issue_editor_assets()}</main>'))))
 
     async def _ui_pull_comment(self, owner: str, repo: str, pr_id: int):
         owner = unquote(owner)
@@ -4451,7 +4454,7 @@ form.addEventListener("submit", event => {{
         )
         pagination = _pagination(base + "/commits", {"ref": resolved_ref, **({"path": history_path} if history_path else {})}, skip // size + 1, has_more, total=total, per_page=size)
         body = html_t(
-            t"""{_repo_tabs(base, "code")}<div class="topbar"><h2>Commits</h2>
+            t"""{_repo_tabs(base, "code")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> Commits</div><div class="topbar"><h2>Commits</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
 <div class="box"><div class="topbar"><p class="muted">ref: <code>{ref}</code> {history_path}</p>{pagination}</div><table><tbody id="commitRows">{rows_html}</tbody></table>
 <div id="loadMoreStatus" class="muted" style="margin-top:10px">{load_more}</div>{pagination}</div>
@@ -4525,7 +4528,7 @@ form.addEventListener("submit", event => {{
 }})();
 </script>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Commits · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(self.request, 200, _html_page(str_t(t"Commits · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-list review-commits">{safe_html(body)}</main>'))))
 
     async def _ui_commit(self, owner: str, repo: str, commitish: str):
         owner = unquote(owner)
@@ -4562,13 +4565,15 @@ form.addEventListener("submit", event => {{
         files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No file list.</td></tr>')
         patch_html = _prism_diff_patch_html(patch_text, truncated, "Patch")
         body = html_t(
-            t"""{_repo_tabs(base, "code")}<div class="topbar"><div><h2><code>{commit[:8]}</code> {meta['subject']}</h2>
+            t"""{_repo_tabs(base, "code")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> <a href="{base}/commits?ref={q(commit)}">Commits</a> <span>/</span> <code>{commit[:8]}</code></div><div class="topbar"><div><h2>{meta['subject']}</h2>
 <div class="muted">{meta['author_name']} &lt;{meta['author_email']}&gt; · {meta['date']}</div>{parents_html}</div>
 <div>{_repo_code_menu(owner, repo, commit)}</div></div>
-<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table>{pagination}</div>
-<div class="box"><h2 style="margin:0 0 10px 0;font-size:16px">Patch</h2>{patch_html}</div>"""
+<nav class="review-section-nav" aria-label="Commit sections"><a href="#commit-files">Files</a><a href="#commit-patch">Changes</a></nav>
+<div class="review-layout"><div class="review-main"><div class="box" id="commit-files" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table>{pagination}</div>
+<div class="box" id="commit-patch"><h2 style="margin:0 0 10px 0;font-size:16px">Patch</h2>{patch_html}</div></div>
+<aside class="review-sidebar" aria-label="Commit details"><h3>Commit details</h3><dl><dt>Commit SHA</dt><dd><code>{commit}</code></dd><dt>Author</dt><dd>{meta['author_name']}</dd><dt>Committed</dt><dd>{meta['date']}</dd><dt>Parents</dt><dd>{parents_html if parent_links else "Initial commit"}</dd></dl></aside></div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Commit {commit[:8]} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(self.request, 200, _html_page(str_t(t"Commit {commit[:8]} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-detail">{safe_html(body)}</main>'))))
 
     async def _ui_archive(self, owner, repo):
         owner, repo = unquote(owner), unquote(repo)

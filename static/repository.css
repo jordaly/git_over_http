@@ -224,7 +224,7 @@ tr.pr-file-selected td:first-child { border-left: 3px solid var(--warn-border, c
 .pr-resolve-form { margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--border-strong); }
 .pr-resolve-form textarea { width: 100%; min-height: 60px; }
 .review-page {
-    --review-accent: #7759c2;
+    --review-accent: var(--link);
     gap: 16px;
     font-size: 14px;
     line-height: 1.5;
@@ -235,12 +235,9 @@ tr.pr-file-selected td:first-child { border-left: 3px solid var(--warn-border, c
 .review-breadcrumb a:hover { text-decoration: underline; }
 .review-page .box { border-radius: 6px; box-shadow: none; padding: 16px; }
 .review-page .pill { border-radius: 4px; font-size: 12px; }
-.review-page .pill-open { background: #e1f3e8; color: #17663b; border-color: #91d4a8; }
-.review-page .pill-merged { background: #eee6fc; color: #5943a0; border-color: #c6b5ed; }
-.review-page .pill-closed { background: #fce7e7; color: #a42b28; border-color: #efaaaa; }
 .review-page .pull-tab { display: inline-flex; padding: 9px 12px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--fg); }
 .review-page .pull-tab-active { border-bottom-color: var(--review-accent); font-weight: 650; }
-.review-page a[href$="/pulls/new"] { background: var(--review-accent); color: #fff; border: 1px solid var(--review-accent); border-radius: 4px; }
+.review-page a[href$="/pulls/new"] { background: var(--accent-bg); color: var(--link); border: 1px solid var(--accent-border); border-radius: 4px; }
 .review-page table { width: 100%; border-collapse: collapse; }
 .review-page td { padding: 14px 12px; vertical-align: middle; border-bottom: 1px solid var(--border); }
 .review-page tr:last-child td { border-bottom: 0; }

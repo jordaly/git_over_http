@@ -322,6 +322,12 @@ class API:
         owner, repo = unquote(match[1]), unquote(match[2])
         tail = match[3] or ""
         path = await self.repository(owner, repo)
+        if tail == "deployments/preflight":
+            from . import preflight
+            return await preflight.read(self, owner, repo, path)
+        if tail == "deployments" or tail.startswith("deployments/"):
+            from . import deployments
+            return await deployments.read(self, owner, repo, tail)
         if tail == "ci/settings":
             from . import settings
             return await settings.read(self, owner, repo)

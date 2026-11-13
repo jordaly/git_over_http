@@ -188,6 +188,33 @@ def specification():
         parameter("recursive", {"type": "boolean", "default": False})])
     endpoint(base + "/ci/settings", "getCISettings",
              obj({"configuration": {"type": "object"}, "revision": string}))
+    deployment = obj({
+        "id": integer, "run_id": integer, "commit_sha": string, "status": string,
+        "started_at": date, "finished_at": nullable_date, "notification": nullable_string,
+        "name": string, "pipeline": string, "branch": nullable_string,
+        "run_retained": {"type": "boolean"}, "log_size_in_bytes": integer})
+    endpoint(base + "/deployments", "listDeployments", deployment, listing=True)
+    endpoint(base + "/deployments/{id}", "getDeployment", deployment)
+    endpoint(base + "/deployments/{id}/steps", "listDeploymentSteps",
+             obj({"index": integer, "name": string, "status": string, "log_size_in_bytes": integer}),
+             listing=True)
+    deployment_log = obj({
+        "deployment_id": integer, "step_index": {"type": ["integer", "null"]},
+        "status": string, "encoding": {"const": "utf-8"}, "content": string,
+        "offset": integer, "next_offset": integer, "size_in_bytes": integer,
+        "has_more": {"type": "boolean"}, "complete": {"type": "boolean"}})
+    for suffix, operation in (("/logs", "getDeploymentLog"),
+                              ("/steps/{step_index}/logs", "getDeploymentStepLog")):
+        endpoint(base + "/deployments/{id}" + suffix, operation, deployment_log,
+                 filters=[parameter("offset", {"type": "integer", "minimum": 0, "default": 0}),
+                          parameter("limit", {"type": "integer", "minimum": 4, "maximum": 65536,
+                                              "default": 16384})])
+    endpoint(base + "/deployments/preflight", "deploymentPreflight", obj({
+        "revision": string, "ok": {"type": "boolean"}, "advisory": {"const": True},
+        "targets": {"type": "array", "items": {"type": "object"}}}))
+    paths[base + "/deployments/preflight"]["get"]["description"] = (
+        "Administrator-only, read-only checks of enabled deployment prerequisites. "
+        "Does not execute scripts or validate arbitrary commands, credentials or remote services.")
     endpoint(base + "/search", "searchRepository", ref("SearchMatch"), listing=True, filters=[
         parameter("q", {"type": "string", "minLength": 1, "maxLength": 256}, required=True),
         parameter("ref", string), parameter("path", string),

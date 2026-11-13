@@ -413,10 +413,76 @@ files, which still store settings in plaintext. Replays recheck administrator ac
 
 Saving does **not** start a deployment, grant trust to repository scripts, bypass
 approvals/branch-tip checks, or perform host deployment preflight. This removes
-manual configuration copying, not configuration duplication: repository-managed
-deployment scripts and deployment history/log/retry APIs remain separate work.
+manual configuration copying, not configuration duplication. See deployment
+diagnostics and the separate advisory preflight below. Repository-managed
+deployment scripts and controlled deployment retries remain separate work.
 
 Tests: `python -m unittest tests.test_api_settings -v`.
+
+## Deployment diagnostics and preflight
+
+All deployment diagnostics require bearer `read` scope and repository access:
+
+| GET endpoint (under `/api/v1/repos/{owner}/{repo}`) | Result |
+| --- | --- |
+| `/deployments` | Paginated history, newest first |
+| `/deployments/{id}` | Status, tested SHA, pipeline/target, timestamps, notification state and retained-CI flag |
+| `/deployments/{id}/steps` | Paginated step names, zero-based indexes, statuses and stored log sizes |
+| `/deployments/{id}/logs` | Combined UTF-8 log chunk |
+| `/deployments/{id}/steps/{step_index}/logs` | One step's UTF-8 log chunk |
+| `/deployments/preflight` | Administrator-only advisory host prerequisite checks |
+
+Deployment IDs are distinct from CI run IDs. History remains readable if the
+associated CI run is no longer retained. Metadata does not expose configuration,
+environment values or step commands. Logs are **not secret-redacted**.
+
+Log query parameters are `offset` (UTF-8 byte offset, default 0) and `limit`
+(4–65536 bytes, default 16384). Continue at `next_offset`; do not count JSON
+characters. Invalid byte boundaries and offsets beyond stored output return `400`.
+Responses contain `content`, `size_in_bytes`, `has_more`, `status` and `complete`.
+`complete` means the attempt/step is terminal and the stored output is exhausted,
+not that runner output was never capped. Deployment storage has no reliable
+historical truncation flag; missing output cannot be recovered through this API.
+Logs are sliced in SQLite, not loaded wholesale by the API.
+
+```sh
+curl --fail-with-body -H "Authorization: Bearer $PYGITHOST_TOKEN" \
+  "$PYGITHOST_URL/api/v1/repos/alice/project/deployments"
+curl --fail-with-body -H "Authorization: Bearer $PYGITHOST_TOKEN" \
+  "$PYGITHOST_URL/api/v1/repos/alice/project/deployments/123/logs?limit=16384"
+```
+
+Preflight examines currently enabled targets under the settings lock and returns
+the settings `revision`, per-target checks, overall `ok` and `advisory: true`.
+It checks configured interpreters, external script readability/executability,
+outside-repository placement, simple direct-script shebang prerequisites and the
+named-step shell. It **does not execute** commands, scripts or deployment code.
+No enabled targets yields `ok: false`. Advanced `/usr/bin/env` shebang flags are
+conservatively reported as unsupported.
+
+Preflight cannot validate arbitrary shell command dependencies, remote credentials,
+network services, deployment destination permissions or future filesystem changes.
+It does not authorize deployment, replace exact-commit CI/branch-tip checks, or
+guarantee a later deployment will succeed. Saving settings remains validation-only;
+call preflight explicitly after saving.
+
+### Shared deployment helper with named steps
+
+A trusted administrator may now combine `script_content` (or an external `script`)
+with named deployment `steps`. The shared helper is staged once and its absolute
+path is available as `PYGITHOST_DEPLOY_SCRIPT`. Named commands invoke it explicitly:
+
+```json
+{"name": "Release", "run": "sh \"$PYGITHOST_DEPLOY_SCRIPT\" release"}
+```
+
+With named steps the helper is **not run implicitly**. Each command chooses its
+interpreter/arguments; `run_with` still controls script-only execution. Steps run
+in order with the existing shared timeout and stop-on-failure behavior. They use
+separate processes, so shell variables do not carry over. This does not trust
+repository-managed scripts or grant ordinary users host execution privileges.
+
+Tests: `python -m unittest tests.test_api_deployments tests.test_deployments -v`.
 
 ## CI automation
 
@@ -689,7 +755,7 @@ HTTP error format, rather than the API error envelope.
 | Pull requests | Conflict inspection/resolution and frozen historical PR diff snapshots |
 | CI settings | Separate variables/retention preferences and server defaults; CI/deployment document reads/replacements are now available to administrators |
 | CI details | Individual step results and email-delivery retry |
-| Deployments | History, results and logs |
+| Deployments | Controlled retries; history, step results and bounded logs are now available |
 | Repository administration | Settings updates and deletion |
 | Access administration | Granular/repository-restricted tokens, collaborator ACLs, service accounts and audit/token-management endpoints |
 | Webhooks | Intentionally deferred; no subscription or delivery infrastructure |

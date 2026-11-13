@@ -182,8 +182,6 @@ def validate_config(raw, *, nested=False):
     for step in deploy_steps:
         if not isinstance(step, dict) or set(step) - {"name", "run"} or any(not isinstance(step.get(key), str) or not step[key].strip() or "\0" in step[key] for key in ("name", "run")):
             raise ValueError("Each deployment step requires a name and run command.")
-    if deploy_steps and (script or content):
-        raise ValueError("Use deployment steps or a deployment script, not both.")
     defaults["deploy_steps"] = deploy_steps
     if raw.get("deploy_enabled", False) and not script and not content and not deploy_steps:
         raise ValueError("Automatic deployment requires a script path or new script contents.")
@@ -958,9 +956,7 @@ class CIManager:
                 if not claimed:
                     await skip("this repository/deployment/commit already has a deployment attempt; see Deployments.")
                     return
-                if config.get("deploy_steps"):
-                    script = None
-                elif config.get("deploy_script_content"):
+                if config.get("deploy_script_content"):
                     prefix = deployment_prefix(config["deploy_interpreter"])
                     runtime = Path(prefix[0]).stem.lower() if prefix else ""
                     suffix = ".py" if "python" in runtime else ".ps1" if runtime in ("pwsh", "powershell") else ".js" if runtime in ("node", "nodejs") else ".sh"
@@ -968,13 +964,19 @@ class CIManager:
                     descriptor = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
                     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
                         handle.write(snapshot["deploy_script_content"])
-                else:
+                elif config.get("deploy_script"):
                     script = Path(config["deploy_script"]).resolve()
                     if script.is_relative_to(Path(bare)) or not script.is_file():
                         raise ValueError("Deployment script must exist outside the repository.")
+                else:
+                    script = None
                 env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
                     PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, PYGITHOST_PIPELINE=identity,
                     PYGITHOST_DEPLOYMENT=deployment_key, CI="true")
+                if script is not None:
+                    # Named commands explicitly invoke the shared helper. Do not
+                    # also execute it implicitly before/after the named steps.
+                    env["PYGITHOST_DEPLOY_SCRIPT"] = str(script)
                 steps = [{"name": step["name"], "run": step["run"], "status": "queued", "output": ""}
                          for step in config.get("deploy_steps", [])]
                 if not steps:

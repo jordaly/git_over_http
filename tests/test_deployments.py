@@ -74,6 +74,25 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([step["status"] for step in steps], ["success", "failed", "skipped"])
         self.assertEqual(attempt[3], "failed")
 
+    async def test_shared_script_is_staged_for_named_steps_without_implicit_execution(self):
+        self.config.update(deploy_script="", deploy_script_content="#!/bin/sh\necho shared\n",
+                           deploy_steps=[{"name": "Release", "run": '"$PYGITHOST_DEPLOY_SCRIPT" release'}])
+        row = await self.run_record()
+        calls = []
+        async def capture(command, **kwargs):
+            if command[0] == "git":
+                kwargs["output"].extend((self.commit + "\n").encode())
+                return 0
+            calls.append(command)
+            script = Path(kwargs["env"]["PYGITHOST_DEPLOY_SCRIPT"])
+            self.assertEqual(script.read_text(), "#!/bin/sh\necho shared\n")
+            self.assertTrue(kwargs["shell"])
+            return 0
+        self.manager._capture_process = AsyncMock(side_effect=capture)
+        await self.manager._deploy(row)
+        self.assertEqual(calls, ['"$PYGITHOST_DEPLOY_SCRIPT" release'])
+        self.assertEqual(database.db_deployment_get(row[0])[0], "success")
+
     async def test_success_and_duplicate_protection(self):
         row = await self.run_record()
         self.capture()

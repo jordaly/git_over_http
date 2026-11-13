@@ -185,3 +185,19 @@ Unfinished attempts become interrupted rather than replayed. Use a supervisor
 that terminates the service's complete process tree/cgroup; Docker containers
 can need separate crash cleanup. There are no environment approvals, secret
 manager, remote runner protocol or built-in rollback.
+## Shared helpers and named steps
+
+Administrator-managed deployment `script_content` or `script` may be combined
+with named `steps`. The helper is staged once; commands can invoke its absolute
+path through `PYGITHOST_DEPLOY_SCRIPT`, for example
+`sh "$PYGITHOST_DEPLOY_SCRIPT" release`. With named steps the helper is not
+executed automatically. Choose the interpreter in each command; `run_with`
+continues to control script-only execution. Steps retain the shared timeout,
+ordered execution and stop-on-failure semantics.
+
+Repository-scoped deployment history, step results and bounded logs are available
+through the [REST API](api.md#deployment-diagnostics-and-preflight).
+Administrators can also request advisory preflight checks without executing
+deployment code. This does not grant trust to repository scripts or bypass CI and
+branch-tip checks. Controlled retries and restricted automation tokens remain
+unfinished.

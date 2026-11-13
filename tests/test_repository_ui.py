@@ -58,6 +58,30 @@ class RepositoryUITests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_deployment_history_hides_details_until_opened(self):
+        database.db_deployment_claim(98765, FLAT_OWNER_UI, "project", self.sha, json.dumps({
+            "deployment_name": "production", "pipeline_id": "checks", "deploy_branch": "main"}))
+        database.db_deployment_progress(98765, "production", "PRIVATE_DEPLOYMENT_OUTPUT",
+            json.dumps([{"name": "Detailed release step", "status": "failed",
+                         "output": "PRIVATE_STEP_OUTPUT"}]))
+        database.db_deployment_finish(98765, "failed", "PRIVATE_DEPLOYMENT_OUTPUT", "production")
+        identity = database.db_deployments_list(FLAT_OWNER_UI, "project")[0][0]
+        path = self.base + "/ci/deployments"
+        for suffix in ("", "?partial=1"):
+            status, page = self.request(path + suffix)
+            self.assertEqual(status, 200)
+            self.assertIn("View details", page)
+            self.assertIn(f'href="{path}/{identity}"', page)
+            self.assertNotIn("PRIVATE_DEPLOYMENT_OUTPUT", page)
+            self.assertNotIn("PRIVATE_STEP_OUTPUT", page)
+            self.assertNotIn("Detailed release step", page)
+        for suffix in ("", "?partial=1"):
+            status, page = self.request(path + f"/{identity}" + suffix)
+            self.assertEqual(status, 200)
+            self.assertIn("PRIVATE_DEPLOYMENT_OUTPUT", page)
+            self.assertIn("PRIVATE_STEP_OUTPUT", page)
+            self.assertIn("Detailed release step", page)
+
     def test_review_pages_have_gitlab_style_layout_and_working_navigation(self):
         identity = database.db_pr_create(FLAT_OWNER_UI, "project", "Review layout",
                                         "Description", "feature/api", "main", None)

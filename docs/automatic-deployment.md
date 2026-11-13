@@ -107,7 +107,10 @@ repository or fetch artifacts with an authenticated API call.
 
 ## Live output and status
 
-**CI → Deployments** and individual deployment pages refresh output, target status
+**CI → Deployments** shows compact summaries with status, target, branch, commit
+and timing. Click **View details** or the deployment number to open its detailed
+page; step output and logs are not included in the history list, including live
+refreshes. Individual deployment pages refresh output, target status
 and email delivery state every two seconds without a manual refresh. Expand a
 step for its output or **Combined output** for the target's complete captured log.
 Use **Copy output** inside **Combined output** to copy that deployment's captured

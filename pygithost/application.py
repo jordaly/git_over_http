@@ -3984,6 +3984,11 @@ document.addEventListener("DOMContentLoaded", function() {{
             identity, run_id, commit, status, started, finished, notification, raw, retained = row[:9]
             config = json.loads(raw or "{}")
             branch = config.get("deploy_branch", "—")
+            if deployment_id is None:
+                entries.append(html_t(t'''<section class="box deployment-summary"><div class="topbar"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2><a class="pill" href="{base}/ci/deployments/{identity}">View details</a></div>
+<p><strong>{config.get("deployment_name") or config.get("pipeline_id", "default")}</strong> · <code>{branch}</code> · <a href="{base}/commit/{q(commit)}"><code>{commit[:8]}</code></a></p>
+<p class="muted">Started: {started} · Duration: {_ci_elapsed(started, finished)}</p></section>'''))
+                continue
             run_link = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}">CI run #{run_id}</a>')) if retained else safe_html(html_t(t'<span class="muted">CI run #{run_id} no longer retained</span>'))
             steps = json.loads(row[10] or "[]")
             step_html = join_html([html_t(t'<details class="ci-step" open><summary><span class="ci-status" data-status="{step["status"]}">{step["status"]}</span> <strong>{step["name"]}</strong></summary><pre tabindex="0">{step["output"] or "No output yet."}</pre></details>') for step in steps])
@@ -3997,7 +4002,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         if (parse_qs(urlparse(self.path).query or "").get("partial") or [""])[0] == "1":
             return await _send_response(self.request, 200, str(results).encode("utf-8"), [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
         body = html_t(t'''{_ci_tabs(base, "deployments")}<div class="topbar"><h2>Deployment history</h2><a class="pill" href="{base}/ci/deployments">Latest deployments</a></div>
-<p class="muted">Deployment results are separate from CI results. Output and status refresh every 2 seconds.</p>
+<p class="muted">Deployment results are separate from CI results. Status refreshes every 2 seconds. Open a deployment to see its steps, logs and details.</p>
 <script>document.addEventListener("click", async function(event) {{ const button = event.target.closest("[data-copy-deployment]"); if (!button) return; const log = document.getElementById(button.dataset.copyDeployment); const feedback = button.parentElement.querySelector("[data-copy-feedback]"); if (!log) return; try {{ await navigator.clipboard.writeText(log.textContent); feedback.textContent = "Copied."; }} catch (_) {{ feedback.textContent = "Could not copy. Select the output and copy it manually."; }} }});</script>
 <p><a href="{base}/ci/config">Configure deployment</a> · <a href="{base}/ci/docs?guide=deployment">Deployment documentation</a></p>{results}
 <script>(function() {{ let busy = false; const timer = setInterval(async function() {{ if (busy) return; busy = true; try {{ const url = new URL(location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (!response.ok || response.redirected) {{ clearInterval(timer); return; }} const text = await response.text(); const current = document.getElementById("deployment-results"); const states = Array.from(current.querySelectorAll("details")).map(el => el.open); const scrolls = Array.from(current.querySelectorAll("pre")).map(el => [el.scrollTop, el.scrollHeight - el.clientHeight - el.scrollTop < 24]); current.outerHTML = text; const updated = document.getElementById("deployment-results"); updated.querySelectorAll("details").forEach((el, i) => {{ if (i < states.length) el.open = states[i]; }}); updated.querySelectorAll("pre").forEach((el, i) => {{ if (scrolls[i]) el.scrollTop = scrolls[i][1] ? el.scrollHeight : scrolls[i][0]; }}); }} catch (_) {{ }} finally {{ busy = false; }} }}, 2000); }})();</script>''')

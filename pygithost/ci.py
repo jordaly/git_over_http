@@ -195,8 +195,8 @@ def validate_config(raw, *, nested=False):
     runner = raw.get("runner", "host")
     image = raw.get("image", "python:3.14-slim")
     mode = raw.get("email_mode", "off")
-    if runner not in ("host", "docker"):
-        raise ValueError("Runner must be host or docker.")
+    if runner not in ("host", "docker", "remote-docker"):
+        raise ValueError("Runner must be host, docker or remote-docker.")
     if not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@-]{0,255}", image):
         raise ValueError("Enter a valid Docker image name.")
     if mode not in ("off", "failures", "all", "recovery"):
@@ -204,7 +204,7 @@ def validate_config(raw, *, nested=False):
     recipients = validate_recipients(raw.get("email_recipients", ""))
     if mode != "off" and not recipients:
         raise ValueError("Email notifications require at least one recipient.")
-    if runner == "docker" and any("\n" in value or "\r" in value for value in env.values()):
+    if runner in ("docker", "remote-docker") and any("\n" in value or "\r" in value for value in env.values()):
         raise ValueError("Docker environment values cannot contain newlines.")
     events = raw.get("events", {})
     if not isinstance(events, dict):
@@ -441,6 +441,8 @@ def docker_command(name, worktree, env_file, config):
                "--cpus=1", "--pids-limit=128", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
                "--mount", f"type=bind,src={worktree},dst=/workspace", "--workdir", "/workspace",
                "--env-file", env_file, "--entrypoint", "/bin/sh"]
+    if config.get("_http_attempt"):
+        command += ["--label", "pygithost.http-attempt=" + config["_http_attempt"]]
     if os.name == "posix":
         if os.getuid() == 0:
             raise ValueError("Run the Docker CI server as an unprivileged user, not root.")
@@ -496,6 +498,8 @@ class CIManager:
                 return
             self._acquire_runner_lock()
             try:
+                from .remote_ci import recover_jobs
+                await _db_call(recover_jobs)
                 await _db_call(database.db_ci_recover_runs)
                 await _db_call(database.db_deployment_recover)
                 rows = await _db_call(database.db_ci_queued_runs)
@@ -1197,6 +1201,9 @@ class CIManager:
         payload = json.loads(payload_json or "{}")
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
         config = validate_config(json.loads(meta["config"])) if meta and meta["config"] else await self.config(owner, repo)
+        if config["runner"] == "remote-docker":
+            from .remote_ci import execute_remote
+            return await execute_remote(self, row, config)
         if not config["command"] and not config["steps"]:
             await _db_call(
                 database.db_ci_run_update,
@@ -1349,7 +1356,9 @@ class CIManager:
                         {key: value for key, value in env.items() if key in BUILTINS or key in config["env"]}), True
                     if config["runner"] == "docker":
                         container = f"pygithost-ci-{os.getpid()}-{run_id}-{index}"
-                        command, shell = docker_command(container, worktree, env_file, {**config, "command": command}), False
+                        command, shell = docker_command(container, worktree, env_file, {
+                            **config, "command": command,
+                            "_http_attempt": getattr(self, "http_attempt", "")}), False
                     rc = await self._capture_process(
                         command, shell=shell, cwd=worktree,
                         env=os.environ.copy() if not shell else env.copy(),

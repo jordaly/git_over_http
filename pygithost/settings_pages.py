@@ -41,7 +41,7 @@ def preferences_forms(action, token, global_values, local_values=None, *, legacy
                 value = inherited if repository else builtin
             inheritance = safe_html(html_t(t'<label class="settings-inherit"><input type="checkbox" name="inherit_{key}" data-inherits="{key}"{safe_html(" checked" if inherit else "")}> Use server default ({str(inherited)})</label>')) if repository else safe_html("")
             if key == "runner":
-                control = html_t(t'<select id="pref-{key}" name="{key}"><option value="docker"{safe_html(" selected" if value == "docker" else "")}>Docker</option><option value="host"{safe_html(" selected" if value == "host" else "")}>Host (trusted code only)</option></select>')
+                control = html_t(t'<select id="pref-{key}" name="{key}"><option value="docker"{safe_html(" selected" if value == "docker" else "")}>Docker</option><option value="remote-docker"{safe_html(" selected" if value == "remote-docker" else "")}>Remote Docker (HTTP runner)</option><option value="host"{safe_html(" selected" if value == "host" else "")}>Host (trusted code only)</option></select>')
             elif key == "cancel_superseded":
                 control = html_t(t'<select id="pref-{key}" name="{key}"><option value="false"{safe_html(" selected" if not value else "")}>No</option><option value="true"{safe_html(" selected" if value else "")}>Yes</option></select>')
             else:

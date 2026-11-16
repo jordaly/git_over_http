@@ -495,6 +495,20 @@ one-attempt-per-commit record.
 
 Tests: `python -m unittest tests.test_api_deployments tests.test_deployments -v`.
 
+## HTTP Docker runners
+
+CI can execute on a separate Linux worker through outbound HTTP polling.
+Select `execution.runner: "remote-docker"` for that pipeline. See
+[HTTP Docker runner](http-runner.md) for provisioning, tokens, protocol and limits.
+
+POST `/api/runner/v1/claim`, `/source`, `/heartbeat` and `/complete` use dedicated
+repository-restricted runner tokens, not personal API tokens or SSH. Attempt
+identity provides retry safety rather than the user API's `Idempotency-Key`.
+Deployment configuration is not sent to workers; host deployment gates remain.
+Plain HTTP requires `--allow-http` and exposes credentials and data in transit.
+
+Tests: `python -m unittest tests.test_remote_ci -q`.
+
 ## CI automation
 
 CI mutations use the same bearer authentication, `write` scope, repository-access

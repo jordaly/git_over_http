@@ -5682,6 +5682,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
     async def dispatch(self):
         path = urlparse(self.path).path
         if path == "/api" or path.startswith("/api/"):
+            if path == "/api/runner/v1" or path.startswith("/api/runner/v1/"):
+                from .remote_ci import RunnerAPI
+                return await RunnerAPI(self).dispatch()
             if path == "/api/docs" and self.command == "GET":
                 return await self._ui_api_docs()
             from .api.router import API

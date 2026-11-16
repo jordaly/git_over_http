@@ -1,9 +1,10 @@
 # Remote CI runners: proposed design
 
-**Status: proposal, not implemented.** The current CI scheduler and its host and
-Docker executors run on the Git server. This document describes how execution
-could move to a separate Ubuntu machine while keeping configuration, job history,
-logs, artifacts, and access controls on the Git server.
+**Status: original design proposal.** An initial outbound HTTP Docker runner is now
+implemented; see [HTTP Docker runner](http-runner.md) for the actual supported
+protocol, installation, restrictions and limits. The remainder of this document
+describes the broader design, including features not yet implemented, such as
+capability/label routing, long polling and chunked transfers.
 
 ## Architecture
 

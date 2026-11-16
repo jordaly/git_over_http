@@ -1,6 +1,6 @@
 # CI JSON: every option
 
-[Quick start](pipelines.md) · [Recipes](pipeline-examples.md) · [Deployment](automatic-deployment.md) · [Retention](ci-retention.md)
+[Quick start](pipelines.md) · [Recipes](pipeline-examples.md) · [Deployment](automatic-deployment.md) · [Retention](ci-retention.md) · [HTTP runner](http-runner.md)
 
 This manual is rendered directly in **CI → Documentation**. Edit the repository
 document under **CI → Settings → Configuration JSON**; it is separate from the

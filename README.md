@@ -37,6 +37,10 @@ authentication, repository browsing, branches, tokens, users, and pull requests.
 - [HTTP Docker runner](docs/http-runner.md): Ubuntu Docker setup, installed test-server
   paths, authorizing repositories, dependency images, service management and troubleshooting
   while GitHost/deployments stay on Windows.
+- [Install a remote runner](docs/remote-runner-setup.md): server requirements and
+  step-by-step provisioning, policy, credentials, service and smoke validation.
+- [Docker profiles](docs/docker-profiles.md): pipeline resource requests, safe
+  defaults, administrator ceilings, networking, writable directories and named secrets.
 - [Remote runner design](docs/remote-ci-runners.md): original proposal and future extensions.
 
 The full reference, recipes, deployment/retention guides and complete JSON examples

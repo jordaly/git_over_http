@@ -178,7 +178,8 @@ Table examples are **field fragments**; use the complete examples for surroundin
 
 | Option | Type / built-in default | Example | Behavior |
 | --- | --- | --- | --- |
-| `runner` | `"docker"` | `"runner":"docker"` | `host` runs as the server OS user, without a sandbox. `docker` uses local Linux containers. Existing concrete legacy host settings remain intact. |
+| `runner` | `"docker"` | `"runner":"remote-docker"` | `host` runs as the server OS user, without a sandbox. `docker` uses local Linux containers; `remote-docker` uses an outbound HTTP worker. Existing concrete legacy host settings remain intact. |
+| `docker` | Hardened profile | `"docker":{"memory_mb":2048}` | Declarative resources, network, paths, tmpfs and named mounts. Remote requests must fit an administrator-owned worker policy; see [Docker profiles](docker-profiles.md). |
 | `image` | String `"python:3.14-slim"` | `"image":"registry.example.com/team/ci:2026-10"` | Docker image must already exist locally. Include tools/dependencies and preferably pin a digest. |
 | `timeout_seconds` | Built-in `1800` | `"timeout_seconds":600` | One budget for checkout, PR merge preparation and all steps. Deployment has a separate timeout. |
 | `env` | Legacy compatibility only | Use the **Environment variables** page table | Up to 64 effective entries; valid identifier keys, string values up to 8192 characters, no NUL. Built-in names are reserved. Legacy JSON remains readable; page-managed repository values are authoritative. |

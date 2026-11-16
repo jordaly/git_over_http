@@ -1,11 +1,19 @@
 # HTTP Docker runner
 
+[Fresh Ubuntu server walkthrough](remote-runner-setup.md) ·
+[Configurable Docker limits and worker policy](docker-profiles.md)
+
 Keep GitHost on Windows and run CI on a dedicated Linux Docker worker. The worker
 makes outbound HTTP requests only: no SSH and no inbound worker ports.
 
 This initial version supports one job at a time per token. Use a separate token
 and private work directory for each worker. Matching uses explicit repository
 restrictions, not labels. Local `host` and `docker` runners remain available.
+
+Container restrictions below describe the **defaults**. Pipelines may request a
+validated `execution.docker` profile; the worker must separately authorize higher
+ceilings or expanded capabilities. See [Docker profiles](docker-profiles.md).
+An existing worker without `--policy-file` retains the restrictive built-in policy.
 
 ## Already-installed test server
 

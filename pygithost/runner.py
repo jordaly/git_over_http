@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 from . import database
 from .ci import CIManager, _db_call, remove_checkout, runner_environment
@@ -73,7 +74,7 @@ class Client:
         return json.loads(raw)
 
 
-async def run_job(client, job, root):
+async def run_job(client, job, root, worker_policy=None):
     """Reuse the local Docker executor; its database is private to this worker."""
     run_id, attempt = job["run_id"], job["attempt"]
     identity = {"run_id": run_id, "attempt": attempt}
@@ -82,6 +83,22 @@ async def run_job(client, job, root):
     monitor = None
     fingerprint = hashlib.sha256(attempt.encode()).hexdigest()
     try:
+        from .docker_profile import authorize
+        try:
+            configuration = job["config"]
+            row = job["row"]
+            if configuration.get("runner") != "docker":
+                raise ValueError("HTTP runners only accept Docker jobs.")
+            authorize(configuration.get("docker"), worker_policy,
+                      timeout=configuration["timeout_seconds"],
+                      repository=f"{row[1]}/{row[2]}", event=row[3])
+        except ValueError as exc:
+            await asyncio.to_thread(client.request, "complete", dict(identity, progress={
+                "status": "failed", "return_code": -1, "phase": "runner policy",
+                "reason": str(exc), "output": "Runner policy rejected this job: " + str(exc),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "truncated": 0, "steps": []}))
+            return
         response = await asyncio.to_thread(client.request, "source", identity)
         if response.get("cancel"):
             return
@@ -109,6 +126,8 @@ async def run_job(client, job, root):
         local_row = (local_id, owner, repo, event, branch, commit, payload)
         manager = CIManager(lambda _owner, _repo: str(bare))
         manager.http_attempt = fingerprint
+        from .docker_profile import policy
+        manager.docker_policy = policy(worker_policy)
         monitor = subprocess.Popen([
             sys.executable, "-m", "pygithost.runner", "_watchdog",
             "--attempt", fingerprint, "--parent", str(os.getpid()),
@@ -174,7 +193,7 @@ async def snapshot(owner, repo, run_id, final=False):
     return result
 
 
-async def serve(client, root, once=False):
+async def serve(client, root, once=False, worker_policy=None):
     """One execution at a time; a private lock prevents competing worker processes."""
     import fcntl
     root = Path(root).resolve()
@@ -203,7 +222,7 @@ async def serve(client, root, once=False):
                         handle.write(fingerprint)
                         handle.flush()
                         os.fsync(handle.fileno())
-                    await run_job(client, job, root)
+                    await run_job(client, job, root, worker_policy)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -234,6 +253,7 @@ def main():
     run.add_argument("--work-dir", required=True)
     run.add_argument("--allow-http", action="store_true", help="Explicitly accept unencrypted transport.")
     run.add_argument("--once", action="store_true")
+    run.add_argument("--policy-file", help="Administrator-managed JSON Docker ceilings and named secrets.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     if args.command == "_watchdog":
@@ -262,8 +282,19 @@ def main():
             or token_file.stat().st_uid != os.getuid()):
         parser.error("Token file must be private, owned by the runner account, and not a symlink.")
     client = Client(args.server, token_file.read_text().strip())
+    from .docker_profile import policy
+    worker_policy = policy()
+    if args.policy_file:
+        path = Path(args.policy_file)
+        if (path.is_symlink() or path.stat().st_mode & 0o027
+                or path.stat().st_uid not in (0, os.getuid()) or path.stat().st_size > 65536):
+            parser.error("Policy file must be administrator-owned/private, not group-writable, and at most 64 KiB.")
+        try:
+            worker_policy = policy(json.loads(path.read_text()))
+        except (ValueError, UnicodeError):
+            parser.error("Invalid Docker policy JSON.")
     async def start():
-        task = asyncio.create_task(serve(client, args.work_dir, args.once))
+        task = asyncio.create_task(serve(client, args.work_dir, args.once, worker_policy))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, task.cancel)

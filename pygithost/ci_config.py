@@ -10,7 +10,7 @@ SETTINGS = {"require_ci", "block_direct_pushes", "protected_branches",
             "artifact_retention_days", "artifact_retention_count", "run_retention_count"}
 COMMON = {"runner", "image", "env", "events", "push_branches", "pr_branches",
           "timeout_seconds", "cancel_superseded", "email_mode", "email_recipients",
-          "artifacts"}
+          "artifacts", "docker"}
 DEPLOYMENT = {"enabled": "deploy_enabled", "branch": "deploy_branch",
               "script": "deploy_script", "script_content": "deploy_script_content",
               "run_with": "deploy_interpreter", "timeout_seconds": "deploy_timeout", "steps": "deploy_steps"}

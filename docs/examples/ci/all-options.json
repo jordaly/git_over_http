@@ -4,7 +4,8 @@
     {
       "name": "checks",
       "execution": {
-        "runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600
+        "runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600,
+        "docker": {"cpus": 1, "memory_mb": 1024, "pids_limit": 128, "tmpfs_mb": 256, "network": "none", "read_only": true}
       },
       "cancellation": {"superseded": true},
       "triggers": {

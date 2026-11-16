@@ -99,6 +99,7 @@ def default_config():
         "push_branches": "",
         "pr_branches": "",
         "runner": "host",
+        "docker": {},
         "image": "python:3.14-slim",
         "email_recipients": "",
         "email_mode": "off",
@@ -197,6 +198,8 @@ def validate_config(raw, *, nested=False):
     mode = raw.get("email_mode", "off")
     if runner not in ("host", "docker", "remote-docker"):
         raise ValueError("Runner must be host, docker or remote-docker.")
+    from .docker_profile import profile
+    defaults["docker"] = profile(raw.get("docker"))
     if not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@-]{0,255}", image):
         raise ValueError("Enter a valid Docker image name.")
     if mode not in ("off", "failures", "all", "recovery"):
@@ -436,17 +439,47 @@ def deployment_workspace():
 
 
 def docker_command(name, worktree, env_file, config):
-    command = ["docker", "run", "--name", name, "--init", "--network=none", "--pull=never", "--log-driver=none",
-               "--cap-drop=ALL", "--security-opt=no-new-privileges", "--memory=1g",
-               "--cpus=1", "--pids-limit=128", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
-               "--mount", f"type=bind,src={worktree},dst=/workspace", "--workdir", "/workspace",
+    from .docker_profile import authorize
+    options, secrets = authorize(config.get("docker"), config.get("_worker_policy"),
+                                 timeout=config["timeout_seconds"] if "_worker_policy" in config else JOB_TIMEOUT,
+                                 repository=config.get("_repository", ""), event=config.get("_event", ""))
+    command = ["docker", "run", "--name", name, "--init", "--network=" + options["network"],
+               "--pull=never", "--log-driver=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+               "--memory=" + (f"{options['memory_mb'] // 1024}g" if options["memory_mb"] % 1024 == 0 else f"{options['memory_mb']}m"),
+               f"--cpus={options['cpus']}",
+               f"--pids-limit={options['pids_limit']}", "--tmpfs",
+               f"/tmp:rw,nosuid,nodev,size={options['tmpfs_mb']}m",
+               "--mount", f"type=bind,src={worktree},dst={options['checkout_path']}" +
+               (",readonly" if options["checkout_read_only"] else ""),
+               "--workdir", options["workdir"],
                "--env-file", env_file, "--entrypoint", "/bin/sh"]
+    if options["read_only"]:
+        command.append("--read-only")
+    uid = 0 if options["user"] == "root" else os.getuid() if os.name == "posix" else 1000
+    gid = 0 if options["user"] == "root" else os.getgid() if os.name == "posix" else 1000
+    for mount in options["tmpfs"]:
+        command += ["--tmpfs", f"{mount['target']}:rw,nosuid,nodev,size={mount['size_mb']}m,uid={uid},gid={gid},mode=0700"]
+    for mount in options["mounts"]:
+        if mount["source"] == "checkout":
+            source = worktree
+        elif mount["source"] == "results":
+            directory = Path(worktree) / ".ci-results"
+            if directory.is_symlink():
+                raise ValueError("Results directory cannot be a symlink.")
+            directory.mkdir(exist_ok=True)
+            source = str(directory)
+        else:
+            source = secrets[mount["source"].split(":", 1)[1]]
+        if "," in source:
+            raise ValueError("Docker bind paths cannot contain commas.")
+        command += ["--mount", f"type=bind,src={source},dst={mount['target']}" +
+                    (",readonly" if mount["read_only"] else "")]
     if config.get("_http_attempt"):
         command += ["--label", "pygithost.http-attempt=" + config["_http_attempt"]]
     if os.name == "posix":
         if os.getuid() == 0:
             raise ValueError("Run the Docker CI server as an unprivileged user, not root.")
-        command += ["--user", f"{os.getuid()}:{os.getgid()}"]
+        command += ["--user", f"{uid}:{gid}"]
     return [*command, config["image"], "-c", config["command"]]
 
 
@@ -1340,7 +1373,8 @@ class CIManager:
                     if any("\n" in value or "\r" in value for value in config["env"].values()):
                         raise ValueError("Docker environment values cannot contain newlines.")
                     container_env = {key: value for key, value in env.items() if key in BUILTINS or key in config["env"]}
-                    container_env.update(PYGITHOST_WORKTREE="/workspace", HOME="/tmp", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+                    container_env.update(PYGITHOST_WORKTREE=config["docker"]["checkout_path"],
+                                         HOME="/tmp", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
                     env_file = str(Path(temp_root) / "container.env")
                     Path(env_file).write_text("\n".join(f"{key}={value}" for key, value in container_env.items()), encoding="utf-8")
                 commands = config["steps"] or [{"name": "Command", "run": config["command"]}]
@@ -1352,13 +1386,17 @@ class CIManager:
                         phase = f"step {index + 1}: {step['name']}"
                         current_step.update(status="running", started_at=datetime.now(timezone.utc).isoformat())
                         await save_steps()
-                    command, shell = render_command(step["run"],
-                        {key: value for key, value in env.items() if key in BUILTINS or key in config["env"]}), True
+                    substitutions = {key: value for key, value in env.items() if key in BUILTINS or key in config["env"]}
+                    if config["runner"] == "docker":
+                        substitutions["PYGITHOST_WORKTREE"] = config["docker"]["checkout_path"]
+                    command, shell = render_command(step["run"], substitutions), True
                     if config["runner"] == "docker":
                         container = f"pygithost-ci-{os.getpid()}-{run_id}-{index}"
                         command, shell = docker_command(container, worktree, env_file, {
                             **config, "command": command,
-                            "_http_attempt": getattr(self, "http_attempt", "")}), False
+                            "_http_attempt": getattr(self, "http_attempt", ""),
+                            **({"_worker_policy": self.docker_policy} if hasattr(self, "docker_policy") else {}),
+                            "_repository": f"{owner}/{repo}", "_event": event}), False
                     rc = await self._capture_process(
                         command, shell=shell, cwd=worktree,
                         env=os.environ.copy() if not shell else env.copy(),

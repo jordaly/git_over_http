@@ -509,6 +509,12 @@ Plain HTTP requires `--allow-http` and exposes credentials and data in transit.
 
 Tests: `python -m unittest tests.test_remote_ci -q`.
 
+Pipeline configuration accepts `execution.docker` resource/capability requests.
+Worker-owned ceilings and secret/network permissions are configured separately,
+not through the repository settings API. A rejected request fails with phase
+`runner policy`. See [Docker profiles](docker-profiles.md) and the
+[new-server installation requirements](remote-runner-setup.md).
+
 ## CI automation
 
 CI mutations use the same bearer authentication, `write` scope, repository-access

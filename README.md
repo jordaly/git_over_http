@@ -34,7 +34,9 @@ authentication, repository browsing, branches, tokens, users, and pull requests.
   Git-managed pipelines, and staging/production deployments.
 - [Automatic deployment walkthrough](docs/automatic-deployment.md).
 - [Retention and pagination](docs/ci-retention.md).
-- [HTTP Docker runner](docs/http-runner.md): run CI on Ubuntu while GitHost stays on Windows.
+- [HTTP Docker runner](docs/http-runner.md): Ubuntu Docker setup, installed test-server
+  paths, authorizing repositories, dependency images, service management and troubleshooting
+  while GitHost/deployments stay on Windows.
 - [Remote runner design](docs/remote-ci-runners.md): original proposal and future extensions.
 
 The full reference, recipes, deployment/retention guides and complete JSON examples

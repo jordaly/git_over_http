@@ -148,6 +148,21 @@ class RemoteProtocolTests(unittest.TestCase):
         self.assertEqual(Client("http://192.168.16.16:8000", "secret").url,
                          "http://192.168.16.16:8000")
 
+    def test_runner_usage_guide_is_rendered_and_artifact_example_is_valid(self):
+        from pygithost.ci_config import compile_document
+        from pygithost.ci_docs import manual_content
+        text = (Path(__file__).resolve().parents[1] / "docs/http-runner.md").read_text()
+        examples = [json.loads(block.split("```", 1)[0])
+                    for block in text.split("```json\n")[1:]]
+        configuration, artifact_example = examples
+        configuration["pipelines"][0].update(artifact_example)
+        self.assertEqual(compile_document(configuration)["artifacts"]["paths"], ["test-results.json"])
+        rendered = str(manual_content("http-runner", None, "/r/root/project"))
+        for marker in ("Already-installed test server", "Change authorized repositories",
+                       "Docker images and dependencies", "Troubleshooting",
+                       "192.168.250.1:8000", "pygithost-runner.service"):
+            self.assertIn(marker, rendered)
+
     def test_bundle_contains_exact_commit_and_pr_head(self):
         root = Path(self.temp.name)
         repo = root / "source"

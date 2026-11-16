@@ -180,11 +180,11 @@ port publishing and entrypoint overrides are not supported.
 
 ## What is not configurable here
 
-This changes container resources and declared capabilities, not the wire protocol:
-source bundles remain limited to 32 MiB, artifact ZIPs to 16 MiB compressed /
-20 MiB uncompressed / 1000 files, logs to the existing collection cap, and JSON
-requests to 26 MiB. Image pulls remain administrator-managed. There is no automatic
-retry, Docker-in-Docker or distributed SQL test lock.
+Source, logs, artifacts and transfer budgets are configured separately through
+`execution.source_limit_mb` and `execution.limits`; see [CI limits](ci-limits.md).
+The source default is 100 MiB, with no hard-coded upper configured size ceiling.
+Image pulls remain administrator-managed. There is no automatic retry,
+Docker-in-Docker or distributed SQL test lock.
 
 The SistemaFuente Wine wrappers currently launch Docker themselves; do not run
 those host wrappers inside a CI container. Invoke the image's internal test

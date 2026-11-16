@@ -173,7 +173,7 @@ def specification():
     download = base + "/ci/runs/{id}/artifacts/download"
     endpoint(download, "downloadRunArtifacts", {"type": "string", "format": "binary"})
     paths[download]["get"]["responses"]["200"] = {
-        "description": "Original ZIP archive, at most 32 MiB. No redirects, extraction or range downloads.",
+        "description": "Original ZIP archive, bounded by the run's configured artifact limit (32 MiB for legacy runs). No redirects, extraction or range downloads.",
         "headers": {"Content-Disposition": {"schema": string}, "Content-Length": {"schema": integer}},
         "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
     }

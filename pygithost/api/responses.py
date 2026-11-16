@@ -8,3 +8,4 @@ class BinaryDownload:
     content: bytes
     size: int
     filename: str
+    timeout_seconds: int = 20

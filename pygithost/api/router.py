@@ -58,7 +58,7 @@ class API:
                     ("Content-Disposition", f'attachment; filename="{download.filename}"'),
                     ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
                     ("X-Request-ID", self.request_id), ("Accept-Ranges", "none"),
-                ], include_body=self.request.method != "HEAD"), RESPONSE_TIMEOUT)
+                 ], include_body=self.request.method != "HEAD"), download.timeout_seconds)
         except (TimeoutError, asyncio.CancelledError) as exc:
             # Headers may already be sent; never append a second JSON response.
             # Abort drops buffered ZIP bytes even if the peer stopped reading.

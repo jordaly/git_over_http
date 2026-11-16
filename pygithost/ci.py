@@ -99,6 +99,8 @@ def default_config():
         "push_branches": "",
         "pr_branches": "",
         "runner": "host",
+        "source_limit_mb": 100,
+        "limits": {},
         "docker": {},
         "image": "python:3.14-slim",
         "email_recipients": "",
@@ -200,6 +202,10 @@ def validate_config(raw, *, nested=False):
         raise ValueError("Runner must be host, docker or remote-docker.")
     from .docker_profile import profile
     defaults["docker"] = profile(raw.get("docker"))
+    from .ci_limits import DEFAULT_SOURCE_LIMIT_MB, source_limit_mb
+    defaults["source_limit_mb"] = source_limit_mb(raw.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB))
+    from .ci_limits import execution_limits
+    defaults["limits"] = execution_limits(raw.get("limits"))
     if not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@-]{0,255}", image):
         raise ValueError("Enter a valid Docker image name.")
     if mode not in ("off", "failures", "all", "recovery"):
@@ -358,14 +364,17 @@ def protected_branch(config, branch):
     )
 
 
-def collect_artifacts(worktree, patterns):
+def collect_artifacts(worktree, patterns, limits=None):
     """Collect regular, non-symlink files only; never follow paths outside checkout."""
+    from .ci_limits import execution_limits, MIB
+    limits = execution_limits(limits)
+    maximum = limits["artifact_uncompressed_mb"] * MIB
     root = Path(worktree)
     files, total, visited = {}, 0, 0
     for pattern in patterns:
         for path in root.glob(pattern):
             visited += 1
-            if visited > 10000:
+            if visited > max(10000, limits["artifact_files"] * 10):
                 raise ValueError("Artifact patterns match too many entries.")
             relative = path.relative_to(root)
             if ".git" in relative.parts or any(part.is_symlink() or part.is_junction() for part in (path, *path.parents)):
@@ -374,8 +383,8 @@ def collect_artifacts(worktree, patterns):
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 continue
             files[str(relative)] = path
-            if len(files) > 1000:
-                raise ValueError("Artifacts exceed the 1000-file limit.")
+            if len(files) > limits["artifact_files"]:
+                raise ValueError(f"Artifacts exceed the {limits['artifact_files']}-file limit.")
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, path in sorted(files.items()):
@@ -405,11 +414,13 @@ def collect_artifacts(worktree, patterns):
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise ValueError("Artifact is not a regular private file.")
-                data = stream.read(20 * 1024 * 1024 - total + 1)
+                data = stream.read(min(maximum - total + 1, info.st_size + 1))
             total += len(data)
-            if total > 20 * 1024 * 1024:
-                raise ValueError("Artifacts exceed the 20 MiB limit.")
+            if total > maximum:
+                raise ValueError(f"Artifacts exceed the {limits['artifact_uncompressed_mb']} MiB limit.")
             archive.writestr(name.replace(os.sep, "/"), data)
+    if buffer.tell() > limits["artifact_mb"] * MIB:
+        raise ValueError(f"Artifact ZIP exceeds the {limits['artifact_mb']} MiB limit.")
     return buffer.getvalue() if files else None
 
 
@@ -1163,7 +1174,8 @@ class CIManager:
                 await _db_call(database.db_ci_run_update, row[0], notification=f"failed ({error_type}; check server SMTP settings)")
 
     async def _capture_process(
-        self, command, *, shell, cwd, env, output, truncated, timeout, on_output=None
+        self, command, *, shell, cwd, env, output, truncated, timeout, on_output=None,
+        max_output=MAX_OUTPUT
     ):
         if timeout <= 0:
             raise asyncio.TimeoutError
@@ -1206,7 +1218,7 @@ class CIManager:
                 chunk = await process.stdout.read(65536)
                 if not chunk:
                     break
-                available = MAX_OUTPUT - len(output)
+                available = max_output - len(output)
                 if available > 0:
                     output.extend(chunk[:available])
                 if len(chunk) > available:
@@ -1237,6 +1249,10 @@ class CIManager:
         if config["runner"] == "remote-docker":
             from .remote_ci import execute_remote
             return await execute_remote(self, row, config)
+        maximum_output = config["limits"]["log_mb"] * 1024 * 1024
+
+        async def capture(*args, **kwargs):
+            return await self._capture_process(*args, **kwargs, max_output=maximum_output)
         if not config["command"] and not config["steps"]:
             await _db_call(
                 database.db_ci_run_update,
@@ -1305,7 +1321,7 @@ class CIManager:
 
         logger = asyncio.create_task(flush_logs())
         try:
-            rc = await self._capture_process(
+            rc = await capture(
                 ["git", "clone", "--no-hardlinks", "--no-checkout", "--", bare, worktree],
                 shell=False,
                 cwd=None,
@@ -1315,12 +1331,12 @@ class CIManager:
                 timeout=deadline - asyncio.get_running_loop().time(),
             )
             if rc == 0:
-                rc = await self._capture_process(
+                rc = await capture(
                     ["git", "-C", worktree, "checkout", "--detach", commit], shell=False,
                     cwd=None, env=env, output=output, truncated=truncated,
                     timeout=deadline - asyncio.get_running_loop().time())
             if rc == 0:
-                rc = await self._capture_process(
+                rc = await capture(
                     ["git", "-C", worktree, "remote", "remove", "origin"], shell=False,
                     cwd=None, env=env, output=output, truncated=truncated,
                     timeout=deadline - asyncio.get_running_loop().time())
@@ -1330,7 +1346,7 @@ class CIManager:
                 and payload.get("head_commit")
             ):
                 phase = "merge"
-                rc = await self._capture_process(
+                rc = await capture(
                     [
                         "git",
                         "-C",
@@ -1397,7 +1413,7 @@ class CIManager:
                             "_http_attempt": getattr(self, "http_attempt", ""),
                             **({"_worker_policy": self.docker_policy} if hasattr(self, "docker_policy") else {}),
                             "_repository": f"{owner}/{repo}", "_event": event}), False
-                    rc = await self._capture_process(
+                    rc = await capture(
                         command, shell=shell, cwd=worktree,
                         env=os.environ.copy() if not shell else env.copy(),
                         output=output, truncated=truncated,
@@ -1409,7 +1425,7 @@ class CIManager:
                         await save_steps()
                         current_step = None
                     if container and index < len(commands) - 1 and rc == 0:
-                        remove_rc = await self._capture_process(["docker", "rm", "--force", container], shell=False,
+                        remove_rc = await capture(["docker", "rm", "--force", container], shell=False,
                             cwd=None, env=os.environ.copy(), output=output, truncated=truncated, timeout=30)
                         if remove_rc:
                             raise ValueError("Container cleanup failed between steps.")
@@ -1421,7 +1437,7 @@ class CIManager:
             rc, status = -1, "timed_out"
             output.extend(
                 f"CI execution exceeded the {config['timeout_seconds']} second limit.\n".encode()[
-                    : MAX_OUTPUT - len(output)
+                    : maximum_output - len(output)
                 ]
             )
         except asyncio.CancelledError:
@@ -1429,7 +1445,7 @@ class CIManager:
         except Exception as exc:
             rc, status = -1, "failed"
             message = (str(exc) + "\n").encode("utf-8", "replace")
-            output.extend(message[: MAX_OUTPUT - len(output)])
+            output.extend(message[: maximum_output - len(output)])
         finally:
             cleanup_error = None
             if current_step is not None:
@@ -1445,7 +1461,7 @@ class CIManager:
                 cleanup_error = f"Step metadata could not be saved: {exc}"
             if container:
                 try:
-                    remove_rc = await self._capture_process(
+                    remove_rc = await capture(
                         ["docker", "rm", "--force", container],
                         shell=False,
                         cwd=None,
@@ -1462,12 +1478,12 @@ class CIManager:
             if artifacts["paths"] and not cancelled and (artifacts["when"] == "always" or
                     (artifacts["when"] == "success") == (status == "success")):
                 try:
-                    archive = await _db_call(collect_artifacts, worktree, artifacts["paths"])
+                    archive = await _db_call(collect_artifacts, worktree, artifacts["paths"], config["limits"])
                     if archive:
                         await _db_call(database.db_ci_artifact_set, run_id, archive)
                 except Exception as exc:
                     status, rc, phase = "failed", -1, "artifacts"
-                    output.extend(f"Artifact collection failed: {exc}\n".encode()[:MAX_OUTPUT - len(output)])
+                    output.extend(f"Artifact collection failed: {exc}\n".encode()[:maximum_output - len(output)])
             try:
                 await asyncio.wait_for(
                     _db_call(remove_checkout, temp_root), timeout=120
@@ -1480,7 +1496,7 @@ class CIManager:
                                  "remove this job directory only after its processes have stopped.")
             if cleanup_error:
                 output.extend(
-                    (cleanup_error + "\n").encode()[: MAX_OUTPUT - len(output)]
+                    (cleanup_error + "\n").encode()[: maximum_output - len(output)]
                 )
             logs_done.set()
             await asyncio.gather(logger, return_exceptions=True)

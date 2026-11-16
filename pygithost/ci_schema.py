@@ -4,7 +4,7 @@ import copy
 import re
 
 
-EXECUTION = {"runner", "image", "timeout_seconds", "env", "docker"}
+EXECUTION = {"runner", "image", "timeout_seconds", "env", "docker", "source_limit_mb", "limits"}
 PR_EVENTS = {"opened": "pr_opened", "updated": "pr_updated", "reopened": "pr_reopened", "merged": "pr_merged"}
 POLICIES = {"require_ci", "block_direct_pushes", "protected_branches"}
 GROUPS = {"execution", "triggers", "cancellation", "artifacts"}

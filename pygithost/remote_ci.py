@@ -18,9 +18,9 @@ from pathlib import Path
 from . import database
 from .api.errors import APIError
 from .api.router import API
+from .ci_limits import (DEFAULT_SOURCE_LIMIT_MB, source_limit_bytes, execution_limits,
+                        progress_bytes, completion_bytes, MIB)
 
-MAX_SOURCE = 32 * 1024 * 1024
-MAX_ARTIFACT = 16 * 1024 * 1024
 LEASE = 90
 
 
@@ -66,8 +66,12 @@ def recover_jobs():
         conn.close()
 
 
-def source_bundle(bare, commit, head):
+def source_bundle(bare, commit, head, limit_mb=DEFAULT_SOURCE_LIMIT_MB, timeout=60):
     """Bundle only the required histories, never expose server paths/credentials."""
+    maximum = source_limit_bytes(limit_mb)
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError("Source preparation timeout must be a positive integer.")
+    deadline = time.monotonic() + timeout
     for value in (commit, head):
         if value and not re.fullmatch(r"[0-9a-fA-F]{40,64}", value):
             raise ValueError("Remote CI requires full commit IDs.")
@@ -75,7 +79,7 @@ def source_bundle(bare, commit, head):
         clone, bundle = str(Path(root) / "repo.git"), Path(root) / "source.bundle"
         def git(*args):
             subprocess.run(["git", *args], check=True, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=60)
+                           stderr=subprocess.DEVNULL, timeout=max(.001, deadline - time.monotonic()))
         git("clone", "--bare", "--shared", "--", str(Path(bare).resolve()), clone)
         refs = []
         for name, sha in (("base", commit), ("head", head)):
@@ -84,8 +88,8 @@ def source_bundle(bare, commit, head):
                 git("--git-dir", clone, "update-ref", ref, sha)
                 refs.append(ref)
         git("--git-dir", clone, "bundle", "create", str(bundle), *refs)
-        if bundle.stat().st_size > MAX_SOURCE:
-            raise ValueError("Remote CI source exceeds the 32 MiB bundle limit.")
+        if bundle.stat().st_size > maximum:
+            raise ValueError(f"Remote CI source exceeds the configured {limit_mb} MiB bundle limit.")
         return bundle.read_bytes()
 
 
@@ -97,7 +101,9 @@ async def execute_remote(manager, row, config):
                  if not k.startswith("deploy") and k not in ("document", "pipelines")}
     execution.update(runner="docker", email_mode="off")
     source = await asyncio.to_thread(source_bundle, manager.repo_path(owner, repo),
-                                    commit, json.loads(payload).get("head_commit", ""))
+                                    commit, json.loads(payload).get("head_commit", ""),
+                                    config.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB),
+                                    execution_limits(config.get("limits"))["source_timeout_seconds"])
     document = json.dumps(dict(row=list(row), config=execution))
     def enqueue():
         conn = connect()
@@ -107,9 +113,10 @@ async def execute_remote(manager, row, config):
                          (run_id, owner, repo, document, source))
         finally:
             conn.close()
-    await asyncio.to_thread(enqueue)
-    await _db_call(database.db_ci_run_update, run_id, phase="waiting for HTTP runner")
+    enqueue_task = asyncio.create_task(asyncio.to_thread(enqueue))
     try:
+        await asyncio.shield(enqueue_task)
+        await _db_call(database.db_ci_run_update, run_id, phase="waiting for HTTP runner")
         while True:
             def state():
                 conn = connect()
@@ -134,6 +141,9 @@ async def execute_remote(manager, row, config):
                 return
             await asyncio.sleep(1)
     finally:
+        # Cancellation can arrive after INSERT but before the phase write.
+        # Drain the insertion before closing so no late queued attempt survives.
+        await asyncio.gather(enqueue_task, return_exceptions=True)
         def close():
             conn = connect()
             try:
@@ -173,11 +183,13 @@ def operation(digest, repositories, action, document):
         run_id, attempt = document.get("run_id"), document.get("attempt")
         if type(run_id) is not int or not isinstance(attempt, str):
             raise APIError(422, "validation_error", "A run_id and attempt are required.")
-        row = conn.execute("SELECT owner,repo,state,runner,attempt,source,heartbeat FROM ci_remote_jobs WHERE run_id=?",
+        row = conn.execute("SELECT owner,repo,state,runner,attempt,source,heartbeat,document FROM ci_remote_jobs WHERE run_id=?",
                            (run_id,)).fetchone()
         if (not row or f"{row[0]}/{row[1]}" not in repositories or row[3] != digest
                 or not hmac.compare_digest(row[4] or "", attempt)):
             raise APIError(404, "not_found", "Assigned job not found.")
+        config = json.loads(row[7]).get("config", {})
+        limits = execution_limits(config.get("limits"))
         run = conn.execute("SELECT status FROM ci_runs WHERE id=?", (run_id,)).fetchone()
         if not run or run[0] not in ("queued", "running"):
             conn.execute("UPDATE ci_remote_jobs SET state='closed',source=X'',artifact=NULL WHERE run_id=?", (run_id,))
@@ -191,24 +203,27 @@ def operation(digest, repositories, action, document):
             conn.commit()
             return {"cancel": True}
         if action == "source":
+            if len(row[5]) > source_limit_bytes(config.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB)):
+                raise APIError(413, "source_too_large", "Source exceeds this run's configured bundle limit.")
             conn.execute("UPDATE ci_remote_jobs SET heartbeat=? WHERE run_id=?", (time.time(), run_id))
             conn.commit()
             return {"bundle": base64.b64encode(row[5]).decode()}
         if action not in ("heartbeat", "complete"):
             raise APIError(404, "not_found", "Unknown runner operation.")
-        values = validate_progress(document.get("progress", {}), final=action == "complete")
+        values = validate_progress(document.get("progress", {}), final=action == "complete", limits=limits)
         artifact = None
         if action == "complete" and document.get("artifact"):
             try:
                 artifact = base64.b64decode(document["artifact"], validate=True)
             except (ValueError, TypeError):
                 raise APIError(422, "validation_error", "Invalid artifact encoding.") from None
-            if len(artifact) > MAX_ARTIFACT:
-                raise APIError(413, "too_large", "Artifact exceeds 16 MiB.")
+            if len(artifact) > limits["artifact_mb"] * MIB:
+                raise APIError(413, "too_large", "Artifact exceeds this run's configured compressed limit.")
             try:
                 with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
                     files = archive.infolist()
-                    if (len(files) > 1000 or sum(f.file_size for f in files) > 20 * 1024 * 1024
+                    if (len(files) > limits["artifact_files"]
+                            or sum(f.file_size for f in files) > limits["artifact_uncompressed_mb"] * MIB
                             or any(f.filename.startswith(("/", "\\")) or "\\" in f.filename
                                    or ".." in f.filename.split("/") for f in files)):
                         raise ValueError()
@@ -233,20 +248,20 @@ def operation(digest, repositories, action, document):
         conn.close()
 
 
-def validate_progress(raw, *, final):
-    from .ci import MAX_OUTPUT
+def validate_progress(raw, *, final, limits=None):
+    maximum = execution_limits(limits)["log_mb"] * MIB
     allowed = {"status", "output", "truncated", "return_code", "finished_at",
                "started_at", "phase", "reason", "warnings", "steps"}
     if not isinstance(raw, dict) or set(raw) - allowed:
         raise APIError(422, "validation_error", "Invalid progress fields.")
-    if len(json.dumps(raw, ensure_ascii=False).encode()) > 3 * MAX_OUTPUT:
-        raise APIError(413, "too_large", "Progress exceeds 3 MiB.")
+    if len(json.dumps(raw, ensure_ascii=False).encode()) > 3 * maximum:
+        raise APIError(413, "too_large", "Progress exceeds the configured log budget.")
     if final and (raw.get("status") not in ("success", "failed", "timed_out", "interrupted")
                   or type(raw.get("return_code")) is not int
                   or (raw.get("status") == "success" and raw["return_code"] != 0)):
         raise APIError(422, "validation_error", "Invalid terminal result.")
     for key in allowed - {"steps", "truncated", "return_code"}:
-        if key in raw and (not isinstance(raw[key], str) or len(raw[key].encode()) > MAX_OUTPUT):
+        if key in raw and (not isinstance(raw[key], str) or len(raw[key].encode()) > maximum):
             raise APIError(422, "validation_error", "Invalid progress text.")
     if "steps" in raw and (not isinstance(raw["steps"], list) or len(raw["steps"]) > 64):
         raise APIError(422, "validation_error", "Invalid steps.")
@@ -259,6 +274,21 @@ def validate_progress(raw, *, final):
     if "truncated" in raw and type(raw["truncated"]) is not int:
         raise APIError(422, "validation_error", "Invalid truncation flag.")
     return raw
+
+
+def assigned_limits(digest, repositories, run_id):
+    """Resolve upload bounds from a token-owned assignment, never request JSON."""
+    if not run_id.isascii() or not run_id.isdecimal() or len(run_id) > 18:
+        raise APIError(422, "validation_error", "Invalid X-Runner-Run-ID.")
+    conn = connect()
+    try:
+        row = conn.execute("SELECT owner,repo,document FROM ci_remote_jobs WHERE run_id=? AND runner=?",
+                           (int(run_id), digest)).fetchone()
+        if not row or f"{row[0]}/{row[1]}" not in repositories:
+            raise APIError(404, "not_found", "Active assignment not found.")
+        return execution_limits(json.loads(row[2]).get("config", {}).get("limits"))
+    finally:
+        conn.close()
 
 
 class RunnerAPI(API):
@@ -288,16 +318,21 @@ class RunnerAPI(API):
                 raise APIError(405, "method_not_allowed", "Runner operations use POST.")
             if action not in ("claim", "source", "heartbeat", "complete"):
                 raise APIError(404, "not_found", "Unknown runner operation.")
-            # Larger body only for bounded artifact completion; standard API limits remain unchanged.
+            limits = execution_limits()
+            run_id = self.request.headers.get("X-Runner-Run-ID", "")
+            if run_id and action in ("heartbeat", "complete"):
+                limits = await asyncio.to_thread(assigned_limits, digest, json.loads(token[0]), run_id)
+            maximum = (completion_bytes(limits) if action == "complete" else
+                       progress_bytes(limits) if action == "heartbeat" else MIB)
             size = self.request.headers.get("Content-Length", "")
             if (len([k for k, _v in self.request.headers.items() if k.lower() == "content-length"]) != 1
                     or self.request.headers.get("Transfer-Encoding") or not size.isascii() or not size.isdecimal()
-                    or len(size) > 8 or int(size) > 26 * 1024 * 1024):
-                raise APIError(413, "too_large", "Runner request exceeds 26 MiB or lacks a valid length.")
+                    or len(size) > len(str(maximum)) or int(size) > maximum):
+                raise APIError(413, "too_large", "Runner request exceeds its configured budget or lacks a valid length.")
             if self.request.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 raise APIError(415, "unsupported_media_type", "Use application/json.")
             async with self.handler.server.api_slots:
-                async with asyncio.timeout(60):
+                async with asyncio.timeout(limits["transfer_timeout_seconds"]):
                     raw = await self.request.reader.readexactly(int(size))
                     def pairs(items):
                         result = {}
@@ -352,10 +387,15 @@ def runner_specification():
         if action == "complete":
             required.append("progress")
             properties["artifact"] = {"type": "string", "contentEncoding": "base64",
-                                      "description": "Optional ZIP, at most 16 MiB compressed."}
+                                      "description": "Optional ZIP, bounded by the assignment's limits.artifact_mb."}
         paths["/" + action] = {"post": {
             "operationId": "runner_" + action,
-            "description": "Repository-restricted runner token required. Assignment identity makes retries safe; no Idempotency-Key.",
+            "description": "Repository-restricted runner token required. Assignment identity makes retries safe; no Idempotency-Key. "
+                           "X-Runner-Run-ID resolves token-owned progress/artifact upload budgets from the stored run snapshot.",
+            "parameters": ([{"name": "X-Runner-Run-ID", "in": "header", "required": False,
+                             "schema": {"type": "integer", "minimum": 1},
+                             "description": "Required for uploads exceeding the default operation budget."}]
+                           if action in ("heartbeat", "complete") else []),
             "requestBody": {"required": True, "content": {"application/json": {"schema": {
                 "type": "object", "properties": properties, "required": required}}}},
             "responses": {"200": {"description": "Job, bundle, acknowledgement or cancel flag.",

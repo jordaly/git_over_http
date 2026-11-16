@@ -21,7 +21,9 @@ from datetime import datetime, timezone
 
 from . import database
 from .ci import CIManager, _db_call, remove_checkout, runner_environment
-from .remote_ci import MAX_ARTIFACT, MAX_SOURCE, create_token
+from .remote_ci import create_token
+from .ci_limits import (DEFAULT_SOURCE_LIMIT_MB, source_limit_bytes, source_response_bytes,
+                        execution_limits, MIB)
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +64,57 @@ class Client:
                 return None
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def request(self, action, document):
+    def request(self, action, document, *, source_limit_mb=DEFAULT_SOURCE_LIMIT_MB, timeout=30):
+        maximum = source_response_bytes(source_limit_mb) if action == "source" else 46 * 1024 * 1024
+        headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
+        if type(document.get("run_id")) is int:
+            headers["X-Runner-Run-ID"] = str(document["run_id"])
         req = urllib.request.Request(self.url + "/api/runner/v1/" + action,
             data=json.dumps(document).encode(), headers={
-                "Authorization": "Bearer " + self.token, "Content-Type": "application/json"},
+                **headers},
             method="POST")
-        with self.opener.open(req, timeout=30) as response:
-            raw = response.read(46 * 1024 * 1024 + 1)
-        if len(raw) > 46 * 1024 * 1024:
-            raise ValueError("Runner response exceeds limit.")
+        with self.opener.open(req, timeout=timeout) as response:
+            raw = bytearray()
+            while True:
+                chunk = response.read(min(65536, maximum + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > maximum:
+                    raise ValueError("Runner response exceeds this operation's configured limit.")
         return json.loads(raw)
+
+
+class JobStopped(Exception):
+    pass
+
+
+async def transfer_with_heartbeats(client, identity, awaitable):
+    """Source preparation/uploads must not expire the job lease while busy."""
+    async def heartbeat():
+        last_contact = time.monotonic()
+        while True:
+            try:
+                response = await asyncio.to_thread(client.request, "heartbeat", identity)
+                if response.get("cancel"):
+                    return
+                last_contact = time.monotonic()
+            except (OSError, ValueError, urllib.error.URLError):
+                if time.monotonic() - last_contact > 45:
+                    return
+            await asyncio.sleep(5)
+    work = asyncio.create_task(awaitable)
+    monitor = asyncio.create_task(heartbeat())
+    try:
+        done, _ = await asyncio.wait({work, monitor}, return_when=asyncio.FIRST_COMPLETED)
+        if work in done:
+            return await work
+        raise JobStopped("Job cancelled or disconnected during transfer.")
+    finally:
+        for task in (work, monitor):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(work, monitor, return_exceptions=True)
 
 
 async def run_job(client, job, root, worker_policy=None):
@@ -89,6 +132,8 @@ async def run_job(client, job, root, worker_policy=None):
             row = job["row"]
             if configuration.get("runner") != "docker":
                 raise ValueError("HTTP runners only accept Docker jobs.")
+            maximum_source = source_limit_bytes(configuration.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB))
+            limits = execution_limits(configuration.get("limits"))
             authorize(configuration.get("docker"), worker_policy,
                       timeout=configuration["timeout_seconds"],
                       repository=f"{row[1]}/{row[2]}", event=row[3])
@@ -99,20 +144,23 @@ async def run_job(client, job, root, worker_policy=None):
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "truncated": 0, "steps": []}))
             return
-        response = await asyncio.to_thread(client.request, "source", identity)
+        response = await transfer_with_heartbeats(client, identity, asyncio.to_thread(
+            client.request, "source", identity, timeout=limits["transfer_timeout_seconds"],
+            source_limit_mb=configuration.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB)))
         if response.get("cancel"):
             return
         source = base64.b64decode(response["bundle"], validate=True)
-        if len(source) > MAX_SOURCE:
-            raise ValueError("Source bundle exceeds limit.")
+        if len(source) > maximum_source:
+            raise ValueError("Source bundle exceeds this run's configured limit.")
         bundle = workspace / "source.bundle"
         bundle.write_bytes(source)
         bare = workspace / "repo.git"
         def clone():
             subprocess.run(["git", "clone", "--bare", "--", str(bundle), str(bare)],
-                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=limits["source_timeout_seconds"],
                            env=runner_environment(str(workspace)))
-        await asyncio.to_thread(clone)
+        await transfer_with_heartbeats(client, identity, asyncio.to_thread(clone))
         # Paths/configuration are never taken directly from repository code.
         row = job["row"]
         _, owner, repo, event, branch, commit, payload = row
@@ -140,7 +188,8 @@ async def run_job(client, job, root, worker_policy=None):
             try:
                 progress = await snapshot(owner, repo, local_id)
                 response = await asyncio.to_thread(client.request, "heartbeat",
-                                                  dict(identity, progress=progress))
+                                                  dict(identity, progress=progress),
+                                                  timeout=limits["transfer_timeout_seconds"])
                 last_contact = time.monotonic()
                 if response.get("cancel"):
                     task.cancel()
@@ -156,19 +205,22 @@ async def run_job(client, job, root, worker_policy=None):
         await task
         progress = await snapshot(owner, repo, local_id, final=True)
         artifact = await _db_call(database.db_ci_artifact_get, owner, repo, local_id, content=True)
-        if artifact and len(artifact) > MAX_ARTIFACT:
-            progress.update(status="failed", return_code=-1, reason="Remote artifact exceeds 16 MiB.")
+        if artifact and len(artifact) > limits["artifact_mb"] * MIB:
+            progress.update(status="failed", return_code=-1, reason="Remote artifact exceeds this run's configured limit.")
             artifact = None
         completion = dict(identity, progress=progress,
                           artifact=base64.b64encode(artifact).decode() if artifact else "")
         # Completion is safe to repeat: the server applies one terminal result.
         for _ in range(6):
             try:
-                await asyncio.to_thread(client.request, "complete", completion)
+                await transfer_with_heartbeats(client, identity, asyncio.to_thread(
+                    client.request, "complete", completion, timeout=limits["transfer_timeout_seconds"]))
                 return
             except (OSError, ValueError, urllib.error.URLError):
                 await asyncio.sleep(5)
         raise RuntimeError("Unable to report completion; job will be interrupted, not replayed.")
+    except JobStopped:
+        return
     finally:
         if task and not task.done():
             task.cancel()

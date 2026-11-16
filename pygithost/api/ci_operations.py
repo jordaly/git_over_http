@@ -1,6 +1,7 @@
 """CI automation without configuration overrides, deployment controls or webhooks."""
 
 import asyncio
+import json
 import re
 from urllib.parse import quote
 
@@ -12,6 +13,17 @@ from .validation import fields, sha, text
 
 MAX_LOG_BYTES = 65536
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+
+
+def artifact_limits(owner, repo, identity):
+    from .. import database
+    from ..ci_limits import execution_limits, MIB
+    metadata = database.db_ci_run_metadata(owner, repo, identity)
+    config = json.loads(metadata["config"] or "{}") if metadata else {}
+    if "limits" not in config:
+        return MAX_ARTIFACT_BYTES, 20
+    limits = execution_limits(config["limits"])
+    return limits["artifact_mb"] * MIB, limits["transfer_timeout_seconds"]
 
 
 async def run(owner, repo, identity):
@@ -116,20 +128,22 @@ async def read(api, owner, repo, tail):
         # Otherwise slow clients could retain an unbounded number of ZIP bodies.
         await api.handler.server.api_download_slots.acquire()
         api.download_slot = True
+    maximum, timeout = await asyncio.to_thread(artifact_limits, owner, repo, identity)
     row = await asyncio.to_thread(
-        data.artifact_content, owner, repo, identity, MAX_ARTIFACT_BYTES,
+        data.artifact_content, owner, repo, identity, maximum,
         head=api.request.method == "HEAD")
     if row is None:
         raise APIError(404, "not_found", "Artifact archive is missing or expired.")
     size, content = row
-    if size > MAX_ARTIFACT_BYTES:
-        raise APIError(413, "artifact_too_large", "Archive exceeds the 32 MiB API download limit.")
-    return BinaryDownload(content or b"", size, f"ci-{identity}-artifacts.zip")
+    if size > maximum:
+        raise APIError(413, "artifact_too_large", "Archive exceeds this run's API download limit (32 MiB for legacy runs).")
+    return BinaryDownload(content or b"", size, f"ci-{identity}-artifacts.zip", timeout)
 
 
 async def artifact_list(api, owner, repo, identity=None):
     rows = await asyncio.to_thread(
         data.artifacts, owner, repo, api.per_page + 1, api.offset, identity)
     base = "/api/v1/repos/" + quote(owner, safe="") + "/" + quote(repo, safe="")
-    return [{**row, "downloadable": row["size_in_bytes"] <= MAX_ARTIFACT_BYTES,
-             "download_url": base + f"/ci/runs/{row['run_id']}/artifacts/download"} for row in rows]
+    bounds = await asyncio.to_thread(lambda: [artifact_limits(owner, repo, row["run_id"])[0] for row in rows])
+    return [{**row, "downloadable": row["size_in_bytes"] <= maximum,
+             "download_url": base + f"/ci/runs/{row['run_id']}/artifacts/download"} for row, maximum in zip(rows, bounds)]

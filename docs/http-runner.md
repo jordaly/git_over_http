@@ -397,9 +397,12 @@ Docker-daemon or watchdog failure still requires inspection before a manual reru
 Stopping a job cannot undo external side effects. Do not delete the receipt to
 force uncertain jobs to rerun. Inspect leftover `job-*` directories before removal.
 
-Limits: 32 MiB source bundle (including required commit histories), 16 MiB artifact
-ZIP compressed, 20 MiB declared uncompressed, 1000 artifact files, 26 MiB request
-JSON. Existing bounded log collection applies. Transfers are buffered, not chunked.
+Default limits: 100 MiB source bundle (including required histories), 16 MiB
+artifact ZIP compressed, 20 MiB uncompressed, 1000 artifact files and 1 MiB logs.
+Configure `execution.source_limit_mb` and `execution.limits` to change them;
+there is no hard-coded upper configured size ceiling. Protocol body limits scale
+with the stored run limits. Transfers remain buffered, not chunked.
+See [CI limits](ci-limits.md) for timeouts, defaults and capacity warnings.
 
 Results appear in the normal CI UI/API, including logs, steps and artifacts.
 Deployment stays on Windows with the existing exact-commit, branch-tip and trust

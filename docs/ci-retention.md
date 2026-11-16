@@ -19,7 +19,8 @@ override. Saving a server default applies to repositories without an override.
 | Completed CI runs to retain | 100, or server default | Keep unlimited completed runs | 1000000 |
 
 A **bundle** is the ZIP archive collected from one CI run, not an individual file
-inside the ZIP. Existing per-run artifact limits (20 MiB and 1000 files) still
+inside the ZIP. Per-run artifact limits (default 20 MiB uncompressed and 1000
+files, configurable through `execution.limits`) still
 apply; unlimited retention does not remove those limits.
 
 ### Examples

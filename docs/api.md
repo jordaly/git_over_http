@@ -636,7 +636,9 @@ curl --fail-with-body \
 Successful downloads use `application/zip`, `Content-Disposition: attachment`,
 `Content-Length`, `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 `HEAD` reports archive size without loading or sending its body.
-Full downloads are capped at **32 MiB**, separately from the JSON response limit.
+Full downloads honor the run's `execution.limits.artifact_mb` snapshot (default
+16 MiB for new runs). Legacy runs without that snapshot retain the **32 MiB**
+API ceiling, separately from the JSON response limit. See [CI limits](ci-limits.md).
 At most two archive bodies are read/transferred concurrently per server process;
 the permit remains held until the transfer finishes or the connection closes.
 Oversized metadata has `downloadable=false`; GET/HEAD download requests return

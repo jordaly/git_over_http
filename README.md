@@ -41,6 +41,8 @@ authentication, repository browsing, branches, tokens, users, and pull requests.
   step-by-step provisioning, policy, credentials, service and smoke validation.
 - [Docker profiles](docs/docker-profiles.md): pipeline resource requests, safe
   defaults, administrator ceilings, networking, writable directories and named secrets.
+- [CI transfer limits](docs/ci-limits.md): configurable source (100 MiB default),
+  logs, artifacts, file counts and preparation/transfer timeouts.
 - [Remote runner design](docs/remote-ci-runners.md): original proposal and future extensions.
 
 The full reference, recipes, deployment/retention guides and complete JSON examples

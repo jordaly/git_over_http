@@ -180,6 +180,8 @@ Table examples are **field fragments**; use the complete examples for surroundin
 | --- | --- | --- | --- |
 | `runner` | `"docker"` | `"runner":"remote-docker"` | `host` runs as the server OS user, without a sandbox. `docker` uses local Linux containers; `remote-docker` uses an outbound HTTP worker. Existing concrete legacy host settings remain intact. |
 | `docker` | Hardened profile | `"docker":{"memory_mb":2048}` | Declarative resources, network, paths, tmpfs and named mounts. Remote requests must fit an administrator-owned worker policy; see [Docker profiles](docker-profiles.md). |
+| `source_limit_mb` | `100` | `"source_limit_mb":500` | Positive integer MiB for the remote source bundle; no hard-coded upper configured size ceiling. |
+| `limits` | Bounded defaults | `"limits":{"log_mb":8,"artifact_mb":128}` | Log/artifact sizes/counts and source/transfer timeouts; see [CI limits](ci-limits.md). |
 | `image` | String `"python:3.14-slim"` | `"image":"registry.example.com/team/ci:2026-10"` | Docker image must already exist locally. Include tools/dependencies and preferably pin a digest. |
 | `timeout_seconds` | Built-in `1800` | `"timeout_seconds":600` | One budget for checkout, PR merge preparation and all steps. Deployment has a separate timeout. |
 | `env` | Legacy compatibility only | Use the **Environment variables** page table | Up to 64 effective entries; valid identifier keys, string values up to 8192 characters, no NUL. Built-in names are reserved. Legacy JSON remains readable; page-managed repository values are authoritative. |
@@ -470,11 +472,11 @@ exists there. No documented `PYGITHOST_HEAD_COMMIT` is provided.
 | Email | 20 plain addresses, at most 2048 joined characters. |
 | Docker image | At most 256 valid image-name characters. |
 | Artifact patterns | 32 patterns of 256 characters; relative forward-slash paths, no `.git`, traversal, absolute paths, colon, backslash or NUL. |
-| Artifact archive | 20 MiB uncompressed / 1000 files; at most 10,000 matched entries. |
+| Artifact archive | Defaults: 16 MiB compressed / 20 MiB uncompressed / 1000 files. Configurable through `execution.limits`; glob budget scales with file count. |
 | Deployment script content | 64 KiB UTF-8, no NUL. |
 | Deployment path/interpreter | At most 4096 characters; path absolute and outside repo; interpreter one line with no CR/LF/NUL. |
 | Deployment branch/timeout | One valid branch of up to 255 characters; timeout 1–86400 seconds. |
-| Stored combined logs | 1 MiB cap while output continues to drain. |
+| Stored combined logs | Default 1 MiB; configurable `execution.limits.log_mb`. Output continues to drain after truncation. |
 
 ### Troubleshooting
 

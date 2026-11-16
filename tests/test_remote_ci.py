@@ -137,6 +137,10 @@ class RemoteProtocolTests(unittest.TestCase):
         self.assertTrue(self.call("complete", dict(result, artifact=base64.b64encode(buffer.getvalue()).decode()))["accepted"])
 
     def test_remote_configuration_and_client_url_validation(self):
+        from pygithost.ci_config import compile_document
+        text = (Path(__file__).resolve().parents[1] / "docs/http-runner.md").read_text()
+        document = json.loads(text.split("```json\n", 1)[1].split("```", 1)[0])
+        self.assertEqual(compile_document(document)["runner"], "remote-docker")
         self.assertEqual(validate_config({"runner": "remote-docker"})["runner"], "remote-docker")
         for url in ("ftp://host", "http://user:pass@host", "http://host/path", "http://host?token=x"):
             with self.assertRaises(ValueError):

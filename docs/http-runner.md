@@ -35,7 +35,7 @@ Select `remote-docker` explicitly in the repository CI configuration:
         "image": "python:3.14-slim",
         "timeout_seconds": 600
       },
-      "events": {"push": true, "manual": true},
+      "triggers": {"push": {"enabled": true}, "manual": {"enabled": true}},
       "steps": [{"name": "Tests", "run": "python -m unittest discover -q"}]
     }
   ]
@@ -78,6 +78,11 @@ Plain HTTP exposes credentials, source, logs and secrets in transit. `--allow-ht
 explicitly accepts this risk on the trusted test network. For HTTPS, change the URL
 and omit that flag. TLS verification remains enabled. Redirects and environment
 proxies are not used. GitHost's client IP allowlist must permit the worker.
+
+For the private Ubuntu VM on the test Windows host, use
+`http://192.168.250.1:8000` and allow the VM's `192.168.250.2` address. Connecting
+through the host's LAN address can traverse WinNAT and appear to GitHost as the
+Windows host itself; the private interface avoids needing that broader allowlist.
 
 Example systemd service; adapt the account and absolute paths:
 

@@ -58,9 +58,14 @@ class BuildConfigurationTests(unittest.TestCase):
 
     def test_pull_classification_does_not_hide_authentication_or_network_errors(self):
         self.assertTrue(image_build.unavailable(b"manifest unknown"))
+        self.assertTrue(image_build.unavailable(
+            b'Error response from daemon: failed to resolve reference "docker.io/library/python:missing": docker.io/library/python:missing: not found'))
         for text in (b"pull access denied, repository does not exist", b"unauthorized",
                      b"TLS certificate error", b"connection refused", b"no such host",
-                     b"manifest unknown: authentication required"):
+                     b"manifest unknown: authentication required",
+                     b'failed to resolve reference "registry/private:tag": registry/private:tag: 403 Forbidden',
+                     b'failed to resolve reference "registry/private:tag": another/image:tag: not found',
+                     b"repository not found", b"manifest unknown: toomanyrequests"):
             self.assertFalse(image_build.unavailable(text), text)
 
     def test_documentation_example_and_in_page_guide(self):
@@ -165,6 +170,20 @@ class BuildPreparationTests(unittest.IsolatedAsyncioTestCase):
             await self.prepare()
         self.assertFalse(any(cmd[1] == "build" for cmd in self.commands))
         self.assertIn(b"access denied", self.output)
+
+    async def test_docker29_exact_missing_reference_allows_build_fallback(self):
+        self.config["image_build"]["pull"] = True
+        async def modern(command, **kwargs):
+            if command[1] == "pull":
+                self.commands.append(command)
+                kwargs["output"].extend(
+                    b'Error response from daemon: failed to resolve reference "docker.io/local/test:v1": docker.io/local/test:v1: not found\n')
+                return 1
+            return await self.capture(command, **kwargs)
+        self.manager._capture_process.side_effect = modern
+        await self.prepare()
+        self.assertEqual(sum(cmd[1] == "build" for cmd in self.commands), 1)
+        self.assertIn(b"not found", self.output)
 
     async def test_prerequisite_resolves_to_private_base_image_arg(self):
         self.config["image_build"] = image_build.configuration({

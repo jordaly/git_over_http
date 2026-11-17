@@ -144,10 +144,14 @@ async def lock_file(path, *, exclusive=True):
 def unavailable(output):
     """Fail closed: access denied, DNS, TLS and timeouts are NOT missing images."""
     text = output.decode("utf-8", "replace").lower()
-    if any(word in text for word in ("unauthorized", "authentication", "denied", "timeout",
+    if any(word in text for word in ("unauthorized", "authentication", "denied", "forbidden",
+                                     "toomanyrequests", "too many requests", "timeout",
                                      "timed out", "connection", "certificate", "no such host")):
         return False
-    return "manifest unknown" in text or "manifest_unknown" in text
+    return ("manifest unknown" in text or "manifest_unknown" in text
+            or any(re.fullmatch(
+                r'(?:error response from daemon: )?failed to resolve reference "([^"\r\n]+)": \1: not found',
+                line.strip()) for line in text.splitlines()))
 
 
 async def prepare(manager, row, config, checkout, output, truncated, publish):

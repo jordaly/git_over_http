@@ -45,7 +45,8 @@ The worker checks out the exact queued source, then:
 
 1. Reuses a local requested image or matching private build-cache image.
 2. With `pull: true`, tries downloading the requested final image.
-3. Falls back to building only on confirmed **manifest unknown**. Authentication,
+3. Falls back to building only on confirmed **manifest unknown**, or Docker 29's
+   exact `failed to resolve reference "REF": REF: not found` response. Authentication,
    ambiguous "pull access denied", DNS, TLS, network and daemon errors fail visibly.
 4. With explicit `pull: false`, skips that pull and builds when absent. No registry
    is required for these local-only tags.

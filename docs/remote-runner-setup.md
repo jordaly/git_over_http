@@ -130,7 +130,9 @@ sudo docker pull python:3.14-slim
 sudo -u githost-runner docker image inspect python:3.14-slim >/dev/null
 ```
 
-For the real application, build or publish a reviewed dependency image beforehand.
+For the real application, build or publish a reviewed dependency image beforehand,
+or explicitly authorize [building missing images](image-builds.md) for a trusted
+repository/event. Builds remain disabled by default.
 With worker policy `image_pull: "missing"` (the default), the service downloads
 absent images on the Ubuntu host before execution; pre-pulling is not required.
 Use `never` for offline/cache-only workers or `always` to refresh before each job.

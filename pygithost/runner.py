@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 def cleanup_attempt(fingerprint):
     if not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
         raise ValueError("Invalid attempt fingerprint.")
+    # A killed worker must also disconnect its daemon build request. Match only
+    # this attempt's Docker build CLI, never unrelated processes/containers.
+    for entry in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            args = entry.read_bytes().split(b"\0")
+            if (len(args) > 2 and Path(os.fsdecode(args[0])).name == "docker"
+                    and args[1] == b"build"
+                    and ("pygithost.http-attempt=" + fingerprint).encode() in args):
+                os.kill(int(entry.parent.name), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
     result = subprocess.run(["docker", "ps", "-aq", "--filter",
                              "label=pygithost.http-attempt=" + fingerprint],
                             capture_output=True, text=True, check=True, timeout=15)
@@ -91,6 +102,8 @@ class JobStopped(Exception):
 
 async def execute_with_image(manager, row, config):
     """Provision on the worker host, never grant network/Docker access to jobs."""
+    if config.get("image_build"):
+        return await manager._execute(row)
     run_id = row[0]
     limits = execution_limits(config.get("limits"))
     maximum = limits["log_mb"] * MIB
@@ -191,6 +204,10 @@ async def run_job(client, job, root, worker_policy=None):
                        timeout=configuration["timeout_seconds"],
                        repository=f"{row[1]}/{row[2]}", event=row[3],
                        image_pull_timeout=limits["image_pull_timeout_seconds"])
+            from .image_build import authorize as authorize_build
+            from .docker_profile import policy
+            authorize_build(configuration.get("image_build"), policy(worker_policy),
+                            f"{row[1]}/{row[2]}", row[3])
         except ValueError as exc:
             await asyncio.to_thread(client.request, "complete", dict(identity, progress={
                 "status": "failed", "return_code": -1, "phase": "runner policy",
@@ -233,7 +250,8 @@ async def run_job(client, job, root, worker_policy=None):
         monitor = subprocess.Popen([
             sys.executable, "-m", "pygithost.runner", "_watchdog",
             "--attempt", fingerprint, "--parent", str(os.getpid()),
-            "--seconds", str(config["timeout_seconds"] + limits["image_pull_timeout_seconds"] + 10)],
+            "--seconds", str(config["timeout_seconds"] + limits["image_pull_timeout_seconds"]
+                             + (config.get("image_build") or {}).get("timeout_seconds", 0) + 10)],
             start_new_session=True, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         task = asyncio.create_task(execute_with_image(manager, local_row, config))
@@ -360,10 +378,29 @@ def main():
     run.add_argument("--allow-http", action="store_true", help="Explicitly accept unencrypted transport.")
     run.add_argument("--once", action="store_true")
     run.add_argument("--policy-file", help="Administrator-managed JSON Docker ceilings and named secrets.")
+    prune = commands.add_parser("prune-images", help="Remove only old, unused runner-built images; refuse while build jobs are active.")
+    prune.add_argument("--older-than-hours", type=int, default=168)
+    prune.add_argument("--cache-dir", help="Same private cache directory as the worker account.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     if args.command == "_watchdog":
         watchdog(args.attempt, args.parent, args.seconds)
+        return
+    if args.command == "prune-images":
+        import fcntl
+        from .image_build import cache_directory
+        if args.older_than_hours < 1:
+            parser.error("--older-than-hours must be positive.")
+        root = cache_directory(args.cache_dir)
+        with (root / "prune.lock").open("a") as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                parser.error("Build jobs are active; cache pruning refused.")
+            subprocess.run(["docker", "image", "prune", "--all", "--force",
+                            "--filter", "label=pygithost.build-cache=1",
+                            "--filter", f"until={args.older_than_hours}h"],
+                           check=True, timeout=300)
         return
     if args.command in ("create-token", "revoke-token"):
         if not Path(args.db).is_file():

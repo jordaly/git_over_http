@@ -126,8 +126,9 @@ One-worker/per-token concurrency and GitHost scheduler limits remain unchanged.
 
 The Ubuntu **worker host** needs internet/registry access; the job container does
 not receive that access or a Docker socket. Container steps still use
-`--pull=never` after provisioning. Custom images must be built or published before
-use; the runner does not build Dockerfiles automatically.
+`--pull=never` after provisioning. Custom images must normally be built/published
+before use. Trusted repositories may opt into
+[building missing images](image-builds.md), separately authorized by worker policy.
 
 Pipelines set `execution.limits.image_pull_timeout_seconds` (default 600), bounded
 by `max_image_pull_timeout_seconds` in the worker policy (default 600). Registry

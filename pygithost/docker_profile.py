@@ -20,6 +20,8 @@ POLICY_DEFAULTS = {
     "networks": ["none"], "allow_writable_root": False, "allow_root": False,
     "secrets": {},
     "image_pull": "missing", "max_image_pull_timeout_seconds": 600,
+    "builds": {"repositories": [], "events": [], "networks": ["none"],
+               "max_timeout_seconds": 1800, "max_memory_mb": 1024, "max_cpus": 1},
 }
 
 
@@ -110,6 +112,21 @@ def policy(raw=None):
         raise ValueError("Invalid worker network allowlist.")
     if not isinstance(result["secrets"], dict) or len(result["secrets"]) > 32:
         raise ValueError("Invalid worker secrets.")
+    builds = result["builds"]
+    if not isinstance(builds, dict) or set(builds) - set(POLICY_DEFAULTS["builds"]):
+        raise ValueError("Invalid worker image build policy.")
+    builds = result["builds"] = {**copy.deepcopy(POLICY_DEFAULTS["builds"]), **builds}
+    for key in ("repositories", "events", "networks"):
+        if not isinstance(builds[key], list) or len(builds[key]) > 128:
+            raise ValueError("Invalid build policy allowlist.")
+    if (any(not isinstance(repo, str) or not re.fullmatch(r"[^/\s]+/[^/\s]+", repo)
+            for repo in builds["repositories"])
+            or any(event not in ("manual", "push", "pull_request_merged") for event in builds["events"])
+            or not builds["networks"] or any(net not in ("none", "bridge") for net in builds["networks"])):
+        raise ValueError("Builds require explicit repository/trusted-event/network allowlists.")
+    number(builds["max_timeout_seconds"], 1, 86400, "build max timeout")
+    number(builds["max_memory_mb"], 1, 131072, "build max memory")
+    number(builds["max_cpus"], .1, 64, "build max CPUs", False)
     for name, secret in result["secrets"].items():
         if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name)
                 or not isinstance(secret, dict) or set(secret) != {"path", "repositories", "events"}

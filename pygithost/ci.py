@@ -104,6 +104,7 @@ def default_config():
         "limits": {},
         "docker": {},
         "image": "python:3.14-slim",
+        "image_build": None,
         "email_recipients": "",
         "email_mode": "off",
         "cancel_superseded": False,
@@ -207,8 +208,14 @@ def validate_config(raw, *, nested=False):
     defaults["source_limit_mb"] = source_limit_mb(raw.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB))
     from .ci_limits import execution_limits
     defaults["limits"] = execution_limits(raw.get("limits"))
+    from .image_build import configuration as build_configuration
+    defaults["image_build"] = build_configuration(raw.get("image_build"))
+    if defaults["image_build"] and runner == "host":
+        raise ValueError("Image builds require a remote Docker worker.")
     if not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@-]{0,255}", image):
         raise ValueError("Enter a valid Docker image name.")
+    if defaults["image_build"] and "@" in image:
+        raise ValueError("A build fallback requires an image tag, not an immutable image digest.")
     if mode not in ("off", "failures", "all", "recovery"):
         raise ValueError("Invalid email notification mode.")
     recipients = validate_recipients(raw.get("email_recipients", ""))
@@ -1284,6 +1291,7 @@ class CIManager:
         deadline = asyncio.get_running_loop().time() + config["timeout_seconds"]
         phase = "checkout"
         container = None
+        image_guard = None
         env = runner_environment(temp_root)
         step_states = [dict(name=step["name"], status="pending", started_at=None,
                             finished_at=None, return_code=None, output="", duration="—")
@@ -1368,6 +1376,18 @@ class CIManager:
                     timeout=deadline - asyncio.get_running_loop().time(),
                 )
             if rc == 0:
+                if config.get("image_build"):
+                    if not hasattr(self, "docker_policy"):
+                        raise ValueError("Image builds require an explicitly authorized HTTP worker.")
+                    from .image_build import prepare
+                    phase = "image build"
+                    async def publish_image():
+                        await _db_call(database.db_ci_run_update, run_id,
+                            output=output.decode("utf-8", "replace"), truncated=int(truncated[0]), phase=phase)
+                    preparation_started = asyncio.get_running_loop().time()
+                    image_guard = await prepare(self, row, config, worktree, output, truncated, publish_image)
+                    # Build preparation has its own budget, not the test-step budget.
+                    deadline += asyncio.get_running_loop().time() - preparation_started
                 phase = "command"
                 env.update(
                     {
@@ -1439,8 +1459,11 @@ class CIManager:
             status = "success" if rc == 0 else "failed"
         except asyncio.TimeoutError:
             rc, status = -1, "timed_out"
+            timeout_label = ("Image build preparation" if phase == "image build" else "CI execution")
+            timeout_budget = (config["image_build"]["timeout_seconds"] if phase == "image build"
+                              else config["timeout_seconds"])
             output.extend(
-                f"CI execution exceeded the {config['timeout_seconds']} second limit.\n".encode()[
+                f"{timeout_label} exceeded the {timeout_budget} second limit.\n".encode()[
                     : maximum_output - len(output)
                 ]
             )
@@ -1504,6 +1527,8 @@ class CIManager:
                 )
             logs_done.set()
             await asyncio.gather(logger, return_exceptions=True)
+            if image_guard:
+                image_guard.close()
         await _db_call(
             database.db_ci_run_update,
             run_id,

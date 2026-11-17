@@ -1,5 +1,9 @@
 # HTTP Docker runner
 
+Trusted repositories can opt into [building missing images](image-builds.md)
+after source checkout. Builds require explicit worker authorization; pipelines
+without `image_build` retain download-only behavior.
+
 GitHost enables SQLite WAL during database initialization, not on every connection.
 Runner schema creation and upgrades also run only at initialization. Runtime
 connections retain `synchronous=NORMAL` and foreign-key enforcement. If SQLite

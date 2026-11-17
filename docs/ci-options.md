@@ -102,6 +102,13 @@ authoritative; syntax highlighting does not prove that every option is valid.
 
 ## Page settings and inheritance
 
+For trusted HTTP-runner pipelines, `execution.image_build` declares an optional
+build-if-missing recipe (Dockerfile, context, target, args, prerequisites and
+resource/time limits). It defaults to `null`; administrators must also authorize
+the repository/event in worker policy. See [Build missing images](image-builds.md).
+This is a Settings execution option, not an extra field accepted in the restricted
+repository steps file.
+
 **Admin → Settings** includes basic server configuration, appearance,
 environment variables, and run/artifact retention. Basic server changes
 are written atomically to the startup config file and take effect **after a

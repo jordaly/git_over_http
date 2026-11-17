@@ -19,6 +19,7 @@ GUIDES = {
     "http-runner": ("HTTP Docker runner", "docs/http-runner.md"),
     "runner-setup": ("Install a remote runner", "docs/remote-runner-setup.md"),
     "docker-profiles": ("Docker limits and policy", "docs/docker-profiles.md"),
+    "image-builds": ("Build missing images", "docs/image-builds.md"),
     "ci-limits": ("Source and transfer limits", "docs/ci-limits.md"),
     "logging": ("Logging and audit trail", "docs/logging.md"),
     "retention": ("Retention", "docs/ci-retention.md"),

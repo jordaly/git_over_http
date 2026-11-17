@@ -1,5 +1,12 @@
 # HTTP Docker runner
 
+GitHost enables SQLite WAL during database initialization, not on every connection.
+If a database error escapes CI coordination, an active run is marked `interrupted`
+with an explicitly uncertain outcome; retained logs, step evidence and phase are
+preserved. Coordinator errors cannot overwrite a terminal result. These errors do
+not prove that application tests failed, and uncertain executions are not replayed
+automatically. Inspect server logs before authorizing another run.
+
 [Fresh Ubuntu server walkthrough](remote-runner-setup.md) ·
 [Configurable Docker limits and worker policy](docker-profiles.md)
 

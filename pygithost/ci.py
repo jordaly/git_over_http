@@ -12,6 +12,7 @@ import signal
 import shutil
 import shlex
 import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -940,14 +941,14 @@ class CIManager:
                 )
             raise
         except Exception as exc:
+            logging.getLogger(__name__).exception("CI coordinator failed for run #%s", row[0])
             if ci_finished:
                 logging.getLogger(__name__).exception("Deployment processing failed for run #%s", row[0])
                 return
             await _db_call(
-                database.db_ci_run_update,
+                database.db_ci_run_coordinator_error,
                 row[0],
-                status="failed",
-                output=str(exc)[:MAX_OUTPUT],
+                database_error=isinstance(exc, sqlite3.Error),
                 finished_at=datetime.now(timezone.utc).isoformat(),
             )
         finally:

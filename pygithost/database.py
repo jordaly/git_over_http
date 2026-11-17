@@ -44,9 +44,12 @@ def _safe_seg(value: str) -> bool:
 def _db_connect() -> sqlite3.Connection:
     _ensure_dir(DB_PATH)
     conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
+    try:
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -112,6 +115,9 @@ def _db_migrate_pr_author_nullable(conn):
 def _db_init() -> None:
     conn = _db_connect()
     try:
+        mode = conn.execute("PRAGMA journal_mode=WAL;").fetchone()[0]
+        if mode.lower() != "wal":
+            raise RuntimeError("SQLite WAL initialization failed.")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -1676,6 +1682,22 @@ def db_ci_run_create(owner: str, repo: str, event: str, branch: str, commit_hash
         cur = conn.execute("INSERT INTO ci_runs(owner,repo,event,branch,commit_hash,payload_json,config_json,notification) VALUES(?,?,?,?,?,?,?,?)",
             (owner, repo, event, branch, commit_hash, payload_json, config_json, notification))
         return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def db_ci_run_coordinator_error(run_id: int, *, database_error: bool, finished_at: str) -> None:
+    """Record infrastructure failure without destroying evidence or terminal results."""
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """UPDATE ci_runs SET status=?, reason=?, finished_at=?
+               WHERE id=? AND status IN ('queued','running')""",
+            ("interrupted" if database_error else "failed",
+             "GitHost database error; execution outcome is uncertain. No automatic retry."
+             if database_error else "GitHost coordinator error; inspect server logs.",
+             finished_at, run_id),
+        )
     finally:
         conn.close()
 

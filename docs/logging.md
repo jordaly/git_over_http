@@ -135,6 +135,14 @@ runner-token issuance records its name and repository restrictions.
 
 ## Operational notes
 
+- `pygithost.database` warns on SQLite busy errors, connection-setup retries,
+  statements taking at least one second, and long explicit transactions.
+  Diagnostics include connection IDs, operation names, thread/process IDs and
+  active local transaction ages—not SQL text or bound values. A listed transaction
+  is a possible blocker, not proof that it owns the conflicting lock. External
+  processes and uninstrumented connections are not enumerated.
+  See [HTTP runner database coordination](http-runner.md).
+
 - Logging is process-wide and thread-safe; a single server process writes the
   file. Do not point two server processes at the same rotating file.
 - `DEBUG` enables exception tracebacks on request failures. Those tracebacks can

@@ -74,6 +74,23 @@ class RemoteProtocolTests(unittest.TestCase):
             self.call("heartbeat", identity, digest="other")
         self.assertEqual(self.call("source", identity)["bundle"], base64.b64encode(b"bundle").decode())
 
+    def test_progress_validation_does_not_hold_writer_transaction(self):
+        from pygithost import remote_ci
+        self.enqueue()
+        identity = self.claim()
+        original = remote_ci.validate_progress
+        def validating(*args, **kwargs):
+            other = database._db_connect()
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.rollback()
+            finally:
+                other.close()
+            return original(*args, **kwargs)
+        with mock.patch.object(remote_ci, "validate_progress", side_effect=validating) as validation:
+            self.assertTrue(self.call("heartbeat", identity)["accepted"])
+            validation.assert_called_once()
+
     def file_source(self, run, content=b"private bundle"):
         path = Path(self.temp.name) / f"{run}.bundle"
         path.write_bytes(content)
@@ -323,6 +340,7 @@ class RemoteProtocolTests(unittest.TestCase):
             state TEXT NOT NULL DEFAULT 'queued', runner TEXT, attempt TEXT,
             heartbeat REAL, result TEXT, artifact BLOB)""")
         conn.close()
+        database._db_init()
         self.enqueue()
         identity = self.claim()
         self.assertEqual(base64.b64decode(self.call("source", identity)["bundle"]), b"bundle")

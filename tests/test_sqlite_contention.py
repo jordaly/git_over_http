@@ -2,6 +2,8 @@ import asyncio
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -61,6 +63,96 @@ class ConnectionContentionTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 database._db_connect()
         connection.close.assert_called_once()
+
+    def test_connection_recovers_from_real_wal_writer_contention(self):
+        database._db_init()
+        ready, release = threading.Event(), threading.Event()
+        def writer():
+            conn = sqlite3.connect(database.DB_PATH, isolation_level=None)
+            try:
+                conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("INSERT INTO users(username,pass_salt,pass_hash) VALUES('lock-holder',X'01',X'02')")
+                ready.set()
+                release.wait(3)
+                conn.rollback()
+            finally:
+                conn.close()
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(ready.wait(3))
+        real_connect = sqlite3.connect
+        attempts = []
+        def short_connect(*args, **kwargs):
+            kwargs["timeout"] = .02
+            attempts.append(time.monotonic())
+            return real_connect(*args, **kwargs)
+        timer = threading.Timer(.12, release.set)
+        timer.start()
+        try:
+            with mock.patch.object(database.sqlite3, "connect", side_effect=short_connect):
+                conn = database._db_connect()
+                try:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM users").fetchone()[0], 0)
+                finally:
+                    conn.close()
+            self.assertGreater(len(attempts), 1)
+        finally:
+            release.set()
+            thread.join(3)
+            timer.join()
+
+    def test_remote_runtime_connections_do_not_run_schema_migrations(self):
+        from pygithost.remote_ci import connect
+        database._db_init()
+        statements = []
+        original = database._db_connect
+        def traced():
+            conn = original()
+            conn.set_trace_callback(statements.append)
+            return conn
+        with mock.patch.object(database, "_db_connect", side_effect=traced):
+            conn = connect()
+            conn.close()
+        self.assertFalse(any(sql.lstrip().upper().startswith(("CREATE", "ALTER"))
+                             for sql in statements), statements)
+
+    def test_persistent_busy_is_bounded_and_closes_every_connection(self):
+        error = sqlite3.OperationalError("database is locked")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        connections = [mock.Mock() for _ in range(3)]
+        for conn in connections:
+            conn.execute.side_effect = error
+        with mock.patch.object(database.sqlite3, "connect", side_effect=connections) as opening:
+            with mock.patch.object(database.time, "sleep") as waiting:
+                with self.assertRaises(sqlite3.OperationalError):
+                    database._db_connect()
+        self.assertEqual(opening.call_count, 3)
+        self.assertEqual(waiting.call_count, 2)
+        for conn in connections:
+            conn.close.assert_called_once()
+
+    def test_busy_diagnostics_identify_local_transaction_without_values(self):
+        database._db_init()
+        holder = database._db_connect()
+        holder.operation = "known_lock_holder"
+        contender = sqlite3.connect(database.DB_PATH, timeout=.02, isolation_level=None,
+                                    factory=database._Connection)
+        try:
+            holder.execute("BEGIN IMMEDIATE")
+            holder.execute("INSERT INTO users(username,pass_salt,pass_hash) VALUES('PRIVATE_VALUE',X'01',X'02')")
+            with self.assertLogs("pygithost.database", level="WARNING") as logs:
+                with self.assertRaises(sqlite3.OperationalError):
+                    contender.execute("BEGIN IMMEDIATE")
+            text = " ".join(logs.output)
+            self.assertIn("known_lock_holder", text)
+            self.assertIn(str(id(holder)), text)
+            self.assertNotIn("PRIVATE_VALUE", text)
+        finally:
+            contender.close()
+            holder.rollback()
+            holder.close()
+        self.assertNotIn(id(holder), database._transactions)
 
 
 class CoordinatorFailureTests(unittest.IsolatedAsyncioTestCase):

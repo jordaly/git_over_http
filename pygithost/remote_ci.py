@@ -12,6 +12,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -29,6 +30,12 @@ LEASE = 90
 
 def connect():
     conn = database._db_connect()
+    conn.operation = "remote_ci." + sys._getframe(1).f_code.co_name
+    return conn
+
+
+def initialize_schema(conn):
+    """Run schema changes once at startup, never during runner polling."""
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS ci_runner_tokens (
             digest TEXT PRIMARY KEY, name TEXT NOT NULL, repositories TEXT NOT NULL);
@@ -46,9 +53,7 @@ def connect():
             conn.execute("ALTER TABLE ci_remote_jobs ADD COLUMN source_path TEXT")
         except Exception:
             if "source_path" not in {r[1] for r in conn.execute("PRAGMA table_info(ci_remote_jobs)")}:
-                conn.close()
                 raise
-    return conn
 
 
 def _queue_source_cleanup(conn, paths):
@@ -238,6 +243,24 @@ def operation(digest, repositories, action, document):
     """All claims and attempt transitions are serialized by SQLite."""
     conn = connect()
     try:
+        prepared = None
+        if action in ("heartbeat", "complete"):
+            if type(document.get("run_id")) is not int or not isinstance(document.get("attempt"), str):
+                raise APIError(422, "validation_error", "A run_id and attempt are required.")
+            # Expensive JSON/base64/ZIP validation must not hold the writer lock.
+            candidate = conn.execute("""SELECT j.owner,j.repo,j.document,j.attempt,j.heartbeat
+                FROM ci_remote_jobs j JOIN ci_runs r ON r.id=j.run_id
+                WHERE j.run_id=? AND j.runner=? AND j.state='claimed'
+                AND r.status IN ('queued','running')""",
+                (document.get("run_id"), digest)).fetchone()
+            if (candidate and f"{candidate[0]}/{candidate[1]}" in repositories
+                    and isinstance(document.get("attempt"), str)
+                    and hmac.compare_digest(candidate[3] or "", document["attempt"])
+                    and time.time() - candidate[4] <= LEASE):
+                limits = execution_limits(json.loads(candidate[2]).get("config", {}).get("limits"))
+                prepared = _prepare_progress(action, document, limits)
+                result_json = json.dumps(prepared[0]) if action == "complete" else None
+                steps_json = json.dumps(prepared[0]["steps"]) if "steps" in prepared[0] else None
         conn.execute("BEGIN IMMEDIATE")
         if action == "claim":
             # Startup recovery/retention may have interrupted or removed a run.
@@ -316,28 +339,14 @@ def operation(digest, repositories, action, document):
             return {"bundle": base64.b64encode(source).decode()}
         if action not in ("heartbeat", "complete"):
             raise APIError(404, "not_found", "Unknown runner operation.")
-        values = validate_progress(document.get("progress", {}), final=action == "complete", limits=limits)
-        artifact = None
-        if action == "complete" and document.get("artifact"):
-            try:
-                artifact = base64.b64decode(document["artifact"], validate=True)
-            except (ValueError, TypeError):
-                raise APIError(422, "validation_error", "Invalid artifact encoding.") from None
-            if len(artifact) > limits["artifact_mb"] * MIB:
-                raise APIError(413, "too_large", "Artifact exceeds this run's configured compressed limit.")
-            try:
-                with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
-                    files = archive.infolist()
-                    if (len(files) > limits["artifact_files"]
-                            or sum(f.file_size for f in files) > limits["artifact_uncompressed_mb"] * MIB
-                            or any(f.filename.startswith(("/", "\\")) or "\\" in f.filename
-                                   or ".." in f.filename.split("/") for f in files)):
-                        raise ValueError()
-            except (ValueError, zipfile.BadZipFile):
-                raise APIError(422, "validation_error", "Invalid or excessive artifact ZIP.") from None
+        if prepared is None:
+            # State changed since the unlocked read. Do not validate while locked.
+            conn.rollback()
+            return {"cancel": True}
+        values, artifact = prepared
         if action == "complete":
             conn.execute("UPDATE ci_remote_jobs SET state='finished',result=?,artifact=? WHERE run_id=?",
-                         (json.dumps(values), artifact, run_id))
+                         (result_json, artifact, run_id))
         else:
             conn.execute("UPDATE ci_remote_jobs SET heartbeat=? WHERE run_id=?", (time.time(), run_id))
             updates = {k: v for k, v in values.items() if k in ("output", "truncated", "phase")}
@@ -347,11 +356,34 @@ def operation(digest, repositories, action, document):
                              (*updates.values(), run_id))
                 conn.execute("UPDATE ci_runs SET started_at=COALESCE(started_at,datetime('now')) WHERE id=?", (run_id,))
             if "steps" in values:
-                conn.execute("INSERT OR REPLACE INTO ci_steps VALUES(?,?)", (run_id, json.dumps(values["steps"])))
+                conn.execute("INSERT OR REPLACE INTO ci_steps VALUES(?,?)", (run_id, steps_json))
         conn.commit()
         return {"accepted": True, "cancel": False}
     finally:
         conn.close()
+
+
+def _prepare_progress(action, document, limits):
+    values = validate_progress(document.get("progress", {}), final=action == "complete", limits=limits)
+    artifact = None
+    if action == "complete" and document.get("artifact"):
+        try:
+            artifact = base64.b64decode(document["artifact"], validate=True)
+        except (ValueError, TypeError):
+            raise APIError(422, "validation_error", "Invalid artifact encoding.") from None
+        if len(artifact) > limits["artifact_mb"] * MIB:
+            raise APIError(413, "too_large", "Artifact exceeds this run's configured compressed limit.")
+        try:
+            with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
+                files = archive.infolist()
+                if (len(files) > limits["artifact_files"]
+                        or sum(f.file_size for f in files) > limits["artifact_uncompressed_mb"] * MIB
+                        or any(f.filename.startswith(("/", "\\")) or "\\" in f.filename
+                               or ".." in f.filename.split("/") for f in files)):
+                    raise ValueError()
+        except (ValueError, zipfile.BadZipFile):
+            raise APIError(422, "validation_error", "Invalid or excessive artifact ZIP.") from None
+    return values, artifact
 
 
 def validate_progress(raw, *, final, limits=None):

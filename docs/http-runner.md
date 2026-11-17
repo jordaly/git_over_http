@@ -1,6 +1,20 @@
 # HTTP Docker runner
 
 GitHost enables SQLite WAL during database initialization, not on every connection.
+Runner schema creation and upgrades also run only at initialization. Runtime
+connections retain `synchronous=NORMAL` and foreign-key enforcement. If SQLite
+reports `SQLITE_BUSY` during connection setup, GitHost closes that connection and
+retries setup at most twice (each connection has a five-second busy timeout,
+with 50/100 ms backoff). No application statement or job command is replayed.
+Other SQLite errors and sustained contention still fail explicitly.
+
+Progress and artifact validation happen before acquiring the runner's write
+transaction; assignment ownership and state are checked again under that lock.
+SQLite warnings identify local connection/operation/thread IDs, active explicit
+transactions and their ages, plus statements/transactions taking at least one
+second. They do not include SQL text, parameters or credentials. This identifies
+possible in-process blockers, not locks held by uninstrumented external processes.
+
 If a database error escapes CI coordination, an active run is marked `interrupted`
 with an explicitly uncertain outcome; retained logs, step evidence and phase are
 preserved. Coordinator errors cannot overwrite a terminal result. These errors do

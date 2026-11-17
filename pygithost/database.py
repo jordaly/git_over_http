@@ -3,10 +3,14 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
 import sqlite3
+import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from .config import AppConfig
@@ -41,16 +45,89 @@ def _safe_seg(value: str) -> bool:
     return bool(value) and _SAFE_SEGMENT.match(value) is not None and ".." not in value
 
 
+_transactions = {}
+_transactions_lock = threading.Lock()
+
+
+def sqlite_busy(exc):
+    """Only SQLite's BUSY family is safe to wait for; not arbitrary SQL errors."""
+    return (isinstance(exc, sqlite3.OperationalError)
+            and getattr(exc, "sqlite_errorcode", 0) & 255 == sqlite3.SQLITE_BUSY)
+
+
+class _Connection(sqlite3.Connection):
+    """Parameter-free diagnostics for long transactions and lock failures."""
+    def execute(self, sql, parameters=()):
+        started = time.monotonic()
+        try:
+            return super().execute(sql, parameters)
+        except sqlite3.Error as exc:
+            if sqlite_busy(exc):
+                with _transactions_lock:
+                    holders = [
+                        dict(info, age_seconds=round(time.monotonic() - info["started"], 3))
+                        for info in _transactions.values()
+                    ]
+                logging.getLogger(__name__).warning(
+                    "SQLite busy: connection=%s operation=%s thread=%s active_transactions=%s",
+                    id(self), getattr(self, "operation", "unknown"), threading.get_ident(), holders)
+            raise
+        finally:
+            with _transactions_lock:
+                if self.in_transaction:
+                    _transactions.setdefault(id(self), {
+                        "connection": id(self), "operation": getattr(self, "operation", "unknown"),
+                        "thread": threading.get_ident(), "pid": os.getpid(), "started": started,
+                    })
+                else:
+                    _transactions.pop(id(self), None)
+            elapsed = time.monotonic() - started
+            if elapsed >= 1:
+                logging.getLogger(__name__).warning(
+                    "Slow SQLite statement: connection=%s operation=%s elapsed_seconds=%.3f",
+                    id(self), getattr(self, "operation", "unknown"), elapsed)
+
+    def _transaction_end(self):
+        with _transactions_lock:
+            info = _transactions.pop(id(self), None)
+        if info and time.monotonic() - info["started"] >= 1:
+            logging.getLogger(__name__).warning(
+                "Long SQLite transaction: connection=%s operation=%s elapsed_seconds=%.3f",
+                id(self), info["operation"], time.monotonic() - info["started"])
+
+    def commit(self):
+        super().commit()
+        self._transaction_end()
+
+    def rollback(self):
+        super().rollback()
+        self._transaction_end()
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            self._transaction_end()
+
+
 def _db_connect() -> sqlite3.Connection:
     _ensure_dir(DB_PATH)
-    conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
-    try:
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-    except BaseException:
-        conn.close()
-        raise
-    return conn
+    operation = sys._getframe(1).f_code.co_name
+    for attempt in range(3):
+        conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None, factory=_Connection)
+        conn.operation = operation
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            return conn
+        except BaseException as exc:
+            conn.close()
+            if not sqlite_busy(exc) or attempt == 2:
+                raise
+            # No application SQL has run: reopening cannot replay a mutation.
+            logging.getLogger(__name__).warning(
+                "Retrying SQLite connection setup: operation=%s attempt=%s", operation, attempt + 1)
+            time.sleep(.05 * (2 ** attempt))
 
 
 def _db_migrate_pr_author_nullable(conn):
@@ -118,6 +195,8 @@ def _db_init() -> None:
         mode = conn.execute("PRAGMA journal_mode=WAL;").fetchone()[0]
         if mode.lower() != "wal":
             raise RuntimeError("SQLite WAL initialization failed.")
+        from .remote_ci import initialize_schema
+        initialize_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (

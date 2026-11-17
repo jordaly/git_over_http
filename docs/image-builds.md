@@ -140,6 +140,12 @@ build stage and COPY from it. The worker does not download arbitrary archives or
 run host scripts to silently prepare application dependencies.
 Use `.dockerignore` to exclude `.git`, secrets and unrelated files. Keep private
 database configuration in runtime named-secret mounts, never build args/contexts.
+Checkouts are private. COPY can therefore preserve restrictive input permissions;
+set appropriate ownership/read permissions in the Dockerfile for the unprivileged
+runtime UID rather than weakening checkout privacy or running tests as root.
+The existing Wine Dockerfile also contains experimental earlier stages; the legacy
+builder can execute stages that BuildKit would skip. A clean-worker production
+recipe must separate those probes or use a reviewed, prebuilt base image.
 
 ## Cache and cleanup
 

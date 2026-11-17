@@ -12,6 +12,7 @@ from .application import (
 from .cli import main
 from .config import AppConfig
 from .context import AppContext
+from .logging_setup import configure_logging
 
 __all__ = [
     "AsyncGitServer",
@@ -19,6 +20,7 @@ __all__ = [
     "AppContext",
     "GitHTTPHandler",
     "apply_config",
+    "configure_logging",
     "default_config_for_platform",
     "load_config",
     "main",

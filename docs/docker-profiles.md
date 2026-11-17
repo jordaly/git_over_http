@@ -30,6 +30,10 @@ deny writable root and root-user requests, expose no secrets, and limit job
 `timeout_seconds` to 1800. Extra tmpfs sizes plus `/tmp` count against the aggregate
 tmpfs ceiling. Requests over a ceiling **fail**, not silently clamp.
 
+Image acquisition is separate from container networking. The worker host defaults
+to `image_pull: "missing"` and may download absent images from a registry even
+when the job's network is `none`.
+
 `PYGITHOST_WORKTREE` and command substitutions follow `checkout_path`.
 Every step gets a fresh container: only checkout/results files persist. Tmpfs,
 container-root changes, processes and shell state do not survive between steps.
@@ -72,7 +76,8 @@ This configuration requests more memory/CPU, a read-only `/source`, a writable
 }
 ```
 
-`my-project-ci:1` must exist on Ubuntu and contain the project's dependencies.
+`my-project-ci:1` must either exist on Ubuntu or be available from a registry the
+worker can access. It must already contain the project's dependencies.
 The results mount maps to `.ci-results` inside the host checkout, allowing normal
 artifact collection even when the container's `/source` view is read-only.
 Do not commit `.ci-results` as a symlink.
@@ -92,6 +97,8 @@ Store this JSON **on Ubuntu, outside any repository**, for example
   "networks": ["none"],
   "allow_writable_root": false,
   "allow_root": false,
+  "image_pull": "missing",
+  "max_image_pull_timeout_seconds": 600,
   "secrets": {}
 }
 ```
@@ -106,6 +113,35 @@ resources. Invalid policy prevents startup.
 Changing repository JSON cannot raise these worker ceilings. Ensure the VM has
 enough actual CPU/RAM/disk; increasing a ceiling does not provision capacity.
 One-worker/per-token concurrency and GitHost scheduler limits remain unchanged.
+
+### Image download policy
+
+`image_pull` is administrator-owned; repositories cannot change it:
+
+| Value | Worker behavior |
+|---|---|
+| `missing` (default) | Inspect the local cache; download the configured image only if unavailable. |
+| `never` | Use cached/local images only; fail if missing. Suitable for offline workers. |
+| `always` | Download/refresh the configured image before every job. Requires registry access even when cached. |
+
+The Ubuntu **worker host** needs internet/registry access; the job container does
+not receive that access or a Docker socket. Container steps still use
+`--pull=never` after provisioning. Custom images must be built or published before
+use; the runner does not build Dockerfiles automatically.
+
+Pipelines set `execution.limits.image_pull_timeout_seconds` (default 600), bounded
+by `max_image_pull_timeout_seconds` in the worker policy (default 600). Registry
+output appears in the combined CI log with phase `image`. Failed/timed-out pulls
+fail the run before commands execute; cancellation stops the worker's Docker CLI.
+The daemon may retain partial layers or continue a cache download after the CLI
+disconnects—do not prune shared Docker data automatically.
+
+For private registries, an administrator can run
+`sudo -H -u githost-runner docker login registry.example.com` interactively on the
+worker. Keep its credential configuration private in that account's home; never
+mount it in a job or supply registry passwords through pipeline JSON.
+Pin `image@sha256:...` for reproducibility. `missing` deliberately reuses a cached
+tag; `always` can obtain a different image when a mutable tag changes.
 
 ### Controlled network access
 
@@ -183,7 +219,7 @@ port publishing and entrypoint overrides are not supported.
 Source, logs, artifacts and transfer budgets are configured separately through
 `execution.source_limit_mb` and `execution.limits`; see [CI limits](ci-limits.md).
 The source default is 100 MiB, with no hard-coded upper configured size ceiling.
-Image pulls remain administrator-managed. There is no automatic retry,
+Image download mode remains administrator-controlled. There is no automatic retry,
 Docker-in-Docker or distributed SQL test lock.
 
 The SistemaFuente Wine wrappers currently launch Docker themselves; do not run

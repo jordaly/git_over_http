@@ -57,6 +57,11 @@ class ServerRunner:
         backend_path=None,
         bind_host="127.0.0.1",
         require_auth=False,
+        log_file=None,
+        log_level="INFO",
+        log_format="json",
+        access_log=True,
+        audit_log=True,
     ):
         self.allow_ips = set({"127.0.0.1"} if allow_ips is None else allow_ips)
         self.url_prefix = url_prefix
@@ -68,6 +73,11 @@ class ServerRunner:
         self.port = None
         self.bind_host = bind_host
         self.require_auth = require_auth
+        self.log_file = log_file
+        self.log_level = log_level
+        self.log_format = log_format
+        self.access_log = access_log
+        self.audit_log = audit_log
 
         self.httpd = None
         self.thread = None
@@ -92,6 +102,11 @@ class ServerRunner:
             allowed_client_ips=tuple(self.allow_ips),
             require_auth=self.require_auth,
             filter_ips=True,
+            log_file=self.log_file,
+            log_level=self.log_level,
+            log_format=self.log_format,
+            access_log=self.access_log,
+            audit_log=self.audit_log,
         )
         app = srv.AsyncGitServer(srv.AppContext(config), allowlist=self.allow_ips)
         self.app = app

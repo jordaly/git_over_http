@@ -6,8 +6,11 @@ import hashlib
 import hmac
 import io
 import json
+import logging
+import os
 import re
 import secrets
+import shutil
 import subprocess
 import tempfile
 import time
@@ -34,8 +37,45 @@ def connect():
             document TEXT NOT NULL, source BLOB NOT NULL,
             state TEXT NOT NULL DEFAULT 'queued', runner TEXT, attempt TEXT,
             heartbeat REAL, result TEXT, artifact BLOB);
+        CREATE TABLE IF NOT EXISTS ci_remote_source_cleanup (
+            path TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
     """)
+    if "source_path" not in {r[1] for r in conn.execute("PRAGMA table_info(ci_remote_jobs)")}:
+        try:
+            conn.execute("ALTER TABLE ci_remote_jobs ADD COLUMN source_path TEXT")
+        except Exception:
+            if "source_path" not in {r[1] for r in conn.execute("PRAGMA table_info(ci_remote_jobs)")}:
+                conn.close()
+                raise
     return conn
+
+
+def _queue_source_cleanup(conn, paths):
+    """Record paths in the same transaction that closes their assignments."""
+    conn.executemany("INSERT OR IGNORE INTO ci_remote_source_cleanup(path) VALUES(?)",
+                     [(str(path),) for path in set(paths) if path])
+
+
+def _delete_sources(paths):
+    """Best-effort deletion, retaining failed paths for the next claim/recovery."""
+    conn = connect()
+    try:
+        _queue_source_cleanup(conn, paths)
+        pending = [row[0] for row in conn.execute("SELECT path FROM ci_remote_source_cleanup")]
+        for path in pending:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError as exc:
+                # Windows readers/scanners can temporarily deny deletion. Do not
+                # turn a successful/cancelled run or server startup into failure.
+                logging.getLogger(__name__).warning(
+                    "Remote source cleanup deferred",
+                    extra={"event": "source_cleanup_deferred", "error_type": type(exc).__name__})
+            else:
+                conn.execute("DELETE FROM ci_remote_source_cleanup WHERE path=?", (path,))
+    finally:
+        conn.close()
 
 
 def create_token(name, repositories):
@@ -48,6 +88,13 @@ def create_token(name, repositories):
                      (hashlib.sha256(token.encode()).hexdigest(), name, json.dumps(repositories)))
     finally:
         conn.close()
+    # Runner tokens grant repository access, so issuance is always audited even
+    # when HTTP audit logging is disabled. Audit failures never block issuance.
+    try:
+        database.db_audit_append("runner_token_create", "success", actor="cli",
+                                 target=str(name), detail="repositories=" + json.dumps(repositories))
+    except Exception:
+        logging.getLogger(__name__).warning("Runner token audit write failed")
     return token
 
 
@@ -56,17 +103,20 @@ def recover_jobs():
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        paths = [r[0] for r in conn.execute("SELECT source_path FROM ci_remote_jobs")]
+        _queue_source_cleanup(conn, paths)
         conn.execute("""UPDATE ci_runs SET status='interrupted',return_code=-1,
             finished_at=datetime('now'),reason='HTTP runner coordinator restarted; no automatic replay.'
             WHERE status IN ('queued','running') AND id IN
             (SELECT run_id FROM ci_remote_jobs WHERE state IN ('queued','claimed','finished'))""")
-        conn.execute("UPDATE ci_remote_jobs SET state='closed',source=X'',artifact=NULL WHERE state!='closed'")
+        conn.execute("UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL")
         conn.commit()
+        _delete_sources(paths)
     finally:
         conn.close()
 
 
-def source_bundle(bare, commit, head, limit_mb=DEFAULT_SOURCE_LIMIT_MB, timeout=60):
+def source_bundle(bare, commit, head, limit_mb=DEFAULT_SOURCE_LIMIT_MB, timeout=60, *, destination=None):
     """Bundle only the required histories, never expose server paths/credentials."""
     maximum = source_limit_bytes(limit_mb)
     if type(timeout) is not int or timeout <= 0:
@@ -90,7 +140,22 @@ def source_bundle(bare, commit, head, limit_mb=DEFAULT_SOURCE_LIMIT_MB, timeout=
         git("--git-dir", clone, "bundle", "create", str(bundle), *refs)
         if bundle.stat().st_size > maximum:
             raise ValueError(f"Remote CI source exceeds the configured {limit_mb} MiB bundle limit.")
+        if destination is not None:
+            shutil.copyfile(bundle, destination)
+            return Path(destination)
         return bundle.read_bytes()
+
+
+def source_bundle_file(*args):
+    """Keep the source outside SQLite in an exclusively created private file."""
+    fd, name = tempfile.mkstemp(prefix="pygithost-source-", suffix=".bundle")
+    os.close(fd)
+    try:
+        source_bundle(*args, destination=name)
+        return name
+    except BaseException:
+        _delete_sources([name])
+        raise
 
 
 async def execute_remote(manager, row, config):
@@ -100,16 +165,25 @@ async def execute_remote(manager, row, config):
     execution = {k: v for k, v in config.items()
                  if not k.startswith("deploy") and k not in ("document", "pipelines")}
     execution.update(runner="docker", email_mode="off")
-    source = await asyncio.to_thread(source_bundle, manager.repo_path(owner, repo),
+    preparation = asyncio.create_task(asyncio.to_thread(source_bundle_file, manager.repo_path(owner, repo),
                                     commit, json.loads(payload).get("head_commit", ""),
                                     config.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB),
-                                    execution_limits(config.get("limits"))["source_timeout_seconds"])
+                                     execution_limits(config.get("limits"))["source_timeout_seconds"]))
+    try:
+        source = await asyncio.shield(preparation)
+    except asyncio.CancelledError:
+        # A cancelled to_thread await does not stop Git. Drain preparation before
+        # returning, otherwise shutdown can leave an untracked temporary file.
+        result = await asyncio.gather(preparation, return_exceptions=True)
+        if not isinstance(result[0], BaseException):
+            _delete_sources([result[0]])
+        raise
     document = json.dumps(dict(row=list(row), config=execution))
     def enqueue():
         conn = connect()
         try:
             # Never replace an existing attempt, including uncertain executions.
-            conn.execute("INSERT INTO ci_remote_jobs(run_id,owner,repo,document,source) VALUES(?,?,?,?,?)",
+            conn.execute("INSERT INTO ci_remote_jobs(run_id,owner,repo,document,source,source_path) VALUES(?,?,?,?,X'',?)",
                          (run_id, owner, repo, document, source))
         finally:
             conn.close()
@@ -147,11 +221,17 @@ async def execute_remote(manager, row, config):
         def close():
             conn = connect()
             try:
-                conn.execute("UPDATE ci_remote_jobs SET state='closed',source=X'',artifact=NULL WHERE run_id=?",
+                conn.execute("BEGIN IMMEDIATE")
+                _queue_source_cleanup(conn, [source])
+                conn.execute("UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL WHERE run_id=?",
                              (run_id,))
+                conn.commit()
             finally:
                 conn.close()
-        await asyncio.to_thread(close)
+        try:
+            await asyncio.to_thread(close)
+        finally:
+            _delete_sources([source])
 
 
 def operation(digest, repositories, action, document):
@@ -161,7 +241,11 @@ def operation(digest, repositories, action, document):
         conn.execute("BEGIN IMMEDIATE")
         if action == "claim":
             # Startup recovery/retention may have interrupted or removed a run.
-            conn.execute("""UPDATE ci_remote_jobs SET state='closed',source=X'',artifact=NULL
+            paths = [r[0] for r in conn.execute("""SELECT source_path FROM ci_remote_jobs
+                WHERE state IN ('queued','claimed') AND NOT EXISTS
+                (SELECT 1 FROM ci_runs r WHERE r.id=run_id AND r.status IN ('queued','running'))""")]
+            _queue_source_cleanup(conn, paths)
+            conn.execute("""UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL
                 WHERE state IN ('queued','claimed') AND NOT EXISTS
                 (SELECT 1 FROM ci_runs r WHERE r.id=run_id AND r.status IN ('queued','running'))""")
             # Repeated claim requests after a lost response return the same job.
@@ -179,11 +263,12 @@ def operation(digest, repositories, action, document):
                     row = (run_id, raw, attempt)
                     break
             conn.commit()
+            _delete_sources(paths)
             return {"job": dict(json.loads(row[1]), run_id=row[0], attempt=row[2]) if row else None}
         run_id, attempt = document.get("run_id"), document.get("attempt")
         if type(run_id) is not int or not isinstance(attempt, str):
             raise APIError(422, "validation_error", "A run_id and attempt are required.")
-        row = conn.execute("SELECT owner,repo,state,runner,attempt,source,heartbeat,document FROM ci_remote_jobs WHERE run_id=?",
+        row = conn.execute("SELECT owner,repo,state,runner,attempt,source,heartbeat,document,source_path FROM ci_remote_jobs WHERE run_id=?",
                            (run_id,)).fetchone()
         if (not row or f"{row[0]}/{row[1]}" not in repositories or row[3] != digest
                 or not hmac.compare_digest(row[4] or "", attempt)):
@@ -192,8 +277,10 @@ def operation(digest, repositories, action, document):
         limits = execution_limits(config.get("limits"))
         run = conn.execute("SELECT status FROM ci_runs WHERE id=?", (run_id,)).fetchone()
         if not run or run[0] not in ("queued", "running"):
-            conn.execute("UPDATE ci_remote_jobs SET state='closed',source=X'',artifact=NULL WHERE run_id=?", (run_id,))
+            _queue_source_cleanup(conn, [row[8]])
+            conn.execute("UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL WHERE run_id=?", (run_id,))
             conn.commit()
+            _delete_sources([row[8]])
             return {"cancel": True}
         if row[2] != "claimed" or time.time() - row[6] > LEASE:
             # A duplicate completion is acknowledged, but never applied twice.
@@ -203,11 +290,30 @@ def operation(digest, repositories, action, document):
             conn.commit()
             return {"cancel": True}
         if action == "source":
-            if len(row[5]) > source_limit_bytes(config.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB)):
-                raise APIError(413, "source_too_large", "Source exceeds this run's configured bundle limit.")
             conn.execute("UPDATE ci_remote_jobs SET heartbeat=? WHERE run_id=?", (time.time(), run_id))
             conn.commit()
-            return {"bundle": base64.b64encode(row[5]).decode()}
+            # No write lock is held while reading/encoding a potentially large file.
+            maximum = source_limit_bytes(config.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB))
+            if row[8]:
+                try:
+                    with open(row[8], "rb") as stream:
+                        if os.fstat(stream.fileno()).st_size > maximum:
+                            raise APIError(413, "source_too_large", "Source exceeds this run's configured bundle limit.")
+                        source = bytearray()
+                        while True:
+                            chunk = stream.read(min(65536, maximum + 1 - len(source)))
+                            if not chunk:
+                                break
+                            source.extend(chunk)
+                            if len(source) > maximum:
+                                raise APIError(413, "source_too_large", "Source exceeds this run's configured bundle limit.")
+                except FileNotFoundError:
+                    return {"cancel": True}
+            else:
+                source = row[5]  # Compatibility with jobs queued before migration.
+            if len(source) > maximum:
+                raise APIError(413, "source_too_large", "Source exceeds this run's configured bundle limit.")
+            return {"bundle": base64.b64encode(source).decode()}
         if action not in ("heartbeat", "complete"):
             raise APIError(404, "not_found", "Unknown runner operation.")
         values = validate_progress(document.get("progress", {}), final=action == "complete", limits=limits)

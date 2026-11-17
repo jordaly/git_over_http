@@ -190,16 +190,20 @@ Table examples are **field fragments**; use the complete examples for surroundin
 environment prevents accidental credential inheritance but does not restrict
 filesystem/process access. Host CI is trusted-code-only.
 
-**Docker** uses `/bin/sh`, overrides the image entrypoint, and mounts only the
-independent checkout—not the production repository or Docker socket. No network,
-read-only root filesystem, no capabilities or privilege escalation; limits are
+**Docker** uses `/bin/sh` and overrides the image entrypoint. By default it mounts
+the independent checkout—not the production repository or Docker socket. Defaults:
+no network, read-only root filesystem, no capabilities or privilege escalation;
 1 GiB memory, one CPU, 128 PIDs and a 256 MiB writable `/tmp`. Checkout storage has
 no disk quota. Linux uses the server user's UID/GID. This is defense in depth, not
 a complete hostile-code boundary; use a dedicated runner host for hostile code.
+Resource/path requests and worker-approved named mounts are described in
+[Docker profiles](docker-profiles.md).
 
-Jobs cannot pull missing images or install dependencies from the network. Even
-`pip install -e .` may need network for build dependencies; build the tools into
-your CI image. Docker environment values cannot contain CR/LF.
+Remote workers can download missing images on the host by default, controlled by
+worker policy `image_pull`. Local Docker jobs still require prepared local images.
+Job containers cannot install dependencies from the network under the default
+network isolation. Even `pip install -e .` may need network for build dependencies;
+build the tools into your CI image. Docker environment values cannot contain CR/LF.
 
 Each run has an independent clone, without an origin remote or shared object files.
 Jobs/deployments are sequential per repository. Pipeline order is not a dependency
@@ -486,7 +490,7 @@ exists there. No documented `PYGITHOST_HEAD_COMMIT` is provided.
 | A branch array fails | Use `["main"]`, not a scalar/newline-separated string. `[]` matches all; disable trigger to stop it. |
 | Another object's setting has no effect | Expected: configurations are independent. Put values explicitly on the affected pipeline/deployment. |
 | Step loses cd/export | Fresh shell per step; combine dependent operations. |
-| Docker cannot install/build | Prebuild dependencies/tools in the image; no job network or automatic image pull. |
+| Docker cannot install/build | Prebuild dependencies/tools in the image; containers have no network by default. Remote image downloads use the worker host and its `image_pull` policy. |
 | Another pipeline passed but merge is blocked | Each applicable pipeline needs its own exact-commit PR check, not a push/manual run. |
 | Deployment did not run | Check push/merged event, enabled block, exact branch tip, changed settings and prior attempt. |
 | Rerun uses old settings | Expected: original snapshot and SHAs. Queue a new run for new settings. |

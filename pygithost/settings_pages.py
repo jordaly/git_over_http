@@ -127,13 +127,21 @@ BASIC_GROUPS = {
     "Network": ("host", "port", "url_prefix", "realm"),
     "Storage and Git": ("git_project_root", "git_http_backend", "db_path", "trace_log", "flat_owner_ui"),
     "Security": ("require_auth", "filter_ips", "allowed_client_ips", "session_cookie_secure", "session_ttl_seconds", "static_requires_auth"),
+    "Logging": ("log_level", "log_format", "log_file", "log_max_bytes", "log_backup_count", "access_log", "audit_log"),
     "Advanced": ("session_cookie_name", "login_path", "static_url_prefix", "static_root", "static_cache_seconds", "pr_patch_max_bytes", "prism_diff_highlight_max_bytes", "max_header_bytes", "read_chunk"),
 }
 LABELS = {"host": "Bind address", "port": "HTTP port", "url_prefix": "Git URL prefix", "realm": "Authentication realm",
           "git_project_root": "Repository storage directory", "git_http_backend": "Git HTTP backend executable",
           "db_path": "Database path", "trace_log": "Git trace log (optional)", "require_auth": "Require authentication",
           "filter_ips": "Restrict client IPs", "allowed_client_ips": "Allowed IP addresses (one per line)",
-          "session_cookie_secure": "HTTPS-only session cookies", "static_requires_auth": "Require authentication for static files"}
+          "session_cookie_secure": "HTTPS-only session cookies", "static_requires_auth": "Require authentication for static files",
+          "log_level": "Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+          "log_format": "Log format (json or text)",
+          "log_file": "Log file (optional; empty logs to stderr only)",
+          "log_max_bytes": "Rotate after bytes (minimum 1024)",
+          "log_backup_count": "Rotated files to keep (0-100; 0 disables rotation)",
+          "access_log": "Write one access record per request",
+          "audit_log": "Record web security events in SQLite"}
 
 
 def basic_form(action, token, running, config_path):
@@ -183,7 +191,7 @@ def save_basic(config_path, form):
         else:
             if len(text) > 4096 or any(ord(char) < 32 for char in text):
                 raise ValueError(f"Invalid {key}.")
-            current[key] = None if key == "trace_log" and not text else text
+            current[key] = None if key in ("trace_log", "log_file") and not text else text
     for key in ("git_project_root", "git_http_backend", "db_path", "static_root", "session_cookie_name", "flat_owner_ui"):
         if not current[key]:
             raise ValueError(f"{key} cannot be empty.")

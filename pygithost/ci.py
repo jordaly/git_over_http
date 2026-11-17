@@ -451,9 +451,12 @@ def deployment_workspace():
 
 def docker_command(name, worktree, env_file, config):
     from .docker_profile import authorize
+    from .ci_limits import execution_limits
     options, secrets = authorize(config.get("docker"), config.get("_worker_policy"),
                                  timeout=config["timeout_seconds"] if "_worker_policy" in config else JOB_TIMEOUT,
-                                 repository=config.get("_repository", ""), event=config.get("_event", ""))
+                                 repository=config.get("_repository", ""), event=config.get("_event", ""),
+                                 image_pull_timeout=(execution_limits(config.get("limits"))["image_pull_timeout_seconds"]
+                                                     if "_worker_policy" in config else 600))
     command = ["docker", "run", "--name", name, "--init", "--network=" + options["network"],
                "--pull=never", "--log-driver=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                "--memory=" + (f"{options['memory_mb'] // 1024}g" if options["memory_mb"] % 1024 == 0 else f"{options['memory_mb']}m"),
@@ -1241,7 +1244,7 @@ class CIManager:
                 await process.wait()
             raise
 
-    async def _execute(self, row):
+    async def _execute(self, row, *, initial_output=b"", initial_truncated=False, started_at=None):
         run_id, owner, repo, event, branch, commit, payload_json = row
         payload = json.loads(payload_json or "{}")
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
@@ -1269,10 +1272,10 @@ class CIManager:
             database.db_ci_run_update,
             run_id,
             status="running",
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=started_at or datetime.now(timezone.utc).isoformat(),
         )
-        output = bytearray()
-        truncated = [False]
+        output = bytearray(initial_output[:maximum_output])
+        truncated = [initial_truncated or len(initial_output) > maximum_output]
         temp_root = tempfile.mkdtemp(prefix="pygithost-ci-")
         worktree = str(Path(temp_root) / "checkout")
         bare = self.repo_path(owner, repo)

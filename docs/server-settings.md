@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | **Admin → Settings → Appearance** | Display name and browser favicon | Immediately. |
 | **Admin → Settings → Basic server configuration** | Bind address/port, Git URLs/backend, repository/database/static paths, authentication, allowed IPs, cookies and request limits | Saved to the startup file; restart required. |
+| **Admin → Settings → Basic server configuration → Logging** | Log level/format, rotating file, retention bounds, access log and audit trail | Saved to the startup file; restart required. See [Logging and audit trail](logging.md). |
 | **Admin → Settings → Environment variables** | Server-wide CI variables | Future runs; repository values can override names. |
 | **Admin → Settings → Runs and artifacts** | Default artifact age/count and completed-run count | Existing stored data, immediately after acknowledgement. |
 | **Repository → CI → Settings** | Monaco pipeline JSON plus separate variable and retention controls | Future CI snapshots, except retention which applies immediately. |

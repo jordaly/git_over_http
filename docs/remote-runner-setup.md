@@ -121,17 +121,22 @@ sudo -u githost-runner docker info --format '{{.ServerVersion}}'
 Fix group membership if Docker access is denied; restart an existing worker after
 membership changes. Do not grant jobs the Docker socket.
 
-## 5. Preinstall the approved job image
+## 5. Choose and verify the approved job image
 
-For a standard-library smoke test:
+For a standard-library smoke test, optionally pre-pull the image to verify access:
 
 ```bash
 sudo docker pull python:3.14-slim
 sudo -u githost-runner docker image inspect python:3.14-slim >/dev/null
 ```
 
-For the real application, build a reviewed dependency image beforehand. Jobs use
-`--pull=never` and cannot download packages with the default network isolation.
+For the real application, build or publish a reviewed dependency image beforehand.
+With worker policy `image_pull: "missing"` (the default), the service downloads
+absent images on the Ubuntu host before execution; pre-pulling is not required.
+Use `never` for offline/cache-only workers or `always` to refresh before each job.
+Containers still use `--pull=never` and cannot download packages with the default
+network isolation. Ensure the service can reach the registry, including DNS and
+any required proxy/firewall configuration for the Docker daemon.
 Keep private-registry credentials in the administrative provisioning process,
 not a job-mounted Docker configuration.
 See [Dependency images](http-runner.md#docker-images-and-dependencies).
@@ -150,6 +155,8 @@ Create `/etc/pygithost-runner/policy.json` with `sudoedit`:
   "networks": ["none"],
   "allow_writable_root": false,
   "allow_root": false,
+  "image_pull": "missing",
+  "max_image_pull_timeout_seconds": 600,
   "secrets": {}
 }
 ```
@@ -236,6 +243,10 @@ sudo journalctl -u pygithost-runner --no-pager -n 50
 Idle workers may produce no new logs. Fix invalid policy, permission and interpreter
 errors before attempting a job. Active service status is not proof of job success.
 
+The first job may show phase `image` while the daemon downloads a missing image.
+Check its combined CI log for registry errors. The default image-provisioning
+budget is 600 seconds, independent of the command execution budget.
+
 ## 9. Validate a disposable smoke pipeline
 
 In an authorized repository's **CI → Settings → Configuration JSON**, add a smoke
@@ -290,6 +301,12 @@ for worker upgrades. Update the worker to the same tested code revision as GitHo
 it does not update itself. Stop the idle service before changing its code/policy.
 Do not reset local changes, delete receipts/SQLite files, prune Docker indiscriminately
 or remove database fixture recovery journals to force progress.
+
+GitHost keeps new source bundles in private temporary files, with paths/cleanup
+metadata in SQLite. Blocked deletions are queued persistently and retried; monitor
+`source_cleanup_deferred` warnings and free space on the **GitHost host** as well
+as the worker. Do not delete cleanup records or unrelated temporary files.
+See [Server-side source storage](http-runner.md#server-side-source-storage).
 
 For a deliberate stop: `sudo systemctl stop pygithost-runner`. Stopping an active
 job interrupts it; this is not pause/resume. For decommissioning, also disable the

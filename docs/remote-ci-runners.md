@@ -6,6 +6,11 @@ protocol, installation, restrictions and limits. The remainder of this document
 describes the broader design, including features not yet implemented, such as
 capability/label routing, long polling and chunked transfers.
 
+Image provisioning has also evolved from this proposal: the implemented worker
+can download missing registry images on its host, controlled by administrator
+policy. The pre-pull-only restrictions below describe the original design, not
+the current remote worker's default.
+
 ## Architecture
 
 ```text

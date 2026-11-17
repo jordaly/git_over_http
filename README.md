@@ -18,6 +18,8 @@ authentication, repository browsing, branches, tokens, users, and pull requests.
 - [Repository interface](#repository-interface): browsing files and managing branches.
 - [Server and repository settings](docs/server-settings.md): page controls, inheritance,
   environment variables, retention and restart-required configuration.
+- [Logging and audit trail](docs/logging.md): JSON application/access records,
+  rotating files, SQLite security events and configuration keys.
 - [Browser editing and pull requests](docs/repository-workflow.md): single-file editing,
   Web IDE, search, commit/discard, PR creation and permalinks.
 - [Continuous integration](#continuous-integration): runners, pipelines, protections,

@@ -20,7 +20,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from . import database
-from .ci import CIManager, _db_call, remove_checkout, runner_environment
+from .ci import CIManager, _db_call, remove_checkout, runner_environment, validate_config
 from .remote_ci import create_token
 from .ci_limits import (DEFAULT_SOURCE_LIMIT_MB, source_limit_bytes, source_response_bytes,
                         execution_limits, MIB)
@@ -89,6 +89,58 @@ class JobStopped(Exception):
     pass
 
 
+async def execute_with_image(manager, row, config):
+    """Provision on the worker host, never grant network/Docker access to jobs."""
+    run_id = row[0]
+    limits = execution_limits(config.get("limits"))
+    maximum = limits["log_mb"] * MIB
+    output, truncated = bytearray(), [False]
+    started = datetime.now(timezone.utc).isoformat()
+    deadline = asyncio.get_running_loop().time() + limits["image_pull_timeout_seconds"]
+
+    async def publish():
+        await _db_call(database.db_ci_run_update, run_id, output=output.decode("utf-8", "replace"),
+                       truncated=int(truncated[0]), phase="image")
+
+    await _db_call(database.db_ci_run_update, run_id, status="running", started_at=started, phase="image")
+    try:
+        mode = manager.docker_policy["image_pull"]
+        inspect_output = bytearray()
+        if mode != "always":
+            cached = await manager._capture_process(
+                ["docker", "image", "inspect", "--format={{.Id}}", config["image"]],
+                shell=False, cwd=None, env=os.environ.copy(), output=inspect_output,
+                truncated=[False], timeout=deadline - asyncio.get_running_loop().time(), max_output=maximum)
+            if cached == 0:
+                output.extend(b"Using cached Docker image.\n")
+            elif mode == "never":
+                raise ValueError("Docker image is not available locally; worker policy forbids image downloads.")
+        if mode == "always" or not output:
+            output.extend(b"Downloading Docker image on the worker host.\n"[:maximum])
+            await publish()
+            result = await manager._capture_process(
+                ["docker", "pull", "--quiet", config["image"]], shell=False, cwd=None,
+                env=os.environ.copy(), output=output, truncated=truncated, on_output=publish,
+                timeout=deadline - asyncio.get_running_loop().time(), max_output=maximum)
+            if result:
+                raise ValueError("Docker image download failed; check registry access and worker credentials.")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        reason = ("Docker image provisioning timed out." if isinstance(exc, asyncio.TimeoutError)
+                  else str(exc) if isinstance(exc, ValueError) else
+                  "Docker image provisioning failed (" + type(exc).__name__ + ").")
+        message = ("\n" + reason + "\n").encode()
+        output.extend(message[:max(0, maximum - len(output))])
+        await _db_call(database.db_ci_run_update, run_id,
+                       status="timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed",
+                       output=output.decode("utf-8", "replace"), truncated=int(truncated[0]),
+                       return_code=-1, phase="image", reason=reason,
+                       finished_at=datetime.now(timezone.utc).isoformat())
+        return
+    await manager._execute(row, initial_output=bytes(output), initial_truncated=truncated[0], started_at=started)
+
+
 async def transfer_with_heartbeats(client, identity, awaitable):
     """Source preparation/uploads must not expire the job lease while busy."""
     async def heartbeat():
@@ -128,15 +180,17 @@ async def run_job(client, job, root, worker_policy=None):
     try:
         from .docker_profile import authorize
         try:
-            configuration = job["config"]
+            configuration = validate_config(job["config"])
+            job["config"] = configuration
             row = job["row"]
             if configuration.get("runner") != "docker":
                 raise ValueError("HTTP runners only accept Docker jobs.")
             maximum_source = source_limit_bytes(configuration.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB))
             limits = execution_limits(configuration.get("limits"))
             authorize(configuration.get("docker"), worker_policy,
-                      timeout=configuration["timeout_seconds"],
-                      repository=f"{row[1]}/{row[2]}", event=row[3])
+                       timeout=configuration["timeout_seconds"],
+                       repository=f"{row[1]}/{row[2]}", event=row[3],
+                       image_pull_timeout=limits["image_pull_timeout_seconds"])
         except ValueError as exc:
             await asyncio.to_thread(client.request, "complete", dict(identity, progress={
                 "status": "failed", "return_code": -1, "phase": "runner policy",
@@ -179,10 +233,10 @@ async def run_job(client, job, root, worker_policy=None):
         monitor = subprocess.Popen([
             sys.executable, "-m", "pygithost.runner", "_watchdog",
             "--attempt", fingerprint, "--parent", str(os.getpid()),
-            "--seconds", str(config["timeout_seconds"] + 10)],
+            "--seconds", str(config["timeout_seconds"] + limits["image_pull_timeout_seconds"] + 10)],
             start_new_session=True, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        task = asyncio.create_task(manager._execute(local_row))
+        task = asyncio.create_task(execute_with_image(manager, local_row, config))
         last_contact = time.monotonic()
         while not task.done():
             try:

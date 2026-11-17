@@ -30,6 +30,7 @@ class API:
         self.handler = handler
         self.request = handler.request
         self.request_id = secrets.token_hex(16)
+        self.request.request_id = self.request_id
         self.identity = None
         self.response_headers = []
         self.response_status = 200

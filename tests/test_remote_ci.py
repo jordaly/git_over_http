@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -72,6 +73,284 @@ class RemoteProtocolTests(unittest.TestCase):
         with self.assertRaises(APIError):
             self.call("heartbeat", identity, digest="other")
         self.assertEqual(self.call("source", identity)["bundle"], base64.b64encode(b"bundle").decode())
+
+    def file_source(self, run, content=b"private bundle"):
+        path = Path(self.temp.name) / f"{run}.bundle"
+        path.write_bytes(content)
+        conn = connect()
+        try:
+            conn.execute("UPDATE ci_remote_jobs SET source=X'',source_path=? WHERE run_id=?",
+                         (str(path), run))
+        finally:
+            conn.close()
+        return path
+
+    def test_file_source_keeps_worker_protocol_and_database_small(self):
+        run = self.enqueue()
+        content = b"x" * (2 * 1024 * 1024)
+        self.file_source(run, content)
+        identity = self.claim()
+        self.assertEqual(base64.b64decode(self.call("source", identity)["bundle"]), content)
+        conn = connect()
+        try:
+            self.assertEqual(conn.execute("SELECT length(source) FROM ci_remote_jobs").fetchone()[0], 0)
+        finally:
+            conn.close()
+        self.assertLess(Path(database.DB_PATH).stat().st_size, len(content))
+
+    def test_cancelled_file_source_is_removed(self):
+        run = self.enqueue()
+        path = self.file_source(run)
+        identity = self.claim()
+        database.db_ci_run_update(run, status="interrupted")
+        self.assertTrue(self.call("source", identity)["cancel"])
+        self.assertFalse(path.exists())
+
+    def test_restart_removes_file_sources(self):
+        from pygithost.remote_ci import recover_jobs
+        run = self.enqueue()
+        path = self.file_source(run)
+        recover_jobs()
+        self.assertFalse(path.exists())
+
+    def pending_sources(self):
+        conn = connect()
+        try:
+            return [row[0] for row in conn.execute("SELECT path FROM ci_remote_source_cleanup")]
+        finally:
+            conn.close()
+
+    def test_audit_failure_does_not_hide_an_issued_runner_token(self):
+        with mock.patch.object(database, "db_audit_append", side_effect=OSError("PRIVATE_AUDIT_ERROR")):
+            with self.assertLogs("pygithost.remote_ci", level="WARNING") as logs:
+                token = create_token("audit-failure", self.repositories)
+        conn = connect()
+        try:
+            digest = conn.execute("SELECT digest FROM ci_runner_tokens WHERE name='audit-failure'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(digest, hashlib.sha256(token.encode()).hexdigest())
+        self.assertNotIn(token, "\n".join(logs.output))
+        self.assertNotIn("PRIVATE_AUDIT_ERROR", "\n".join(logs.output))
+
+    def test_restart_preserves_blocked_source_cleanup_and_retries_it(self):
+        from pygithost.remote_ci import recover_jobs
+        run = self.enqueue()
+        path = self.file_source(run)
+        with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
+            with self.assertLogs("pygithost.remote_ci", level="WARNING"):
+                recover_jobs()
+        self.assertTrue(path.exists())
+        self.assertIn(str(path), self.pending_sources())
+        self.assertEqual(database.db_ci_run_get("alice", "project", run)[4], "interrupted")
+        recover_jobs()
+        self.assertFalse(path.exists())
+        self.assertEqual(self.pending_sources(), [])
+        self.assertIsNone(self.call("claim")["job"])
+
+    def test_claim_and_cancellation_tolerate_blocked_source_cleanup(self):
+        for action in ("claim", "heartbeat"):
+            with self.subTest(action=action):
+                run = self.enqueue()
+                path = self.file_source(run)
+                identity = self.claim()
+                database.db_ci_run_update(run, status="cancelled")
+                with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
+                    with self.assertLogs("pygithost.remote_ci", level="WARNING"):
+                        result = self.call(action, identity if action != "claim" else {})
+                self.assertTrue(result["cancel"] if action == "heartbeat" else result["job"] is None)
+                self.assertTrue(path.exists())
+                self.assertIn(str(path), self.pending_sources())
+                self.assertIsNone(self.call("claim")["job"])
+                self.assertFalse(path.exists())
+                self.assertEqual(self.pending_sources(), [])
+
+    def test_one_blocked_source_does_not_prevent_other_cleanup(self):
+        from pygithost.remote_ci import recover_jobs
+        blocked = self.file_source(self.enqueue())
+        removable = self.file_source(self.enqueue())
+        unlink = Path.unlink
+        def selective_unlink(path, *args, **kwargs):
+            if path == blocked:
+                raise PermissionError("Windows sharing lock")
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, "unlink", selective_unlink):
+            with self.assertLogs("pygithost.remote_ci", level="WARNING"):
+                recover_jobs()
+        self.assertTrue(blocked.exists())
+        self.assertFalse(removable.exists())
+        self.assertEqual(self.pending_sources(), [str(blocked)])
+        self.call("claim")
+        self.assertFalse(blocked.exists())
+
+    def test_successful_run_is_not_failed_by_a_source_cleanup_lock(self):
+        from pygithost.remote_ci import execute_remote
+        run = database.db_ci_run_create("alice", "project", "push", "main", "a" * 40, "{}", "{}")
+        path = Path(self.temp.name) / "completion.bundle"
+        path.write_bytes(b"bundle")
+
+        async def check():
+            task = asyncio.create_task(execute_remote(
+                mock.Mock(), (run, "alice", "project", "push", "main", "a" * 40, "{}"), {}))
+            try:
+                deadline = asyncio.get_running_loop().time() + 5
+                job = None
+                while job is None and asyncio.get_running_loop().time() < deadline:
+                    job = self.call("claim")["job"]
+                    await asyncio.sleep(.01)
+                self.assertIsNotNone(job)
+                self.call("complete", {"run_id": run, "attempt": job["attempt"],
+                                      "progress": {"status": "success", "return_code": 0, "output": "done"}})
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        with mock.patch("pygithost.remote_ci.source_bundle_file", return_value=str(path)):
+            with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
+                with self.assertLogs("pygithost.remote_ci", level="WARNING"):
+                    asyncio.run(check())
+        self.assertEqual(database.db_ci_run_get("alice", "project", run)[4], "success")
+        self.assertIn(str(path), self.pending_sources())
+        self.call("claim")
+        self.assertFalse(path.exists())
+
+    def test_cancelled_preparation_retains_blocked_unqueued_source(self):
+        from pygithost.remote_ci import execute_remote
+        path = Path(self.temp.name) / "cancelled-preparation.bundle"
+        started, release = threading.Event(), threading.Event()
+        def prepare(*args):
+            started.set()
+            release.wait(5)
+            path.write_bytes(b"bundle")
+            return str(path)
+        async def check():
+            task = asyncio.create_task(execute_remote(
+                mock.Mock(), (1, "alice", "project", "push", "main", "a" * 40, "{}"), {}))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                task.cancel()
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        with mock.patch("pygithost.remote_ci.source_bundle_file", side_effect=prepare):
+            with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
+                with self.assertLogs("pygithost.remote_ci", level="WARNING"):
+                    asyncio.run(check())
+        self.assertTrue(path.exists())
+        self.assertIn(str(path), self.pending_sources())
+        self.call("claim")
+        self.assertFalse(path.exists())
+
+    def test_file_source_reads_chunks_not_the_configured_maximum(self):
+        run = self.enqueue()
+        self.file_source(run, b"bundle")
+        conn = connect()
+        try:
+            conn.execute("UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
+                         (json.dumps({"config": {"source_limit_mb": 1_000_000}}), run))
+        finally:
+            conn.close()
+        identity = self.claim()
+        real_open = open
+        reads = []
+        class Reader:
+            def __init__(self, stream):
+                self.stream = stream
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                self.stream.close()
+            def fileno(self):
+                return self.stream.fileno()
+            def read(self, size):
+                reads.append(size)
+                if not 0 < size <= 65536:
+                    raise AssertionError("Source read allocated the configured maximum")
+                return self.stream.read(size)
+        with mock.patch("pygithost.remote_ci.open", create=True,
+                        side_effect=lambda *args, **kwargs: Reader(real_open(*args, **kwargs))):
+            self.assertEqual(base64.b64decode(self.call("source", identity)["bundle"]), b"bundle")
+        self.assertTrue(reads)
+
+    def test_growing_source_file_cannot_bypass_the_byte_limit(self):
+        run = self.enqueue()
+        path = self.file_source(run, b"x" * (1024 * 1024))
+        conn = connect()
+        try:
+            conn.execute("UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
+                         (json.dumps({"config": {"source_limit_mb": 1}}), run))
+        finally:
+            conn.close()
+        identity = self.claim()
+        real_fstat = os.fstat
+        def grow_after_stat(fd):
+            info = real_fstat(fd)
+            with path.open("ab") as stream:
+                stream.write(b"x")
+            return info
+        with mock.patch("pygithost.remote_ci.os.fstat", side_effect=grow_after_stat):
+            with self.assertRaises(APIError) as error:
+                self.call("source", identity)
+        self.assertEqual(error.exception.status, 413)
+
+    def test_claim_removes_abandoned_file_sources(self):
+        run = self.enqueue()
+        path = self.file_source(run)
+        database.db_ci_run_update(run, status="interrupted")
+        self.assertIsNone(self.call("claim")["job"])
+        self.assertFalse(path.exists())
+
+    def test_missing_file_cancels_download(self):
+        run = self.enqueue()
+        path = self.file_source(run)
+        identity = self.claim()
+        path.unlink()
+        self.assertTrue(self.call("source", identity)["cancel"])
+
+    def test_legacy_schema_migrates_without_losing_queued_bundle(self):
+        conn = connect()
+        conn.execute("DROP TABLE ci_remote_jobs")
+        conn.execute("""CREATE TABLE ci_remote_jobs (
+            run_id INTEGER PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL,
+            document TEXT NOT NULL, source BLOB NOT NULL,
+            state TEXT NOT NULL DEFAULT 'queued', runner TEXT, attempt TEXT,
+            heartbeat REAL, result TEXT, artifact BLOB)""")
+        conn.close()
+        self.enqueue()
+        identity = self.claim()
+        self.assertEqual(base64.b64decode(self.call("source", identity)["bundle"]), b"bundle")
+
+    def test_cancel_during_preparation_deletes_unqueued_source(self):
+        from pygithost.remote_ci import execute_remote
+        path = Path(self.temp.name) / "preparing.bundle"
+        started, release = threading.Event(), threading.Event()
+
+        def prepare(*args):
+            started.set()
+            release.wait(5)
+            path.write_bytes(b"bundle")
+            return str(path)
+
+        async def check():
+            manager = mock.Mock()
+            task = asyncio.create_task(execute_remote(
+                manager, (1, "alice", "project", "push", "main", "a" * 40, "{}"), {}))
+            await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(path.exists())
+
+        with mock.patch("pygithost.remote_ci.source_bundle_file", side_effect=prepare):
+            asyncio.run(check())
 
     def test_heartbeat_completion_and_duplicate_completion(self):
         run = self.enqueue()
@@ -175,6 +454,14 @@ class RemoteProtocolTests(unittest.TestCase):
         git("-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.com",
             "commit", "--allow-empty", "-m", "head")
         head = git("-C", repo, "rev-parse", "HEAD")
+        from pygithost.remote_ci import source_bundle_file
+        private = Path(source_bundle_file(repo, commit, head))
+        self.addCleanup(private.unlink, missing_ok=True)
+        if os.name != "nt":
+            self.assertEqual(private.stat().st_mode & 0o777, 0o600)
+        private_clone = root / "private-clone"
+        git("clone", "--bare", private, private_clone)
+        self.assertEqual(git("--git-dir", private_clone, "rev-parse", "ci-head"), head)
         bundle = root / "test.bundle"
         bundle.write_bytes(source_bundle(repo, commit, head))
         clone = root / "clone"
@@ -233,6 +520,14 @@ class RunnerHTTPTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertNotIn("PRIVATE_DEPLOYMENT", json.dumps(job))
         self.assertEqual(job["config"]["runner"], "docker")
+        conn = connect()
+        try:
+            stored, path = conn.execute(
+                "SELECT length(source),source_path FROM ci_remote_jobs WHERE run_id=?", (run,)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(stored, 0)
+        self.assertTrue(Path(path).is_file())
         identity = {"run_id": run, "attempt": job["attempt"]}
         source = client.request("source", identity)
         self.assertTrue(base64.b64decode(source["bundle"]).startswith(b"# v"))
@@ -244,6 +539,7 @@ class RunnerHTTPTests(unittest.TestCase):
                       artifact=base64.b64encode(buffer.getvalue()).decode())
         self.assertTrue(client.request("complete", result)["accepted"])
         task.result(timeout=10)
+        self.assertFalse(Path(path).exists())
         run_row = database.db_ci_run_get("alice", "project", run)
         self.assertEqual(run_row[4:6], ("success", "passed"))
         self.assertEqual(database.db_ci_artifact_get("alice", "project", run, content=True), buffer.getvalue())
@@ -265,6 +561,11 @@ class RunnerHTTPTests(unittest.TestCase):
             job = client.request("claim", {})["job"]
             time.sleep(0.02)
         self.assertIsNotNone(job)
+        conn = connect()
+        try:
+            path = conn.execute("SELECT source_path FROM ci_remote_jobs WHERE run_id=?", (run,)).fetchone()[0]
+        finally:
+            conn.close()
         task.cancel()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -273,6 +574,10 @@ class RunnerHTTPTests(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertTrue(response["cancel"])
+        deadline = time.monotonic() + 5
+        while Path(path).exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(Path(path).exists())
 
     @unittest.skipUnless(os.name == "posix" and os.getuid() != 0, "worker requires unprivileged Linux")
     def test_worker_process_checkout_steps_logs_and_artifacts_over_http(self):
@@ -286,6 +591,11 @@ class RunnerHTTPTests(unittest.TestCase):
         docker.write_text(f"""#!{sys.executable}
 import os, subprocess, sys
 args = sys.argv[1:]
+if args[:2] == ['image', 'inspect']:
+    raise SystemExit(1)
+if args[0] == 'pull':
+    print('Simulated registry download')
+    raise SystemExit(0)
 if args[0] == 'run':
     mount = args[args.index('--mount') + 1]
     worktree = mount.split('src=', 1)[1].split(',dst=', 1)[0]
@@ -326,6 +636,7 @@ if args[0] == 'run':
         row = database.db_ci_run_get("alice", "project", run)
         self.assertEqual(row[4], "success", row[5])
         self.assertIn("API fixture", row[5])
+        self.assertIn("Simulated registry download", row[5])
         steps = json.loads(database.db_ci_steps_get(run))
         self.assertEqual([step["status"] for step in steps], ["success", "success"])
         artifact = database.db_ci_artifact_get("alice", "project", run, content=True)

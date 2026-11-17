@@ -3,8 +3,10 @@
 [Back to README](../README.md)
 
 This guide starts a local instance before exposing it to other machines. PyGitHost
-uses Python's standard library; Git must be installed separately. CI Docker runners
-also require a local Linux Docker daemon and a prepared image.
+uses Python's standard library; Git must be installed separately. Local Docker CI
+requires a local Linux Docker daemon and prepared image. Remote Docker CI uses a
+separate Linux worker, which can download missing registry images on its host
+according to administrator policy. See [Remote runner setup](remote-runner-setup.md).
 
 ## 1. Check prerequisites
 
@@ -77,6 +79,9 @@ use HTTPS and secure cookies for remote access.
 | `session_cookie_secure` | Set to `true` when serving the browser interface through HTTPS. Secure cookies are not suitable for ordinary local HTTP. |
 | `static_root` | Directory containing this checkout's `static/` assets. Review it if moving the checkout or configuration. |
 | `trace_log` | Optional Git backend trace destination; restrict access to diagnostic logs. |
+| `log_level`, `log_format`, `log_file` | Application/access logging: level, `json` or `text`, and rotating file. Empty `log_file` logs to stderr only. See [Logging](logging.md). |
+| `log_max_bytes`, `log_backup_count` | Rotation threshold and number of retained files. |
+| `access_log`, `audit_log` | Enable per-request access records and SQLite security events. |
 
 Use JSON booleans (`true` / `false`), not quoted strings. Prefer absolute paths
 for storage and executables so service startup does not depend on its working

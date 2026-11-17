@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 from contextvars import ContextVar
 import ipaddress
+import logging
 import mimetypes
 import os
 import platform
@@ -16,6 +17,7 @@ import sqlite3
 import sys
 import signal
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import formatdate
@@ -25,6 +27,8 @@ from urllib.parse import parse_qs, unquote, urlparse, urlencode
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 from .config import AppConfig
 from .context import AppContext
+from .logging_setup import access as log_access
+from .logging_setup import configure_logging, safe_target
 from .ci import CIManager, default_config as ci_default_config, protected_branch
 from .ci_protection import prepare_hooks
 from .ci_documentation import ci_configuration_guide
@@ -107,7 +111,10 @@ from .database import (
     db_verify_session,
     db_verify_token,
     db_verify_token_any_user,
+    db_audit_append,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _display_name = ContextVar("display_name", default="pygithost")
@@ -363,6 +370,13 @@ CONFIG_GLOBAL_MAP = {
     "static_root": "STATIC_ROOT",
     "static_cache_seconds": "STATIC_CACHE_SECONDS",
     "static_requires_auth": "STATIC_REQUIRES_AUTH",
+    "log_level": "LOG_LEVEL",
+    "log_format": "LOG_FORMAT",
+    "log_file": "LOG_FILE",
+    "log_max_bytes": "LOG_MAX_BYTES",
+    "log_backup_count": "LOG_BACKUP_COUNT",
+    "access_log": "ACCESS_LOG",
+    "audit_log": "AUDIT_LOG",
 }
 
 
@@ -1310,6 +1324,9 @@ class Request:
     remote_user_id: int | None = None
     remote_is_admin: bool = False
     remote_scopes: set[str] = field(default_factory=set)
+    status: int | None = None
+    response_size: int | None = None
+    request_id: str | None = None
 
 
 class BadRequest(Exception):
@@ -1366,6 +1383,8 @@ async def _read_http_request(reader: asyncio.StreamReader, writer: asyncio.Strea
 
 
 async def _send_response(req: Request, status: int, body: bytes = b"", headers: list[tuple[str, str]] | None = None, reason: str | None = None, include_body: bool = True) -> None:
+    req.status = status
+    req.response_size = len(body)
     reason = reason or _STATUS_REASONS.get(status, "OK")
     headers = headers or []
     has_length = any(k.lower() == "content-length" for k, _ in headers)
@@ -1676,6 +1695,31 @@ class GitHTTPHandler:
         self.request.remote_is_admin = self.remote_is_admin
         self.request.remote_scopes = self.remote_scopes
 
+    async def _audit(self, action: str, outcome: str = "success", *, target: str | None = None,
+                     detail: str | None = None, actor: str | None = None,
+                     actor_user_id: int | None = None) -> None:
+        """Append a security event without letting audit failures break requests."""
+        if not self.server.audit_log:
+            return
+        try:
+            await asyncio.to_thread(
+                db_audit_append,
+                action,
+                outcome,
+                actor=self.remote_user if actor is None else actor,
+                actor_user_id=self.remote_user_id if actor_user_id is None else actor_user_id,
+                target=target,
+                detail=detail,
+                ip=self._client_ip(),
+                user_agent=self.headers.get("User-Agent") or "",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Audit write failed",
+                extra={"event": "audit_failure", "action": action,
+                       "error_type": type(exc).__name__},
+            )
+
     async def _require_session_auth(self) -> bool:
         if not REQUIRE_AUTH:
             return True
@@ -1733,10 +1777,14 @@ class GitHTTPHandler:
         next_url = _safe_next_url(form.get("next") or "/")
 
         if not _safe_seg(username):
+            await self._audit("login", "failure", actor=username or None, target="web",
+                              detail="invalid_username")
             return await self._ui_login("Invalid username or password.", "warn")
 
         info = await asyncio.to_thread(db_verify_password, username, password)
         if not info:
+            await self._audit("login", "failure", actor=username, target="web",
+                              detail="invalid_credentials")
             return await self._ui_login("Invalid username or password.", "warn")
 
         session_token = await asyncio.to_thread(
@@ -1746,6 +1794,7 @@ class GitHTTPHandler:
             self.headers.get("User-Agent") or "",
         )
         self._apply_auth_info(info)
+        await self._audit("login", "success", target="web")
         await _send_redirect(
             self.request,
             next_url,
@@ -1754,6 +1803,7 @@ class GitHTTPHandler:
 
     async def _ui_logout(self):
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
+        await self._audit("logout", "success", target="web")
         await asyncio.to_thread(db_revoke_session, cookies.get(SESSION_COOKIE_NAME))
         await _send_redirect(
             self.request,
@@ -2016,9 +2066,12 @@ class GitHTTPHandler:
         try:
             token = await asyncio.to_thread(db_create_token, int(self.remote_user_id or 0), name, scopes, expires_at)
         except ValueError as e:
+            await self._audit("token_create", "failure", target=name, detail=str(e))
             return await self._ui_tokens(str(e), "warn")
         except Exception as e:
+            await self._audit("token_create", "failure", target=name, detail=type(e).__name__)
             return await self._ui_tokens(str_t(t"Failed to create token: {e}"), "warn")
+        await self._audit("token_create", "success", target=name, detail=f"scopes={scopes}")
         return await self._ui_tokens("Token created.", "ok", token)
 
     async def _ui_revoke_token(self):
@@ -2030,7 +2083,9 @@ class GitHTTPHandler:
 
         ok = await asyncio.to_thread(db_revoke_token, int(self.remote_user_id or 0), token_id)
         if not ok:
+            await self._audit("token_revoke", "failure", target=str(token_id), detail="not_found")
             return await self._ui_tokens("Token was not found or was already revoked.", "warn")
+        await self._audit("token_revoke", "success", target=str(token_id))
         return await self._ui_tokens("Token revoked.", "ok")
 
     async def _ui_create_repo(self):
@@ -2122,8 +2177,12 @@ class GitHTTPHandler:
                     message = "Settings saved."
                 else:
                     raise ValueError("Unknown settings action.")
+                await self._audit("settings_save", "success", target=action,
+                                  detail=f"fields={len(form)}")
                 notice = safe_html(html_t(t'<p class="ok" role="status">{message}</p>'))
             except (ValueError, OSError) as exc:
+                await self._audit("settings_save", "failure", target=action,
+                                  detail=type(exc).__name__)
                 notice = safe_html(html_t(t'<p class="warn" role="alert">{str(exc)}</p>'))
                 submitted_preferences = form if action.startswith("ci_") else None
         global_values, _repo = await _call_in_thread(db_ci_preferences_get)
@@ -2288,9 +2347,12 @@ class GitHTTPHandler:
         try:
             await asyncio.to_thread(db_create_user, username, password, is_admin)
         except sqlite3.IntegrityError:
+            await self._audit("user_create", "failure", target=username, detail="already_exists")
             return await self._ui_admin_users("User already exists.", "warn")
         except Exception as e:
+            await self._audit("user_create", "failure", target=username, detail=type(e).__name__)
             return await self._ui_admin_users(str_t(t"Failed to create user: {e}"), "warn")
+        await self._audit("user_create", "success", target=username, detail=f"admin={bool(is_admin)}")
         return await self._ui_admin_users(str_t(t"User created: {username}"), "ok")
 
     async def _ui_admin_users_reset(self):
@@ -2310,7 +2372,9 @@ class GitHTTPHandler:
         try:
             await asyncio.to_thread(db_reset_password, user_id, new_password)
         except Exception as e:
+            await self._audit("user_password_reset", "failure", target=u[1], detail=type(e).__name__)
             return await self._ui_admin_users(str_t(t"Failed to reset password: {e}"), "warn")
+        await self._audit("user_password_reset", "success", target=u[1])
         return await self._ui_admin_users(str_t(t"Password updated for: {u[1]}"), "ok")
 
     async def _ui_admin_users_toggle(self):
@@ -2330,8 +2394,10 @@ class GitHTTPHandler:
         try:
             await asyncio.to_thread(db_set_user_active, user_id, make_active)
         except Exception as e:
+            await self._audit("user_status", "failure", target=u[1], detail=type(e).__name__)
             return await self._ui_admin_users(str_t(t"Failed to update user: {e}"), "warn")
         status = "active" if make_active else "disabled"
+        await self._audit("user_status", "success", target=u[1], detail=status)
         return await self._ui_admin_users(str_t(t"User '{u[1]}' is now {status}."), "ok")
 
     # ========================================================
@@ -5293,6 +5359,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             if not has_conn:
                 response_lines.append("Connection: close\r\n")
             response_lines.append("\r\n")
+            self.request.status = status_code
+            self.request.response_size = 0
             connected = await self._write_git_response("".join(response_lines).encode("iso-8859-1", "replace"))
 
             while True:
@@ -5304,6 +5372,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                     break
                 if connected:
                     connected = await self._write_git_response(chunk)
+                    if connected:
+                        self.request.response_size += len(chunk)
 
             if body_task is not None:
                 await body_task
@@ -5712,6 +5782,16 @@ class AsyncGitServer:
         self._display_name = None
         self._display_name_lock = asyncio.Lock()
         self.config_path = Path(config_path).resolve() if config_path is not None else None
+        server_config = self.context.config
+        self.log_file = configure_logging(
+            level=server_config.log_level,
+            log_file=server_config.log_file,
+            max_bytes=server_config.log_max_bytes,
+            backup_count=server_config.log_backup_count,
+            log_format=server_config.log_format,
+        )
+        self.access_log = bool(server_config.access_log)
+        self.audit_log = bool(server_config.audit_log)
         self.settings_lock = asyncio.Lock()
         self.settings_csrf_secret = secrets.token_bytes(32)
         from .api.policy import RateLimiter
@@ -5777,6 +5857,10 @@ class AsyncGitServer:
         await self.ci_manager.stop()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        started = time.monotonic()
+        req = None
+        peer = writer.get_extra_info("peername")
+        ip = peer[0] if peer else ""
         try:
             req = await _read_http_request(reader, writer)
             handler = GitHTTPHandler(req, self)
@@ -5786,19 +5870,45 @@ class AsyncGitServer:
             # or disconnected while we were sending a response. Ignore it quietly.
             pass
         except BadRequest as e:
-            peer = writer.get_extra_info("peername")
-            ip = peer[0] if peer else ""
             dummy_req = Request("GET", "/", "HTTP/1.1", Headers([]), BodyReader(reader), writer, ip)
+            req = req or dummy_req
             with contextlib.suppress(ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError):
                 await _send_text(dummy_req, 400, str_t(t"400 Bad Request: {e}\n"))
+            req.status = dummy_req.status
         except Exception as e:
-            peer = writer.get_extra_info("peername")
-            ip = peer[0] if peer else ""
             dummy_req = Request("GET", "/", "HTTP/1.1", Headers([]), BodyReader(reader), writer, ip)
+            req = req or dummy_req
             with contextlib.suppress(ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError):
                 await _send_text(dummy_req, 500, str_t(t"500 Internal Server Error: {e}\n"))
-            print(str_t(t"[ERROR] {type(e).__name__}: {e}"), file=sys.stderr)
+            req.status = dummy_req.status
+            # Never log exception text here: it can include request data.  The
+            # type plus the access record is enough to locate the request.
+            logger.error(
+                "Unhandled request failure",
+                extra={
+                    "event": "request_failure",
+                    "error_type": type(e).__name__,
+                    "method": req.method,
+                    "path": safe_target(req.target),
+                    "ip": ip,
+                    "request_id": req.request_id,
+                },
+            )
+            logger.debug("Unhandled request traceback", exc_info=True)
         finally:
+            if self.access_log:
+                log_access(
+                    method=req.method if req else "?",
+                    target=req.target if req else "/",
+                    status=req.status if req else None,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    ip=ip,
+                    user=req.remote_user if req else None,
+                    size=req.response_size if req else None,
+                    protocol=req.version if req else "HTTP/1.1",
+                    request_id=req.request_id if req else None,
+                    level=logging.DEBUG if (req is not None and req.status is None) else None,
+                )
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
@@ -5826,7 +5936,12 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     os.environ["GIT_PROJECT_ROOT"] = GIT_PROJECT_ROOT
     os.environ["GIT_HTTP_EXPORT_ALL"] = "1"
 
-    app = AsyncGitServer(AppContext(config), config_path=config_path)
+    try:
+        app = AsyncGitServer(AppContext(config), config_path=config_path)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: could not configure logging: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     server = None
     try:
         await app.ci_manager.start()
@@ -5850,12 +5965,31 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     print("Tokens page: /tokens")
     print("Pull requests: /r/<owner>/<repo>/pulls (ff-only merge)")
     print("=" * 60)
+    logger.info(
+        "Server started",
+        extra={
+            "event": "server_start",
+            "port": PORT,
+            "platform": CURRENT_PLATFORM,
+            "path": URL_PREFIX,
+            "delivery": app.log_file or "stderr",
+        },
+    )
 
     try:
         async with server:
             await server.serve_forever()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Server stopped unexpectedly",
+            extra={"event": "server_error", "error_type": type(exc).__name__},
+        )
+        raise
     finally:
         await app.shutdown()
+        logger.info("Server stopped", extra={"event": "server_stop", "port": PORT})
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

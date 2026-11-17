@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
 
+from .logging_setup import LOG_FORMATS, LOG_LEVELS
+
 
 CONFIG_SCHEMA_VERSION = 1
 DEFAULT_CONFIG_FILENAME = "pygithost.config.json"
@@ -28,6 +30,7 @@ def _platform_paths(target: str) -> dict[str, object]:
             "git_http_backend": r"C:\Program Files\Git\mingw64\libexec\git-core\git-http-backend.exe",
             "trace_log": r"C:\temp\git-http-backend.log",
             "db_path": r"C:\temp\pygithost.db",
+            "log_file": r"C:\temp\pygithost.log",
         }
     if target == "Linux":
         return {
@@ -35,6 +38,7 @@ def _platform_paths(target: str) -> dict[str, object]:
             "git_http_backend": "/usr/lib/git-core/git-http-backend",
             "trace_log": None,
             "db_path": str(Path.home() / ".local/share/pygithost/pygithost.db"),
+            "log_file": str(Path.home() / ".local/share/pygithost/pygithost.log"),
         }
     if target == "Darwin":
         return {
@@ -42,6 +46,7 @@ def _platform_paths(target: str) -> dict[str, object]:
             "git_http_backend": "/opt/homebrew/opt/git/libexec/git-core/git-http-backend",
             "trace_log": "/tmp/git-http-backend.log",
             "db_path": str(Path.home() / ".local/share/pygithost/pygithost.db"),
+            "log_file": str(Path.home() / ".local/share/pygithost/pygithost.log"),
         }
     raise NotImplementedError(target)
 
@@ -74,6 +79,13 @@ class AppConfig:
     static_root: str
     static_cache_seconds: int
     static_requires_auth: bool
+    log_level: str
+    log_format: str
+    log_file: str | None
+    log_max_bytes: int
+    log_backup_count: int
+    access_log: bool
+    audit_log: bool
 
     @classmethod
     def default_for_platform(cls, target: str | None = None) -> AppConfig:
@@ -111,6 +123,12 @@ class AppConfig:
             static_root=_static_root(),
             static_cache_seconds=60 * 60,
             static_requires_auth=False,
+            log_level="INFO",
+            log_format="json",
+            log_max_bytes=10 * 1024 * 1024,
+            log_backup_count=5,
+            access_log=True,
+            audit_log=True,
         )
 
     @classmethod
@@ -140,6 +158,8 @@ class AppConfig:
             "read_chunk",
             "session_ttl_seconds",
             "static_cache_seconds",
+            "log_max_bytes",
+            "log_backup_count",
         ):
             values[key] = int(values[key])
         for key in (
@@ -147,8 +167,25 @@ class AppConfig:
             "filter_ips",
             "session_cookie_secure",
             "static_requires_auth",
+            "access_log",
+            "audit_log",
         ):
             values[key] = bool(values[key])
+
+        values["log_level"] = str(values["log_level"]).strip().upper()
+        values["log_format"] = str(values["log_format"]).strip().lower()
+        if values["log_level"] not in LOG_LEVELS:
+            raise ValueError(f"log_level must be one of {', '.join(LOG_LEVELS)}")
+        if values["log_format"] not in LOG_FORMATS:
+            raise ValueError(f"log_format must be one of {', '.join(LOG_FORMATS)}")
+        if not 1024 <= values["log_max_bytes"] <= 2**31:
+            raise ValueError("log_max_bytes must be between 1024 and 2147483648")
+        if not 0 <= values["log_backup_count"] <= 100:
+            raise ValueError("log_backup_count must be between 0 and 100")
+        if values["log_file"] is not None:
+            values["log_file"] = str(values["log_file"]).strip() or None
+            if values["log_file"] is not None and len(values["log_file"]) > 4096:
+                raise ValueError("log_file path is too long")
 
         if not 0 <= values["port"] <= 65535:
             raise ValueError("port must be between 0 and 65535")

@@ -57,6 +57,7 @@ see [Docker profiles](docker-profiles.md).
 | `limits.artifact_files` | **1000** | Artifact file count; glob traversal budget scales to at least ten times this count, with a 10,000-entry minimum. |
 | `limits.source_timeout_seconds` | **60 s** | Total GitHost source-bundle preparation budget and the worker's bundle-clone timeout. |
 | `limits.transfer_timeout_seconds` | **60 s** | Worker source/log/completion HTTP operations, server upload processing and CI artifact download transfer timeout. Socket timeouts are not guaranteed total wall-clock deadlines. |
+| `limits.image_pull_timeout_seconds` | **600 s** | Remote image inspection/download budget before execution, bounded by worker policy `max_image_pull_timeout_seconds`. |
 | `timeout_seconds` | **1800 s** | Existing execution budget for checkout, merge and steps. The worker's administrator-owned timeout ceiling still applies. |
 
 `source_limit_mb` and source preparation are remote-runner features. Log and
@@ -90,16 +91,26 @@ changed by a CI pipeline setting.
 ## Capacity warning
 
 These are **limits, not preallocated capacity**. Raising them does not add RAM,
-disk, bandwidth or CPU. Git bundles, base64 JSON, uploaded artifacts and logs are
-still buffered/stored in memory and SQLite; peak memory can be several times the
-payload size. Use conservative measured values on both GitHost and the worker.
+disk, bandwidth or CPU. New remote source bundles are kept in private temporary
+files; SQLite stores their paths and cleanup metadata, not their contents.
+Legacy source BLOBs remain compatible. Logs and artifacts still live in SQLite.
+Source files are read in bounded chunks, not by reserving the configured ceiling,
+but the complete bundle and base64 JSON response are still assembled in memory.
+Peak memory can be several times the actual payload size. Use conservative
+measured values on both GitHost and the worker.
 Very large jobs may require a future streamed/object-storage transport rather
 than simply increasing the values. OS/filesystem, database and proxy limits still
 apply even though the configuration schema has no fixed upper size ceiling.
 
+Failed file deletions are retained in the persistent `ci_remote_source_cleanup`
+queue and retried during subsequent claims or startup recovery. A Windows sharing
+lock does not turn a successful/cancelled run into a failure or prevent startup.
+Monitor deferred-cleanup warnings and temporary disk usage; do not clear the queue
+or remove unrelated temporary files to force progress.
+
 Shared infrastructure/security rules remain administrator-controlled: one job per
 worker token, scheduler concurrency, API rate/download permits, step-count and
-configuration-document bounds, heartbeat/lease rules, image provisioning and
+configuration-document bounds, heartbeat/lease rules, image download mode and
 Docker policy permissions. A pipeline cannot request arbitrary host paths,
 privileged containers, Docker socket access or automatic replay of uncertain work.
 

@@ -5,6 +5,7 @@ MIB = 1024 * 1024
 LIMIT_DEFAULTS = {
     "log_mb": 1, "artifact_mb": 16, "artifact_uncompressed_mb": 20,
     "artifact_files": 1000, "source_timeout_seconds": 60, "transfer_timeout_seconds": 60,
+    "image_pull_timeout_seconds": 600,
 }
 
 

@@ -19,6 +19,7 @@ POLICY_DEFAULTS = {
     "max_tmpfs_mb": 256, "max_timeout_seconds": 1800,
     "networks": ["none"], "allow_writable_root": False, "allow_root": False,
     "secrets": {},
+    "image_pull": "missing", "max_image_pull_timeout_seconds": 600,
 }
 
 
@@ -93,13 +94,16 @@ def policy(raw=None):
         raise ValueError("Unknown worker Docker policy fields.")
     result = {**copy.deepcopy(POLICY_DEFAULTS), **copy.deepcopy(raw)}
     for key, high in (("max_memory_mb", 131072), ("max_pids_limit", 32768),
-                      ("max_tmpfs_mb", 131072), ("max_timeout_seconds", 86400)):
+                      ("max_tmpfs_mb", 131072), ("max_timeout_seconds", 86400),
+                      ("max_image_pull_timeout_seconds", 86400)):
         number(result[key], 1, high, key)
     number(result["max_cpus"], .1, 64, "max_cpus", False)
     for key in ("allow_root", "allow_writable_root"):
         if type(result[key]) is not bool:
             raise ValueError("Worker permissions must be boolean.")
     networks = result["networks"]
+    if result["image_pull"] not in ("never", "missing", "always"):
+        raise ValueError("Worker image_pull must be never, missing or always.")
     if (not isinstance(networks, list) or not networks or len(networks) > 32
             or any(not isinstance(n, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", n)
                    or n in ("host", "container") for n in networks)):
@@ -119,7 +123,8 @@ def policy(raw=None):
     return result
 
 
-def authorize(request, worker_policy=None, *, timeout=1800, repository="", event=""):
+def authorize(request, worker_policy=None, *, timeout=1800, repository="", event="",
+              image_pull_timeout=600):
     request, limits = profile(request), policy(worker_policy)
     for key in ("cpus", "memory_mb", "pids_limit"):
         if request[key] > limits["max_" + key]:
@@ -128,6 +133,8 @@ def authorize(request, worker_policy=None, *, timeout=1800, repository="", event
         raise ValueError("Docker tmpfs request exceeds worker policy.")
     if timeout > limits["max_timeout_seconds"]:
         raise ValueError("CI timeout exceeds worker policy.")
+    if image_pull_timeout > limits["max_image_pull_timeout_seconds"]:
+        raise ValueError("Image pull timeout exceeds worker policy.")
     if request["network"] not in limits["networks"]:
         raise ValueError("Docker network is not permitted by worker policy.")
     if not request["read_only"] and not limits["allow_writable_root"]:

@@ -57,7 +57,8 @@ class DockerProfileTests(unittest.TestCase):
     def test_invalid_types_paths_and_docker_escape_hatches(self):
         for request in (
             {"cpus": True}, {"cpus": float("nan")}, {"memory_mb": 0}, {"pids_limit": -1},
-            {"privileged": True}, {"network": "host"}, {"network": "container:abc"},
+            {"privileged": True}, {"image_pull": "always"},
+            {"network": "host"}, {"network": "container:abc"},
             {"user": "1000:1000"}, {"read_only": "false"},
             {"checkout_path": "/tmp/source"}, {"checkout_path": "/"},
             {"checkout_path": "/source,readonly"}, {"workdir": "/source/../etc"},

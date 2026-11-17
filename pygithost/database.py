@@ -33,6 +33,14 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
+_SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_seg(value: str) -> bool:
+    """Match the server's username rules without importing the application."""
+    return bool(value) and _SAFE_SEGMENT.match(value) is not None and ".." not in value
+
+
 def _db_connect() -> sqlite3.Connection:
     _ensure_dir(DB_PATH)
     conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
@@ -176,6 +184,24 @@ def _db_init() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_hash ON sessions(session_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at, revoked_at)")
         conn.execute("DELETE FROM sessions WHERE expires_at <= datetime('now', 'localtime')")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                actor TEXT,
+                actor_user_id INTEGER,
+                action TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                target TEXT,
+                detail TEXT,
+                ip TEXT,
+                user_agent TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_events(action, created_at)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS pull_requests (
@@ -687,6 +713,53 @@ def db_revoke_token(user_id: int, token_id: int) -> bool:
         return cur.rowcount > 0
     finally:
         conn.close()
+
+
+def db_audit_append(action: str, outcome: str = "success", *, actor: str | None = None,
+                    actor_user_id: int | None = None, target: str | None = None,
+                    detail: str | None = None, ip: str | None = None,
+                    user_agent: str | None = None) -> None:
+    """Persist one security-relevant event. Never accepts passwords or tokens."""
+    def clip(value, limit):
+        if value is None:
+            return None
+        text = str(value).replace("\x00", "")
+        return text[:limit]
+
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """INSERT INTO audit_events(actor,actor_user_id,action,outcome,target,detail,ip,user_agent)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (clip(actor, 256), actor_user_id, clip(action, 64), clip(outcome, 32),
+             clip(target, 512), clip(detail, 1000), clip(ip, 64), clip(user_agent, 512)),
+        )
+    finally:
+        conn.close()
+
+
+def db_audit_list(limit: int = 100, action: str | None = None) -> list[dict[str, object]]:
+    """Return the most recent audit events, newest first (tests and admin tools)."""
+    limit = max(1, min(int(limit), 1000))
+    conn = _db_connect()
+    try:
+        if action:
+            rows = conn.execute(
+                """SELECT id,created_at,actor,actor_user_id,action,outcome,target,detail,ip,user_agent
+                   FROM audit_events WHERE action=? ORDER BY id DESC LIMIT ?""",
+                (action, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id,created_at,actor,actor_user_id,action,outcome,target,detail,ip,user_agent
+                   FROM audit_events ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    finally:
+        conn.close()
+    keys = ("id", "created_at", "actor", "actor_user_id", "action", "outcome",
+            "target", "detail", "ip", "user_agent")
+    return [dict(zip(keys, row, strict=True)) for row in rows]
 
 
 def _token_info_from_row(row):

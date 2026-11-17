@@ -125,7 +125,9 @@ substitute. Omitted PR events default to opened, updated and reopened.
 }
 ```
 
-Pre-pull/build the image and include dependencies: Docker jobs have no network.
+Build/publish the image with dependencies included: Docker jobs have no network
+by default. Remote workers download missing registry images according to worker
+policy; local Docker jobs need the image preinstalled.
 For 30-day artifacts, at most 50 bundles and 100 completed runs, enter those values
 in **CI → Settings → Runs and artifacts**, acknowledge cleanup and save.
 Install trusted executable deployment scripts outside repositories before enabling

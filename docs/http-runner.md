@@ -50,7 +50,7 @@ artifact transfer back to Windows. Existing application pipelines were not chang
    desired repository list; see [Change authorized repositories](#change-authorized-repositories).
 4. Open the repository's **CI → Settings → Configuration JSON**. In the chosen
    pipeline's `execution`, set `runner` to `remote-docker` and `image` to the
-   locally prepared image name. Preserve its other triggers, steps and policies;
+   prepared local or registry image name. Preserve its other triggers, steps and policies;
    do not replace a working configuration with the minimal example below.
 5. Save, then use the repository's **CI** manual-run action if enabled, or push a
    real update if its push trigger is enabled.
@@ -229,8 +229,14 @@ exists, inspect it rather than cloning over it or discarding changes.
 The account needs Docker daemon access. The `docker` group effectively grants root
 access: use a dedicated VM, not a shared host for hostile code.
 
-Pre-pull images (`sudo docker pull python:3.14-slim`). Jobs use `--pull=never` and the
-existing hardened executor: no network, read-only root, writable checkout/tmp,
+The remote worker defaults to **pull if missing**: it checks the local cache and
+downloads a missing image on the Ubuntu host before executing the job. Existing
+images are reused. Administrators can set worker-policy `image_pull` to `never`
+(offline/cache-only) or `always` (refresh before each job). Pre-pulling remains
+optional: `sudo docker pull python:3.14-slim`.
+
+Containers themselves still use `--pull=never` and the existing hardened executor:
+no network by default, read-only root, writable checkout/tmp,
 dropped capabilities, no Docker socket, CPU/memory/process limits. Each step uses
 a fresh container; files persist in the shared checkout, not installed packages
 or shell state. Dependencies must already be in the image.
@@ -348,7 +354,7 @@ its token or preinstall an image.
 | HTTP 403 | GitHost client IP allowlist. On this VM use `192.168.250.1:8000`, not the Windows LAN address. |
 | HTTP 401 | Wrong/revoked token; personal API tokens are not runner tokens. Check file ownership and permissions without printing it. |
 | Docker permission denied | `githost-runner` needs Docker access; restart the worker after group-membership changes. |
-| Image missing | Pre-pull/build the exact configured image on Ubuntu; jobs never pull images automatically. |
+| Image unavailable / phase `image` fails | With `image_pull=missing` (default), the worker host downloads it. Check host internet/DNS, registry permissions, image name and pull timeout. With `never`, pre-pull/build it or change the worker policy. |
 | Package downloads fail | Expected: containers have no network. Install dependencies in the image beforehand. |
 | PowerShell/Windows command not found | Convert only Linux-compatible checks to `/bin/sh`; keep Windows-specific jobs local. |
 | Job interrupted after disconnect | Inspect real container/target state. Fix connectivity, then manually rerun with a new run ID; do not delete the attempt receipt. |
@@ -416,3 +422,27 @@ python -m pygithost.runner revoke-token --db C:\path\to\githost.db --name ubuntu
 
 Revocation rejects subsequent requests. The worker fails closed and the server
 expires its lease. Stop the worker too when decommissioning it.
+## Server-side source storage
+
+New remote CI jobs keep their Git bundle in a private temporary file; SQLite
+stores its path, not the bundle contents. The file is removed when the job
+closes, is cancelled, or is interrupted by coordinator startup recovery.
+Cleanup paths are recorded durably before assignment references are cleared.
+If Windows readers/scanners temporarily block deletion, startup and job results
+are not failed: the path remains in `ci_remote_source_cleanup` and is retried
+on later runner claims or coordinator recovery, including after a restart.
+Cancellation during source preparation also waits for preparation to finish
+and removes the unqueued file.
+
+The runner HTTP protocol is unchanged: `source` still returns a base64 bundle.
+Existing queued jobs with SQLite bundles remain readable during migration.
+Deploy the server update normally; workers do not require a simultaneous update.
+Reading and encoding a file-backed bundle happens after releasing SQLite's
+write transaction. This change does not shrink existing database files or move
+artifact storage out of SQLite; it does not run `VACUUM`.
+
+Source reads use bounded chunks rather than allocating the configured size
+ceiling. A small bundle therefore does not reserve that whole budget; the byte
+limit is still enforced if the file grows while being read. The complete bundle
+and base64 response remain buffered in memory, so large actual payloads still
+require adequate RAM.

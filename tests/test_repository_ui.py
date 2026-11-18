@@ -879,12 +879,45 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn('name="pipeline" value="lint"', filtered)
         self.assertIn("1 workflow run", filtered)
         self.assertIn("lint #", filtered)
+        self.assertIn(f'/ci/runs/{lint_run}">CI fixture</a>', filtered)
         self.assertNotIn(f"/ci/runs/{older}", filtered)
         status, fragment = self.request(path + "&partial=1")
         self.assertEqual(status, 200)
         self.assertIn("1 workflow run", fragment)
         self.assertNotIn("ci-workflow-nav", fragment)
         self.assertNotIn(f"/ci/runs/{older}", fragment)
+
+    def test_workflow_run_title_uses_pr_head_commit_subject(self):
+        self.git("-C", self.source, "commit", "--allow-empty", "-m", "Fix <runner> timeout")
+        head_sha = self.git("-C", self.source, "rev-parse", "HEAD")
+        self.git("-C", self.source, "push", self.bare, "HEAD:refs/heads/feature/api")
+        pr_id = database.db_pr_create(
+            FLAT_OWNER_UI,
+            "project",
+            "Improve workflow reliability",
+            "",
+            "feature/api",
+            "main",
+            self.fixture_user(),
+        )
+        run_id = database.db_ci_run_create(
+            FLAT_OWNER_UI,
+            "project",
+            "pull_request",
+            "main",
+            self.sha,
+            json.dumps({"pr_number": pr_id, "head_commit": head_sha, "head_branch": "feature/api"}),
+        )
+        for suffix in ("/ci", "/ci?partial=1", f"/ci/runs/{run_id}"):
+            with self.subTest(suffix=suffix):
+                status, body = self.request(self.base + suffix)
+                self.assertEqual(status, 200)
+                self.assertIn("Fix &lt;runner&gt; timeout", body)
+                self.assertIn(f"/commit/{head_sha}", body)
+                self.assertIn(f"/pulls/{pr_id}", body)
+                self.assertIn("Improve workflow reliability", body)
+                self.assertIn("Opened by pagination-user", body)
+                self.assertIn("feature/api", body)
 
     def test_retention_and_deployment_editor_posts_are_rejected(self):
         content = 'import sys\nprint("deploying", sys.argv[1])\n'

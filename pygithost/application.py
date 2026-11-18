@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1108,6 +1108,64 @@ async def _git_commit_meta(repo_git: str, commit: str) -> dict[str, str] | None:
         "subject": parts[5].strip(),
         "body": parts[6].rstrip(),
     }
+
+
+async def _ci_commit_subjects(
+    repo_git: str, commits: Collection[str]
+) -> dict[str, tuple[str, str]]:
+    hashes = sorted(
+        {sha.lower() for sha in commits if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha)}
+    )
+    if not hashes:
+        return {}
+    code, out, _ = await _run_git(
+        repo_git,
+        ["log", "--no-walk", "--ignore-missing", "--format=%H%x00%an%x00%s", *hashes, "--"],
+    )
+    subjects: dict[str, tuple[str, str]] = {}
+    if code == 0:
+        for line in out.decode("utf-8", "replace").split("\n"):
+            fields = line.split("\0", 2)
+            if len(fields) == 3:
+                sha, author, subject = fields
+                subjects[sha] = (subject.strip()[:240], author.strip()[:120])
+    return subjects
+
+
+def _ci_run_origin(
+    base: str,
+    event: str,
+    commit: str,
+    pr_id: int | None,
+    pr_author: str,
+    commit_author: str,
+    pr_title: str = "",
+) -> SafeHTML:
+    label = {
+        "pull_request": "Pull request opened",
+        "pull_request_updated": "Pull request updated",
+        "pull_request_reopened": "Pull request reopened",
+        "pull_request_merged": "Pull request merged",
+        "push": "Push",
+        "manual": "Manual run",
+    }.get(event, event.replace("_", " ").capitalize())
+    pr_link = (
+        safe_html(html_t(t'<a href="{base}/pulls/{pr_id}" title="{pr_title}">PR #{pr_id}</a>'))
+        if pr_id is not None
+        else safe_html("")
+    )
+    commit_link = (
+        safe_html(html_t(t'<a href="{base}/commit/{commit}"><code>{commit[:8]}</code></a>'))
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit)
+        else safe_html("")
+    )
+    author = (
+        ("Opened by " if event == "pull_request" else "PR author: ") + pr_author
+        if pr_author
+        else ("Commit author: " + commit_author if commit_author else "")
+    )
+    author_html = safe_html(html_t(t"<span>{author}</span>")) if author else safe_html("")
+    return safe_html(html_t(t"<span>{label}</span>{pr_link}{commit_link}{author_html}"))
 
 
 async def _git_commit_name_status(repo_git: str, commit: str) -> list[tuple[str, str]]:
@@ -5794,7 +5852,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         before = (
             int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
         )
-        from .database import db_ci_run_workflows, db_ci_runs_count
+        from .database import db_ci_run_contexts, db_ci_run_workflows, db_ci_runs_count
 
         size = _page_size(query_params)
         total = await _call_in_thread(
@@ -5829,6 +5887,22 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         has_next = page * size < total
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        contexts = await _call_in_thread(db_ci_run_contexts, owner, repo, [row[0] for row in runs])
+        commit_hashes = {
+            row[0]: contexts.get(row[0], ("", "", None, "", ""))[0] or row[3] for row in runs
+        }
+        subjects = await _ci_commit_subjects(
+            _repo_bare_path(owner, repo), set(commit_hashes.values())
+        )
+        status_labels = {
+            "success": "Completed successfully",
+            "failed": "Failed",
+            "timed_out": "Timed out",
+            "running": "In progress",
+            "queued": "Queued",
+            "cancelled": "Cancelled",
+            "interrupted": "Interrupted",
+        }
         rows: list[str] = []
         status_symbols = {
             "success": "✓",
@@ -5841,9 +5915,20 @@ document.addEventListener("DOMContentLoaded", function() {{
         }
         for run in runs:
             run_event = str(run[1])
-            run_branch = str(run[2])
-            run_commit = str(run[3])
+            _, head_branch, pr_id, pr_title, pr_author = contexts.get(
+                run[0], ("", "", None, "", "")
+            )
+            run_branch = head_branch or run[2]
+            run_commit = commit_hashes[run[0]]
+            subject, author = subjects.get(run_commit.lower(), ("", ""))
+            title = (
+                subject
+                or pr_title
+                or f"{run_event.replace('_', ' ').capitalize()} on {run_branch or 'repository'}"
+            )
+            origin = _ci_run_origin(base, run_event, run_commit, pr_id, pr_author, author, pr_title)
             run_status = str(run[4])
+            status_label = status_labels.get(run_status, run_status.replace("_", " ").capitalize())
             warning = (
                 safe_html(
                     html_t(
@@ -5857,10 +5942,10 @@ document.addEventListener("DOMContentLoaded", function() {{
                 html_t(
                     t'''<li class="ci-workflow-run">
 <span class="ci-run-marker" data-status="{run_status}" aria-hidden="true">{status_symbols.get(run_status, "·")}</span>
-<div class="ci-run-primary"><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">{run[12]} #{run[0]}</a>
-<div class="ci-run-meta"><span>{run_event.replace("_", " ")}</span><code>{run_commit[:8]}</code><span>{run_status.replace("_", " ")}</span>{warning}</div></div>
+<div class="ci-run-primary"><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">{title}</a>
+<div class="ci-run-meta"><span>{run[12]} #{run[0]}</span>{origin}<span>{status_label}</span>{warning}</div></div>
 <span class="ci-run-branch" title="{run_branch}">{run_branch or "—"}</span>
-<div class="ci-run-when"><span>{run[8]}</span><span>{_ci_elapsed(run[9], run[10])}</span></div>
+<div class="ci-run-when"><time datetime="{str(run[8]).replace(" ", "T")}" title="{run[8]} UTC">{_relative_time(run[8])}</time><span>{_ci_elapsed(run[9], run[10])}</span></div>
 </li>'''
                 )
             )
@@ -6219,19 +6304,25 @@ document.addEventListener("DOMContentLoaded", function() {{
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
             )
 
-        title_commit = payload.get("head_commit") or run[3]
-        commit_meta = (
-            await _git_commit_meta(_repo_bare_path(owner, repo), title_commit)
-            if title_commit
-            else None
+        from .database import db_ci_run_contexts
+
+        contexts = await _call_in_thread(db_ci_run_contexts, owner, repo, [run_id])
+        head_commit, head_branch, pr_id, pr_title, pr_author = contexts.get(
+            run_id, ("", "", None, "", "")
         )
+        title_commit = head_commit or run[3]
+        subjects = await _ci_commit_subjects(_repo_bare_path(owner, repo), {title_commit})
+        subject, author = subjects.get(title_commit.lower(), ("", ""))
+        origin = _ci_run_origin(base, run[1], title_commit, pr_id, pr_author, author, pr_title)
         run_title = (
-            commit_meta["subject"]
-            if commit_meta and commit_meta.get("subject")
-            else str_t(t"{run[1].replace('_', ' ').capitalize()} run on {run[2] or 'repository'}")
+            subject
+            or pr_title
+            or str_t(t"{run[1].replace('_', ' ').capitalize()} run on {run[2] or 'repository'}")
         )
+        workflow = str(payload.get("pipeline_id") or "default")
+        workflow_href = base + "/ci?" + urlencode({"pipeline": workflow})
         body = safe_html(
-            html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2 id="ci-run-title">{run_title}</h2><p class="muted">Run #{run_id} · {run[1].replace("_", " ")} · <code>{run[2]}</code> · <a href="{base}/commit/{q(title_commit)}"><code>{title_commit[:8]}</code></a></p></div>
+            html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2 id="ci-run-title">{run_title}</h2><div class="ci-run-meta"><a href="{workflow_href}">{workflow}</a><span>Run #{run_id}</span>{origin}<span class="ci-run-branch">{head_branch or run[2]}</span></div></div>
 <div><a class="pill" href="{base}/ci">← All runs</a></div></div>
 {result_html}
 <script>(function() {{

@@ -11,7 +11,7 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast, overload
 
@@ -2319,6 +2319,40 @@ def db_ci_run_workflows(owner: str, repo: str) -> list[str]:
                 (owner, repo),
             )
         ]
+    finally:
+        conn.close()
+
+
+def db_ci_run_contexts(
+    owner: str, repo: str, run_ids: Sequence[int]
+) -> dict[int, tuple[str, str, int | None, str, str]]:
+    """Return only the presentation fields for the requested repository runs."""
+    if not run_ids:
+        return {}
+    conn = _db_connect()
+    try:
+        placeholders = ",".join("?" for _ in run_ids)
+        return dict(
+            (
+                run_id,
+                (head_commit, head_branch, pr_id, title, author),
+            )
+            for run_id, head_commit, head_branch, pr_id, title, author in conn.execute(
+                f"""WITH selected AS (
+                    SELECT id, owner, repo, CASE WHEN json_valid(payload_json)
+                        THEN payload_json ELSE '{{}}' END AS payload
+                    FROM ci_runs WHERE owner=? AND repo=? AND id IN ({placeholders})
+                )
+                SELECT s.id, COALESCE(CAST(json_extract(s.payload,'$.head_commit') AS TEXT),''),
+                       COALESCE(CAST(json_extract(s.payload,'$.head_branch') AS TEXT),''),
+                       p.id, COALESCE(p.title,''), COALESCE(u.username,'')
+                FROM selected s
+                LEFT JOIN pull_requests p ON p.owner=s.owner AND p.repo=s.repo
+                     AND p.id=json_extract(s.payload,'$.pr_number')
+                LEFT JOIN users u ON u.id=p.author_user_id""",
+                (owner, repo, *run_ids),
+            )
+        )
     finally:
         conn.close()
 

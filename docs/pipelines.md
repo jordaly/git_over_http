@@ -81,7 +81,7 @@ Prepare the image on the server (`docker pull python:3.14-slim`). Tools and
 dependencies are not installed automatically, and Docker jobs have no network by
 default.
 
-To verify the setup, commit and push `ci/config.json`, then open **CI → Runs**.
+To verify the setup, commit and push `ci/config.json`, then open **CI → Run pipeline**.
 A push may already have queued `ci`; to test on demand, choose the branch, select
 **Check configuration**, then queue pipeline `ci` from the validated commit. If a
 step needs a credential, add it under **CI → Settings** with the appropriate scope.
@@ -208,7 +208,7 @@ another pipeline setting.
 
 Before pushing, run `python -m pygithost ci validate` in the checkout. Use
 `--rev HEAD` to check the committed version rather than working files.
-In **CI → Runs**, select a branch and click **Check configuration** to validate
+In **CI → Run pipeline**, select a branch and click **Check configuration** to validate
 the committed files and list that branch's pipelines without running them.
 
 After committing a configuration change, queue a **new** manual run or push a new

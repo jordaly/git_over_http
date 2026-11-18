@@ -394,7 +394,7 @@ Project CI and deployment definitions are owned by the repository, not by the
 database or this API. Commit them to **`ci/config.json`**. This settings endpoint
 shows the default branch configuration; CI runs use their recorded commit (the
 target/base commit for pull-request checks). Validate before committing with
-`python -m pygithost ci validate`; the web **CI → Runs** page provides the same
+`python -m pygithost ci validate`; the web **CI → Run pipeline** page provides the same
 read-only branch check with the exact configuration commit and status.
 
 The entry file may use the simple pipeline form or a full grouped document with
@@ -562,7 +562,7 @@ Use the names returned by `GET .../ci/pipelines`. The simple form of
 named pipelines. An explicit pipeline is required; API triggering does not fan out
 to every pipeline.
 Optionally include a full commit `sha` to reject a moved branch with `409`.
-The web **CI → Runs** page applies the same guard by binding **Queue run** to the
+The web **CI → Run pipeline** page applies the same guard by binding **Queue run** to the
 SHA from its read-only **Check configuration** result. The server resolves and
 records the actual branch commit; arbitrary events, commits from another branch,
 environment overrides, commands, runner settings and deployment flags are not

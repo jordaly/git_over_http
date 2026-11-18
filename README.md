@@ -434,7 +434,7 @@ to queue, cancel, or rerun jobs; email retry requires admin access when
 authentication is enabled. With authentication disabled, the IP
 allowlist is the security boundary, including for CI administration.
 
-**CI → Runs** validates configuration branch-first. Choose a branch and select
+**CI → Run pipeline** validates configuration branch-first. Choose a branch and select
 **Check configuration** to read its committed `ci/config.json` and referenced files
 without queueing a job. The page shows the exact configuration commit SHA and a
 status: `valid`, `missing`, `invalid`, `blocked` (administrator trust denied), or

@@ -80,7 +80,7 @@ same parser used by the server and exits nonzero for a missing, invalid or
 unresolvable configuration. Working-tree validation is a pre-commit check; runtime
 CI still reads the recorded commit.
 
-**CI → Runs** validates branch-first. Choose a branch and select **Check
+**CI → Run pipeline** validates branch-first. Choose a branch and select **Check
 configuration** to read its committed `ci/config.json` and referenced files without
 queuing a job. The page shows the exact configuration commit SHA and status:
 `valid`, `missing`, `invalid`, `blocked` (administrator authorization denied), or
@@ -543,7 +543,7 @@ exists there. No documented `PYGITHOST_HEAD_COMMIT` is provided.
 
 | Symptom | Check |
 | --- | --- |
-| No runs appear | Commit `ci/config.json`; enable the effective trigger and inspect case-sensitive branch arrays. In **CI → Runs**, choose the branch and select **Check configuration** for its exact commit/status, or run `python -m pygithost ci validate --rev HEAD`. Manual also needs an existing branch/write access. A missing file creates no run; an invalid file fails configuration. |
+| No runs appear | Commit `ci/config.json`; enable the effective trigger and inspect case-sensitive branch arrays. In **CI → Run pipeline**, choose the branch and select **Check configuration** for its exact commit/status, or run `python -m pygithost ci validate --rev HEAD`. Manual also needs an existing branch/write access. A missing file creates no run; an invalid file fails configuration. |
 | Manual run says the branch changed | The validated configuration SHA no longer matches the branch tip. Select **Check configuration** again, review the new commit, then queue from that result. |
 | A branch array fails | Use `["main"]`, not a scalar/newline-separated string. `[]` matches all; disable trigger to stop it. |
 | Another object's setting has no effect | Expected: configurations are independent. Put values explicitly on the affected pipeline/deployment. |

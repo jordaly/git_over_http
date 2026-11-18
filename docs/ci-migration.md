@@ -183,7 +183,7 @@ simple form cannot set them.
    uncommitted working-tree changes. A malformed default-branch file fails closed
    and may require administrator Git/filesystem repair.
 2. Commit the migrated files and push.
-3. In **CI → Runs**, select the branch and **Check configuration**. Confirm the
+3. In **CI → Run pipeline**, select the branch and **Check configuration**. Confirm the
    exact configuration commit SHA and a `valid` status, then queue a **new** manual
    run from that result. Manual runs never deploy, and a request is rejected if the
    branch moved after the check.
@@ -209,7 +209,7 @@ than replaying it. Verify the real target after any interruption.
 | Project retention form applied immediately | Project retention comes from the full document on the default branch, within administrator limits. |
 | Repository environment and retention shared the CI settings page | Environment values remain on the project page, scoped to ordinary non-PR CI, authorized protected branches, or deployments only; retention is server defaults plus optional default-branch project JSON. |
 | Page variables were copied into every run snapshot | New snapshots exclude page credentials. Values are resolved live at execution, withheld from all unmerged PR checks, and may appear in remote assignments/logs. |
-| Configuration was validated only when a run was queued | Run `python -m pygithost ci validate` or use **CI → Runs → Check configuration** to read the exact commit and status without queueing. |
+| Configuration was validated only when a run was queued | Run `python -m pygithost ci validate` or use **CI → Run pipeline → Check configuration** to read the exact commit and status without queueing. |
 | Root file references were supported | Entry point is `ci/config.json`; referenced pipeline files must be under `ci/`. |
 | Repository JSON could not grant host execution | Host jobs and enabled deployments require `PYGITHOST_CI_TRUSTED_REPOSITORIES`. |
 | Historical definitions might load implicitly | No automatic migration, no implicit deployment and no historical retry. |

@@ -175,7 +175,7 @@ from the web UI.
 Commit the [repository pipeline example](examples/ci/repository-pipeline.json) as
 `ci/config.json`, prepare the Python Docker image, and adapt its steps to your
 project. Validate before committing with `python -m pygithost ci validate`
-(add `--rev HEAD` for the committed version), or choose a branch in **CI → Runs**
+(add `--rev HEAD` for the committed version), or choose a branch in **CI → Run pipeline**
 and select **Check configuration** to see its exact configuration commit and status
 without queueing. A missing file creates no run; an invalid file fails
 configuration, and a malformed committed file fails closed with CI required and all

@@ -352,6 +352,7 @@ def _ci_tabs(base: str, active: str) -> SafeHTML:
     links: list[str] = []
     for key, suffix, label in (
         ("runs", "/ci", "Runs"),
+        ("run", "/ci/run", "Run pipeline"),
         ("deployments", "/ci/deployments", "Deployments"),
         ("settings", "/ci/config", "Settings"),
         ("docs", "/ci/docs", "Documentation"),
@@ -5824,7 +5825,6 @@ document.addEventListener("DOMContentLoaded", function() {{
             offset=(page - 1) * size,
         )
         has_next = page * size < total
-        branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows: list[str] = []
         for run in runs:
@@ -5852,6 +5852,29 @@ document.addEventListener("DOMContentLoaded", function() {{
             if rows
             else safe_html(html_t(t'<tr><td colspan="9" class="muted">{empty}</td></tr>'))
         )
+        pagination = _pagination(
+            base + "/ci",
+            {
+                **{key: value for key, value in filters.items() if value},
+                **({"before": str(before)} if before is not None else {}),
+            },
+            page,
+            has_next,
+            total=total,
+            per_page=size,
+        )
+        results_html = safe_html(
+            html_t(t"""<div id="ci-results">
+<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Warnings</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>""")
+        )
+        if partial:
+            return await _send_response(
+                self.request,
+                200,
+                str(results_html).encode("utf-8"),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+            )
+        branches = await _git_list_branches(_repo_bare_path(owner, repo))
         filter_options = {
             "warnings": [
                 ("", "All warnings"),
@@ -5899,40 +5922,45 @@ document.addEventListener("DOMContentLoaded", function() {{
                 for value, label in branch_values
             ]
         )
+        active_filters = sum(bool(value) for value in filters.values())
+        filter_label = f"Filters ({active_filters} active)" if active_filters else "Filters"
         filter_form = safe_html(
-            html_t(t'''<div class="box ci-compact"><form method="GET" action="{base}/ci" class="ci-toolbar">
+            html_t(t'''<details class="box ci-compact ci-run-filters"><summary>{filter_label}</summary><form method="GET" action="{base}/ci" class="ci-toolbar">
 <input type="hidden" name="per_page" value="{size}">
 <input aria-label="Search runs" name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
 <select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
 <select aria-label="Warnings" name="warnings">{options_html["warnings"]}</select>
 <select aria-label="Branch" name="branch">{branch_options}</select><button type="submit">Filter runs</button>
-<a class="pill" href="{base}/ci">Clear filters</a></form></div>''')
+<a class="pill" href="{base}/ci">Clear filters</a></form></details>''')
         )
-        pagination = _pagination(
-            base + "/ci",
-            {
-                **{key: value for key, value in filters.items() if value},
-                **({"before": str(before)} if before is not None else {}),
-            },
-            page,
-            has_next,
-            total=total,
-            per_page=size,
+        notice_html = (
+            safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
         )
-        results_html = safe_html(
-            html_t(t"""<div id="ci-results">
-<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Warnings</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>""")
+        body = html_t(t"""{_ci_tabs(base, "runs")}{notice_html}{filter_form}{results_html}
+<script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>""")
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"CI · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>')),
+            ),
         )
-        if partial:
-            return await _send_response(
-                self.request,
-                200,
-                str(results_html).encode("utf-8"),
-                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
-            )
-        selected_branch = (query_params.get("run_branch") or [""])[0]
+
+    async def _ui_ci_manual(
+        self, owner: str, repo: str, *, branch: str = "", notice: str = ""
+    ) -> None:
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._not_found()
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return await self._not_found()
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        branches = await _git_list_branches(repo_git)
+        query_params = parse_qs(urlparse(getattr(self, "path", "")).query or "")
+        selected_branch = branch or (query_params.get("run_branch") or [""])[0]
         if selected_branch not in branches:
-            default_branch = await _git_default_branch(_repo_bare_path(owner, repo))
+            default_branch = await _git_default_branch(repo_git)
             selected_branch = (
                 default_branch if default_branch in branches else next(iter(branches), "")
             )
@@ -5976,18 +6004,19 @@ document.addEventListener("DOMContentLoaded", function() {{
             else "Manual runs require write access, a runnable pipeline, and an existing branch."
         )
         notice_html = (
-            safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
+            safe_html(html_t(t'<div class="warn" role="status">{notice}</div>'))
+            if notice
+            else safe_html("")
         )
-        body = html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><h2>CI runs</h2></div>{notice_html}
-<div class="box ci-compact"><form class="ci-toolbar" method="GET" action="{base}/ci"><label>Branch to validate<select name="run_branch" required>{manual_options}</select></label><button type="submit">Check configuration</button></form>
-<p>Configuration: <strong>{config_status}</strong> <code>{config_commit}</code> {config_error}</p>
-<form class="ci-toolbar" method="POST" action="{base}/ci/run"><strong>Run manually</strong><input type="hidden" name="branch" value="{selected_branch}"><input type="hidden" name="sha" value="{config_commit}"><select aria-label="Pipeline" name="pipeline">{pipeline_options}</select><button type="submit"{disabled}>Queue run</button><small class="muted">{manual_notice}</small></form></div>{filter_form}{results_html}
-<script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
+        body = html_t(t'''{_ci_tabs(base, "run")}<div class="topbar"><h2>Run pipeline</h2></div>{notice_html}
+<div class="box"><h3>Check configuration</h3><form class="ci-toolbar" method="GET" action="{base}/ci/run"><label>Branch to validate <select name="run_branch" required>{manual_options}</select></label><button type="submit">Check configuration</button></form>
+<p>Configuration: <strong>{config_status}</strong> <code>{config_commit}</code> {config_error}</p></div>
+<div class="box"><h3>Run manually</h3><form class="ci-toolbar" method="POST" action="{base}/ci/run"><input type="hidden" name="branch" value="{selected_branch}"><input type="hidden" name="sha" value="{config_commit}"><label>Pipeline <select name="pipeline">{pipeline_options}</select></label><button type="submit"{disabled}>Queue run</button><small class="muted">{manual_notice}</small></form></div>''')
         await _send_html(
             self.request,
             200,
             _html_page(
-                str_t(t"CI · {owner}/{repo}"),
+                str_t(t"Run pipeline · {owner}/{repo}"),
                 safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>')),
             ),
         )
@@ -6245,7 +6274,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
 <ol>
 <li>Commit <code>ci/config.json</code> with a simple steps pipeline or a full configuration with named pipelines and deployments. This is the only project configuration entry point. Any referenced pipeline files must also be under <code>ci/</code>; commands run from the checkout root.</li>
 <li>Keep credentials out of Git. Add them in <a href="{base}/ci/config">CI → Settings</a>, where repository secrets and environment variables are still managed.</li>
-<li>Push the commit, then check <a href="{base}/ci">CI → Runs</a>. You can queue a manual run to verify the configuration without deploying.</li>
+<li>Push the commit, then check <a href="{base}/ci/run">CI → Run pipeline</a>. You can queue a manual run to verify the configuration without deploying.</li>
 </ol>
 <p>Upgrading from the old editor? Move the saved definitions into <code>ci/config.json</code>; they are not imported automatically. Host jobs and enabled deployments still require administrator authorization.</p>
 <nav class="row" aria-label="Repository CI setup"><a href="{base}/ci/docs?guide=start#repository-ci-directory">Directory layout</a><a href="{base}/ci/docs?guide=examples#multiple-git-managed-pipelines">Multiple pipeline files</a><a href="{base}/ci/docs?guide=migration">Migration guide</a><a href="{base}/ci/docs?example=repository-pipeline">Repository pipeline example</a></nav></section>
@@ -6378,17 +6407,17 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             else None
         )
         if not commit:
-            return await self._ui_ci(owner, repo, notice="Select a valid branch.")
+            return await self._ui_ci_manual(owner, repo, notice="Select a valid branch.")
         if form.get("sha") and form["sha"] != commit:
-            return await self._ui_ci(
-                owner, repo, notice="Branch changed. Check its configuration again."
+            return await self._ui_ci_manual(
+                owner, repo, branch=branch, notice="Branch changed. Check its configuration again."
             )
         try:
             run_id = await self.server.ci_manager.enqueue(
                 owner, repo, "manual", branch, commit, pipeline=form.get("pipeline", "default")
             )
         except ValueError as exc:
-            return await self._ui_ci(owner, repo, notice=str(exc))
+            return await self._ui_ci_manual(owner, repo, branch=branch, notice=str(exc))
         if run_id:
             return await _send_redirect(
                 self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}")
@@ -6396,14 +6425,16 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         if (await self.server.ci_manager.config(owner, repo, commit, include_secrets=False)).get(
             "_autodetect_repository_config"
         ):
-            return await self._ui_ci(
+            return await self._ui_ci_manual(
                 owner,
                 repo,
+                branch=branch,
                 notice="No run queued. Add ci/config.json to the selected branch to use automatic repository CI.",
             )
-        return await self._ui_ci(
+        return await self._ui_ci_manual(
             owner,
             repo,
+            branch=branch,
             notice="No run queued. Select a runnable pipeline with steps or a repository file.",
         )
 
@@ -7951,6 +7982,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/docs$", p)
         if m:
             return await self._ui_ci_docs(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/ci/run$", p)
+        if m:
+            return await self._ui_ci_manual(unquote(m.group(1)), unquote(m.group(2)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci$", p)
         if m:
             qs = parse_qs(parsed.query or "")

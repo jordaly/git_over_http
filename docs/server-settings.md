@@ -29,7 +29,7 @@ committed to `ci/config.json`; the repository settings page intentionally contai
 only environment variables/secrets. `PUT /ci/settings` is disabled, and project
 retention has no separate page form. Validate before committing with
 `python -m pygithost ci validate` (add `--rev HEAD` for committed files), or select
-a branch under **CI → Runs** and choose **Check configuration** to read its exact
+a branch under **CI → Run pipeline** and choose **Check configuration** to read its exact
 configuration commit and status without queueing a job.
 
 ## Worked inheritance example

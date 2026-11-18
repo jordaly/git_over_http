@@ -9,11 +9,11 @@ from __future__ import annotations
 import json
 import platform
 from dataclasses import asdict, dataclass, fields
+from os import PathLike
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypedDict
 
 from .logging_setup import LOG_FORMATS, LOG_LEVELS
-
 
 CONFIG_SCHEMA_VERSION = 1
 DEFAULT_CONFIG_FILENAME = "pygithost.config.json"
@@ -23,7 +23,15 @@ def _static_root() -> str:
     return str(Path(__file__).resolve().parent.parent / "static")
 
 
-def _platform_paths(target: str) -> dict[str, object]:
+class _PlatformPaths(TypedDict):
+    git_project_root: str
+    git_http_backend: str
+    trace_log: str | None
+    db_path: str
+    log_file: str
+
+
+def _platform_paths(target: str) -> _PlatformPaths:
     if target == "Windows":
         return {
             "git_project_root": r"C:\Servidor_Git",
@@ -142,12 +150,8 @@ class AppConfig:
         if isinstance(ips, str):
             ips = [part.strip() for part in ips.split(",") if part.strip()]
         if not isinstance(ips, (list, tuple)):
-            raise ValueError(
-                "allowed_client_ips must be an array or comma-separated string"
-            )
-        values["allowed_client_ips"] = tuple(
-            str(ip).strip() for ip in ips if str(ip).strip()
-        )
+            raise ValueError("allowed_client_ips must be an array or comma-separated string")
+        values["allowed_client_ips"] = tuple(str(ip).strip() for ip in ips if str(ip).strip())
 
         for key in (
             "schema_version",
@@ -196,7 +200,7 @@ class AppConfig:
         return cls(**values)
 
     @classmethod
-    def from_file(cls, path: str | Path) -> AppConfig:
+    def from_file(cls, path: str | PathLike[str]) -> AppConfig:
         with Path(path).expanduser().open("r", encoding="utf-8") as stream:
             raw = json.load(stream)
         if not isinstance(raw, dict):
@@ -208,7 +212,7 @@ class AppConfig:
         values["allowed_client_ips"] = list(self.allowed_client_ips)
         return values
 
-    def write(self, path: str | Path, *, overwrite: bool = False) -> Path:
+    def write(self, path: str | PathLike[str], *, overwrite: bool = False) -> Path:
         destination = Path(path).expanduser()
         if destination.exists() and not overwrite:
             raise FileExistsError(

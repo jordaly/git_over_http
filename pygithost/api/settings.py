@@ -7,16 +7,17 @@ from .. import database
 from ..ci_config import editor_document
 from . import data
 from .errors import APIError
+from .types import APIContext, SettingsSnapshot
 from .validation import expected_revision, fields
 
 
-def authorize(api):
+def authorize(api: APIContext) -> None:
     # Configuration contains plaintext environment values and executable host code.
     if not api.identity["is_admin"]:
         raise APIError(403, "forbidden", "Administrator required for CI/deployment settings.")
 
 
-async def snapshot(api, owner, repo):
+async def snapshot(api: APIContext, owner: str, repo: str) -> SettingsSnapshot:
     raw = await asyncio.to_thread(database.db_ci_config_get, owner, repo)
     preferences = await asyncio.to_thread(database.db_ci_preferences_get, owner, repo)
     config = await api.handler.server.ci_manager.config(owner, repo)
@@ -26,14 +27,14 @@ async def snapshot(api, owner, repo):
     }
 
 
-async def read(api, owner, repo):
+async def read(api: APIContext, owner: str, repo: str) -> object:
     authorize(api)
     api.parameters()
     async with api.handler.server.settings_lock:
         return await snapshot(api, owner, repo)
 
 
-async def update(api, owner, repo):
+async def update(api: APIContext, owner: str, repo: str) -> tuple[int, dict[str, str]]:
     authorize(api)
     if api.request.method != "PUT":
         raise APIError(405, "method_not_allowed", "Use PUT to replace CI/deployment configuration.")
@@ -47,13 +48,20 @@ async def update(api, owner, repo):
     async with api.handler.server.settings_lock:
         current = await snapshot(api, owner, repo)
         if current["revision"] != document["expected_revision"]:
-            raise APIError(409, "revision_conflict", "Settings changed. Fetch the current revision.")
+            raise APIError(
+                409, "revision_conflict", "Settings changed. Fetch the current revision."
+            )
         try:
             await api.handler.server.ci_manager.save_document(
-                owner, repo, document["configuration"], preserve_page_settings=True)
-        except (ValueError, RecursionError):
+                owner, repo, document["configuration"], preserve_page_settings=True
+            )
+        except ValueError, RecursionError:
             # Do not echo scripts, paths or environment values in error/audit output.
-            raise APIError(422, "validation_error", "Invalid CI/deployment configuration. See the configuration JSON reference.") from None
+            raise APIError(
+                422,
+                "validation_error",
+                "Invalid CI/deployment configuration. See the configuration JSON reference.",
+            ) from None
         saved = await snapshot(api, owner, repo)
         # Durable idempotency caches responses: never copy configuration secrets
         # or executable payloads into the mutation audit table.

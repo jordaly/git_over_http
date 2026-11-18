@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from .application import main_async
-from .config import AppConfig, DEFAULT_CONFIG_FILENAME
+from .config import DEFAULT_CONFIG_FILENAME, AppConfig
 
 
 def default_config_path() -> Path:

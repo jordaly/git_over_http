@@ -1,5 +1,4 @@
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
@@ -8,8 +7,9 @@ import shutil
 import sys
 import threading
 import unittest
-from unittest import mock
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 from pygithost import database
 from pygithost.api import ci_operations, data
@@ -42,14 +42,19 @@ class APICITests(unittest.TestCase):
         self.manager.started = True
 
     def save_pipeline(self, **overrides):
-        config = {"runner": "host", "steps": [{"name": "Checks", "run": "echo api-ci"}],
-                  "events": {"manual": False}, **overrides}
+        config = {
+            "runner": "host",
+            "steps": [{"name": "Checks", "run": "echo api-ci"}],
+            "events": {"manual": False},
+            **overrides,
+        }
         database.db_ci_config_set("alice", "project", json.dumps(config))
         return config
 
     def trigger(self, *, key=None, **document):
-        return self.mutate(self.ci_base + "/runs",
-            {"pipeline": "default", "branch": "main", **document}, key=key)
+        return self.mutate(
+            self.ci_base + "/runs", {"pipeline": "default", "branch": "main", **document}, key=key
+        )
 
     def archive(self, identity=None):
         target = io.BytesIO()
@@ -78,10 +83,16 @@ class APICITests(unittest.TestCase):
         self.assertEqual(len(self.manager.pending), 1)
 
     def test_trigger_one_named_pipeline_without_fanout(self):
-        config = compile_document({"version": 1, "pipelines": [
-            {"name": "checks", "steps": [{"name": "Checks", "run": "echo checks"}]},
-            {"name": "build", "steps": [{"name": "Build", "run": "echo build"}]},
-        ], "deployments": []})
+        config = compile_document(
+            {
+                "version": 1,
+                "pipelines": [
+                    {"name": "checks", "steps": [{"name": "Checks", "run": "echo checks"}]},
+                    {"name": "build", "steps": [{"name": "Build", "run": "echo build"}]},
+                ],
+                "deployments": [],
+            }
+        )
         database.db_ci_config_set("alice", "project", json.dumps(config))
         status, _headers, result = self.trigger(pipeline="build")
         self.assertEqual(status, 202, result)
@@ -104,7 +115,9 @@ class APICITests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=1) as pool:
                 first = pool.submit(self.trigger, key="concurrent-trigger")
                 try:
-                    self.assertTrue(entered.wait(timeout=10), "First trigger never reached the scheduler")
+                    self.assertTrue(
+                        entered.wait(timeout=10), "First trigger never reached the scheduler"
+                    )
                     status, _headers, result = self.trigger(key="concurrent-trigger")
                     self.assertEqual(status, 409, result)
                     self.assertEqual(result["code"], "operation_pending")
@@ -135,7 +148,9 @@ class APICITests(unittest.TestCase):
 
     def test_scheduler_error_is_private_and_uncertain_request_is_not_reexecuted(self):
         self.save_pipeline()
-        with mock.patch.object(self.manager, "enqueue", side_effect=RuntimeError("PRIVATE_SCHEDULER_ERROR")):
+        with mock.patch.object(
+            self.manager, "enqueue", side_effect=RuntimeError("PRIVATE_SCHEDULER_ERROR")
+        ):
             status, headers, result = self.trigger(key="scheduler-error")
         self.assertEqual(status, 500, result)
         self.assertEqual(result["request_id"], headers["X-Request-ID"])
@@ -149,10 +164,15 @@ class APICITests(unittest.TestCase):
 
     def test_invalid_repository_pipeline_creates_failed_run_without_execution_override(self):
         (self.source / "ci").mkdir()
-        (self.source / "ci/config.json").write_text(json.dumps({
-            "version": 1, "runner": "host",
-            "steps": [{"name": "Forbidden override", "run": "echo PRIVATE_COMMAND"}],
-        }))
+        (self.source / "ci/config.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "runner": "host",
+                    "steps": [{"name": "Forbidden override", "run": "echo PRIVATE_COMMAND"}],
+                }
+            )
+        )
         self.git("-C", self.source, "add", "ci/config.json")
         self.git("-C", self.source, "commit", "-m", "Invalid repository CI execution override")
         self.git("-C", self.source, "push", self.bare, "main")
@@ -172,8 +192,14 @@ class APICITests(unittest.TestCase):
         self.assertEqual(self.trigger(sha="f" * 40)[0], 409)
         self.assertEqual(self.trigger(sha="main")[0], 422)
         self.assertEqual(self.trigger(branch="missing")[0], 404)
-        for override in ({"env": {"X": "value"}}, {"runner": "host"}, {"event": "push"},
-                         {"steps": []}, {"deploy_enabled": True}, {"payload": {"pr_number": 1}}):
+        for override in (
+            {"env": {"X": "value"}},
+            {"runner": "host"},
+            {"event": "push"},
+            {"steps": []},
+            {"deploy_enabled": True},
+            {"payload": {"pr_number": 1}},
+        ):
             with self.subTest(override=override):
                 self.assertEqual(self.trigger(**override)[0], 422)
         self.assertEqual(self.mutate(self.ci_base + "/runs", {"branch": "main"})[0], 422)
@@ -193,7 +219,9 @@ class APICITests(unittest.TestCase):
         status, _headers, result = self.trigger()
         self.assertEqual(status, 202, result)
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(database.db_ci_run_metadata("alice", "project", result["id"])["phase"], "queue")
+        self.assertEqual(
+            database.db_ci_run_metadata("alice", "project", result["id"])["phase"], "queue"
+        )
         logs = self.request(self.ci_base + f"/runs/{result['id']}/logs")[2]
         self.assertEqual(logs["phase"], "queue")
         self.assertIn("queue is full", logs["reason"])
@@ -218,8 +246,12 @@ class APICITests(unittest.TestCase):
         async def prepare():
             self.manager.started = True
             task = asyncio.create_task(asyncio.Event().wait())
-            self.manager.active[self.run] = ((self.run, "alice", "project", "manual", "main", self.sha, "{}"), task)
+            self.manager.active[self.run] = (
+                (self.run, "alice", "project", "manual", "main", self.sha, "{}"),
+                task,
+            )
             return task
+
         task = asyncio.run_coroutine_threadsafe(prepare(), self.server.loop).result(timeout=10)
         database.db_ci_run_update(self.run, status="running")
         status, _headers, result = self.mutate(self.ci_base + f"/runs/{self.run}/cancel", {})
@@ -238,7 +270,9 @@ class APICITests(unittest.TestCase):
                     return accepted
 
                 with mock.patch.object(self.manager, "cancel", side_effect=finish_before_cancel):
-                    status, _headers, result = self.mutate(self.ci_base + f"/runs/{self.run}/cancel", {})
+                    status, _headers, result = self.mutate(
+                        self.ci_base + f"/runs/{self.run}/cancel", {}
+                    )
                 self.assertEqual(status, 200 if accepted else 409, result)
                 self.assertEqual(database.db_ci_run_get("alice", "project", self.run)[4], "success")
                 if accepted:
@@ -266,18 +300,24 @@ class APICITests(unittest.TestCase):
         database.db_ci_run_update(self.run, status="failed")
         conn = database._db_connect()
         try:
-            conn.execute("UPDATE ci_runs SET event='push',config_json=?,payload_json='{}' WHERE id=?",
-                         (json.dumps(original), self.run))
+            conn.execute(
+                "UPDATE ci_runs SET event='push',config_json=?,payload_json='{}' WHERE id=?",
+                (json.dumps(original), self.run),
+            )
         finally:
             conn.close()
-        self.save_pipeline(env={"SNAPSHOT": "changed"}, steps=[{"name": "Changed", "run": "echo new"}])
+        self.save_pipeline(
+            env={"SNAPSHOT": "changed"}, steps=[{"name": "Changed", "run": "echo new"}]
+        )
         path = self.ci_base + f"/runs/{self.run}/rerun"
         status, _headers, result = self.mutate(path, {}, key="rerun-once")
         self.assertEqual(status, 202, result)
         self.assertNotEqual(result["id"], self.run)
         self.assertEqual(result["event"], "push")
         self.assertEqual(result["head_sha"], self.sha)
-        snapshot = json.loads(database.db_ci_run_metadata("alice", "project", result["id"])["config"])
+        snapshot = json.loads(
+            database.db_ci_run_metadata("alice", "project", result["id"])["config"]
+        )
         self.assertEqual(snapshot["env"]["SNAPSHOT"], "original")
         self.assertEqual(snapshot["steps"], original["steps"])
         self.assertEqual(self.mutate(path, {}, key="rerun-once")[2], result)
@@ -303,7 +343,9 @@ class APICITests(unittest.TestCase):
         database.db_ci_run_update(self.run, status="failed")
         conn = database._db_connect()
         try:
-            conn.execute("UPDATE ci_runs SET config_json='PRIVATE_INVALID_SNAPSHOT' WHERE id=?", (self.run,))
+            conn.execute(
+                "UPDATE ci_runs SET config_json='PRIVATE_INVALID_SNAPSHOT' WHERE id=?", (self.run,)
+            )
         finally:
             conn.close()
         path = self.ci_base + f"/runs/{self.run}/rerun"
@@ -314,7 +356,9 @@ class APICITests(unittest.TestCase):
             self.assertNotIn("PRIVATE_INVALID_SNAPSHOT", json.dumps(result))
             conn = database._db_connect()
             try:
-                conn.execute("UPDATE ci_runs SET config_json=? WHERE id=?", (json.dumps(original), self.run))
+                conn.execute(
+                    "UPDATE ci_runs SET config_json=? WHERE id=?", (json.dumps(original), self.run)
+                )
             finally:
                 conn.close()
             status, headers, result = self.mutate(path, {}, key="bad-snapshot")
@@ -328,27 +372,43 @@ class APICITests(unittest.TestCase):
         self.save_pipeline()
         self.archive()
         for token in (self.token, self.admin_token):
-            for tail, document in (("/runs", {"branch": "main", "pipeline": "default"}),
-                                   (f"/runs/{self.run}/cancel", {}), (f"/runs/{self.run}/rerun", {})):
+            for tail, document in (
+                ("/runs", {"branch": "main", "pipeline": "default"}),
+                (f"/runs/{self.run}/cancel", {}),
+                (f"/runs/{self.run}/rerun", {}),
+            ):
                 with self.subTest(token=token, tail=tail):
-                    self.assertEqual(self.mutate(self.ci_base + tail, document, token=token)[0], 403)
+                    self.assertEqual(
+                        self.mutate(self.ci_base + tail, document, token=token)[0], 403
+                    )
         bob_base = "/api/v1/repos/bob/project/ci"
         for suffix in ("logs", "artifacts", "artifacts/download"):
-            self.assertEqual(self.request(f"{bob_base}/runs/{self.run}/{suffix}",
-                                          token=self.bob_token)[0], 404)
-            self.assertEqual(self.request(f"{bob_base}/runs/{self.run}/{suffix}",
-                                          token=self.admin_token)[0], 404)
+            self.assertEqual(
+                self.request(f"{bob_base}/runs/{self.run}/{suffix}", token=self.bob_token)[0], 404
+            )
+            self.assertEqual(
+                self.request(f"{bob_base}/runs/{self.run}/{suffix}", token=self.admin_token)[0], 404
+            )
         for action in ("cancel", "rerun"):
-            self.assertEqual(self.mutate(f"{bob_base}/runs/{self.run}/{action}", {},
-                                          token=self.admin_write_token)[0], 404)
-        self.assertEqual(self.mutate(bob_base + "/runs",
-                                    {"branch": "main", "pipeline": "default"})[0], 404)
+            self.assertEqual(
+                self.mutate(
+                    f"{bob_base}/runs/{self.run}/{action}", {}, token=self.admin_write_token
+                )[0],
+                404,
+            )
+        self.assertEqual(
+            self.mutate(bob_base + "/runs", {"branch": "main", "pipeline": "default"})[0], 404
+        )
 
     def test_logs_and_archives_require_fresh_bearer_authentication(self):
         self.archive()
-        paths = [self.ci_base + "/artifacts", *[
-            self.ci_base + f"/runs/{self.run}/" + suffix
-            for suffix in ("logs", "artifacts", "artifacts/download")]]
+        paths = [
+            self.ci_base + "/artifacts",
+            *[
+                self.ci_base + f"/runs/{self.run}/" + suffix
+                for suffix in ("logs", "artifacts", "artifacts/download")
+            ],
+        ]
         for path in paths:
             for token in (None, "invalid-token"):
                 with self.subTest(path=path, token=token):
@@ -356,7 +416,9 @@ class APICITests(unittest.TestCase):
                     self.assertEqual(status, 401)
                     self.assertEqual(result["code"], "unauthorized")
                     self.assertIn("Bearer", headers["WWW-Authenticate"])
-        read_token = next(row[0] for row in database.db_list_tokens_for_user(self.alice) if row[1] == "test")
+        read_token = next(
+            row[0] for row in database.db_list_tokens_for_user(self.alice) if row[1] == "test"
+        )
         self.assertTrue(database.db_revoke_token(self.alice, read_token))
         for path in paths:
             self.assertEqual(self.request(path)[0], 401)
@@ -382,8 +444,15 @@ class APICITests(unittest.TestCase):
         self.assertFalse(last["has_more"])
         self.assertTrue(last["complete"])
         self.assertNotIn("DO_NOT_EXPOSE", json.dumps(first))
-        for query in ("offset=2", "offset=10", "offset=-1", "offset=2147483648",
-                      "limit=1", "limit=65537", "limit=4&limit=8"):
+        for query in (
+            "offset=2",
+            "offset=10",
+            "offset=-1",
+            "offset=2147483648",
+            "limit=1",
+            "limit=65537",
+            "limit=4&limit=8",
+        ):
             with self.subTest(query=query):
                 self.assertEqual(self.request(path + "?" + query)[0], 400)
         self.assertEqual(self.request(path + "?offset=9")[2]["content"], "")
@@ -392,7 +461,9 @@ class APICITests(unittest.TestCase):
     def test_logs_are_pollable_and_read_in_sql_instead_of_loading_whole_output(self):
         database.db_ci_run_update(self.run, status="running", output="x" * (3 * 1024 * 1024))
         path = self.ci_base + f"/runs/{self.run}/logs"
-        with mock.patch.object(database, "db_ci_run_get", side_effect=AssertionError("Must slice in SQL")):
+        with mock.patch.object(
+            database, "db_ci_run_get", side_effect=AssertionError("Must slice in SQL")
+        ):
             status, _headers, result = self.request(path + "?limit=65536")
         self.assertEqual(status, 200, result)
         self.assertEqual(len(result["content"].encode()), 65536)
@@ -412,11 +483,13 @@ class APICITests(unittest.TestCase):
             with self.subTest(limit=limit):
                 offset, collected = 0, bytearray()
                 while True:
-                    status, _headers, result = self.request(path + f"?offset={offset}&limit={limit}")
+                    status, _headers, result = self.request(
+                        path + f"?offset={offset}&limit={limit}"
+                    )
                     self.assertEqual(status, 200, result)
                     encoded = result["content"].encode("utf-8")
                     self.assertLessEqual(len(encoded), limit)
-                    self.assertEqual(encoded, original[offset:result["next_offset"]])
+                    self.assertEqual(encoded, original[offset : result["next_offset"]])
                     self.assertGreater(result["next_offset"], offset)
                     collected.extend(encoded)
                     offset = result["next_offset"]
@@ -474,7 +547,9 @@ class APICITests(unittest.TestCase):
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
         self.assertIn(f"ci-{self.run}-artifacts.zip", headers["Content-Disposition"])
         with mock.patch("pygithost.api.data.artifact_content", wraps=data.artifact_content) as read:
-            status, headers, content = self.request(artifact["download_url"], method="HEAD", decode=False)
+            status, headers, content = self.request(
+                artifact["download_url"], method="HEAD", decode=False
+            )
         self.assertEqual(status, 200)
         self.assertEqual(content, b"")
         self.assertEqual(int(headers["Content-Length"]), len(archive))
@@ -482,7 +557,9 @@ class APICITests(unittest.TestCase):
 
     def test_artifact_size_limit_without_fetching_oversized_blob(self):
         archive = self.archive()
-        self.assertEqual(data.artifact_content("alice", "project", self.run, 1), (len(archive), None))
+        self.assertEqual(
+            data.artifact_content("alice", "project", self.run, 1), (len(archive), None)
+        )
         with mock.patch.object(ci_operations, "MAX_ARTIFACT_BYTES", 1):
             self.assertFalse(self.request(self.ci_base + "/artifacts")[2][0]["downloadable"])
             path = self.ci_base + f"/runs/{self.run}/artifacts/download"
@@ -490,6 +567,7 @@ class APICITests(unittest.TestCase):
             self.assertEqual(status, 413)
             self.assertEqual(result["code"], "artifact_too_large")
             self.assertEqual(self.request(path, method="HEAD")[0], 413)
+
         async def permits_available():
             slots = self.server.app.api_download_slots
             async with asyncio.timeout(1):
@@ -499,6 +577,7 @@ class APICITests(unittest.TestCase):
                     slots.release()
                 finally:
                     slots.release()
+
         asyncio.run_coroutine_threadsafe(permits_available(), self.server.loop).result(timeout=5)
 
     def test_artifact_expiry_missing_run_and_empty_list(self):
@@ -509,7 +588,10 @@ class APICITests(unittest.TestCase):
         self.archive()
         conn = database._db_connect()
         try:
-            conn.execute("UPDATE ci_artifacts SET created_at=datetime('now','-8 days') WHERE run_id=?", (self.run,))
+            conn.execute(
+                "UPDATE ci_artifacts SET created_at=datetime('now','-8 days') WHERE run_id=?",
+                (self.run,),
+            )
         finally:
             conn.close()
         self.assertEqual(self.request(self.ci_base + "/artifacts")[2], [])
@@ -533,7 +615,10 @@ class APICITests(unittest.TestCase):
         archive = self.archive()
         conn = database._db_connect()
         try:
-            conn.execute("UPDATE ci_artifacts SET created_at='2000-01-01 00:00:00' WHERE run_id=?", (self.run,))
+            conn.execute(
+                "UPDATE ci_artifacts SET created_at='2000-01-01 00:00:00' WHERE run_id=?",
+                (self.run,),
+            )
         finally:
             conn.close()
         item = self.request(self.ci_base + "/artifacts")[2][0]
@@ -545,8 +630,11 @@ class APICITests(unittest.TestCase):
         self.assertEqual(self.request(item["download_url"])[0], 404)
 
     def test_artifact_count_retention_is_repository_scoped(self):
-        database.db_ci_config_set("alice", "project", json.dumps({
-            "artifact_retention_days": 0, "artifact_retention_count": 1}))
+        database.db_ci_config_set(
+            "alice",
+            "project",
+            json.dumps({"artifact_retention_days": 0, "artifact_retention_count": 1}),
+        )
         self.archive()
         foreign = database.db_ci_run_create("bob", "project", "manual", "main", self.sha, "{}")
         self.archive(foreign)
@@ -554,14 +642,19 @@ class APICITests(unittest.TestCase):
         self.archive(newer)
         items = self.request(self.ci_base + "/artifacts")[2]
         self.assertEqual([item["run_id"] for item in items], [newer])
-        self.assertEqual(self.request(self.ci_base + f"/runs/{self.run}/artifacts/download")[0], 404)
+        self.assertEqual(
+            self.request(self.ci_base + f"/runs/{self.run}/artifacts/download")[0], 404
+        )
         self.assertEqual(self.request(self.ci_base + f"/runs/{self.run}")[0], 200)
-        status, _headers, items = self.request("/api/v1/repos/bob/project/ci/artifacts", token=self.bob_token)
+        status, _headers, items = self.request(
+            "/api/v1/repos/bob/project/ci/artifacts", token=self.bob_token
+        )
         self.assertEqual(status, 200)
         self.assertEqual([item["run_id"] for item in items], [foreign])
 
     def test_download_concurrency_limit_is_held_until_transfers_finish(self):
         from pygithost import application
+
         archive = self.archive()
         path = self.ci_base + f"/runs/{self.run}/artifacts/download"
         waiting, sending, release = threading.Event(), threading.Event(), asyncio.Event()
@@ -588,14 +681,20 @@ class APICITests(unittest.TestCase):
                 await release.wait()
             return await original_send(request, status, body, headers, **kwargs)
 
-        with mock.patch.object(application, "_send_response", side_effect=blocked_send), mock.patch(
-                "pygithost.api.data.artifact_content", wraps=data.artifact_content) as read:
+        with (
+            mock.patch.object(application, "_send_response", side_effect=blocked_send),
+            mock.patch("pygithost.api.data.artifact_content", wraps=data.artifact_content) as read,
+        ):
             with ThreadPoolExecutor(max_workers=3) as pool:
                 requests = [pool.submit(self.request, path, decode=False) for _ in range(3)]
                 try:
                     self.assertTrue(sending.wait(timeout=10), "Two transfers did not start")
-                    self.assertTrue(waiting.wait(timeout=10), "Third transfer did not wait for a permit")
-                    self.assertEqual(read.call_count, 2, "Queued download loaded a third archive body")
+                    self.assertTrue(
+                        waiting.wait(timeout=10), "Third transfer did not wait for a permit"
+                    )
+                    self.assertEqual(
+                        read.call_count, 2, "Queued download loaded a third archive body"
+                    )
                 finally:
                     self.server.loop.call_soon_threadsafe(release.set)
                 for request in requests:
@@ -610,8 +709,11 @@ class APICITests(unittest.TestCase):
         try:
             for _ in range(100):
                 identity = conn.execute(
-                    "INSERT INTO ci_runs(owner,repo,event) VALUES('alice','project','manual')").lastrowid
-                conn.execute("INSERT INTO ci_artifacts(run_id,archive) VALUES(?,?)", (identity, archive))
+                    "INSERT INTO ci_runs(owner,repo,event) VALUES('alice','project','manual')"
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO ci_artifacts(run_id,archive) VALUES(?,?)", (identity, archive)
+                )
         finally:
             conn.close()
         status, headers, items = self.request(self.ci_base + "/artifacts?per_page=100")
@@ -630,32 +732,49 @@ class APICITests(unittest.TestCase):
         script = self.root / "deployment.sh"
         script.write_text("#!/bin/sh\ntouch " + shlex.quote(str(marker)) + "\n")
         script.chmod(0o700)
-        command = (shlex.quote(sys.executable) +
-            ' -c "from pathlib import Path; Path(\'report.txt\').write_text(\'real-api-artifact\'); print(\'real-api-ci-ok\')"')
-        self.save_pipeline(steps=[{"name": "Produce report", "run": command}],
+        command = (
+            shlex.quote(sys.executable)
+            + " -c \"from pathlib import Path; Path('report.txt').write_text('real-api-artifact'); print('real-api-ci-ok')\""
+        )
+        self.save_pipeline(
+            steps=[{"name": "Produce report", "run": command}],
             artifacts={"paths": ["report.txt"], "when": "always"},
-            deploy_enabled=True, deploy_branch="main", deploy_script=str(script), deploy_interpreter="sh")
+            deploy_enabled=True,
+            deploy_branch="main",
+            deploy_script=str(script),
+            deploy_interpreter="sh",
+        )
         status, _headers, created = self.trigger(key="real-manual")
         self.assertEqual(status, 202, created)
-        asyncio.run_coroutine_threadsafe(self.manager.wait_idle(), self.server.loop).result(timeout=30)
+        asyncio.run_coroutine_threadsafe(self.manager.wait_idle(), self.server.loop).result(
+            timeout=30
+        )
         result = self.request(self.ci_base + f"/runs/{created['id']}")[2]
-        self.assertEqual(result["status"], "success", database.db_ci_run_get("alice", "project", created["id"]))
+        self.assertEqual(
+            result["status"], "success", database.db_ci_run_get("alice", "project", created["id"])
+        )
         logs = self.request(self.ci_base + f"/runs/{created['id']}/logs")[2]
         self.assertIn("real-api-ci-ok", logs["content"])
         self.assertTrue(logs["complete"])
         status, _headers, archive = self.request(
-            self.ci_base + f"/runs/{created['id']}/artifacts/download", decode=False)
+            self.ci_base + f"/runs/{created['id']}/artifacts/download", decode=False
+        )
         self.assertEqual(status, 200)
         with zipfile.ZipFile(io.BytesIO(archive)) as content:
             self.assertEqual(content.read("report.txt"), b"real-api-artifact")
         self.assertFalse(marker.exists())
         self.assertEqual(database.db_deployments_count("alice", "project"), 0)
         status, _headers, rerun = self.mutate(
-            self.ci_base + f"/runs/{created['id']}/rerun", {}, key="real-manual-rerun")
+            self.ci_base + f"/runs/{created['id']}/rerun", {}, key="real-manual-rerun"
+        )
         self.assertEqual(status, 202, rerun)
         self.assertEqual(rerun["event"], "manual")
-        asyncio.run_coroutine_threadsafe(self.manager.wait_idle(), self.server.loop).result(timeout=30)
-        self.assertEqual(self.request(self.ci_base + f"/runs/{rerun['id']}")[2]["status"], "success")
+        asyncio.run_coroutine_threadsafe(self.manager.wait_idle(), self.server.loop).result(
+            timeout=30
+        )
+        self.assertEqual(
+            self.request(self.ci_base + f"/runs/{rerun['id']}")[2]["status"], "success"
+        )
         self.assertFalse(marker.exists())
         self.assertEqual(database.db_deployments_count("alice", "project"), 0)
 
@@ -681,7 +800,11 @@ class APICITests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers["Content-Type"])
         self.assertIn(b'aria-label="API documentation sections"', page)
-        for anchor in ("ci-automation", "ci-api-safety-and-test-coverage", "responses-pagination-and-errors"):
+        for anchor in (
+            "ci-automation",
+            "ci-api-safety-and-test-coverage",
+            "responses-pagination-and-errors",
+        ):
             with self.subTest(anchor=anchor):
                 self.assertIn(f'href="#{anchor}"'.encode(), page)
                 self.assertIn(f'id="{anchor}"'.encode(), page)
@@ -704,6 +827,7 @@ class APIDownloadTests(unittest.IsolatedAsyncioTestCase):
         from pygithost import application
         from pygithost.api.responses import BinaryDownload
         from pygithost.api.router import API
+
         handler = mock.Mock()
         handler.request.method = "GET"
         api = API(handler)
@@ -711,8 +835,10 @@ class APIDownloadTests(unittest.IsolatedAsyncioTestCase):
         async def blocked(*_args, **_kwargs):
             await asyncio.Future()
 
-        with mock.patch.object(application, "_send_response", side_effect=blocked) as send, mock.patch(
-                "pygithost.api.router.RESPONSE_TIMEOUT", 0.01):
+        with (
+            mock.patch.object(application, "_send_response", side_effect=blocked) as send,
+            mock.patch("pygithost.api.router.RESPONSE_TIMEOUT", 0.01),
+        ):
             with self.assertRaises(application.ClientDisconnected):
                 await api.send_download(BinaryDownload(b"zip", 3, "ci-1-artifacts.zip"))
         handler.request.writer.close.assert_called_once()
@@ -723,6 +849,7 @@ class APIDownloadTests(unittest.IsolatedAsyncioTestCase):
         from pygithost import application
         from pygithost.api.responses import BinaryDownload
         from pygithost.api.router import API
+
         handler = mock.Mock()
         handler.request.method = "GET"
         api = API(handler)
@@ -733,7 +860,9 @@ class APIDownloadTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Future()
 
         with mock.patch.object(application, "_send_response", side_effect=blocked) as send:
-            task = asyncio.create_task(api.send_download(BinaryDownload(b"zip", 3, "ci-1-artifacts.zip")))
+            task = asyncio.create_task(
+                api.send_download(BinaryDownload(b"zip", 3, "ci-1-artifacts.zip"))
+            )
             try:
                 async with asyncio.timeout(5):
                     await started.wait()

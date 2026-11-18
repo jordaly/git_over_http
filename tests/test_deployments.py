@@ -9,7 +9,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from pygithost import database
-from pygithost.ci import CIManager, default_config, deployment_prefix, pipeline_config, validate_config
+from pygithost.ci import (
+    CIManager,
+    default_config,
+    deployment_prefix,
+    pipeline_config,
+    validate_config,
+)
 from pygithost.ci_documentation import ci_configuration_guide
 
 
@@ -24,8 +30,11 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.script.write_text("#!/bin/sh\necho deployed\n")
         self.script.chmod(0o700)
         self.commit = "a" * 40
-        self.config = {**default_config(), "deploy_enabled": True,
-                       "deploy_script": str(self.script)}
+        self.config = {
+            **default_config(),
+            "deploy_enabled": True,
+            "deploy_script": str(self.script),
+        }
 
     def tearDown(self):
         database.DB_PATH = self.old_db
@@ -33,8 +42,15 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def run_record(self, event="push", branch="main", status="success"):
         await self.manager.save_config("owner", "repo", self.config)
-        run_id = database.db_ci_run_create("owner", "repo", event, branch,
-            self.commit, "{}", json.dumps(validate_config(self.config)))
+        run_id = database.db_ci_run_create(
+            "owner",
+            "repo",
+            event,
+            branch,
+            self.commit,
+            "{}",
+            json.dumps(validate_config(self.config)),
+        )
         database.db_ci_run_update(run_id, status=status)
         return (run_id, "owner", "repo", event, branch, self.commit, "{}")
 
@@ -49,14 +65,20 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["env"]["PYGITHOST_COMMIT"], self.commit)
             kwargs["output"].extend(b"deployed\n")
             return code
+
         self.manager._capture_process = AsyncMock(side_effect=execute)
 
     async def test_steps_publish_live_output_and_stop_on_failure(self):
-        self.config.update(deploy_script="", deploy_steps=[
-            {"name": "Prepare", "run": "echo prepare"},
-            {"name": "Release", "run": "exit 1"},
-            {"name": "Verify", "run": "echo verify"}])
+        self.config.update(
+            deploy_script="",
+            deploy_steps=[
+                {"name": "Prepare", "run": "echo prepare"},
+                {"name": "Release", "run": "exit 1"},
+                {"name": "Verify", "run": "echo verify"},
+            ],
+        )
         row = await self.run_record()
+
         async def capture(command, **kwargs):
             if command[0] == "git":
                 kwargs["output"].extend((self.commit + "\n").encode())
@@ -67,6 +89,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(current[0], "running")
             self.assertIn(command, current[1])
             return int(command == "exit 1")
+
         self.manager._capture_process = AsyncMock(side_effect=capture)
         await self.manager._deploy(row)
         attempt = database.db_deployments_list("owner", "repo")[0]
@@ -75,10 +98,14 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempt[3], "failed")
 
     async def test_shared_script_is_staged_for_named_steps_without_implicit_execution(self):
-        self.config.update(deploy_script="", deploy_script_content="#!/bin/sh\necho shared\n",
-                           deploy_steps=[{"name": "Release", "run": '"$PYGITHOST_DEPLOY_SCRIPT" release'}])
+        self.config.update(
+            deploy_script="",
+            deploy_script_content="#!/bin/sh\necho shared\n",
+            deploy_steps=[{"name": "Release", "run": '"$PYGITHOST_DEPLOY_SCRIPT" release'}],
+        )
         row = await self.run_record()
         calls = []
+
         async def capture(command, **kwargs):
             if command[0] == "git":
                 kwargs["output"].extend((self.commit + "\n").encode())
@@ -88,6 +115,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(script.read_text(), "#!/bin/sh\necho shared\n")
             self.assertTrue(kwargs["shell"])
             return 0
+
         self.manager._capture_process = AsyncMock(side_effect=capture)
         await self.manager._deploy(row)
         self.assertEqual(calls, ['"$PYGITHOST_DEPLOY_SCRIPT" release'])
@@ -104,15 +132,25 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager._capture_process.await_count, 6)
 
     async def test_two_named_targets_keep_results_logs_and_email_independent(self):
-        document = {"pipelines": [{"name": "checks", "steps": [{"name": "Test", "run": "echo test"}]}],
+        document = {
+            "pipelines": [{"name": "checks", "steps": [{"name": "Test", "run": "echo test"}]}],
             "deployments": [
                 {"name": "staging", "pipeline": "checks", "script": str(self.script)},
-                {"name": "production", "pipeline": "checks", "script": str(self.script),
-                 "notifications": {"email": {"mode": "all", "recipients": ["ops@example.com"]}}}]}
+                {
+                    "name": "production",
+                    "pipeline": "checks",
+                    "script": str(self.script),
+                    "notifications": {"email": {"mode": "all", "recipients": ["ops@example.com"]}},
+                },
+            ],
+        }
         config = await self.manager.save_document("owner", "repo", document)
-        run_id = database.db_ci_run_create("owner", "repo", "push", "main", self.commit, "{}", json.dumps(config))
+        run_id = database.db_ci_run_create(
+            "owner", "repo", "push", "main", self.commit, "{}", json.dumps(config)
+        )
         database.db_ci_run_update(run_id, status="success")
         row = (run_id, "owner", "repo", "push", "main", self.commit, "{}")
+
         async def capture(command, **kwargs):
             if command[0] == "git":
                 kwargs["output"].extend((self.commit + "\n").encode())
@@ -120,13 +158,19 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             name = kwargs["env"]["PYGITHOST_DEPLOYMENT"]
             kwargs["output"].extend(name.encode())
             return 1 if name == "staging" else 0
+
         self.manager._capture_process = AsyncMock(side_effect=capture)
         await self.manager._deploy(row)
         attempts = database.db_deployments_for_run(run_id)
-        self.assertEqual([(entry[1], entry[2], entry[3]) for entry in attempts],
-                         [("staging", "failed", "staging"), ("production", "success", "production")])
+        self.assertEqual(
+            [(entry[1], entry[2], entry[3]) for entry in attempts],
+            [("staging", "failed", "staging"), ("production", "success", "production")],
+        )
         self.assertEqual(database.db_ci_run_get("owner", "repo", run_id)[4], "success")
-        with patch("pygithost.ci.send_notification") as send, patch("pygithost.ci.load_settings", return_value={}):
+        with (
+            patch("pygithost.ci.send_notification") as send,
+            patch("pygithost.ci.load_settings", return_value={}),
+        ):
             await self.manager._deliver_deployment_notification(row)
             send.assert_called_once()
         attempts = database.db_deployments_for_run(run_id)
@@ -141,8 +185,15 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.capture()
         rows = []
         for config in (self.config, child):
-            run_id = database.db_ci_run_create("owner", "repo", "push", "main", self.commit,
-                "{}", json.dumps(validate_config(config)))
+            run_id = database.db_ci_run_create(
+                "owner",
+                "repo",
+                "push",
+                "main",
+                self.commit,
+                "{}",
+                json.dumps(validate_config(config)),
+            )
             database.db_ci_run_update(run_id, status="success")
             row = (run_id, "owner", "repo", "push", "main", self.commit, "{}")
             rows.append(row)
@@ -165,19 +216,27 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                 status TEXT NOT NULL DEFAULT 'running', output TEXT NOT NULL DEFAULT '',
                 started_at TEXT NOT NULL DEFAULT (datetime('now')), finished_at TEXT,
                 UNIQUE(owner,repo,commit_hash))""")
-            conn.execute("INSERT INTO ci_deployments(run_id,owner,repo,commit_hash,status,output) VALUES(1,'owner','repo','sha','success','legacy output')")
+            conn.execute(
+                "INSERT INTO ci_deployments(run_id,owner,repo,commit_hash,status,output) VALUES(1,'owner','repo','sha','success','legacy output')"
+            )
         finally:
             conn.close()
         database._db_init()
         database._db_init()
         self.assertEqual(database.db_deployment_get(1), ("success", "legacy output"))
         self.assertFalse(database.db_deployment_claim(2, "owner", "repo", "sha"))
-        self.assertTrue(database.db_deployment_claim(3, "owner", "repo", "sha", '{"pipeline_id":"staging"}'))
+        self.assertTrue(
+            database.db_deployment_claim(3, "owner", "repo", "sha", '{"pipeline_id":"staging"}')
+        )
 
     async def test_conditions_exclude_pr_manual_wrong_branch_and_failure(self):
         self.capture()
-        for args in [("manual", "main", "success"), ("pull_request", "main", "success"),
-                     ("push", "other", "success"), ("push", "main", "failed")]:
+        for args in [
+            ("manual", "main", "success"),
+            ("pull_request", "main", "success"),
+            ("push", "other", "success"),
+            ("push", "main", "failed"),
+        ]:
             row = await self.run_record(*args)
             await self.manager._deploy(row)
             self.assertIsNone(database.db_deployment_get(row[0]))
@@ -199,13 +258,19 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("enabled", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
 
     async def test_changed_database_script_is_not_deployed_from_old_run(self):
-        self.config.update(deploy_interpreter="python", deploy_script_content='print("old")\n', deploy_script="")
+        self.config.update(
+            deploy_interpreter="python", deploy_script_content='print("old")\n', deploy_script=""
+        )
         row = await self.run_record()
-        await self.manager.save_config("owner", "repo", {**self.config, "deploy_script_content": 'print("new")\n'})
+        await self.manager.save_config(
+            "owner", "repo", {**self.config, "deploy_script_content": 'print("new")\n'}
+        )
         self.capture()
         await self.manager._deploy(row)
         self.manager._capture_process.assert_not_awaited()
-        self.assertIn("settings changed", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
+        self.assertIn(
+            "settings changed", database.db_ci_run_metadata("owner", "repo", row[0])["reason"]
+        )
 
     async def test_failure_and_timeout_do_not_change_ci_result(self):
         for index, error in enumerate([None, asyncio.TimeoutError()]):
@@ -213,7 +278,9 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             row = await self.run_record()
             self.capture(code=1, error=error)
             await self.manager._deploy(row)
-            self.assertEqual(database.db_deployment_get(row[0])[0], "failed" if error is None else "timed_out")
+            self.assertEqual(
+                database.db_deployment_get(row[0])[0], "failed" if error is None else "timed_out"
+            )
             self.assertEqual(database.db_ci_run_get("owner", "repo", row[0])[4], "success")
 
     async def test_recovery_does_not_allow_repeated_attempt(self):
@@ -225,33 +292,51 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_uploaded_script_stored_and_executable(self):
         content = "#!/bin/sh\r\nprintf '%s' \"$1\"\r\n"
-        saved = await self.manager.save_config("owner", "repo", {
-            **self.config, "deploy_script": "", "deploy_script_content": content})
+        saved = await self.manager.save_config(
+            "owner", "repo", {**self.config, "deploy_script": "", "deploy_script_content": content}
+        )
         self.assertEqual(saved["deploy_script"], "")
         self.assertEqual(saved["deploy_script_content"], content.replace("\r\n", "\n"))
         self.assertFalse((Path(self.temp.name) / "deployment-scripts").exists())
-        self.assertEqual(json.loads(database.db_ci_config_get("owner", "repo"))["deploy_script_content"], saved["deploy_script_content"])
-        again = await self.manager.save_config("owner", "repo", {
-            **self.config, "deploy_script_content": content})
+        self.assertEqual(
+            json.loads(database.db_ci_config_get("owner", "repo"))["deploy_script_content"],
+            saved["deploy_script_content"],
+        )
+        again = await self.manager.save_config(
+            "owner", "repo", {**self.config, "deploy_script_content": content}
+        )
         self.assertEqual(again["deploy_script"], "")
-        self.assertEqual(await self.manager.deployment_script_content("owner", "repo", saved), content.replace("\r\n", "\n"))
-        self.assertEqual(await self.manager.deployment_script_content("owner", "repo", {"deploy_script": str(self.script)}), "")
+        self.assertEqual(
+            await self.manager.deployment_script_content("owner", "repo", saved),
+            content.replace("\r\n", "\n"),
+        )
+        self.assertEqual(
+            await self.manager.deployment_script_content(
+                "owner", "repo", {"deploy_script": str(self.script)}
+            ),
+            "",
+        )
 
     async def test_invalid_upload_not_saved(self):
         for content in ["#!/bin/sh\n" + "x" * 65536, "#!/bin/sh\n\0"]:
             with self.assertRaises(ValueError):
-                await self.manager.save_config("owner", "repo", {
-                    **self.config, "deploy_script_content": content})
+                await self.manager.save_config(
+                    "owner", "repo", {**self.config, "deploy_script_content": content}
+                )
         self.assertIsNone(database.db_ci_config_get("owner", "repo"))
 
     async def test_python_upload_without_shebang(self):
         content = 'import sys\nprint("deployed " + sys.argv[1])\n'
-        saved = await self.manager.save_config("owner", "repo", {
-            **self.config, "deploy_interpreter": "python", "deploy_script_content": content})
+        saved = await self.manager.save_config(
+            "owner",
+            "repo",
+            {**self.config, "deploy_interpreter": "python", "deploy_script_content": content},
+        )
         self.config = saved
         row = await self.run_record()
         original = self.manager._capture_process
         paths = []
+
         async def capture(command, **kwargs):
             if command[0] == "git":
                 if "clone" in command:
@@ -265,39 +350,66 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(path.read_text(), content)
             self.assertEqual(path.suffix, ".py")
             return await original(command, **kwargs)
+
         self.manager._capture_process = capture
         await self.manager._deploy(row)
-        self.assertEqual(database.db_deployment_get(row[0]),
-                         ("success", "deployed " + self.commit + "\n"))
+        self.assertEqual(
+            database.db_deployment_get(row[0]), ("success", "deployed " + self.commit + "\n")
+        )
         self.assertFalse(paths[0].exists())
 
     async def test_direct_upload_still_requires_shebang_on_posix(self):
         if os.name != "nt":
             with self.assertRaisesRegex(ValueError, "shebang"):
-                await self.manager.save_config("owner", "repo", {
-                    **self.config, "deploy_script_content": 'print("hello")'})
+                await self.manager.save_config(
+                    "owner", "repo", {**self.config, "deploy_script_content": 'print("hello")'}
+                )
 
     @unittest.skipUnless(os.name == "posix", "POSIX executable script")
     async def test_real_ci_then_uploaded_deployment(self):
         bare = Path(self.temp.name) / "repo.git"
         source = Path(self.temp.name) / "source"
         source.mkdir()
+
         def git(*args):
-            return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.DEVNULL).decode().strip()
+            return (
+                subprocess.check_output(["git", *map(str, args)], stderr=subprocess.DEVNULL)
+                .decode()
+                .strip()
+            )
+
         git("init", "-b", "main", source)
-        git("-C", source, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-            "commit", "--allow-empty", "-m", "Initial")
+        git(
+            "-C",
+            source,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initial",
+        )
         self.commit = git("-C", source, "rev-parse", "HEAD")
         git("clone", "--bare", source, bare)
-        config = await self.manager.save_config("owner", "repo", {
-            **self.config, "command": "echo tests passed", "events": {"push": True},
-            "deploy_script_content": '#!/bin/sh\nprintf "deployed %s" "$1"\n'})
+        config = await self.manager.save_config(
+            "owner",
+            "repo",
+            {
+                **self.config,
+                "command": "echo tests passed",
+                "events": {"push": True},
+                "deploy_script_content": '#!/bin/sh\nprintf "deployed %s" "$1"\n',
+            },
+        )
         run_id = await self.manager.enqueue("owner", "repo", "push", "main", self.commit)
         try:
             await asyncio.wait_for(self.manager.wait_idle(), timeout=15)
             self.assertEqual(database.db_ci_run_get("owner", "repo", run_id)[4], "success")
-            self.assertEqual(database.db_deployment_get(run_id),
-                             ("success", "deployed " + self.commit))
+            self.assertEqual(
+                database.db_deployment_get(run_id), ("success", "deployed " + self.commit)
+            )
             self.assertEqual(config["deploy_script"], "")
             self.assertIn("deploy_script_content", config)
         finally:
@@ -307,25 +419,50 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         bare = Path(self.temp.name) / "repo.git"
         source = Path(self.temp.name) / "source"
         source.mkdir()
+
         def git(*args):
-            return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.DEVNULL).decode().strip()
+            return (
+                subprocess.check_output(["git", *map(str, args)], stderr=subprocess.DEVNULL)
+                .decode()
+                .strip()
+            )
+
         git("init", "-b", "main", source)
         (source / "deploy").mkdir()
         (source / "deploy/artifact.txt").write_text("from-repo\n")
         git("-C", source, "-c", "user.name=Test", "-c", "user.email=test@example.com", "add", ".")
-        git("-C", source, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-            "commit", "-m", "Initial")
+        git(
+            "-C",
+            source,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Initial",
+        )
         self.commit = git("-C", source, "rev-parse", "HEAD")
         git("clone", "--bare", source, bare)
-        await self.manager.save_config("owner", "repo", {
-            **self.config, "command": "true", "events": {"push": True},
-            "deploy_script": "", "deploy_script_content": "",
-            "deploy_steps": [
-                {"name": "Read repository file", "run": "cat deploy/artifact.txt"},
-                {"name": "Show checkout", "run": 'printf "%s\\n" "$PYGITHOST_WORKTREE"'},
-                {"name": "Verify pinned checkout",
-                 "run": 'test -d .git && test -f deploy/artifact.txt && test -z "$(git remote)"'},
-            ]})
+        await self.manager.save_config(
+            "owner",
+            "repo",
+            {
+                **self.config,
+                "command": "true",
+                "events": {"push": True},
+                "deploy_script": "",
+                "deploy_script_content": "",
+                "deploy_steps": [
+                    {"name": "Read repository file", "run": "cat deploy/artifact.txt"},
+                    {"name": "Show checkout", "run": 'printf "%s\\n" "$PYGITHOST_WORKTREE"'},
+                    {
+                        "name": "Verify pinned checkout",
+                        "run": 'test -d .git && test -f deploy/artifact.txt && test -z "$(git remote)"',
+                    },
+                ],
+            },
+        )
         run_id = await self.manager.enqueue("owner", "repo", "push", "main", self.commit)
         try:
             await asyncio.wait_for(self.manager.wait_idle(), timeout=20)
@@ -341,33 +478,49 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_checkout_failure_does_not_consume_the_deployment_attempt(self):
         row = await self.run_record()
+
         async def execute(command, **kwargs):
             if command[0] == "git" and "clone" in command:
                 return 128
             kwargs["output"].extend((self.commit + "\n").encode())
             return 0
+
         self.manager._capture_process = AsyncMock(side_effect=execute)
         await self.manager._deploy(row)
         self.assertIsNone(database.db_deployment_get(row[0]))
-        self.assertIn("did not start", database.db_ci_run_metadata("owner", "repo", row[0])["reason"])
+        self.assertIn(
+            "did not start", database.db_ci_run_metadata("owner", "repo", row[0])["reason"]
+        )
         self.assertTrue(database.db_deployment_claim(row[0], "owner", "repo", self.commit))
 
     def test_repository_pipeline_cannot_configure_deployment(self):
         with self.assertRaises(ValueError):
-            pipeline_config({"version": 1, "command": "true", "deploy_enabled": True}, default_config())
+            pipeline_config(
+                {"version": 1, "command": "true", "deploy_enabled": True}, default_config()
+            )
 
     def test_invalid_config(self):
-        for values in [{"deploy_interpreter": '"unclosed'}, {"deploy_timeout": 0}, {"deploy_script": "relative.sh"},
-                       {"deploy_branch": "main; branch"}, {"deploy_enabled": "yes"}]:
+        for values in [
+            {"deploy_interpreter": '"unclosed'},
+            {"deploy_timeout": 0},
+            {"deploy_script": "relative.sh"},
+            {"deploy_branch": "main; branch"},
+            {"deploy_enabled": "yes"},
+        ]:
             with self.assertRaises(ValueError):
                 validate_config({**default_config(), **values})
 
     def test_arbitrary_runner_and_arguments(self):
         for command, expected in [
-            ("node", ["node"]), ("bash -e", ["bash", "-e"]),
+            ("node", ["node"]),
+            ("bash -e", ["bash", "-e"]),
             ("pwsh -NoProfile -File", ["pwsh", "-NoProfile", "-File"]),
-            ('"C:/Program Files/Python/python.exe" -u', ["C:/Program Files/Python/python.exe", "-u"]),
-            ("", []), ("python", [sys.executable]),
+            (
+                '"C:/Program Files/Python/python.exe" -u',
+                ["C:/Program Files/Python/python.exe", "-u"],
+            ),
+            ("", []),
+            ("python", [sys.executable]),
         ]:
             self.assertEqual(deployment_prefix(command), expected)
 
@@ -392,22 +545,39 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail[9], "deployment output")
 
     async def test_explicit_runner_does_not_require_shebang(self):
-        saved = await self.manager.save_config("owner", "repo", {
-            **self.config, "deploy_interpreter": "node", "deploy_script_content": "console.log(process.argv[2]);"})
+        saved = await self.manager.save_config(
+            "owner",
+            "repo",
+            {
+                **self.config,
+                "deploy_interpreter": "node",
+                "deploy_script_content": "console.log(process.argv[2]);",
+            },
+        )
         self.assertEqual(saved["deploy_interpreter"], "node")
 
     async def test_deployment_email_modes_and_duplicate_protection(self):
-        for index, (mode, status, sends) in enumerate([
-            ("off", "failed", False), ("failures", "success", False),
-            ("failures", "failed", True), ("all", "success", True),
-            ("failures", "timed_out", True), ("failures", "interrupted", True),
-        ]):
+        for index, (mode, status, sends) in enumerate(
+            [
+                ("off", "failed", False),
+                ("failures", "success", False),
+                ("failures", "failed", True),
+                ("all", "success", True),
+                ("failures", "timed_out", True),
+                ("failures", "interrupted", True),
+            ]
+        ):
             self.commit = f"{index:040x}"
             self.config.update(email_mode=mode, email_recipients="deploy@example.com")
             row = await self.run_record()
-            database.db_deployment_claim(row[0], "owner", "repo", self.commit, json.dumps(self.config))
+            database.db_deployment_claim(
+                row[0], "owner", "repo", self.commit, json.dumps(self.config)
+            )
             database.db_deployment_finish(row[0], status, "SECRET output")
-            with patch("pygithost.ci.send_notification") as send, patch("pygithost.ci.load_settings", return_value={}):
+            with (
+                patch("pygithost.ci.send_notification") as send,
+                patch("pygithost.ci.load_settings", return_value={}),
+            ):
                 await self.manager._deliver_deployment_notification(row)
                 await self.manager._deliver_deployment_notification(row)
                 self.assertEqual(send.call_count, int(sends))
@@ -422,7 +592,10 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         row = await self.run_record()
         database.db_deployment_claim(row[0], "owner", "repo", self.commit, json.dumps(self.config))
         database.db_deployment_finish(row[0], "success", "done")
-        with patch("pygithost.ci.send_notification", side_effect=OSError("secret password")), patch("pygithost.ci.load_settings", return_value={}):
+        with (
+            patch("pygithost.ci.send_notification", side_effect=OSError("secret password")),
+            patch("pygithost.ci.load_settings", return_value={}),
+        ):
             await self.manager._deliver_deployment_notification(row)
         record = database.db_deployment_email_record(row[0])
         self.assertEqual(record[4], "success")
@@ -432,20 +605,30 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
     async def test_deployment_recovery_email(self):
         self.config.update(email_mode="recovery", email_recipients="deploy@example.com")
         first = await self.run_record()
-        database.db_deployment_claim(first[0], "owner", "repo", self.commit, json.dumps(self.config))
+        database.db_deployment_claim(
+            first[0], "owner", "repo", self.commit, json.dumps(self.config)
+        )
         database.db_deployment_finish(first[0], "failed", "")
         self.commit = "b" * 40
         row = await self.run_record()
         database.db_deployment_claim(row[0], "owner", "repo", self.commit, json.dumps(self.config))
         database.db_deployment_finish(row[0], "success", "")
-        with patch("pygithost.ci.send_notification") as send, patch("pygithost.ci.load_settings", return_value={}):
+        with (
+            patch("pygithost.ci.send_notification") as send,
+            patch("pygithost.ci.load_settings", return_value={}),
+        ):
             await self.manager._deliver_deployment_notification(row)
             send.assert_called_once()
 
     def test_deployment_documentation_is_rendered(self):
         guide = str(ci_configuration_guide())
-        for text in ['id="every-deployment-option"', 'href="#every-deployment-option"',
-                     "script_content", "PYGITHOST_COMMIT",
-                     "one attempt", "not secret-redacted",
-                     "automatic artifact handoff"]:
+        for text in [
+            'id="every-deployment-option"',
+            'href="#every-deployment-option"',
+            "script_content",
+            "PYGITHOST_COMMIT",
+            "one attempt",
+            "not secret-redacted",
+            "automatic artifact handoff",
+        ]:
             self.assertIn(text, guide)

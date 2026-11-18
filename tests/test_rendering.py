@@ -44,5 +44,5 @@ class PageLayoutTests(unittest.TestCase):
         self.assertIn('aria-label="Workspace navigation"', header)
         self.assertIn('id="theme-toggle"', header)
         self.assertLess(page.index("</header>"), page.index("page-content"))
-        self.assertLess(page.index('/static/ui.css'), page.index('/static/ci.css'))
-        self.assertLess(page.index('/static/ui.css'), page.index('/static/repository.css'))
+        self.assertLess(page.index("/static/ui.css"), page.index("/static/ci.css"))
+        self.assertLess(page.index("/static/ui.css"), page.index("/static/repository.css"))

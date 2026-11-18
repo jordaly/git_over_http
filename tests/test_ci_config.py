@@ -3,7 +3,7 @@ import json
 import unittest
 
 from pygithost.ci import CIManager, validate_config
-from pygithost.ci_config import EXAMPLE, compile_document, export_document, editor_document
+from pygithost.ci_config import EXAMPLE, compile_document, editor_document, export_document
 
 
 class JSONConfigurationTests(unittest.TestCase):
@@ -27,8 +27,11 @@ class JSONConfigurationTests(unittest.TestCase):
         self.assertTrue(config["events"]["pr_opened"])
         self.assertTrue(config["events"]["manual"])
         self.assertFalse(config["deploy_enabled"])
-        for invalid in ({"file": "../outside.json"}, {"file": ".ci-config.json", "pipelines": []},
-                        {"file": ".ci-config.json", "version": True}):
+        for invalid in (
+            {"file": "../outside.json"},
+            {"file": ".ci-config.json", "pipelines": []},
+            {"file": ".ci-config.json", "version": True},
+        ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 compile_document(invalid)
 
@@ -48,22 +51,40 @@ class JSONConfigurationTests(unittest.TestCase):
 
     def test_validation_rejects_old_modes_and_unknown_fields(self):
         for document in (
-            [], {"pipelines": [{}]}, {"pipelines": {"bad/name": {"steps": [{"name": "x", "run": "echo x"}]}}},
+            [],
+            {"pipelines": [{}]},
+            {"pipelines": {"bad/name": {"steps": [{"name": "x", "run": "echo x"}]}}},
             {"pipelines": {"tests": {"command": "echo old"}}},
             {"pipelines": {"tests": {"steps": []}}},
             {"defaults": {"steps": []}, "pipelines": {}},
             {"defaults": {"events": {"typo": True}}, "pipelines": {}},
             {"settings": {"runner": "docker"}, "pipelines": {}},
-            {"pipelines": {"tests": {"steps": [{"name": "x", "run": "echo x"}], "require_ci": True}}},
+            {
+                "pipelines": {
+                    "tests": {"steps": [{"name": "x", "run": "echo x"}], "require_ci": True}
+                }
+            },
             {"version": True, "pipelines": {}},
         ):
             with self.subTest(document=document), self.assertRaises(ValueError):
                 compile_document(document)
 
     def test_deployment_and_repository_policy(self):
-        config = compile_document({"settings": {"require_ci": True, "run_retention_count": 0},
-            "pipelines": {"release": {"steps": [{"name": "Tests", "run": "echo test"}],
-                "deployment": {"branch": "main", "script_content": "print('deploy')", "run_with": "python"}}}})
+        config = compile_document(
+            {
+                "settings": {"require_ci": True, "run_retention_count": 0},
+                "pipelines": {
+                    "release": {
+                        "steps": [{"name": "Tests", "run": "echo test"}],
+                        "deployment": {
+                            "branch": "main",
+                            "script_content": "print('deploy')",
+                            "run_with": "python",
+                        },
+                    }
+                },
+            }
+        )
         self.assertTrue(config["require_ci"])
         self.assertEqual(config["run_retention_count"], 0)
         child = CIManager.pipelines(config)[0]
@@ -72,9 +93,22 @@ class JSONConfigurationTests(unittest.TestCase):
         self.assertEqual(CIManager.pipelines(compile_document({"pipelines": {}})), [])
 
     def test_legacy_configuration_converts_without_changing_execution(self):
-        legacy = validate_config({"command": "echo legacy", "events": {"push": True},
-            "require_ci": True, "deploy_enabled": True, "deploy_script": "/opt/deploy/app.sh",
-            "pipelines": [{"pipeline_id": "lint", "repository_config": True, "repository_file": "lint.json"}]})
+        legacy = validate_config(
+            {
+                "command": "echo legacy",
+                "events": {"push": True},
+                "require_ci": True,
+                "deploy_enabled": True,
+                "deploy_script": "/opt/deploy/app.sh",
+                "pipelines": [
+                    {
+                        "pipeline_id": "lint",
+                        "repository_config": True,
+                        "repository_file": "lint.json",
+                    }
+                ],
+            }
+        )
         document = export_document(legacy)
         converted = compile_document(document)
         self.assertEqual(converted["steps"], [{"name": "Run", "run": "echo legacy"}])
@@ -84,16 +118,27 @@ class JSONConfigurationTests(unittest.TestCase):
         self.assertEqual(export_document(converted), document)
 
     def test_migration_never_enables_disabled_deployment(self):
-        config = validate_config({"command": "echo test", "events": {"push": True},
-            "deploy_script": "/opt/deploy/app.sh", "deploy_enabled": False})
+        config = validate_config(
+            {
+                "command": "echo test",
+                "events": {"push": True},
+                "deploy_script": "/opt/deploy/app.sh",
+                "deploy_enabled": False,
+            }
+        )
         document = export_document(config)
         self.assertFalse(document["pipelines"]["default"]["deployment"]["enabled"])
         self.assertFalse(compile_document(document)["deploy_enabled"])
 
     def test_sixteen_pipelines_need_no_special_default(self):
-        config = compile_document({"pipelines": {
-            f"job-{index}": {"steps": [{"name": "Test", "run": "echo test"}]}
-            for index in range(16)}})
+        config = compile_document(
+            {
+                "pipelines": {
+                    f"job-{index}": {"steps": [{"name": "Test", "run": "echo test"}]}
+                    for index in range(16)
+                }
+            }
+        )
         self.assertEqual(len(CIManager.pipelines(config)), 16)
 
     def test_branch_filters_are_string_arrays(self):
@@ -113,15 +158,27 @@ class JSONConfigurationTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 compile_document({"defaults": {"push_branches": value}, "pipelines": {}})
         with self.assertRaises(ValueError):
-            compile_document({"pipelines": {"test": {"steps": [{"name": "x", "run": "echo x"}], "pr_branches": "main"}}})
+            compile_document(
+                {
+                    "pipelines": {
+                        "test": {"steps": [{"name": "x", "run": "echo x"}], "pr_branches": "main"}
+                    }
+                }
+            )
 
     def test_existing_branch_strings_are_exported_as_arrays(self):
         legacy = validate_config({"command": "echo test", "push_branches": "main\nrelease/*"})
         document = export_document(legacy)
         self.assertEqual(document["pipelines"]["default"]["push_branches"], ["main", "release/*"])
         self.assertEqual(compile_document(document)["push_branches"], "main\nrelease/*")
-        saved = {"document": {"defaults": {"push_branches": "main"}, "pipelines": {
-            "test": {"steps": [{"name": "x", "run": "echo x"}], "pr_branches": "main"}}}}
+        saved = {
+            "document": {
+                "defaults": {"push_branches": "main"},
+                "pipelines": {
+                    "test": {"steps": [{"name": "x", "run": "echo x"}], "pr_branches": "main"}
+                },
+            }
+        }
         converted = export_document(saved)
         self.assertEqual(converted["defaults"]["push_branches"], ["main"])
         self.assertEqual(converted["pipelines"]["test"]["pr_branches"], ["main"])
@@ -129,8 +186,13 @@ class JSONConfigurationTests(unittest.TestCase):
 
     def test_other_multivalue_fields_use_string_arrays(self):
         document = copy.deepcopy(EXAMPLE)
-        document["defaults"].update(email_mode="failures", email_recipients=["ci@example.com", "ops@example.com"])
-        document["settings"] = {"block_direct_pushes": True, "protected_branches": ["main", "release/*"]}
+        document["defaults"].update(
+            email_mode="failures", email_recipients=["ci@example.com", "ops@example.com"]
+        )
+        document["settings"] = {
+            "block_direct_pushes": True,
+            "protected_branches": ["main", "release/*"],
+        }
         config = compile_document(document)
         self.assertEqual(config["protected_branches"], "main\nrelease/*")
         self.assertEqual(config["email_recipients"], "ci@example.com\nops@example.com")
@@ -146,23 +208,39 @@ class JSONConfigurationTests(unittest.TestCase):
             compile_document(document)
 
     def test_legacy_multivalue_strings_migrate_to_arrays(self):
-        legacy = validate_config({"command": "echo test", "protected_branches": "main\nrelease/*",
-            "email_recipients": "ci@example.com,ops@example.com", "email_mode": "all"})
+        legacy = validate_config(
+            {
+                "command": "echo test",
+                "protected_branches": "main\nrelease/*",
+                "email_recipients": "ci@example.com,ops@example.com",
+                "email_mode": "all",
+            }
+        )
         document = export_document(legacy)
         self.assertEqual(document["settings"]["protected_branches"], ["main", "release/*"])
-        self.assertEqual(document["pipelines"]["default"]["email_recipients"], ["ci@example.com", "ops@example.com"])
+        self.assertEqual(
+            document["pipelines"]["default"]["email_recipients"],
+            ["ci@example.com", "ops@example.com"],
+        )
         compile_document(document)
 
     def test_examples_in_docs_validate(self):
         import re
         from pathlib import Path
-        for path in ("docs/pipeline-examples.md", "docs/pipelines.md", "docs/ci-migration.md", "docs/server-settings.md"):
+
+        for path in (
+            "docs/pipeline-examples.md",
+            "docs/pipelines.md",
+            "docs/ci-migration.md",
+            "docs/server-settings.md",
+        ):
             for block in re.findall(r"```json\n(.*?)\n```", Path(path).read_text(), re.S):
                 with self.subTest(path=path):
                     compile_document(json.loads(block))
 
     def test_downloadable_examples_validate_and_cover_every_option(self):
         from pathlib import Path
+
         from pygithost.ci import default_config, pipeline_config
         from pygithost.ci_config import COMMON, DEPLOYMENT, SETTINGS
         from pygithost.ci_schema import flatten_document, is_grouped, split_named_document
@@ -194,6 +272,7 @@ class JSONConfigurationTests(unittest.TestCase):
                     seen_deployment.update(pipeline.get("deployment", {}))
         # Variables and retention now have page controls, not JSON examples.
         from pygithost.ci_preferences import RETENTION
+
         self.assertEqual(seen_common, COMMON - {"env"})
         self.assertEqual(seen_settings, SETTINGS - set(RETENTION))
         self.assertEqual(seen_deployment, set(DEPLOYMENT))
@@ -201,9 +280,38 @@ class JSONConfigurationTests(unittest.TestCase):
 
         # The page renders this same reference, so coverage checks both surfaces.
         reference = Path("docs/ci-options.md").read_text()
-        fields = {"runner", "image", "timeout_seconds", "env", "steps", "name", "run", "file"} | set(DEPLOYMENT)
-        fields |= {"push.enabled", "push.branches", "pull_request.enabled", "pull_request.branches", "pull_request.events", "manual.enabled", "cancellation.superseded"}
-        fields |= {"artifacts.paths", "artifacts.when", "notifications.email.mode", "notifications.email.recipients"}
-        fields |= {"policies.require_ci", "policies.block_direct_pushes", "policies.protected_branches", "retention.artifacts.days", "retention.artifacts.max_count", "retention.runs.max_count"}
+        fields = {
+            "runner",
+            "image",
+            "timeout_seconds",
+            "env",
+            "steps",
+            "name",
+            "run",
+            "file",
+        } | set(DEPLOYMENT)
+        fields |= {
+            "push.enabled",
+            "push.branches",
+            "pull_request.enabled",
+            "pull_request.branches",
+            "pull_request.events",
+            "manual.enabled",
+            "cancellation.superseded",
+        }
+        fields |= {
+            "artifacts.paths",
+            "artifacts.when",
+            "notifications.email.mode",
+            "notifications.email.recipients",
+        }
+        fields |= {
+            "policies.require_ci",
+            "policies.block_direct_pushes",
+            "policies.protected_branches",
+            "retention.artifacts.days",
+            "retention.artifacts.max_count",
+            "retention.runs.max_count",
+        }
         for field in fields:
             self.assertIn(f"`{field}`", reference)

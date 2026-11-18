@@ -7,22 +7,37 @@ from pygithost.ci_schema import group_document
 
 class GroupedConfigurationTests(unittest.TestCase):
     def example(self):
-        return {"version": 1,
+        return {
+            "version": 1,
             "defaults": {
-                "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600,
-                              "env": {"COMMON": "yes", "MODE": "development"}},
-                "triggers": {"push": {"enabled": True, "branches": ["main", "develop"]},
-                             "pull_request": {"enabled": True, "branches": ["main"]},
-                             "manual": {"enabled": True}},
-                "cancellation": {"superseded": True}},
+                "execution": {
+                    "runner": "docker",
+                    "image": "python:3.14-slim",
+                    "timeout_seconds": 600,
+                    "env": {"COMMON": "yes", "MODE": "development"},
+                },
+                "triggers": {
+                    "push": {"enabled": True, "branches": ["main", "develop"]},
+                    "pull_request": {"enabled": True, "branches": ["main"]},
+                    "manual": {"enabled": True},
+                },
+                "cancellation": {"superseded": True},
+            },
             "pipelines": {
                 "checks": {"steps": [{"name": "Tests", "run": "echo tests"}]},
-                "release": {"execution": {"env": {"MODE": "production"}},
-                            "triggers": {"push": {"branches": ["main"]}, "pull_request": {"enabled": False}},
-                            "steps": [{"name": "Build", "run": "echo build"}]}},
+                "release": {
+                    "execution": {"env": {"MODE": "production"}},
+                    "triggers": {
+                        "push": {"branches": ["main"]},
+                        "pull_request": {"enabled": False},
+                    },
+                    "steps": [{"name": "Build", "run": "echo build"}],
+                },
+            },
             "notifications": {"email": {"mode": "off", "recipients": ["ci@example.com"]}},
             "policies": {"require_ci": True, "protected_branches": ["main"]},
-            "retention": {"artifacts": {"days": 30, "max_count": 50}, "runs": {"max_count": 100}}}
+            "retention": {"artifacts": {"days": 30, "max_count": 50}, "runs": {"max_count": 100}},
+        }
 
     def test_grouped_fields_and_inheritance(self):
         raw = self.example()
@@ -43,14 +58,34 @@ class GroupedConfigurationTests(unittest.TestCase):
         self.assertEqual(CIManager.pipelines(after), CIManager.pipelines(config))
 
     def test_named_lists_are_independent_and_have_explicit_names(self):
-        document = {"pipelines": [
-            {"name": "first", "execution": {"runner": "docker", "env": {"ONLY_FIRST": "yes"}},
-             "triggers": {"manual": {"enabled": True}}, "steps": [{"name": "First", "run": "echo first"}],
-             "notifications": {"email": {"mode": "all", "recipients": ["first@example.com"]}}},
-            {"name": "second", "steps": [{"name": "Second", "run": "echo second"}]}
-        ], "deployments": [
-            {"name": "staging", "pipeline": "first", "enabled": False, "script": "/opt/staging.sh"},
-            {"name": "production", "pipeline": "first", "enabled": False, "script": "/opt/production.sh"}]}
+        document = {
+            "pipelines": [
+                {
+                    "name": "first",
+                    "execution": {"runner": "docker", "env": {"ONLY_FIRST": "yes"}},
+                    "triggers": {"manual": {"enabled": True}},
+                    "steps": [{"name": "First", "run": "echo first"}],
+                    "notifications": {
+                        "email": {"mode": "all", "recipients": ["first@example.com"]}
+                    },
+                },
+                {"name": "second", "steps": [{"name": "Second", "run": "echo second"}]},
+            ],
+            "deployments": [
+                {
+                    "name": "staging",
+                    "pipeline": "first",
+                    "enabled": False,
+                    "script": "/opt/staging.sh",
+                },
+                {
+                    "name": "production",
+                    "pipeline": "first",
+                    "enabled": False,
+                    "script": "/opt/production.sh",
+                },
+            ],
+        }
         config = compile_document(document)
         first, second = CIManager.pipelines(config)
         self.assertEqual(first["runner"], "docker")
@@ -59,13 +94,19 @@ class GroupedConfigurationTests(unittest.TestCase):
         self.assertTrue(second["events"]["manual"])
         self.assertEqual(second["email_mode"], "off")
         self.assertEqual(len(first["deployment_targets"]), 2)
-        self.assertTrue(all(target["email_mode"] == "off" for target in first["deployment_targets"]))
+        self.assertTrue(
+            all(target["email_mode"] == "off" for target in first["deployment_targets"])
+        )
         self.assertEqual(editor_document(config), document)
         for invalid in (
-            {"defaults": {}, **document}, {"notifications": {}, **document},
+            {"defaults": {}, **document},
+            {"notifications": {}, **document},
             {"pipelines": [{"steps": [{"name": "x", "run": "echo x"}]}]},
             {"pipelines": [document["pipelines"][0], document["pipelines"][0]]},
-            {"pipelines": document["pipelines"], "deployments": [{"name": "x", "pipeline": "missing"}]},
+            {
+                "pipelines": document["pipelines"],
+                "deployments": [{"name": "x", "pipeline": "missing"}],
+            },
             {"pipelines": document["pipelines"], "deployments": [{"pipeline": "first"}]},
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
@@ -73,7 +114,10 @@ class GroupedConfigurationTests(unittest.TestCase):
 
     def test_merged_event_is_explicit_and_notifications_can_override(self):
         raw = self.example()
-        raw["pipelines"]["release"]["triggers"]["pull_request"] = {"enabled": True, "events": ["merged"]}
+        raw["pipelines"]["release"]["triggers"]["pull_request"] = {
+            "enabled": True,
+            "events": ["merged"],
+        }
         raw["pipelines"]["release"]["notifications"] = {"email": {"mode": "all"}}
         config = compile_document(raw)
         release = CIManager.pipelines(config)[1]
@@ -103,9 +147,15 @@ class GroupedConfigurationTests(unittest.TestCase):
             compile_document(raw)
 
     def test_old_partial_pr_overrides_migrate_without_changing_behavior(self):
-        raw = {"defaults": {"events": {"pr_opened": True, "pr_updated": True, "manual": True}},
-               "pipelines": {"checks": {"events": {"pr_updated": False},
-                            "steps": [{"name": "Tests", "run": "echo x"}]}}}
+        raw = {
+            "defaults": {"events": {"pr_opened": True, "pr_updated": True, "manual": True}},
+            "pipelines": {
+                "checks": {
+                    "events": {"pr_updated": False},
+                    "steps": [{"name": "Tests", "run": "echo x"}],
+                }
+            },
+        }
         before = compile_document(raw)
         grouped = group_document(raw)
         after = compile_document(grouped)

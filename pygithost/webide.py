@@ -5,6 +5,8 @@ import re
 import subprocess
 import tempfile
 import threading
+from collections.abc import Iterable, Mapping
+from typing import TypedDict
 
 MAX_FILE = 1024 * 1024
 MAX_REQUEST = 5 * MAX_FILE
@@ -21,30 +23,96 @@ class IDEError(ValueError):
     pass
 
 
-def git(repo, *args, data=None, env=None):
-    result = subprocess.run(["git", "--git-dir=" + repo, *args], input=data,
-                            capture_output=True, env=env, timeout=30)
+class TreeEntry(TypedDict):
+    """Metadata for one path recorded in a Git tree."""
+
+    path: str
+    mode: str
+    type: str
+    oid: str
+
+
+class DirectoryEntry(TypedDict):
+    """One direct child of a directory listing."""
+
+    name: str
+    path: str
+    type: str
+
+
+class DirectoryListing(TypedDict):
+    """A bounded listing of one directory."""
+
+    path: str
+    entries: list[DirectoryEntry]
+    truncated: bool
+
+
+class Snapshot(TypedDict):
+    """Initial editor state for one branch."""
+
+    branch: str
+    commit: str
+    root: list[DirectoryEntry]
+    root_truncated: bool
+
+
+class PathIndex(TypedDict):
+    """Flat path index used by "Go to file" and the filename filter."""
+
+    files: list[str]
+
+
+class SearchHit(TypedDict):
+    """One matching line from a bounded repository search."""
+
+    path: str
+    line: int
+    text: str
+
+
+class SearchResults(TypedDict):
+    """Bounded search response."""
+
+    results: list[SearchHit]
+    truncated: bool
+
+
+def git(
+    repo: str,
+    *args: str,
+    data: bytes | None = None,
+    env: Mapping[str, str] | None = None,
+) -> bytes:
+    result = subprocess.run(
+        ["git", "--git-dir=" + repo, *args], input=data, capture_output=True, env=env, timeout=30
+    )
     if result.returncode:
         raise IDEError("Git operation failed: " + result.stderr.decode("utf-8", "replace")[:500])
     return result.stdout
 
 
-def path(value):
-    if (not isinstance(value, str) or not value or len(value.encode("utf-8")) > 4096
-            or any(ord(c) < 32 for c in value) or "\\" in value
-            or any(p in ("", ".", "..") or p.lower() == ".git" for p in value.split("/"))):
+def path(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 4096
+        or any(ord(c) < 32 for c in value)
+        or "\\" in value
+        or any(p in ("", ".", "..") or p.lower() == ".git" for p in value.split("/"))
+    ):
         raise IDEError("Invalid repository file path.")
     return value
 
 
-def head(repo, branch):
+def head(repo: str, branch: str) -> str:
     if not isinstance(branch, str) or not branch or branch.startswith("-"):
         raise IDEError("Choose an existing branch.")
     git(repo, "check-ref-format", "refs/heads/" + branch)
     return git(repo, "rev-parse", "--verify", "refs/heads/" + branch).decode().strip()
 
 
-def _tree_record(record):
+def _tree_record(record: bytes) -> tuple[str, str, str, str] | None:
     """Parse one NUL-delimited `git ls-tree` record into (mode, kind, oid, name)."""
     if not record:
         return None
@@ -52,12 +120,12 @@ def _tree_record(record):
         meta, raw_name = record.split(b"\t", 1)
         mode, kind, oid = meta.decode().split()
         return mode, kind, oid, raw_name.decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
+    except ValueError, UnicodeDecodeError:
         return None
 
 
-def tree(repo, commit):
-    entries = {}
+def tree(repo: str, commit: str) -> dict[str, TreeEntry]:
+    entries: dict[str, TreeEntry] = {}
     for record in git(repo, "ls-tree", "-rz", "--full-tree", commit).split(b"\0"):
         parsed = _tree_record(record)
         if not parsed:
@@ -65,31 +133,35 @@ def tree(repo, commit):
         mode, kind, oid, name = parsed
         entries[name] = {"path": name, "mode": mode, "type": kind, "oid": oid}
         if len(entries) > MAX_INDEX_FILES:
-            raise IDEError(f"This repository exceeds the editor's {MAX_INDEX_FILES:,}-file index limit.")
+            raise IDEError(
+                f"This repository exceeds the editor's {MAX_INDEX_FILES:,}-file index limit."
+            )
     return entries
 
 
-def paths(repo, commit):
+def paths(repo: str, commit: str) -> list[str]:
     """Every path in the commit, without building per-file metadata."""
-    names = []
+    names: list[str] = []
     for record in git(repo, "ls-tree", "-rz", "--full-tree", commit).split(b"\0"):
         parsed = _tree_record(record)
         if not parsed:
             continue
         names.append(parsed[3])
         if len(names) > MAX_INDEX_FILES:
-            raise IDEError(f"This repository exceeds the editor's {MAX_INDEX_FILES:,}-file index limit.")
+            raise IDEError(
+                f"This repository exceeds the editor's {MAX_INDEX_FILES:,}-file index limit."
+            )
     return names
 
 
-def _commit_in_branch(repo, branch, commit):
+def _commit_in_branch(repo: str, branch: str, commit: str) -> str:
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit or ""):
         raise IDEError("Invalid base commit.")
     git(repo, "merge-base", "--is-ancestor", commit, head(repo, branch))
     return commit
 
 
-def children(repo, branch, commit, directory=""):
+def children(repo: str, branch: str, commit: str, directory: str = "") -> DirectoryListing:
     """Direct children of one directory (a single `git ls-tree` call)."""
     _commit_in_branch(repo, branch, commit)
     if directory:
@@ -97,29 +169,35 @@ def children(repo, branch, commit, directory=""):
         spec = commit + ":" + directory
     else:
         spec = commit + ":"
-    entries = []
+    entries: list[DirectoryEntry] = []
     for record in git(repo, "ls-tree", "-z", spec).split(b"\0"):
         parsed = _tree_record(record)
         if not parsed:
             continue
         _mode, kind, _oid, name = parsed
-        entries.append({"name": name,
-                        "path": (directory + "/" if directory else "") + name,
-                        "type": "tree" if kind == "tree" else "blob"})
+        entries.append(
+            {
+                "name": name,
+                "path": (directory + "/" if directory else "") + name,
+                "type": "tree" if kind == "tree" else "blob",
+            }
+        )
     entries.sort(key=lambda item: (0 if item["type"] == "tree" else 1, item["name"].lower()))
     truncated = len(entries) > MAX_DIR_ENTRIES
     return {"path": directory, "entries": entries[:MAX_DIR_ENTRIES], "truncated": truncated}
 
 
-def index(repo, branch, commit):
+def index(repo: str, branch: str, commit: str) -> PathIndex:
     """Optional flat path index for "Go to file" and the filename filter."""
     _commit_in_branch(repo, branch, commit)
     return {"files": paths(repo, commit)}
 
 
-def entry(repo, commit, filename):
+def entry(repo: str, commit: str, filename: str) -> TreeEntry | None:
     """Metadata for one path, without scanning the whole repository."""
-    for record in git(repo, "--literal-pathspecs", "ls-tree", "-z", commit, "--", filename).split(b"\0"):
+    for record in git(repo, "--literal-pathspecs", "ls-tree", "-z", commit, "--", filename).split(
+        b"\0"
+    ):
         parsed = _tree_record(record)
         if parsed and parsed[3] == filename:
             mode, kind, oid, _name = parsed
@@ -127,13 +205,13 @@ def entry(repo, commit, filename):
     return None
 
 
-def regular_entries(repo, commit, names):
+def regular_entries(repo: str, commit: str, names: Iterable[str]) -> set[str]:
     """The subset of `names` that are regular files, resolved in bounded Git calls."""
-    allowed = set()
+    allowed: set[str] = set()
     # Chunk pathspecs to stay well under the platform argument limit.
     unique = [name for name in dict.fromkeys(names) if name]
     for index in range(0, len(unique), 50):
-        chunk = unique[index:index + 50]
+        chunk = unique[index : index + 50]
         output = git(repo, "--literal-pathspecs", "ls-tree", "-rz", commit, "--", *chunk)
         for record in output.split(b"\0"):
             parsed = _tree_record(record)
@@ -142,18 +220,22 @@ def regular_entries(repo, commit, names):
     return allowed
 
 
-def snapshot(repo, branch):
+def snapshot(repo: str, branch: str) -> Snapshot:
     commit = head(repo, branch)
     # Only the root listing is returned up front. The Explorer requests each
     # directory as the user opens it, so huge repositories never ship a full
     # path list on load. The optional flat index powers "Go to file" and the
     # filename filter when those are used.
     listing = children(repo, branch, commit, "")
-    return {"branch": branch, "commit": commit, "root": listing["entries"],
-            "root_truncated": listing["truncated"]}
+    return {
+        "branch": branch,
+        "commit": commit,
+        "root": listing["entries"],
+        "root_truncated": listing["truncated"],
+    }
 
 
-def _blob(repo, info):
+def _blob(repo: str, info: TreeEntry) -> str:
     if info["mode"] not in REGULAR_MODES:
         raise IDEError("Only regular text files can be edited (not symlinks or submodules).")
     if int(git(repo, "cat-file", "-s", info["oid"])) > MAX_FILE:
@@ -167,7 +249,7 @@ def _blob(repo, info):
         raise IDEError("Only UTF-8 text files can be edited.") from exc
 
 
-def read_file(repo, branch, commit, filename):
+def read_file(repo: str, branch: str, commit: str, filename: str) -> str:
     path(filename)
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit or ""):
         raise IDEError("Invalid base commit.")
@@ -179,18 +261,41 @@ def read_file(repo, branch, commit, filename):
     return _blob(repo, info)
 
 
-def search(repo, branch, commit, query):
+def search(repo: str, branch: str, commit: str, query: str) -> SearchResults:
     """Literal, case-insensitive search with bounded output and runtime."""
-    if not isinstance(query, str) or not query.strip() or len(query) > 200 or any(c in query for c in "\0\r\n"):
+    if (
+        not isinstance(query, str)
+        or not query.strip()
+        or len(query) > 200
+        or any(c in query for c in "\0\r\n")
+    ):
         raise IDEError("Enter a single-line search term of 1–200 characters.")
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
         raise IDEError("Invalid base commit.")
     git(repo, "merge-base", "--is-ancestor", commit, head(repo, branch))
     limit = 256 * 1024
     timed_out = threading.Event()
-    with subprocess.Popen(["git", "--git-dir=" + repo, "grep", "--no-textconv", "-z", "-n", "-I", "-F", "-i",
-                           "-e", query, commit, "--"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
-        def expire():
+    with subprocess.Popen(
+        [
+            "git",
+            "--git-dir=" + repo,
+            "grep",
+            "--no-textconv",
+            "-z",
+            "-n",
+            "-I",
+            "-F",
+            "-i",
+            "-e",
+            query,
+            commit,
+            "--",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ) as proc:
+
+        def expire() -> None:
             timed_out.set()
             try:
                 proc.kill()
@@ -200,6 +305,7 @@ def search(repo, branch, commit, query):
         timer = threading.Timer(10, expire)
         timer.daemon = True
         timer.start()
+        assert proc.stdout is not None
         try:
             output = proc.stdout.read(limit + 1)
             if len(output) > limit:
@@ -210,7 +316,7 @@ def search(repo, branch, commit, query):
         truncated = len(output) > limit or timed_out.is_set()
         if proc.returncode not in (0, 1) and not truncated:
             raise IDEError("Repository search failed.")
-    candidates = []
+    candidates: list[SearchHit] = []
     remaining = output[:limit]
     while remaining:
         fields = remaining.split(b"\0", 2)
@@ -219,10 +325,14 @@ def search(repo, branch, commit, query):
         raw_name, raw_line, rest = fields
         text, remaining = rest.split(b"\n", 1)
         try:
-            filename = raw_name[len(commit) + 1:].decode("utf-8")
+            filename = raw_name[len(commit) + 1 :].decode("utf-8")
             path(filename)
-            candidate = {"path": filename, "line": int(raw_line), "text": text.decode("utf-8")[:300]}
-        except (UnicodeError, ValueError):
+            candidate: SearchHit = {
+                "path": filename,
+                "line": int(raw_line),
+                "text": text.decode("utf-8")[:300],
+            }
+        except UnicodeError, ValueError:
             continue
         if len(candidates) == 200:
             truncated = True
@@ -235,10 +345,22 @@ def search(repo, branch, commit, query):
     return {"results": results, "truncated": truncated}
 
 
-def commit_changes(repo, branch, base, changes, message, username):
+def commit_changes(
+    repo: str,
+    branch: str,
+    base: str,
+    changes: Mapping[str, str | None],
+    message: str,
+    username: str | None,
+) -> str:
     if head(repo, branch) != base:
         raise IDEError("The branch changed. Your edits are retained; reload before committing.")
-    if not isinstance(message, str) or not message.strip() or len(message) > 4000 or "\0" in message:
+    if (
+        not isinstance(message, str)
+        or not message.strip()
+        or len(message) > 4000
+        or "\0" in message
+    ):
         raise IDEError("Enter a commit message (up to 4,000 characters).")
     if not isinstance(changes, dict) or not 1 <= len(changes) <= 100:
         raise IDEError("Commit between 1 and 100 changed files.")
@@ -246,7 +368,7 @@ def commit_changes(repo, branch, base, changes, message, username):
     worktrees = git(repo, "worktree", "list", "--porcelain").decode("utf-8", "replace")
     if "branch refs/heads/" + branch + "\n" in worktrees:
         raise IDEError("This branch is checked out on the server. Use a different branch.")
-    updates = []
+    updates: list[tuple[str, str | None, str | None]] = []
     total = 0
     for filename, content in changes.items():
         path(filename)
@@ -274,21 +396,48 @@ def commit_changes(repo, branch, base, changes, message, username):
         # Do not permit inherited identity to impersonate another user.
         name = re.sub(r"[<>\r\n\x00]", "", username or "Browser user")[:100] or "Browser user"
         email = re.sub(r"[^a-zA-Z0-9_.-]", "_", name) + "@users.pygithost.local"
-        env.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
-                   GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+        env.update(
+            GIT_AUTHOR_NAME=name,
+            GIT_AUTHOR_EMAIL=email,
+            GIT_COMMITTER_NAME=name,
+            GIT_COMMITTER_EMAIL=email,
+        )
         git(repo, "read-tree", base, env=env)
-        for filename, mode, oid in updates:
-            record = ((mode + " " + oid) if oid else "0 " + "0" * len(base)) + "\t" + filename
+        for filename, file_mode, file_oid in updates:
+            if file_oid is not None:
+                assert file_mode is not None
+                record = file_mode + " " + file_oid + "\t" + filename
+            else:
+                record = "0 " + "0" * len(base) + "\t" + filename
             git(repo, "update-index", "-z", "--index-info", data=record.encode() + b"\0", env=env)
         new_tree = git(repo, "write-tree", env=env).decode().strip()
         if new_tree == git(repo, "rev-parse", base + "^{tree}").decode().strip():
             raise IDEError("There are no changes to commit.")
-        commit = git(repo, "commit-tree", new_tree, "-p", base,
-                     data=(message.strip() + "\n").encode(), env=env).decode().strip()
+        commit = (
+            git(
+                repo,
+                "commit-tree",
+                new_tree,
+                "-p",
+                base,
+                data=(message.strip() + "\n").encode(),
+                env=env,
+            )
+            .decode()
+            .strip()
+        )
         # Local receive-pack honors repository receive hooks/configuration. The
         # explicit lease protects against pushes outside the HTTP server too.
         # Objects already exist in this repository, so no checkout is necessary.
-        git(repo, "push", "--no-verify", "--porcelain",
+        git(
+            repo,
+            "push",
+            "--no-verify",
+            "--porcelain",
             "--force-with-lease=refs/heads/" + branch + ":" + base,
-            "--", os.path.abspath(repo), commit + ":refs/heads/" + branch, env=env)
+            "--",
+            os.path.abspath(repo),
+            commit + ":refs/heads/" + branch,
+            env=env,
+        )
         return commit

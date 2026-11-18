@@ -3,9 +3,9 @@ import io
 import os
 import shutil
 import unittest
+import zipfile
 from unittest import mock
 from urllib.parse import urlencode
-import zipfile
 
 from pygithost import database
 from pygithost.api import browsing
@@ -47,7 +47,8 @@ class APIBrowsingTests(unittest.TestCase):
         self.git("-C", self.source, "push", self.bare, "main")
         self.comparison = urlencode({"base": self.base_commit, "head": self.head_commit})
         self.browsing_pull = database.db_pr_create(
-            "alice", "project", "Browsing PR", "", "feature/browse", "main", self.alice)
+            "alice", "project", "Browsing PR", "", "feature/browse", "main", self.alice
+        )
 
     def test_tree_lists_metadata_and_paginates_with_commit_header(self):
         status, headers, rows = self.request(self.base + "/tree")
@@ -83,7 +84,9 @@ class APIBrowsingTests(unittest.TestCase):
         self.assertEqual(self.request("/api/v1/repos/alice/empty/tree")[0], 404)
 
     def test_search_is_literal_case_controlled_and_skips_binary_files(self):
-        status, headers, rows = self.request(self.base + "/search?" + urlencode({"q": "Needle", "path": "src"}))
+        status, headers, rows = self.request(
+            self.base + "/search?" + urlencode({"q": "Needle", "path": "src"})
+        )
         self.assertEqual(status, 200, rows)
         self.assertEqual(len(rows), 2)
         self.assertEqual(headers["X-Commit-SHA"], self.target_commit)
@@ -101,7 +104,9 @@ class APIBrowsingTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(rows), 1)
         self.assertIn('rel="next"', headers["Link"])
-        rows = self.request(self.base + "/search?" + urlencode({"q": "feature", "ref": self.head_commit}))[2]
+        rows = self.request(
+            self.base + "/search?" + urlencode({"q": "feature", "ref": self.head_commit})
+        )[2]
         self.assertEqual({row["path"] for row in rows}, {"new.txt", "src/a.txt"})
         for query in ("", "q=", "q=%0A", "q=x&path=../outside", "q=x&ignore_case=1"):
             with self.subTest(query=query):
@@ -119,7 +124,9 @@ class APIBrowsingTests(unittest.TestCase):
         self.assertEqual(entries["moved name.txt"]["status"], "A")
         self.assertEqual(entries["src/space name.txt"]["status"], "D")
         self.assertEqual(entries["new.txt"]["additions"], 1)
-        self.assertEqual(len(self.request(self.base + "/compare/files?" + self.comparison + "&per_page=1")[2]), 1)
+        self.assertEqual(
+            len(self.request(self.base + "/compare/files?" + self.comparison + "&per_page=1")[2]), 1
+        )
 
     def test_compare_patch_and_commit_diff_include_pinned_shas(self):
         status, _headers, result = self.request(self.base + "/compare/diff?" + self.comparison)
@@ -130,12 +137,18 @@ class APIBrowsingTests(unittest.TestCase):
         view = self.request(self.base + "/commits/" + self.head_commit + "/diff")[2]
         self.assertEqual(view, result)
         self.assertEqual(self.request(self.base + "/commits/feature%2Fbrowse/diff")[2], result)
-        self.assertEqual(self.request(self.base + "/compare/files?head=" + self.head_commit)[0], 400)
+        self.assertEqual(
+            self.request(self.base + "/compare/files?head=" + self.head_commit)[0], 400
+        )
 
     def test_root_commit_files_and_patch_do_not_require_an_existing_parent(self):
-        status, _headers, rows = self.request(self.base + "/commits/" + self.initial_commit + "/files")
+        status, _headers, rows = self.request(
+            self.base + "/commits/" + self.initial_commit + "/files"
+        )
         self.assertEqual(status, 200, rows)
-        self.assertEqual(rows, [{"path": "README.md", "status": "A", "additions": 1, "deletions": 0}])
+        self.assertEqual(
+            rows, [{"path": "README.md", "status": "A", "additions": 1, "deletions": 0}]
+        )
         view = self.request(self.base + "/commits/" + self.initial_commit + "/diff")[2]
         self.assertIsNone(view["base_sha"])
         self.assertIn("+API fixture", view["patch"])
@@ -151,20 +164,35 @@ class APIBrowsingTests(unittest.TestCase):
         self.assertNotIn("target-only", result["patch"])
         commits = self.request(base + "/commits")[2]
         self.assertEqual([row["sha"] for row in commits], [self.head_commit])
-        direct = self.request(self.base + "/compare/files?" +
-                              urlencode({"base": self.target_commit, "head": self.head_commit}))[2]
+        direct = self.request(
+            self.base
+            + "/compare/files?"
+            + urlencode({"base": self.target_commit, "head": self.head_commit})
+        )[2]
         self.assertIn("target-only.txt", {row["path"] for row in direct})
 
     def test_read_access_and_pr_ownership_are_enforced_on_every_view(self):
-        for suffix in ("tree", "search?q=Needle", "compare/files?" + self.comparison, "archive",
-                       f"pulls/{self.browsing_pull}/files", f"pulls/{self.browsing_pull}/commits"):
+        for suffix in (
+            "tree",
+            "search?q=Needle",
+            "compare/files?" + self.comparison,
+            "archive",
+            f"pulls/{self.browsing_pull}/files",
+            f"pulls/{self.browsing_pull}/commits",
+        ):
             with self.subTest(suffix=suffix):
                 self.assertEqual(self.request(self.base + "/" + suffix, token=None)[0], 401)
-                self.assertEqual(self.request(self.base + "/" + suffix, token=self.bob_token)[0], 404)
+                self.assertEqual(
+                    self.request(self.base + "/" + suffix, token=self.bob_token)[0], 404
+                )
         for resource in ("files", "diff", "commits"):
-            self.assertEqual(self.request(
-                f"/api/v1/repos/bob/project/pulls/{self.browsing_pull}/{resource}",
-                token=self.admin_token)[0], 404)
+            self.assertEqual(
+                self.request(
+                    f"/api/v1/repos/bob/project/pulls/{self.browsing_pull}/{resource}",
+                    token=self.admin_token,
+                )[0],
+                404,
+            )
 
     def test_source_archive_is_original_zip_and_head_reports_same_size(self):
         path = self.base + "/archive?ref=" + self.head_commit
@@ -177,7 +205,10 @@ class APIBrowsingTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             self.assertIn(prefix + "new.txt", archive.namelist())
             self.assertNotIn(prefix + "target-only.txt", archive.namelist())
-            self.assertEqual(archive.read(prefix + "src/a.txt"), b"Needle literal.*\nsecond line\nfeature content\n")
+            self.assertEqual(
+                archive.read(prefix + "src/a.txt"),
+                b"Needle literal.*\nsecond line\nfeature content\n",
+            )
         status, head_headers, body = self.request(path, method="HEAD", decode=False)
         self.assertEqual(status, 200)
         self.assertEqual(body, b"")
@@ -197,6 +228,7 @@ class APIBrowsingTests(unittest.TestCase):
         self.assertEqual(result["code"], "response_too_large")
         with mock.patch("pygithost.api.git.MAX_OUTPUT", 80):
             self.assertEqual(self.request(self.base + "/tree?recursive=true")[0], 413)
+
         async def verify_slots():
             slots = self.server.app.api_download_slots
             async with asyncio.timeout(2):
@@ -206,6 +238,7 @@ class APIBrowsingTests(unittest.TestCase):
                     slots.release()
                 finally:
                     slots.release()
+
         asyncio.run_coroutine_threadsafe(verify_slots(), self.server.loop).result(timeout=5)
 
     def test_binary_diff_statistics_are_null_not_misleading_line_counts(self):
@@ -214,16 +247,21 @@ class APIBrowsingTests(unittest.TestCase):
         self.git("-C", self.source, "commit", "-m", "Binary change")
         commit = self.git("-C", self.source, "rev-parse", "HEAD")
         self.git("-C", self.source, "push", self.bare, "main")
-        rows = self.request(self.base + "/compare/files?" +
-                            urlencode({"base": self.target_commit, "head": commit}))[2]
-        self.assertEqual(rows, [{"path": "binary.bin", "status": "M", "additions": None, "deletions": None}])
+        rows = self.request(
+            self.base + "/compare/files?" + urlencode({"base": self.target_commit, "head": commit})
+        )[2]
+        self.assertEqual(
+            rows, [{"path": "binary.bin", "status": "M", "additions": None, "deletions": None}]
+        )
 
     def test_unrelated_pr_histories_return_conflict_not_internal_error(self):
         tree = self.git("-C", self.source, "rev-parse", "HEAD^{tree}")
         orphan = self.git("-C", self.source, "commit-tree", tree, "-m", "Unrelated root")
         self.git("-C", self.source, "update-ref", "refs/heads/unrelated", orphan)
         self.git("-C", self.source, "push", self.bare, "unrelated")
-        identity = database.db_pr_create("alice", "project", "Unrelated", "", "unrelated", "main", self.alice)
+        identity = database.db_pr_create(
+            "alice", "project", "Unrelated", "", "unrelated", "main", self.alice
+        )
         for view in ("files", "diff"):
             status, _headers, result = self.request(self.base + f"/pulls/{identity}/{view}")
             self.assertEqual(status, 409, result)
@@ -246,8 +284,14 @@ class APIBrowsingTests(unittest.TestCase):
         self.assertEqual(self.request(self.base + "/search?q=PRIVATE_HOST_CONTENT")[2], [])
 
     def test_submodule_tree_entries_are_not_recursed_or_fetched(self):
-        self.git("-C", self.source, "update-index", "--add", "--cacheinfo",
-                 "160000," + self.initial_commit + ",vendor/module")
+        self.git(
+            "-C",
+            self.source,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000," + self.initial_commit + ",vendor/module",
+        )
         self.git("-C", self.source, "commit", "-m", "Record gitlink without a checkout")
         self.git("-C", self.source, "push", self.bare, "main")
         rows = self.request(self.base + "/tree?recursive=true")[2]
@@ -265,16 +309,30 @@ class APIBrowsingTests(unittest.TestCase):
         self.assertTrue(all("\x1b" not in row["text"] for row in rows))
         files = self.request(self.base + "/compare/files?" + self.comparison)[2]
         self.assertTrue(all(row["status"] in ("A", "D", "M") for row in files))
-        self.assertNotIn("\x1b", self.request(self.base + "/compare/diff?" + self.comparison)[2]["patch"])
+        self.assertNotIn(
+            "\x1b", self.request(self.base + "/compare/diff?" + self.comparison)[2]["patch"]
+        )
 
     def test_schema_and_in_page_documentation_cover_browsing_without_claiming_full_parity(self):
         schema = self.request("/api/v1/openapi.json")[2]
         base = "/repos/{owner}/{repo}"
-        for tail in ("/tree", "/search", "/compare/files", "/compare/diff", "/archive",
-                     "/commits/{ref}/files", "/commits/{ref}/diff", "/pulls/{id}/files",
-                     "/pulls/{id}/diff", "/pulls/{id}/commits"):
+        for tail in (
+            "/tree",
+            "/search",
+            "/compare/files",
+            "/compare/diff",
+            "/archive",
+            "/commits/{ref}/files",
+            "/commits/{ref}/diff",
+            "/pulls/{id}/files",
+            "/pulls/{id}/diff",
+            "/pulls/{id}/commits",
+        ):
             self.assertIn("get", schema["paths"][base + tail])
-        self.assertIn("application/zip", schema["paths"][base + "/archive"]["get"]["responses"]["200"]["content"])
+        self.assertIn(
+            "application/zip",
+            schema["paths"][base + "/archive"]["get"]["responses"]["200"]["content"],
+        )
         self.assertNotIn("content", schema["paths"][base + "/archive"]["head"]["responses"]["200"])
         status, _headers, page = self.request("/api/docs", token=None, decode=False)
         self.assertEqual(status, 200)

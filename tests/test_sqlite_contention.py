@@ -1,10 +1,9 @@
-import asyncio
-from pathlib import Path
 import sqlite3
 import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from pygithost import database
@@ -31,16 +30,20 @@ class ConnectionContentionTests(unittest.TestCase):
         reader.execute("BEGIN")
         reader.execute("SELECT * FROM example").fetchall()
         statements = []
+
         def short_connect(*args, **kwargs):
-            kwargs["timeout"] = .02
+            kwargs["timeout"] = 0.02
             connection = real_connect(*args, **kwargs)
             connection.set_trace_callback(statements.append)
             return connection
+
         try:
             with mock.patch.object(database.sqlite3, "connect", side_effect=short_connect):
                 connection = database._db_connect()
                 try:
-                    self.assertEqual(connection.execute("SELECT value FROM example").fetchone()[0], "retained")
+                    self.assertEqual(
+                        connection.execute("SELECT value FROM example").fetchone()[0], "retained"
+                    )
                 finally:
                     connection.close()
         finally:
@@ -67,27 +70,33 @@ class ConnectionContentionTests(unittest.TestCase):
     def test_connection_recovers_from_real_wal_writer_contention(self):
         database._db_init()
         ready, release = threading.Event(), threading.Event()
+
         def writer():
             conn = sqlite3.connect(database.DB_PATH, isolation_level=None)
             try:
                 conn.execute("PRAGMA locking_mode=EXCLUSIVE")
                 conn.execute("BEGIN IMMEDIATE")
-                conn.execute("INSERT INTO users(username,pass_salt,pass_hash) VALUES('lock-holder',X'01',X'02')")
+                conn.execute(
+                    "INSERT INTO users(username,pass_salt,pass_hash) VALUES('lock-holder',X'01',X'02')"
+                )
                 ready.set()
                 release.wait(3)
                 conn.rollback()
             finally:
                 conn.close()
+
         thread = threading.Thread(target=writer)
         thread.start()
         self.assertTrue(ready.wait(3))
         real_connect = sqlite3.connect
         attempts = []
+
         def short_connect(*args, **kwargs):
-            kwargs["timeout"] = .02
+            kwargs["timeout"] = 0.02
             attempts.append(time.monotonic())
             return real_connect(*args, **kwargs)
-        timer = threading.Timer(.12, release.set)
+
+        timer = threading.Timer(0.12, release.set)
         timer.start()
         try:
             with mock.patch.object(database.sqlite3, "connect", side_effect=short_connect):
@@ -104,18 +113,23 @@ class ConnectionContentionTests(unittest.TestCase):
 
     def test_remote_runtime_connections_do_not_run_schema_migrations(self):
         from pygithost.remote_ci import connect
+
         database._db_init()
         statements = []
         original = database._db_connect
+
         def traced():
             conn = original()
             conn.set_trace_callback(statements.append)
             return conn
+
         with mock.patch.object(database, "_db_connect", side_effect=traced):
             conn = connect()
             conn.close()
-        self.assertFalse(any(sql.lstrip().upper().startswith(("CREATE", "ALTER"))
-                             for sql in statements), statements)
+        self.assertFalse(
+            any(sql.lstrip().upper().startswith(("CREATE", "ALTER")) for sql in statements),
+            statements,
+        )
 
     def test_persistent_busy_is_bounded_and_closes_every_connection(self):
         error = sqlite3.OperationalError("database is locked")
@@ -136,11 +150,14 @@ class ConnectionContentionTests(unittest.TestCase):
         database._db_init()
         holder = database._db_connect()
         holder.operation = "known_lock_holder"
-        contender = sqlite3.connect(database.DB_PATH, timeout=.02, isolation_level=None,
-                                    factory=database._Connection)
+        contender = sqlite3.connect(
+            database.DB_PATH, timeout=0.02, isolation_level=None, factory=database._Connection
+        )
         try:
             holder.execute("BEGIN IMMEDIATE")
-            holder.execute("INSERT INTO users(username,pass_salt,pass_hash) VALUES('PRIVATE_VALUE',X'01',X'02')")
+            holder.execute(
+                "INSERT INTO users(username,pass_salt,pass_hash) VALUES('PRIVATE_VALUE',X'01',X'02')"
+            )
             with self.assertLogs("pygithost.database", level="WARNING") as logs:
                 with self.assertRaises(sqlite3.OperationalError):
                     contender.execute("BEGIN IMMEDIATE")
@@ -161,10 +178,19 @@ class CoordinatorFailureTests(unittest.IsolatedAsyncioTestCase):
         self.old_db = database.DB_PATH
         database.DB_PATH = str(Path(self.temp.name) / "ci.db")
         database._db_init()
-        self.run = database.db_ci_run_create("root", "project", "push", "main", "a" * 40, "{}", "{}")
-        database.db_ci_run_update(self.run, status="running", output="Principal progress retained\n",
-                                  phase="step 3: Principal", truncated=1)
-        database.db_ci_steps_set(self.run, '[{"name":"Principal","status":"running","output":"step evidence"}]')
+        self.run = database.db_ci_run_create(
+            "root", "project", "push", "main", "a" * 40, "{}", "{}"
+        )
+        database.db_ci_run_update(
+            self.run,
+            status="running",
+            output="Principal progress retained\n",
+            phase="step 3: Principal",
+            truncated=1,
+        )
+        database.db_ci_steps_set(
+            self.run, '[{"name":"Principal","status":"running","output":"step evidence"}]'
+        )
         self.row = (self.run, "root", "project", "push", "main", "a" * 40, "{}")
         self.manager = CIManager(lambda *_: "")
         self.manager._schedule_notification = mock.Mock()
@@ -175,7 +201,9 @@ class CoordinatorFailureTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     async def test_database_failure_retains_progress_and_records_unknown_execution(self):
-        self.manager._execute = mock.AsyncMock(side_effect=sqlite3.OperationalError("database is locked"))
+        self.manager._execute = mock.AsyncMock(
+            side_effect=sqlite3.OperationalError("database is locked")
+        )
         await self.manager._run_one(self.row)
         row = database.db_ci_run_get("root", "project", self.run)
         self.assertEqual(row[4], "interrupted")
@@ -194,12 +222,18 @@ class CoordinatorFailureTests(unittest.IsolatedAsyncioTestCase):
         row = database.db_ci_run_get("root", "project", self.run)
         self.assertEqual(row[4], "failed")
         self.assertEqual(row[5], "Principal progress retained\n")
-        self.assertIn("coordinator", database.db_ci_run_metadata("root", "project", self.run)["reason"].lower())
+        self.assertIn(
+            "coordinator",
+            database.db_ci_run_metadata("root", "project", self.run)["reason"].lower(),
+        )
 
     async def test_cleanup_error_cannot_overwrite_a_successful_result(self):
         async def executed_then_cleanup_failed(row):
-            database.db_ci_run_update(self.run, status="success", output="Verified successful result\n", return_code=0)
+            database.db_ci_run_update(
+                self.run, status="success", output="Verified successful result\n", return_code=0
+            )
             raise sqlite3.OperationalError("database is locked")
+
         self.manager._execute = mock.AsyncMock(side_effect=executed_then_cleanup_failed)
         await self.manager._run_one(self.row)
         row = database.db_ci_run_get("root", "project", self.run)

@@ -1,0 +1,4 @@
+# Development tools only; the server remains dependency-free.
+pre-commit==4.5.1
+ruff==0.17.5
+mypy==2.4.1

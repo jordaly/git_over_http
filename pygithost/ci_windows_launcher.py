@@ -5,7 +5,52 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from ctypes import wintypes
+from typing import Any, Protocol, TypeVar
+
+_ReturnT = TypeVar("_ReturnT", covariant=True)
+
+
+class _WinFunction(Protocol[_ReturnT]):
+    """A ctypes DLL callable plus the signature metadata assigned at runtime."""
+
+    argtypes: Sequence[object] | None
+    restype: object
+
+    def __call__(self, *args: object) -> _ReturnT: ...
+
+
+class _Kernel32(Protocol):
+    """The kernel32 entry points used by the launcher."""
+
+    CreateJobObjectW: _WinFunction[int]
+    SetInformationJobObject: _WinFunction[int]
+    CreatePipe: _WinFunction[int]
+    SetHandleInformation: _WinFunction[int]
+    GetStdHandle: _WinFunction[int]
+    CreateProcessW: _WinFunction[int]
+    AssignProcessToJobObject: _WinFunction[int]
+    ResumeThread: _WinFunction[int]
+    ReadFile: _WinFunction[int]
+    WaitForSingleObject: _WinFunction[int]
+    GetExitCodeProcess: _WinFunction[int]
+    TerminateProcess: _WinFunction[int]
+    CloseHandle: _WinFunction[int]
+
+
+_WinError: Callable[[int], OSError] | None = getattr(ctypes, "WinError", None)
+_get_last_error: Callable[[], int] | None = getattr(ctypes, "get_last_error", None)
+
+
+def _win_error(code: int) -> OSError:
+    factory = _WinError
+    return factory(code) if factory is not None else OSError(code)
+
+
+def _last_error() -> int:
+    getter = _get_last_error
+    return getter() if getter is not None else 0
 
 
 class _BasicLimitInformation(ctypes.Structure):
@@ -87,7 +132,7 @@ class _ProcessInformation(ctypes.Structure):
     ]
 
 
-def _shell_executable():
+def _shell_executable() -> str:
     configured = os.environ.get("COMSPEC", "cmd.exe")
     resolved = shutil.which(configured)
     if resolved:
@@ -98,34 +143,33 @@ def _shell_executable():
     return os.path.join(system_root, "System32", "cmd.exe")
 
 
-def _shell_command(command):
+def _shell_command(command: str) -> tuple[str, str]:
     executable = _shell_executable()
     # CMD /s /c strips the outer quote pair. Preserve the command inside it
     # verbatim: list2cmdline escapes quotes for C argv parsing, not CMD syntax.
     return executable, f'{subprocess.list2cmdline([executable])} /d /s /c "{command}"'
 
 
-def _exec_command(arguments):
+def _exec_command(arguments: Sequence[str]) -> tuple[str, str]:
     if not arguments:
         raise ValueError("--exec requires a command")
     # With lpApplicationName supplied, CreateProcessW does not search PATH
     # or append .exe. Resolve tools such as git before calling it.
     executable = shutil.which(arguments[0])
     if executable is None:
-        raise FileNotFoundError(
-            f"CI executable {arguments[0]!r} was not found on the server PATH."
-        )
+        raise FileNotFoundError(f"CI executable {arguments[0]!r} was not found on the server PATH.")
     executable = os.path.abspath(executable)
     return executable, subprocess.list2cmdline([executable, *arguments[1:]])
 
 
-def _launch(arguments):
+def _launch(arguments: Sequence[str]) -> int:
     if os.name != "nt":
         raise OSError("The CI Windows launcher can only run on Windows.")
     if not arguments or arguments[0] not in ("--shell", "--exec"):
         raise ValueError("Expected --shell or --exec")
 
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    win_dll: Any = getattr(ctypes, "WinDLL")
+    kernel: _Kernel32 = win_dll("kernel32", use_last_error=True)
     kernel.CreateJobObjectW.restype = wintypes.HANDLE
     kernel.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     kernel.SetInformationJobObject.argtypes = (
@@ -178,30 +222,26 @@ def _launch(arguments):
     kernel.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
     kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
 
-    job = kernel.CreateJobObjectW(None, None)
+    job: int | None = kernel.CreateJobObjectW(None, None)
     if not job:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise _win_error(_last_error())
     read_pipe = write_pipe = None
     process_info = _ProcessInformation()
     process_assigned = False
     try:
         limits = _ExtendedLimitInformation()
-        limits.BasicLimitInformation.LimitFlags = (
-            0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        )
-        if not kernel.SetInformationJobObject(
-            job, 9, ctypes.byref(limits), ctypes.sizeof(limits)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise _win_error(_last_error())
 
         security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), None, True)
         read_pipe, write_pipe = wintypes.HANDLE(), wintypes.HANDLE()
         if not kernel.CreatePipe(
             ctypes.byref(read_pipe), ctypes.byref(write_pipe), ctypes.byref(security), 0
         ):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error(_last_error())
         if not kernel.SetHandleInformation(read_pipe, 1, 0):  # HANDLE_FLAG_INHERIT
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error(_last_error())
 
         if arguments[0] == "--shell":
             executable, command_line = _shell_command(arguments[1])
@@ -227,28 +267,28 @@ def _launch(arguments):
             ctypes.byref(startup),
             ctypes.byref(process_info),
         ):
-            error = ctypes.WinError(ctypes.get_last_error())
-            raise OSError(f"Cannot start CI executable {executable!r}: {error}") from error
+            launch_error = _win_error(_last_error())
+            raise OSError(
+                f"Cannot start CI executable {executable!r}: {launch_error}"
+            ) from launch_error
         kernel.CloseHandle(write_pipe)
         write_pipe = None
 
         # Keep the initial thread suspended until the process belongs to the job.
         if not kernel.AssignProcessToJobObject(job, process_info.hProcess):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error(_last_error())
         process_assigned = True
         if kernel.ResumeThread(process_info.hThread) == 0xFFFFFFFF:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _win_error(_last_error())
 
         buffer = ctypes.create_string_buffer(65536)
         while True:
             count = wintypes.DWORD()
-            if not kernel.ReadFile(
-                read_pipe, buffer, len(buffer), ctypes.byref(count), None
-            ):
-                error = ctypes.get_last_error()
+            if not kernel.ReadFile(read_pipe, buffer, len(buffer), ctypes.byref(count), None):
+                error = _last_error()
                 if error == 109:  # ERROR_BROKEN_PIPE
                     break
-                raise ctypes.WinError(error)
+                raise _win_error(error)
             if count.value == 0:
                 break
             sys.stdout.buffer.write(buffer.raw[: count.value])
@@ -256,10 +296,8 @@ def _launch(arguments):
 
         kernel.WaitForSingleObject(process_info.hProcess, 0xFFFFFFFF)
         exit_code = wintypes.DWORD()
-        if not kernel.GetExitCodeProcess(
-            process_info.hProcess, ctypes.byref(exit_code)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel.GetExitCodeProcess(process_info.hProcess, ctypes.byref(exit_code)):
+            raise _win_error(_last_error())
         return exit_code.value
     finally:
         if process_info.hProcess:

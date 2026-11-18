@@ -2,21 +2,27 @@ import asyncio
 import base64
 import io
 import json
-from pathlib import Path
 import sys
 import tempfile
 import time
 import unittest
-from unittest import mock
 import zipfile
+from pathlib import Path
+from unittest import mock
 
 from pygithost import database
 from pygithost.api.errors import APIError
 from pygithost.ci import CIManager, collect_artifacts, validate_config
 from pygithost.ci_config import compile_document
-from pygithost.ci_limits import (DEFAULT_SOURCE_LIMIT_MB, MIB, execution_limits,
-                                 source_limit_bytes, source_response_bytes, completion_bytes)
-from pygithost.remote_ci import source_bundle, validate_progress, assigned_limits
+from pygithost.ci_limits import (
+    DEFAULT_SOURCE_LIMIT_MB,
+    MIB,
+    completion_bytes,
+    execution_limits,
+    source_limit_bytes,
+    source_response_bytes,
+)
+from pygithost.remote_ci import assigned_limits, source_bundle, validate_progress
 from pygithost.runner import Client, JobStopped, transfer_with_heartbeats
 from tests import test_remote_ci as protocol_tests
 
@@ -40,13 +46,30 @@ class LimitConfigurationTests(unittest.TestCase):
             execution_limits({"unlimited": True})
 
     def test_named_pipeline_limits_survive_snapshot_roundtrip(self):
-        config = compile_document({"version": 1, "pipelines": [
-            {"name": "first", "execution": {"runner": "remote-docker", "source_limit_mb": 500,
-                "limits": {"log_mb": 8, "artifact_mb": 80}},
-             "steps": [{"name": "Test", "run": "true"}]},
-            {"name": "second", "execution": {"source_limit_mb": 1000,
-                "limits": {"source_timeout_seconds": 900}},
-             "steps": [{"name": "Test", "run": "true"}]}]})
+        config = compile_document(
+            {
+                "version": 1,
+                "pipelines": [
+                    {
+                        "name": "first",
+                        "execution": {
+                            "runner": "remote-docker",
+                            "source_limit_mb": 500,
+                            "limits": {"log_mb": 8, "artifact_mb": 80},
+                        },
+                        "steps": [{"name": "Test", "run": "true"}],
+                    },
+                    {
+                        "name": "second",
+                        "execution": {
+                            "source_limit_mb": 1000,
+                            "limits": {"source_timeout_seconds": 900},
+                        },
+                        "steps": [{"name": "Test", "run": "true"}],
+                    },
+                ],
+            }
+        )
         config = validate_config(json.loads(json.dumps(config)))
         self.assertEqual(config["source_limit_mb"], 500)
         self.assertEqual(config["limits"]["log_mb"], 8)
@@ -55,6 +78,7 @@ class LimitConfigurationTests(unittest.TestCase):
 
     def test_documented_limit_example_compiles_and_is_rendered(self):
         from pygithost.ci_docs import manual_content
+
         text = (Path(__file__).resolve().parents[1] / "docs/ci-limits.md").read_text()
         document = json.loads(text.split("```json\n", 1)[1].split("```", 1)[0])
         config = compile_document(document)
@@ -69,6 +93,7 @@ class LimitConfigurationTests(unittest.TestCase):
             if "bundle" in command and "create" in command:
                 Path(command[command.index("create") + 1]).write_bytes(payload)
             self.assertGreater(kwargs["timeout"], 0)
+
         for size, accepted in ((MIB, True), (MIB + 1, False)):
             payload = b"x" * size
             with mock.patch("pygithost.remote_ci.subprocess.run", side_effect=git):
@@ -106,6 +131,7 @@ class LimitConfigurationTests(unittest.TestCase):
             archive = collect_artifacts(root, ["large.bin"], {"artifact_uncompressed_mb": 2})
             self.assertIsNotNone(archive)
             import os
+
             (root / "random.bin").write_bytes(os.urandom(2 * MIB))
             with self.assertRaisesRegex(ValueError, "ZIP exceeds"):
                 collect_artifacts(root, ["random.bin"], {"artifact_mb": 1})
@@ -128,15 +154,30 @@ class AssignmentLimitTests(unittest.TestCase):
 
     def test_upload_bounds_are_taken_from_token_owned_snapshot(self):
         from pygithost.remote_ci import connect
+
         run = self.enqueue()
         identity = self.claim()
         conn = connect()
         try:
-            conn.execute("UPDATE ci_remote_jobs SET document=? WHERE run_id=?", (
-                json.dumps({"config": {"source_limit_mb": 1, "limits": {"log_mb": 2, "artifact_mb": 80}}}), run))
+            conn.execute(
+                "UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
+                (
+                    json.dumps(
+                        {
+                            "config": {
+                                "source_limit_mb": 1,
+                                "limits": {"log_mb": 2, "artifact_mb": 80},
+                            }
+                        }
+                    ),
+                    run,
+                ),
+            )
         finally:
             conn.close()
-        self.assertEqual(assigned_limits(self.digest, self.repositories, str(run))["artifact_mb"], 80)
+        self.assertEqual(
+            assigned_limits(self.digest, self.repositories, str(run))["artifact_mb"], 80
+        )
         with self.assertRaises(APIError):
             assigned_limits("other-token", self.repositories, str(run))
         with self.assertRaises(APIError):
@@ -145,12 +186,15 @@ class AssignmentLimitTests(unittest.TestCase):
 
     def test_server_source_delivery_rechecks_the_snapshot_limit(self):
         from pygithost.remote_ci import connect
+
         run = self.enqueue()
         identity = self.claim()
         conn = connect()
         try:
-            conn.execute("UPDATE ci_remote_jobs SET document=?,source=? WHERE run_id=?", (
-                json.dumps({"config": {"source_limit_mb": 1}}), b"x" * (MIB + 1), run))
+            conn.execute(
+                "UPDATE ci_remote_jobs SET document=?,source=? WHERE run_id=?",
+                (json.dumps({"config": {"source_limit_mb": 1}}), b"x" * (MIB + 1), run),
+            )
         finally:
             conn.close()
         with self.assertRaises(APIError) as error:
@@ -159,11 +203,17 @@ class AssignmentLimitTests(unittest.TestCase):
 
     def test_artifact_api_download_limit_uses_run_snapshot(self):
         from pygithost.api.ci_operations import artifact_limits
+
         run = self.enqueue()
         conn = database._db_connect()
         try:
-            conn.execute("UPDATE ci_runs SET config_json=? WHERE id=?", (
-                json.dumps({"limits": {"artifact_mb": 128, "transfer_timeout_seconds": 180}}), run))
+            conn.execute(
+                "UPDATE ci_runs SET config_json=? WHERE id=?",
+                (
+                    json.dumps({"limits": {"artifact_mb": 128, "transfer_timeout_seconds": 180}}),
+                    run,
+                ),
+            )
         finally:
             conn.close()
         self.assertEqual(artifact_limits("alice", "project", run), (128 * MIB, 180))
@@ -171,22 +221,37 @@ class AssignmentLimitTests(unittest.TestCase):
 
 class ProcessLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_during_phase_write_closes_inserted_assignment(self):
-        from pygithost.remote_ci import execute_remote, connect
+        from pygithost.remote_ci import connect, execute_remote
+
         with tempfile.TemporaryDirectory() as root:
             old_db = database.DB_PATH
             database.DB_PATH = str(Path(root) / "test.db")
             try:
                 database._db_init()
-                run = database.db_ci_run_create("alice", "project", "push", "main", "a" * 40, "{}", "{}")
+                run = database.db_ci_run_create(
+                    "alice", "project", "push", "main", "a" * 40, "{}", "{}"
+                )
                 row = (run, "alice", "project", "push", "main", "a" * 40, "{}")
-                with mock.patch("pygithost.remote_ci.source_bundle", return_value=b"source"), \
-                     mock.patch.object(database, "db_ci_run_update", side_effect=asyncio.CancelledError):
+                with (
+                    mock.patch("pygithost.remote_ci.source_bundle", return_value=b"source"),
+                    mock.patch.object(
+                        database, "db_ci_run_update", side_effect=asyncio.CancelledError
+                    ),
+                ):
                     with self.assertRaises(asyncio.CancelledError):
-                        await execute_remote(CIManager(lambda *_: root), row, validate_config({"runner": "remote-docker"}))
+                        await execute_remote(
+                            CIManager(lambda *_: root),
+                            row,
+                            validate_config({"runner": "remote-docker"}),
+                        )
                 conn = connect()
                 try:
-                    self.assertEqual(conn.execute("SELECT state FROM ci_remote_jobs WHERE run_id=?", (run,)).fetchone()[0],
-                                     "closed")
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT state FROM ci_remote_jobs WHERE run_id=?", (run,)
+                        ).fetchone()[0],
+                        "closed",
+                    )
                 finally:
                     conn.close()
             finally:
@@ -198,8 +263,14 @@ class ProcessLimitTests(unittest.IsolatedAsyncioTestCase):
             output, state = bytearray(), [False]
             result = await manager._capture_process(
                 [sys.executable, "-c", "import sys; sys.stdout.write('x' * (1024 * 1024 + 1))"],
-                shell=False, cwd=None, env=None, output=output, truncated=state, timeout=15,
-                max_output=maximum)
+                shell=False,
+                cwd=None,
+                env=None,
+                output=output,
+                truncated=state,
+                timeout=15,
+                max_output=maximum,
+            )
             self.assertEqual(result, 0)
             self.assertEqual(len(output), min(maximum, MIB + 1))
             self.assertEqual(state[0], truncated)
@@ -208,12 +279,15 @@ class ProcessLimitTests(unittest.IsolatedAsyncioTestCase):
         class Client:
             def request(self, action, identity):
                 return {"cancel": True}
+
         work_cancelled = asyncio.Event()
+
         async def work():
             try:
                 await asyncio.Event().wait()
             finally:
                 work_cancelled.set()
+
         with self.assertRaises(JobStopped):
             await transfer_with_heartbeats(Client(), {"run_id": 1}, work())
         self.assertTrue(work_cancelled.is_set())
@@ -227,35 +301,54 @@ class LargeHTTPTransferTests(unittest.TestCase):
     tearDown = protocol_tests.RunnerHTTPTests.tearDown
 
     def test_real_http_logs_artifact_upload_and_api_download_exceed_old_caps(self):
-        from pygithost.remote_ci import execute_remote, create_token
-        config = validate_config({"runner": "remote-docker", "command": "true",
-                                  "limits": {"log_mb": 2, "artifact_mb": 40,
-                                             "artifact_uncompressed_mb": 40}})
-        run = database.db_ci_run_create("alice", "project", "push", "main", self.sha, "{}", json.dumps(config))
+        from pygithost.remote_ci import create_token, execute_remote
+
+        config = validate_config(
+            {
+                "runner": "remote-docker",
+                "command": "true",
+                "limits": {"log_mb": 2, "artifact_mb": 40, "artifact_uncompressed_mb": 40},
+            }
+        )
+        run = database.db_ci_run_create(
+            "alice", "project", "push", "main", self.sha, "{}", json.dumps(config)
+        )
         row = (run, "alice", "project", "push", "main", self.sha, "{}")
         task = asyncio.run_coroutine_threadsafe(
-            execute_remote(CIManager(lambda *_: str(self.bare)), row, config), self.server.loop)
-        client = Client(f"http://127.0.0.1:{self.server.port}", create_token("large-worker", ["alice/project"]))
+            execute_remote(CIManager(lambda *_: str(self.bare)), row, config), self.server.loop
+        )
+        client = Client(
+            f"http://127.0.0.1:{self.server.port}", create_token("large-worker", ["alice/project"])
+        )
         job = None
         deadline = time.monotonic() + 15
         while job is None and time.monotonic() < deadline:
             job = client.request("claim", {})["job"]
-            time.sleep(.02)
+            time.sleep(0.02)
         self.assertIsNotNone(job)
         identity = {"run_id": run, "attempt": job["attempt"]}
-        self.assertTrue(client.request("heartbeat", dict(identity, progress={"output": "x" * (MIB + 1)}))["accepted"])
+        self.assertTrue(
+            client.request("heartbeat", dict(identity, progress={"output": "x" * (MIB + 1)}))[
+                "accepted"
+            ]
+        )
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
             archive.writestr("large.bin", b"x" * (33 * MIB))
         self.assertGreater(len(buffer.getvalue()), 32 * MIB)
-        result = dict(identity, progress={"status": "success", "return_code": 0, "output": "done"},
-                      artifact=base64.b64encode(buffer.getvalue()).decode())
+        result = dict(
+            identity,
+            progress={"status": "success", "return_code": 0, "output": "done"},
+            artifact=base64.b64encode(buffer.getvalue()).decode(),
+        )
         self.assertTrue(client.request("complete", result, timeout=120)["accepted"])
         task.result(timeout=30)
         self.assertEqual(database.db_ci_run_get("alice", "project", run)[4], "success")
         status, _, listing = self.request(self.base + f"/ci/runs/{run}/artifacts")
         self.assertEqual(status, 200)
         self.assertTrue(listing[0]["downloadable"])
-        status, _, download = self.request(self.base + f"/ci/runs/{run}/artifacts/download", decode=False)
+        status, _, download = self.request(
+            self.base + f"/ci/runs/{run}/artifacts/download", decode=False
+        )
         self.assertEqual(status, 200)
         self.assertEqual(len(download), len(buffer.getvalue()))

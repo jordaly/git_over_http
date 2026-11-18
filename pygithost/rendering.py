@@ -1,6 +1,7 @@
 """Safe HTML and Python 3.14 t-string rendering helpers."""
 
 import html
+from collections.abc import Iterable
 from string.templatelib import Interpolation, Template
 from urllib.parse import quote
 
@@ -16,8 +17,7 @@ def safe_html(value: object) -> SafeHTML:
 def str_t(template: Template) -> str:
     """Render a t-string without escaping for non-HTML output."""
     return "".join(
-        str(part.value) if isinstance(part, Interpolation) else part
-        for part in template
+        str(part.value) if isinstance(part, Interpolation) else part for part in template
     )
 
 
@@ -37,7 +37,7 @@ def html_t(template: Template) -> str:
     )
 
 
-def join_html(parts: list[str]) -> SafeHTML:
+def join_html(parts: Iterable[str]) -> SafeHTML:
     return safe_html("".join(parts))
 
 

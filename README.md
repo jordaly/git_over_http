@@ -90,6 +90,55 @@ For a safe local setup and a configuration reference, follow
 [Getting started](docs/getting-started.md). Configuration changes require a server
 restart; settings saved through the web interface take effect as documented below.
 
+## Development checks
+
+Using Python 3.14 or newer, install the development tools and enable the local
+Git commit hook (once per clone):
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pre_commit install
+python -m pre_commit run --all-files
+```
+
+Activate your virtual environment first, if using one. The first run downloads
+the pinned hooks and creates isolated environments. Hooks include:
+
+- **Ruff:** Python linting, import sorting, and formatting (Python 3.14, 100 columns).
+  Safe lint fixes and formatting run automatically; review and re-stage changes.
+- **mypy:** strict whole-application type checking, with no baseline filtering.
+  All diagnostics, including existing typing debt, block commits.
+- Python syntax (including t-strings), JSON/YAML/TOML validity, merge conflicts,
+  private keys, whitespace, final newlines, LF line endings, case conflicts,
+  broken symlinks, and newly added files larger than 1,000 KiB.
+
+Vendored assets are excluded from whitespace rewriting. Ruff has narrowly scoped
+exceptions for the legacy application's dynamic configuration globals and
+compatibility imports.
+
+Run individual tools directly:
+
+```sh
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy
+python -m unittest discover -q
+```
+
+Strict mode requires function annotations, checks untyped function bodies, and
+rejects untyped calls, implicit generic arguments, and `Any` returns, among other
+checks. The hook checks all of `pygithost`, `server.py`, and `hl_mappings.py` on
+every commit, including configuration-only commits. Tests are linted/formatted
+but are not in the mypy scope. Type errors must be fixed before the strict hook
+will pass; there is no grandfathering or baseline-update command. Shared SQL row
+types, JSON storage values, and runner interfaces are documented in
+`pygithost/database_types.py` and `pygithost/runner_types.py`. JSON and foreign
+function boundaries still require runtime validation; annotations do not replace
+the existing permission, schema, or resource-limit checks.
+
+The full test suite is deliberately not run on every commit. None of these tools
+adds runtime dependencies to the server.
+
 ## Project structure
 
 - `server.py` is the backward-compatible executable and import facade.

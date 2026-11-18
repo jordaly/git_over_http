@@ -3,8 +3,33 @@
 import asyncio
 import json
 from pathlib import PurePosixPath
+from typing import TypedDict, cast
 
 from . import database
+
+
+class LanguageStat(TypedDict):
+    """Public per-language estimate rendered by the repository page."""
+
+    name: str
+    color: str
+    percentage: float
+
+
+class LanguageBreakdown(LanguageStat):
+    """Full per-language estimate, including the raw byte and file counts."""
+
+    bytes: int
+    files: int
+
+
+class _LanguageTotal(TypedDict):
+    """Accumulator for one language while scanning a tree."""
+
+    name: str
+    bytes: int
+    files: int
+    color: str
 
 
 # Intentionally conservative: data files, lockfiles, images and unknown suffixes
@@ -48,28 +73,71 @@ LANGUAGES = {
     "Dockerfile": ("#287a9a", ".dockerfile"),
     "Makefile": ("#427819", ".mk"),
 }
-EXTENSIONS = {extension: name for name, (_color, extensions) in LANGUAGES.items() for extension in extensions.split()}
-EXCLUDED_FOLDERS = frozenset({
-    ".git", ".venv", "venv", "env", "node_modules", "vendor", "vendors", "packages",
-    "third_party", "third-party", "thirdparty", "bower_components", "site-packages",
-    "bin", "obj", "dist", "build", "coverage", "__pycache__", ".next", ".nuxt", "prismjs",
-})
-GENERATED_SUFFIXES = (".min.js", ".min.css", ".designer.cs", ".designer.vb", ".g.cs", ".g.i.cs",
-                      ".generated.cs", ".generated.ts", ".generated.js", "_pb2.py", ".pb.go")
+EXTENSIONS = {
+    extension: name
+    for name, (_color, extensions) in LANGUAGES.items()
+    for extension in extensions.split()
+}
+EXCLUDED_FOLDERS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "vendor",
+        "vendors",
+        "packages",
+        "third_party",
+        "third-party",
+        "thirdparty",
+        "bower_components",
+        "site-packages",
+        "bin",
+        "obj",
+        "dist",
+        "build",
+        "coverage",
+        "__pycache__",
+        ".next",
+        ".nuxt",
+        "prismjs",
+    }
+)
+GENERATED_SUFFIXES = (
+    ".min.js",
+    ".min.css",
+    ".designer.cs",
+    ".designer.vb",
+    ".g.cs",
+    ".g.i.cs",
+    ".generated.cs",
+    ".generated.ts",
+    ".generated.js",
+    "_pb2.py",
+    ".pb.go",
+)
 
 
-def language_totals(tree):
-    totals = {}
+def language_totals(tree: bytes) -> list[LanguageBreakdown]:
+    totals: dict[str, _LanguageTotal] = {}
     for entry in tree.split(b"\0"):
         metadata, separator, filename = entry.partition(b"\t")
         fields = metadata.split()
-        if not separator or len(fields) != 4 or fields[0] not in (b"100644", b"100755") or fields[1] != b"blob":
+        if (
+            not separator
+            or len(fields) != 4
+            or fields[0] not in (b"100644", b"100755")
+            or fields[1] != b"blob"
+        ):
             continue
         path = PurePosixPath(filename.decode("utf-8", "replace").casefold())
-        if any(part in EXCLUDED_FOLDERS for part in path.parts[:-1]) or path.name.endswith(GENERATED_SUFFIXES):
+        if any(part in EXCLUDED_FOLDERS for part in path.parts[:-1]) or path.name.endswith(
+            GENERATED_SUFFIXES
+        ):
             continue
         if path.name == "dockerfile" or path.name.startswith("dockerfile."):
-            name = "Dockerfile"
+            name: str | None = "Dockerfile"
         elif path.name in ("makefile", "gnumakefile"):
             name = "Makefile"
         else:
@@ -82,25 +150,48 @@ def language_totals(tree):
             continue
         if size <= 0:
             continue
-        item = totals.setdefault(name, {"name": name, "bytes": 0, "files": 0, "color": LANGUAGES[name][0]})
+        item = totals.setdefault(
+            name, {"name": name, "bytes": 0, "files": 0, "color": LANGUAGES[name][0]}
+        )
         item["bytes"] += size
         item["files"] += 1
     total = sum(item["bytes"] for item in totals.values())
-    return [{**item, "percentage": item["bytes"] * 100 / total}
-            for item in sorted(totals.values(), key=lambda item: (-item["bytes"], item["name"]))]
+    return [
+        {
+            "name": item["name"],
+            "color": item["color"],
+            "bytes": item["bytes"],
+            "files": item["files"],
+            "percentage": item["bytes"] * 100 / total,
+        }
+        for item in sorted(totals.values(), key=lambda item: (-item["bytes"], item["name"]))
+    ]
 
 
-async def repository_languages(owner, repo, bare, commit):
+async def repository_languages(
+    owner: str, repo: str, bare: str, commit: str | None
+) -> list[LanguageBreakdown] | None:
     if not commit:
         return []
     cached = await asyncio.to_thread(database.db_repository_languages_get, owner, repo, commit)
     if cached is not None:
-        return json.loads(cached)
+        return cast("list[LanguageBreakdown]", json.loads(cached))
     process = None
     try:
-        process = await asyncio.create_subprocess_exec("git", "--git-dir=" + bare, "ls-tree", "-r", "-l", "-z", "--full-tree", commit,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "--git-dir=" + bare,
+            "ls-tree",
+            "-r",
+            "-l",
+            "-z",
+            "--full-tree",
+            commit,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
         tree = bytearray()
+        assert process.stdout is not None
         async with asyncio.timeout(15):
             while chunk := await process.stdout.read(65536):
                 tree.extend(chunk)
@@ -110,9 +201,11 @@ async def repository_languages(owner, repo, bare, commit):
         if process.returncode:
             return None
         result = await asyncio.to_thread(language_totals, bytes(tree))
-        await asyncio.to_thread(database.db_repository_languages_set, owner, repo, commit, json.dumps(result))
+        await asyncio.to_thread(
+            database.db_repository_languages_set, owner, repo, commit, json.dumps(result)
+        )
         return result
-    except (OSError, asyncio.TimeoutError):
+    except OSError, asyncio.TimeoutError:
         return None
     finally:
         if process is not None and process.returncode is None:

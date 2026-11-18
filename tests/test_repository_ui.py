@@ -3,14 +3,14 @@ import base64
 import http.client
 import io
 import json
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode
 
@@ -40,8 +40,11 @@ class RepositoryUITests(unittest.TestCase):
         self.server = ServerRunner(project_root=str(self.root))
         self.server.__enter__()
         self.base = f"/r/{FLAT_OWNER_UI}/project"
-        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({
-            "block_direct_pushes": True, "protected_branches": "release/*"}))
+        database.db_ci_config_set(
+            FLAT_OWNER_UI,
+            "project",
+            json.dumps({"block_direct_pushes": True, "protected_branches": "release/*"}),
+        )
 
     def tearDown(self):
         self.server.__exit__(None, None, None)
@@ -49,21 +52,44 @@ class RepositoryUITests(unittest.TestCase):
         self.temp.cleanup()
 
     def git(self, *args):
-        return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.PIPE, text=True).strip()
+        return subprocess.check_output(
+            ["git", *map(str, args)], stderr=subprocess.PIPE, text=True
+        ).strip()
 
     def fixture_user(self):
         conn = database._db_connect()
         try:
-            return conn.execute("INSERT INTO users(username,pass_salt,pass_hash) VALUES('pagination-user',?,?)", (b"salt", b"unused-test-hash")).lastrowid
+            return conn.execute(
+                "INSERT INTO users(username,pass_salt,pass_hash) VALUES('pagination-user',?,?)",
+                (b"salt", b"unused-test-hash"),
+            ).lastrowid
         finally:
             conn.close()
 
     def test_deployment_history_hides_details_until_opened(self):
-        database.db_deployment_claim(98765, FLAT_OWNER_UI, "project", self.sha, json.dumps({
-            "deployment_name": "production", "pipeline_id": "checks", "deploy_branch": "main"}))
-        database.db_deployment_progress(98765, "production", "PRIVATE_DEPLOYMENT_OUTPUT",
-            json.dumps([{"name": "Detailed release step", "status": "failed",
-                         "output": "PRIVATE_STEP_OUTPUT"}]))
+        database.db_deployment_claim(
+            98765,
+            FLAT_OWNER_UI,
+            "project",
+            self.sha,
+            json.dumps(
+                {"deployment_name": "production", "pipeline_id": "checks", "deploy_branch": "main"}
+            ),
+        )
+        database.db_deployment_progress(
+            98765,
+            "production",
+            "PRIVATE_DEPLOYMENT_OUTPUT",
+            json.dumps(
+                [
+                    {
+                        "name": "Detailed release step",
+                        "status": "failed",
+                        "output": "PRIVATE_STEP_OUTPUT",
+                    }
+                ]
+            ),
+        )
         database.db_deployment_finish(98765, "failed", "PRIVATE_DEPLOYMENT_OUTPUT", "production")
         identity = database.db_deployments_list(FLAT_OWNER_UI, "project")[0][0]
         path = self.base + "/ci/deployments"
@@ -83,11 +109,15 @@ class RepositoryUITests(unittest.TestCase):
             self.assertIn("Detailed release step", page)
 
     def test_review_pages_have_gitlab_style_layout_and_working_navigation(self):
-        identity = database.db_pr_create(FLAT_OWNER_UI, "project", "Review layout",
-                                        "Description", "feature/api", "main", None)
-        for suffix, marker in (("/pulls", "review-list"), ("/commits?ref=main", "review-commits"),
-                               (f"/pulls/{identity}", 'aria-label="Pull request details"'),
-                               (f"/commit/{self.sha}", 'aria-label="Commit details"')):
+        identity = database.db_pr_create(
+            FLAT_OWNER_UI, "project", "Review layout", "Description", "feature/api", "main", None
+        )
+        for suffix, marker in (
+            ("/pulls", "review-list"),
+            ("/commits?ref=main", "review-commits"),
+            (f"/pulls/{identity}", 'aria-label="Pull request details"'),
+            (f"/commit/{self.sha}", 'aria-label="Commit details"'),
+        ):
             status, page = self.request(self.base + suffix)
             self.assertEqual(status, 200, page)
             self.assertIn("review-page", page)
@@ -99,8 +129,9 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn(f'action="{self.base}/pulls/{identity}/comments"', page)
 
     def test_review_titles_and_branch_names_remain_escaped(self):
-        identity = database.db_pr_create(FLAT_OWNER_UI, "project", "<script>alert(1)</script>",
-                                        "", "feature/api", "main", None)
+        identity = database.db_pr_create(
+            FLAT_OWNER_UI, "project", "<script>alert(1)</script>", "", "feature/api", "main", None
+        )
         for suffix in ("/pulls", f"/pulls/{identity}"):
             status, page = self.request(self.base + suffix)
             self.assertEqual(status, 200)
@@ -108,9 +139,15 @@ class RepositoryUITests(unittest.TestCase):
             self.assertIn("&lt;script&gt;", page)
 
     def test_create_pull_request_without_authentication_has_nullable_author(self):
-        status, _ = self.request(self.base + "/pulls/create", {
-            "title": "Anonymous pull request", "body": "Created with authentication disabled",
-            "source_branch": "feature/api", "target_branch": "main"})
+        status, _ = self.request(
+            self.base + "/pulls/create",
+            {
+                "title": "Anonymous pull request",
+                "body": "Created with authentication disabled",
+                "source_branch": "feature/api",
+                "target_branch": "main",
+            },
+        )
         self.assertEqual(status, 303)
         rows = database.db_pr_list(FLAT_OWNER_UI, "project")
         self.assertEqual(len(rows), 1)
@@ -123,14 +160,27 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_create_pull_request_with_session_preserves_author_and_foreign_key(self):
         import sqlite3
+
         user_id = self.fixture_user()
         session = database.db_create_session(user_id)
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
         try:
             with mock.patch.object(application, "REQUIRE_AUTH", True):
-                connection.request("POST", self.base + "/pulls/create", body=urlencode({
-                    "title": "Authenticated pull request", "source_branch": "feature/api", "target_branch": "main"}),
-                    headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": application.SESSION_COOKIE_NAME + "=" + session})
+                connection.request(
+                    "POST",
+                    self.base + "/pulls/create",
+                    body=urlencode(
+                        {
+                            "title": "Authenticated pull request",
+                            "source_branch": "feature/api",
+                            "target_branch": "main",
+                        }
+                    ),
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Cookie": application.SESSION_COOKIE_NAME + "=" + session,
+                    },
+                )
                 response = connection.getresponse()
                 body = response.read()
                 self.assertEqual(response.status, 303, body)
@@ -140,21 +190,36 @@ class RepositoryUITests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(database.db_pr_get(rows[0][0])[7], user_id)
         with self.assertRaises(sqlite3.IntegrityError):
-            database.db_pr_create(FLAT_OWNER_UI, "project", "Invalid author", "", "feature/api", "main", user_id + 1000)
+            database.db_pr_create(
+                FLAT_OWNER_UI,
+                "project",
+                "Invalid author",
+                "",
+                "feature/api",
+                "main",
+                user_id + 1000,
+            )
 
     def test_create_pull_request_rejects_read_only_access(self):
         with mock.patch.object(application, "_has_write_scope", return_value=False):
-            status, _ = self.request(self.base + "/pulls/create", {
-                "title": "Not allowed", "source_branch": "feature/api", "target_branch": "main"})
+            status, _ = self.request(
+                self.base + "/pulls/create",
+                {"title": "Not allowed", "source_branch": "feature/api", "target_branch": "main"},
+            )
         self.assertEqual(status, 403)
         self.assertEqual(database.db_pr_list(FLAT_OWNER_UI, "project"), [])
 
     def request(self, path, fields=None, *, binary=False):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
         try:
-            connection.request("GET" if fields is None else "POST", path,
+            connection.request(
+                "GET" if fields is None else "POST",
+                path,
                 body=None if fields is None else urlencode(fields),
-                headers={} if fields is None else {"Content-Type": "application/x-www-form-urlencoded"})
+                headers={}
+                if fields is None
+                else {"Content-Type": "application/x-www-form-urlencoded"},
+            )
             response = connection.getresponse()
             body = response.read()
             return response.status, body if binary else body.decode()
@@ -165,17 +230,25 @@ class RepositoryUITests(unittest.TestCase):
         boundary = "----pygithost-test-boundary"
         chunks = []
         for name, value in fields.items():
-            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+            chunks.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+            )
         for name, filename, content_type, data in files:
-            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'.encode())
+            chunks.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'.encode()
+            )
             chunks.append(data)
             chunks.append(b"\r\n")
         chunks.append(f"--{boundary}--\r\n".encode())
         body = b"".join(chunks)
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
         try:
-            connection.request("POST", path, body=body,
-                headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+            connection.request(
+                "POST",
+                path,
+                body=body,
+                headers={"Content-Type": "multipart/form-data; boundary=" + boundary},
+            )
             response = connection.getresponse()
             return response.status, response.read().decode()
         finally:
@@ -185,22 +258,25 @@ class RepositoryUITests(unittest.TestCase):
         self.git("init", "--bare", self.root / "unrelated.git")
         status, page = self.request("/?q=PROJECT")
         self.assertEqual(status, 200)
-        self.assertIn(self.base + '\">', page)
-        self.assertNotIn(f'/r/{FLAT_OWNER_UI}/unrelated', page)
+        self.assertIn(self.base + '">', page)
+        self.assertNotIn(f"/r/{FLAT_OWNER_UI}/unrelated", page)
         self.assertIn("Clear search", page)
         status, page = self.request("/?q=" + FLAT_OWNER_UI)
         self.assertEqual(status, 200)
         self.assertIn("unrelated", page)
         _, page = self.request("/?q=does-not-exist")
         self.assertIn("No matching repositories", page)
-        _, page = self.request("/?" + urlencode({"q": '\"><script>alert(1)</script>'}))
+        _, page = self.request("/?" + urlencode({"q": '"><script>alert(1)</script>'}))
         self.assertNotIn("<script>alert(1)</script>", page)
 
     def test_multiple_pipeline_settings_and_manual_selection(self):
-        document = {"defaults": {"events": {"manual": True}}, "pipelines": {
-            "lint": {"steps": [{"name": "Lint", "run": "echo lint"}]}}}
-        status, page = self.request(self.base + "/ci/config", {
-            "configuration_json": json.dumps(document)})
+        document = {
+            "defaults": {"events": {"manual": True}},
+            "pipelines": {"lint": {"steps": [{"name": "Lint", "run": "echo lint"}]}},
+        }
+        status, page = self.request(
+            self.base + "/ci/config", {"configuration_json": json.dumps(document)}
+        )
         self.assertEqual(status, 200)
         self.assertIn("Configuration saved", page)
         saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
@@ -213,27 +289,34 @@ class RepositoryUITests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         meta = database.db_ci_run_metadata(FLAT_OWNER_UI, "project", rows[0][0])
         self.assertEqual(json.loads(meta["config"])["pipeline_id"], "lint")
-        _, page = self.request(self.base + "/ci/config", {
-            "configuration_json": '{"pipelines":{"lint":{"command":"echo old"}}}'})
+        _, page = self.request(
+            self.base + "/ci/config",
+            {"configuration_json": '{"pipelines":{"lint":{"command":"echo old"}}}'},
+        )
         self.assertIn("unknown fields: command", page)
         self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project")), saved)
 
     def test_full_ci_documentation_and_examples_are_shown_in_page(self):
         status, page = self.request(self.base + "/ci/docs")
         self.assertEqual(status, 200)
-        for heading in ("Every execution option", "Every deployment option", "Every repository setting",
-                        "Independent configuration", "Troubleshooting"):
+        for heading in (
+            "Every execution option",
+            "Every deployment option",
+            "Every repository setting",
+            "Independent configuration",
+            "Troubleshooting",
+        ):
             self.assertIn(heading, page)
-        self.assertIn('<table>', page)
+        self.assertIn("<table>", page)
         self.assertIn('src="/static/ci-docs.js"', page)
         self.assertIn('id="every-execution-option"', page)
-        self.assertIn(self.base + '/ci/docs?example=all-options', page)
+        self.assertIn(self.base + "/ci/docs?example=all-options", page)
         self.assertNotIn('href="examples/ci/', page)
         status, page = self.request(self.base + "/ci/docs?example=all-options")
         self.assertEqual(status, 200)
-        self.assertIn('&quot;branches&quot;', page)
+        self.assertIn("&quot;branches&quot;", page)
         self.assertIn('<code class="language-json">', page)
-        self.assertIn('&quot;protected_branches&quot;', page)
+        self.assertIn("&quot;protected_branches&quot;", page)
         status, page = self.request(self.base + "/ci/docs?guide=deployment")
         self.assertEqual(status, 200)
         self.assertIn("Safe first run", page)
@@ -247,25 +330,39 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_grouped_configuration_is_saved_and_legacy_is_presented_grouped(self):
         import html
+
         _, page = self.request(self.base + "/ci/config")
         self.assertIn('<code class="language-json">', page)
         self.assertIn('src="/static/ci-docs.js"', page)
-        editor = page.split('name="configuration_json"', 1)[1].split(">", 1)[1].split("</textarea>", 1)[0]
+        editor = (
+            page.split('name="configuration_json"', 1)[1]
+            .split(">", 1)[1]
+            .split("</textarea>", 1)[0]
+        )
         migrated = json.loads(html.unescape(editor))
         self.assertIn("policies", migrated)
         self.assertNotIn("settings", migrated)
         document = json.loads(Path("docs/examples/ci/all-options.json").read_text())
-        status, page = self.request(self.base + "/ci/config", {"configuration_json": json.dumps(document)})
+        status, page = self.request(
+            self.base + "/ci/config", {"configuration_json": json.dumps(document)}
+        )
         self.assertEqual(status, 200)
         self.assertIn("Configuration saved", page)
         saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
         self.assertEqual(saved["document"], document)
         _, page = self.request(self.base + "/ci/config")
-        editor = page.split('name="configuration_json"', 1)[1].split(">", 1)[1].split("</textarea>", 1)[0]
+        editor = (
+            page.split('name="configuration_json"', 1)[1]
+            .split(">", 1)[1]
+            .split("</textarea>", 1)[0]
+        )
         from pygithost.ci_preferences import editor_document
+
         self.assertEqual(json.loads(html.unescape(editor)), editor_document(document))
         document["pipelines"][0]["execution"]["working_directory"] = "."
-        _, page = self.request(self.base + "/ci/config", {"configuration_json": json.dumps(document)})
+        _, page = self.request(
+            self.base + "/ci/config", {"configuration_json": json.dumps(document)}
+        )
         self.assertIn("unsupported fields: working_directory", page)
         self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project")), saved)
 
@@ -293,7 +390,14 @@ class RepositoryUITests(unittest.TestCase):
             self.assertEqual(database.db_display_name_get(), "pygithost")
 
     def test_display_name_settings_require_admin(self):
-        with mock.patch("pygithost.application.REQUIRE_AUTH", True), mock.patch("pygithost.application.GitHTTPHandler._require_session_auth", new=mock.AsyncMock(return_value=True)), mock.patch("pygithost.application._require_admin", return_value=False):
+        with (
+            mock.patch("pygithost.application.REQUIRE_AUTH", True),
+            mock.patch(
+                "pygithost.application.GitHTTPHandler._require_session_auth",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch("pygithost.application._require_admin", return_value=False),
+        ):
             for fields in (None, {"display_name": "unauthorized"}):
                 status, _ = self.request("/admin/settings", fields)
                 self.assertEqual(status, 403)
@@ -320,10 +424,13 @@ class RepositoryUITests(unittest.TestCase):
 
         png = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
-            "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
-        status, _ = self.post_multipart("/admin/settings/favicon",
+            "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        )
+        status, _ = self.post_multipart(
+            "/admin/settings/favicon",
             {"csrf": token, "action": "upload"},
-            [("favicon", "icon.png", "image/png", png)])
+            [("favicon", "icon.png", "image/png", png)],
+        )
         self.assertEqual(status, 303)
         _, page = self.request("/admin/settings?favicon=updated")
         self.assertIn("Favicon updated", page)
@@ -333,15 +440,18 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("Current: uploaded image/png", page)
 
         # Reject a mismatched file without replacing the uploaded icon.
-        status, page = self.post_multipart("/admin/settings/favicon",
+        status, page = self.post_multipart(
+            "/admin/settings/favicon",
             {"csrf": token, "action": "upload"},
-            [("favicon", "fake.png", "image/png", b"<html>not an image</html>")])
+            [("favicon", "fake.png", "image/png", b"<html>not an image</html>")],
+        )
         self.assertEqual(status, 200)
         self.assertIn("does not look like", page)
         self.assertEqual(database.db_favicon_get(), ("image/png", png))
 
-        status, _ = self.post_multipart("/admin/settings/favicon",
-            {"csrf": token, "action": "reset"}, [])
+        status, _ = self.post_multipart(
+            "/admin/settings/favicon", {"csrf": token, "action": "reset"}, []
+        )
         self.assertEqual(status, 303)
         _, page = self.request("/admin/settings?favicon=reset")
         self.assertIn("Default favicon restored", page)
@@ -354,6 +464,7 @@ class RepositoryUITests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 asyncio.get_running_loop()
             return [(FLAT_OWNER_UI, "project", "project.git")]
+
         with mock.patch("pygithost.application._scan_repos", side_effect=scan):
             status, page = self.request("/")
         self.assertEqual(status, 200)
@@ -362,6 +473,7 @@ class RepositoryUITests(unittest.TestCase):
     def test_repository_page_reads_independent_metadata_concurrently(self):
         original = application._run_git
         active, peak = 0, 0
+
         async def tracked(*args, **kwargs):
             nonlocal active, peak
             active += 1
@@ -371,6 +483,7 @@ class RepositoryUITests(unittest.TestCase):
                 return await original(*args, **kwargs)
             finally:
                 active -= 1
+
         with mock.patch("pygithost.application._run_git", side_effect=tracked):
             status, page = self.request(self.base)
         self.assertEqual(status, 200)
@@ -477,7 +590,9 @@ class RepositoryUITests(unittest.TestCase):
         database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
         for index in range(35):
             commit = f"{index:040x}"
-            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", commit, "{}")
+            run_id = database.db_ci_run_create(
+                FLAT_OWNER_UI, "project", "push", "main", commit, "{}"
+            )
             database.db_ci_run_update(run_id, status="success")
             database.db_deployment_claim(run_id, FLAT_OWNER_UI, "project", commit)
             database.db_deployment_finish(run_id, "success", "")
@@ -489,7 +604,10 @@ class RepositoryUITests(unittest.TestCase):
             self.assertIn('aria-label="Go to first page"', last)
 
     def test_tokens_and_users_tables_are_paginated(self):
-        tokens = [(index, f"token-{index:02}", "read", True, "2026-01-01", None, None, "active") for index in range(30)]
+        tokens = [
+            (index, f"token-{index:02}", "read", True, "2026-01-01", None, None, "active")
+            for index in range(30)
+        ]
         with mock.patch("pygithost.application.db_list_tokens_for_user", return_value=tokens):
             _, first = self.request("/tokens")
             _, second = self.request("/tokens?page=2")
@@ -499,7 +617,10 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn("token-00", second)
         self.assertIn('rel="prev"', second)
         users = [(index, f"person-{index:02}", False, True, "2026-01-01") for index in range(30)]
-        with mock.patch("pygithost.application._require_admin", return_value=True), mock.patch("pygithost.application.db_list_users", return_value=users):
+        with (
+            mock.patch("pygithost.application._require_admin", return_value=True),
+            mock.patch("pygithost.application.db_list_users", return_value=users),
+        ):
             _, page = self.request("/admin/users?page=2")
         table = page.split("All users</h2><table>", 1)[1].split("</table>", 1)[0]
         self.assertIn("person-25", table)
@@ -578,11 +699,19 @@ class RepositoryUITests(unittest.TestCase):
         self.assertEqual(table.count('<td class="repo-entry-name">'), 50)
 
     def test_pull_requests_and_artifacts_are_paginated(self):
-        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0, "artifact_retention_days": 0}))
+        database.db_ci_config_set(
+            FLAT_OWNER_UI,
+            "project",
+            json.dumps({"run_retention_count": 0, "artifact_retention_days": 0}),
+        )
         user_id = self.fixture_user()
         for index in range(30):
-            database.db_pr_create(FLAT_OWNER_UI, "project", f"Request {index:02}", "", "feature/api", "main", user_id)
-            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}")
+            database.db_pr_create(
+                FLAT_OWNER_UI, "project", f"Request {index:02}", "", "feature/api", "main", user_id
+            )
+            run_id = database.db_ci_run_create(
+                FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}"
+            )
             database.db_ci_artifact_set(run_id, b"zip")
             database.db_ci_run_update(run_id, status="success")
         for suffix in ("/pulls?status=open", "/artifacts?"):
@@ -610,12 +739,28 @@ class RepositoryUITests(unittest.TestCase):
         self.git("-C", self.source, "commit", "--allow-empty", "-m", "Feature commit")
         self.git("-C", self.source, "push", self.bare, "HEAD:feature/api")
         user_id = self.fixture_user()
-        pr_id = database.db_pr_create(FLAT_OWNER_UI, "project", "Paged PR", "", "feature/api", "main", user_id)
-        commits = [{"hash": f"{index:040x}", "subject": f"Paged commit {index:02}",
-                    "author_name": "Test", "date": "2026-01-01T12:00:00+00:00"} for index in range(60)]
+        pr_id = database.db_pr_create(
+            FLAT_OWNER_UI, "project", "Paged PR", "", "feature/api", "main", user_id
+        )
+        commits = [
+            {
+                "hash": f"{index:040x}",
+                "subject": f"Paged commit {index:02}",
+                "author_name": "Test",
+                "date": "2026-01-01T12:00:00+00:00",
+            }
+            for index in range(60)
+        ]
+
         async def git_commits(_bare, _ref, limit=100, skip=0, **_kwargs):
-            return commits[skip:skip + limit]
-        with mock.patch("pygithost.application._git_list_commits", side_effect=git_commits), mock.patch("pygithost.application._git_commit_count", new=mock.AsyncMock(return_value=60)):
+            return commits[skip : skip + limit]
+
+        with (
+            mock.patch("pygithost.application._git_list_commits", side_effect=git_commits),
+            mock.patch(
+                "pygithost.application._git_commit_count", new=mock.AsyncMock(return_value=60)
+            ),
+        ):
             _, first = self.request(self.base + f"/pulls/{pr_id}")
             _, second = self.request(self.base + f"/pulls/{pr_id}?page=2")
             self.assertIn("Paged commit 00", first)
@@ -635,7 +780,9 @@ class RepositoryUITests(unittest.TestCase):
         ids = []
         for index in range(28):
             commit = f"{index:040x}"
-            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", commit, "{}")
+            run_id = database.db_ci_run_create(
+                FLAT_OWNER_UI, "project", "push", "main", commit, "{}"
+            )
             database.db_ci_run_update(run_id, status="success")
             database.db_deployment_claim(run_id, FLAT_OWNER_UI, "project", commit)
             database.db_deployment_finish(run_id, "success", "done")
@@ -656,8 +803,15 @@ class RepositoryUITests(unittest.TestCase):
         database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
         warning_ids = []
         for _ in range(28):
-            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}")
-            database.db_ci_run_update(run_id, status="success", warnings="Cleanup failed: <script>unsafe</script>", reason="Deployment skipped: example")
+            run_id = database.db_ci_run_create(
+                FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}"
+            )
+            database.db_ci_run_update(
+                run_id,
+                status="success",
+                warnings="Cleanup failed: <script>unsafe</script>",
+                reason="Deployment skipped: example",
+            )
             warning_ids.append(run_id)
         clean = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}")
         database.db_ci_run_update(clean, status="success")
@@ -679,9 +833,21 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn("<script>unsafe</script>", detail)
 
     def test_retention_settings_are_saved_from_website(self):
-        status, page = self.request(self.base + "/ci/config", {
-            "configuration_json": json.dumps({"pipelines": {}, "settings": {
-                "artifact_retention_days": 0, "artifact_retention_count": 12, "run_retention_count": 0}})})
+        status, page = self.request(
+            self.base + "/ci/config",
+            {
+                "configuration_json": json.dumps(
+                    {
+                        "pipelines": {},
+                        "settings": {
+                            "artifact_retention_days": 0,
+                            "artifact_retention_count": 12,
+                            "run_retention_count": 0,
+                        },
+                    }
+                )
+            },
+        )
         self.assertEqual(status, 200)
         self.assertIn("Configuration saved", page)
         saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
@@ -693,10 +859,21 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_pasted_deployment_script_with_blank_path_saves_in_json_mode(self):
         content = 'import sys\nprint("deploying", sys.argv[1])\n'
-        status, page = self.request(self.base + "/ci/config", {
-            "configuration_json": json.dumps({"pipelines": {"default": {
-                "steps": [{"name": "Tests", "run": "echo tests"}],
-                "deployment": {"run_with": "python", "script_content": content}}}})})
+        status, page = self.request(
+            self.base + "/ci/config",
+            {
+                "configuration_json": json.dumps(
+                    {
+                        "pipelines": {
+                            "default": {
+                                "steps": [{"name": "Tests", "run": "echo tests"}],
+                                "deployment": {"run_with": "python", "script_content": content},
+                            }
+                        }
+                    }
+                )
+            },
+        )
         self.assertEqual(status, 200)
         self.assertIn("Configuration saved", page)
         saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
@@ -705,8 +882,15 @@ class RepositoryUITests(unittest.TestCase):
         self.assertEqual(saved["deploy_script_content"], content)
         _, reopened = self.request(self.base + "/ci/config")
         import html
-        editor = reopened.split('name="configuration_json"', 1)[1].split(">", 1)[1].split("</textarea>", 1)[0]
-        self.assertEqual(json.loads(html.unescape(editor))["deployments"][0]["script_content"], content)
+
+        editor = (
+            reopened.split('name="configuration_json"', 1)[1]
+            .split(">", 1)[1]
+            .split("</textarea>", 1)[0]
+        )
+        self.assertEqual(
+            json.loads(html.unescape(editor))["deployments"][0]["script_content"], content
+        )
 
     def test_branch_to_pr_prefills_source_and_target(self):
         status, page = self.request(self.base + "/pulls?source=feature%2Fapi&target=main")
@@ -721,18 +905,32 @@ class RepositoryUITests(unittest.TestCase):
         self.git("-C", self.source, "commit", "--allow-empty", "-m", "New branch work")
         new_sha = self.git("-C", self.source, "rev-parse", "HEAD")
         self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/feature/api")
-        _, page = self.request(self.base + "/branches/delete", {"branch": "feature/api", "expected_commit": self.sha})
+        _, page = self.request(
+            self.base + "/branches/delete", {"branch": "feature/api", "expected_commit": self.sha}
+        )
         self.assertIn("Branch changed", page)
         self.assertEqual(self.git("--git-dir", self.bare, "rev-parse", "feature/api"), new_sha)
-        _, page = self.request(self.base + "/branches/delete", {"branch": "release/1", "expected_commit": self.sha})
+        _, page = self.request(
+            self.base + "/branches/delete", {"branch": "release/1", "expected_commit": self.sha}
+        )
         self.assertIn("Protected branches cannot be deleted", page)
-        _, page = self.request(self.base + "/branches/delete", {"branch": "main", "expected_commit": self.sha})
+        _, page = self.request(
+            self.base + "/branches/delete", {"branch": "main", "expected_commit": self.sha}
+        )
         self.assertIn("Default branch is protected", page)
-        _, page = self.request(self.base + "/branches/delete", {"branch": "feature/api", "expected_commit": new_sha})
+        _, page = self.request(
+            self.base + "/branches/delete", {"branch": "feature/api", "expected_commit": new_sha}
+        )
         self.assertIn("Branch deleted", page)
 
     def test_repository_navigation_available_on_code_views(self):
-        for path in ("", "/commits?ref=main", "/tree/main/", "/blob/main/README.md", "/commit/" + self.sha):
+        for path in (
+            "",
+            "/commits?ref=main",
+            "/tree/main/",
+            "/blob/main/README.md",
+            "/commit/" + self.sha,
+        ):
             with self.subTest(path=path):
                 status, page = self.request(self.base + path)
                 self.assertEqual(status, 200)
@@ -741,28 +939,46 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_repository_header_is_identical_and_precedes_tab_content(self):
         headers = []
-        for path in ("", "/branches", "/pulls", "/ci", "/ci/config", "/ci/docs", "/artifacts",
-                     "/commits?ref=main", "/tree/main/", "/blob/main/README.md"):
+        for path in (
+            "",
+            "/branches",
+            "/pulls",
+            "/ci",
+            "/ci/config",
+            "/ci/docs",
+            "/artifacts",
+            "/commits?ref=main",
+            "/tree/main/",
+            "/blob/main/README.md",
+        ):
             with self.subTest(path=path):
                 status, page = self.request(self.base + path)
                 self.assertEqual(status, 200)
                 header = page.split('<header class="repo-header">', 1)[1].split("</header>", 1)[0]
                 headers.append(header)
                 main = page.split('<main class="', 1)[1].split(">", 1)[1]
-                self.assertTrue(main.startswith('<div class="repo-navigation">') or
-                                main.startswith('<div class="repo-ci-navigation">'))
-                self.assertLess(page.index('<header class="repo-header">'),
-                                page.index('aria-label="Repository navigation"'))
+                self.assertTrue(
+                    main.startswith('<div class="repo-navigation">')
+                    or main.startswith('<div class="repo-ci-navigation">')
+                )
+                self.assertLess(
+                    page.index('<header class="repo-header">'),
+                    page.index('aria-label="Repository navigation"'),
+                )
         self.assertTrue(all(header == headers[0] for header in headers))
 
     def test_code_dropdown_uses_current_ref_and_no_redundant_all_repos_button(self):
-        for path, ref in (("", "main"), ("/tree/feature%2Fapi/", "feature%2Fapi"),
-                          ("/commit/" + self.sha, self.sha), ("/blob/main/README.md", "main")):
+        for path, ref in (
+            ("", "main"),
+            ("/tree/feature%2Fapi/", "feature%2Fapi"),
+            ("/commit/" + self.sha, self.sha),
+            ("/blob/main/README.md", "main"),
+        ):
             with self.subTest(path=path):
                 status, page = self.request(self.base + path)
                 self.assertEqual(status, 200)
                 self.assertIn('class="repo-code-menu"', page)
-                self.assertIn(f'/archive.zip?ref={ref}', page)
+                self.assertIn(f"/archive.zip?ref={ref}", page)
                 self.assertIn('aria-label="Repository clone URL"', page)
                 self.assertIn('data-path="/git/project.git"', page)
                 self.assertNotIn("All repos</a>", page)
@@ -774,10 +990,15 @@ class RepositoryUITests(unittest.TestCase):
         self.git("-C", self.source, "commit", "-m", "Feature snapshot")
         new_sha = self.git("-C", self.source, "rev-parse", "HEAD")
         self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/feature/api")
-        for ref, sha, has_new in (("main", self.sha, False), ("feature/api", new_sha, True),
-                                  (self.sha, self.sha, False)):
+        for ref, sha, has_new in (
+            ("main", self.sha, False),
+            ("feature/api", new_sha, True),
+            (self.sha, self.sha, False),
+        ):
             with self.subTest(ref=ref):
-                status, archive = self.request(self.base + "/archive.zip?" + urlencode({"ref": ref}), binary=True)
+                status, archive = self.request(
+                    self.base + "/archive.zip?" + urlencode({"ref": ref}), binary=True
+                )
                 self.assertEqual(status, 200)
                 with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
                     prefix = f"project-{sha[:8]}/"
@@ -792,9 +1013,17 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_ci_run_details_have_commit_title_and_compact_disclosures(self):
         config = {"command": "echo saved command", "runner": "host", "image": "python:3.14-slim"}
-        run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}", json.dumps(config))
-        database.db_ci_run_update(run_id, status="success", output="raw-output-marker\n" * 100,
-            return_code=0, started_at="2026-01-01T12:00:00+00:00", finished_at="2026-01-01T12:00:10+00:00")
+        run_id = database.db_ci_run_create(
+            FLAT_OWNER_UI, "project", "push", "main", self.sha, "{}", json.dumps(config)
+        )
+        database.db_ci_run_update(
+            run_id,
+            status="success",
+            output="raw-output-marker\n" * 100,
+            return_code=0,
+            started_at="2026-01-01T12:00:00+00:00",
+            finished_at="2026-01-01T12:00:10+00:00",
+        )
         path = self.base + f"/ci/runs/{run_id}"
         status, page = self.request(path)
         self.assertEqual(status, 200)
@@ -806,42 +1035,58 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn('<details id="ci-run-output" class="box ci-run-output" open>', page)
         self.assertIn("saved command", page)
         self.assertIn("raw-output-marker", page)
-        steps = [{"name": "Tests", "status": "success", "duration": "10s", "return_code": 0,
-                  "started_at": "2026-01-01T12:00:00+00:00", "finished_at": "2026-01-01T12:00:10+00:00",
-                  "output": "step-output-marker"}]
+        steps = [
+            {
+                "name": "Tests",
+                "status": "success",
+                "duration": "10s",
+                "return_code": 0,
+                "started_at": "2026-01-01T12:00:00+00:00",
+                "finished_at": "2026-01-01T12:00:10+00:00",
+                "output": "step-output-marker",
+            }
+        ]
         database.db_ci_steps_set(run_id, json.dumps(steps))
         _, page = self.request(path)
         self.assertIn("Combined run log", page)
         self.assertIn('<details id="ci-run-output" class="box ci-run-output">', page)
         self.assertIn('<details id="ci-step-0" class="ci-step">', page)
         self.assertIn("step-output-marker", page)
-        self.assertIn('expanded.has(item.id)', page)
-        self.assertIn('positions.get(item.id)', page)
+        self.assertIn("expanded.has(item.id)", page)
+        self.assertIn("positions.get(item.id)", page)
         _, fragment = self.request(path + "?partial=1")
         self.assertIn('id="ci-run-result"', fragment)
         self.assertNotIn('id="ci-run-title"', fragment)
         self.assertNotIn('class="app-header"', fragment)
 
     def test_ci_run_title_falls_back_when_commit_is_unavailable(self):
-        run_id = database.db_ci_run_create(FLAT_OWNER_UI, "project", "manual", "main", "a" * 40, "{}")
+        run_id = database.db_ci_run_create(
+            FLAT_OWNER_UI, "project", "manual", "main", "a" * 40, "{}"
+        )
         _, page = self.request(self.base + f"/ci/runs/{run_id}")
         self.assertIn('id="ci-run-title">Manual run on main</h2>', page)
 
     def test_file_view_has_read_only_actions_breadcrumbs_and_line_links(self):
         status, page = self.request(self.base + "/blob/main/README.md")
         self.assertEqual(status, 200)
-        for label in ("Raw</a>", "Download</a>", "Copy contents</button>", "Permalink</a>", "History</a>"):
+        for label in (
+            "Raw</a>",
+            "Download</a>",
+            "Copy contents</button>",
+            "Permalink</a>",
+            "History</a>",
+        ):
             self.assertIn(label, page)
         self.assertIn('aria-label="File path"', page)
         self.assertIn('id="L1" href="#L1"', page)
-        self.assertIn(f'/blob/{self.sha}/README.md?raw=1', page)
-        self.assertIn(f'path=README.md', page)
+        self.assertIn(f"/blob/{self.sha}/README.md?raw=1", page)
+        self.assertIn("path=README.md", page)
         self.assertIn('id="repo-file-source"', page)
         self.assertIn('id="repo-file-viewport"', page)
         self.assertIn('aria-label="Scrollable file contents"', page)
         self.assertIn('id="repo-file-horizontal"', page)
         self.assertIn('aria-label="Scroll file horizontally"', page)
-        self.assertIn('horizontalScroll.scrollLeft = fileViewport.scrollLeft', page)
+        self.assertIn("horizontalScroll.scrollLeft = fileViewport.scrollLeft", page)
 
     def test_file_raw_and_download_preserve_bytes_and_have_safe_headers(self):
         content = b'<script>alert("file contents")</script>\r\n'
@@ -858,7 +1103,10 @@ class RepositoryUITests(unittest.TestCase):
                 self.assertEqual(response.read(), content)
                 self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
                 self.assertIn("sandbox", response.getheader("Content-Security-Policy"))
-                self.assertIn("attachment" if mode == "download" else "inline", response.getheader("Content-Disposition"))
+                self.assertIn(
+                    "attachment" if mode == "download" else "inline",
+                    response.getheader("Content-Disposition"),
+                )
                 self.assertNotIn("text/html", response.getheader("Content-Type"))
             finally:
                 connection.close()
@@ -894,8 +1142,10 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn('id="repo-copy-file"', page)
 
     def test_large_files_skip_highlighting_but_keep_line_numbers_and_raw_download(self):
-        for name, content in (("large.py", "x" * (100 * 1024 + 1)),
-                              ("many-lines.py", 'print("line")\n' * 2001)):
+        for name, content in (
+            ("large.py", "x" * (100 * 1024 + 1)),
+            ("many-lines.py", 'print("line")\n' * 2001),
+        ):
             with self.subTest(name=name):
                 (self.source / name).write_text(content)
                 self.git("-C", self.source, "add", ".")
@@ -908,13 +1158,15 @@ class RepositoryUITests(unittest.TestCase):
                 self.assertNotIn("temporarily unresponsive", page)
                 self.assertIn('id="repo-highlight-file"', page)
                 self.assertIn('id="L1"', page)
-                self.assertIn('if (true) { updateFileScroll(); return; }', page)
+                self.assertIn("if (true) { updateFileScroll(); return; }", page)
                 _, raw = self.request(self.base + "/blob/main/" + name + "?raw=1")
                 self.assertEqual(raw, content)
 
     def test_file_view_has_no_line_or_byte_preview_cutoff(self):
-        fixtures = (("long.py", 'print("row")\n' * 6000 + "LAST_LINE_MARKER\n"),
-                    ("wide.py", "x" * (1024 * 1024 + 1) + "\nLAST_BYTE_MARKER\n"))
+        fixtures = (
+            ("long.py", 'print("row")\n' * 6000 + "LAST_LINE_MARKER\n"),
+            ("wide.py", "x" * (1024 * 1024 + 1) + "\nLAST_BYTE_MARKER\n"),
+        )
         for name, content in fixtures:
             with self.subTest(name=name):
                 (self.source / name).write_text(content)
@@ -937,8 +1189,10 @@ class RepositoryUITests(unittest.TestCase):
         self.git("-C", self.source, "add", ".")
         self.git("-C", self.source, "commit", "-m", "Nested source fixture")
         self.git("--git-dir", self.bare, "fetch", self.source, "main:refs/heads/main")
-        for kind, path in (("tree", "CapaNegocio/Inventario/"),
-                           ("blob", "CapaNegocio/Inventario/Productos_Datos.cs")):
+        for kind, path in (
+            ("tree", "CapaNegocio/Inventario/"),
+            ("blob", "CapaNegocio/Inventario/Productos_Datos.cs"),
+        ):
             with self.subTest(kind=kind):
                 status, page = self.request(self.base + f"/{kind}/main/{path}")
                 self.assertEqual(status, 200)
@@ -948,7 +1202,9 @@ class RepositoryUITests(unittest.TestCase):
                 self.assertIn(f'href="{self.base}/tree/main/CapaNegocio/"', breadcrumb)
                 self.assertIn("Inventario", breadcrumb)
                 if kind == "blob":
-                    self.assertIn(f'href="{self.base}/tree/main/CapaNegocio/Inventario/"', breadcrumb)
+                    self.assertIn(
+                        f'href="{self.base}/tree/main/CapaNegocio/Inventario/"', breadcrumb
+                    )
                     self.assertIn('aria-current="page">Productos_Datos.cs', breadcrumb)
                 else:
                     self.assertIn('aria-current="page">Inventario', breadcrumb)
@@ -969,7 +1225,9 @@ class RepositoryUITests(unittest.TestCase):
     def test_code_page_shows_commit_metadata_readme_license_and_real_tags(self):
         (self.source / "src").mkdir()
         (self.source / "src" / "main.py").write_text("pass\n")
-        (self.source / "LICENSE").write_text("MIT License\nPermission is hereby granted, free of charge\n")
+        (self.source / "LICENSE").write_text(
+            "MIT License\nPermission is hereby granted, free of charge\n"
+        )
         self.git("-C", self.source, "add", ".")
         self.git("-C", self.source, "commit", "-m", "Add package and license")
         (self.source / "README.md").write_text("# Project\n\nA **useful** repository.\n")
@@ -996,31 +1254,51 @@ class RepositoryUITests(unittest.TestCase):
 
     def test_contributors_can_expand_beyond_first_five(self):
         people = [{"name": f"Contributor {index}", "commits": 10 - index} for index in range(7)]
-        database.db_repository_overview_set(FLAT_OWNER_UI, "project", self.sha,
-            json.dumps({"latest": None, "entries": {}, "commit_count": 49, "contributors": people}))
+        database.db_repository_overview_set(
+            FLAT_OWNER_UI,
+            "project",
+            self.sha,
+            json.dumps({"latest": None, "entries": {}, "commit_count": 49, "contributors": people}),
+        )
         status, page = self.request(self.base)
         self.assertEqual(status, 200)
         self.assertIn('class="repo-contributors-more"', page)
         self.assertIn("Show all 7 contributors", page)
-        expanded = page.split('<details class="repo-contributors-more">', 1)[1].split("</details>", 1)[0]
+        expanded = page.split('<details class="repo-contributors-more">', 1)[1].split(
+            "</details>", 1
+        )[0]
         self.assertIn("Contributor 5", expanded)
         self.assertIn("Contributor 6", expanded)
         self.assertNotIn("Contributor 0", expanded)
 
     def test_commits_are_grouped_by_date_with_pagination_metadata(self):
-        commits = [{"hash": str(index) * 40, "author_name": "UI author", "author_email": "ui@example.test",
-                    "date": date, "subject": f"Grouped commit {index}"}
-                   for index, date in ((1, "2026-10-28 13:00:00 +0000"),
-                                       (2, "2026-10-28 10:00:00 +0000"),
-                                       (3, "2026-10-27 12:00:00 +0000"))]
-        with mock.patch("pygithost.application._git_list_commits", new=mock.AsyncMock(return_value=commits)):
+        commits = [
+            {
+                "hash": str(index) * 40,
+                "author_name": "UI author",
+                "author_email": "ui@example.test",
+                "date": date,
+                "subject": f"Grouped commit {index}",
+            }
+            for index, date in (
+                (1, "2026-10-28 13:00:00 +0000"),
+                (2, "2026-10-28 10:00:00 +0000"),
+                (3, "2026-10-27 12:00:00 +0000"),
+            )
+        ]
+        with mock.patch(
+            "pygithost.application._git_list_commits", new=mock.AsyncMock(return_value=commits)
+        ):
             status, page = self.request(self.base + "/commits?ref=main")
             self.assertEqual(status, 200)
             self.assertEqual(page.count('data-date-heading="2026-10-28"'), 1)
             self.assertEqual(page.count('data-date-heading="2026-10-27"'), 1)
             self.assertEqual(page.count('data-commit-date="2026-10-28"'), 2)
             self.assertIn("Commits on Oct 28, 2026", page)
-            self.assertLess(page.index('data-date-heading="2026-10-28"'), page.index('data-date-heading="2026-10-27"'))
+            self.assertLess(
+                page.index('data-date-heading="2026-10-28"'),
+                page.index('data-date-heading="2026-10-27"'),
+            )
             _, body = self.request(self.base + "/commits?ref=main&partial=1")
             payload = json.loads(body)
             self.assertEqual(payload["commits"][0]["date_key"], "2026-10-28")

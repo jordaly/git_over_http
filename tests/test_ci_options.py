@@ -9,7 +9,11 @@ from pygithost.ci_config import compile_document
 
 class ConfigurationOptionTests(unittest.TestCase):
     def document(self):
-        return {"version": 1, "pipelines": [{"name": "checks", "steps": [{"name": "Test", "run": "echo test"}]}], "deployments": []}
+        return {
+            "version": 1,
+            "pipelines": [{"name": "checks", "steps": [{"name": "Test", "run": "echo test"}]}],
+            "deployments": [],
+        }
 
     def set_value(self, document, path, value):
         target = document
@@ -27,10 +31,25 @@ class ConfigurationOptionTests(unittest.TestCase):
             (("execution", "timeout_seconds"), 37, "timeout_seconds", 37),
             (("execution", "env"), {"MODE": "test"}, "env", {"MODE": "test"}),
             (("cancellation", "superseded"), True, "cancel_superseded", True),
-            (("triggers", "push", "branches"), ["main", "release/*"], "push_branches", "main\nrelease/*"),
+            (
+                ("triggers", "push", "branches"),
+                ["main", "release/*"],
+                "push_branches",
+                "main\nrelease/*",
+            ),
             (("triggers", "pull_request", "branches"), ["develop"], "pr_branches", "develop"),
-            (("artifacts", "paths"), ["dist/*"], "artifacts", {"paths": ["dist/*"], "when": "always"}),
-            (("notifications", "email", "recipients"), ["ci@example.com"], "email_recipients", "ci@example.com"),
+            (
+                ("artifacts", "paths"),
+                ["dist/*"],
+                "artifacts",
+                {"paths": ["dist/*"], "when": "always"},
+            ),
+            (
+                ("notifications", "email", "recipients"),
+                ["ci@example.com"],
+                "email_recipients",
+                "ci@example.com",
+            ),
         ]
         for path, value, internal, expected in cases:
             with self.subTest(path=path):
@@ -41,25 +60,40 @@ class ConfigurationOptionTests(unittest.TestCase):
             for enabled in (True, False):
                 document = self.document()
                 self.set_value(document, ("pipelines", 0, "triggers", trigger, "enabled"), enabled)
-                self.assertEqual(compile_document(document)["events"][trigger], True if trigger == "manual" else enabled)
+                self.assertEqual(
+                    compile_document(document)["events"][trigger],
+                    True if trigger == "manual" else enabled,
+                )
 
     def test_each_pr_event_is_selected_individually(self):
-        mapping = {"opened": "pr_opened", "updated": "pr_updated", "reopened": "pr_reopened", "merged": "pr_merged"}
+        mapping = {
+            "opened": "pr_opened",
+            "updated": "pr_updated",
+            "reopened": "pr_reopened",
+            "merged": "pr_merged",
+        }
         for event, internal in mapping.items():
             for enabled in (True, False):
                 with self.subTest(event=event, enabled=enabled):
                     document = self.document()
-                    document["pipelines"][0]["triggers"] = {"pull_request": {"enabled": enabled, "events": [event]}}
+                    document["pipelines"][0]["triggers"] = {
+                        "pull_request": {"enabled": enabled, "events": [event]}
+                    }
                     flags = compile_document(document)["events"]
-                    self.assertEqual({key for key in mapping.values() if flags[key]}, {internal} if enabled else set())
+                    self.assertEqual(
+                        {key for key in mapping.values() if flags[key]},
+                        {internal} if enabled else set(),
+                    )
 
     def test_each_email_and_artifact_mode(self):
         for mode in ("off", "failures", "all", "recovery"):
             for when in ("always", "success", "failure"):
                 with self.subTest(mode=mode, when=when):
                     document = self.document()
-                    document["pipelines"][0].update(notifications={"email": {"mode": mode, "recipients": ["ci@example.com"]}},
-                                                   artifacts={"paths": [], "when": when})
+                    document["pipelines"][0].update(
+                        notifications={"email": {"mode": mode, "recipients": ["ci@example.com"]}},
+                        artifacts={"paths": [], "when": when},
+                    )
                     config = compile_document(document)
                     self.assertEqual(config["email_mode"], mode)
                     self.assertEqual(config["artifacts"]["when"], when)
@@ -82,14 +116,34 @@ class ConfigurationOptionTests(unittest.TestCase):
 
     def test_each_deployment_option_and_independent_email(self):
         document = self.document()
-        document["pipelines"][0]["notifications"] = {"email": {"mode": "all", "recipients": ["pipeline@example.com"]}}
-        document["deployments"] = [{"name": "production", "pipeline": "checks", "enabled": False,
-            "branch": "develop", "script_content": "print('deploy')\n", "run_with": "python", "timeout_seconds": 73,
-            "notifications": {"email": {"mode": "failures", "recipients": ["target@example.com"]}}}]
+        document["pipelines"][0]["notifications"] = {
+            "email": {"mode": "all", "recipients": ["pipeline@example.com"]}
+        }
+        document["deployments"] = [
+            {
+                "name": "production",
+                "pipeline": "checks",
+                "enabled": False,
+                "branch": "develop",
+                "script_content": "print('deploy')\n",
+                "run_with": "python",
+                "timeout_seconds": 73,
+                "notifications": {
+                    "email": {"mode": "failures", "recipients": ["target@example.com"]}
+                },
+            }
+        ]
         target = compile_document(document)["deployment_targets"][0]
-        expected = {"deployment_name": "production", "deploy_enabled": False, "deploy_branch": "develop",
-                    "deploy_script_content": "print('deploy')\n", "deploy_interpreter": "python", "deploy_timeout": 73,
-                    "email_mode": "failures", "email_recipients": "target@example.com"}
+        expected = {
+            "deployment_name": "production",
+            "deploy_enabled": False,
+            "deploy_branch": "develop",
+            "deploy_script_content": "print('deploy')\n",
+            "deploy_interpreter": "python",
+            "deploy_timeout": 73,
+            "email_mode": "failures",
+            "email_recipients": "target@example.com",
+        }
         for key, value in expected.items():
             self.assertEqual(target[key], value, key)
         document["deployments"][0].pop("script_content")
@@ -101,14 +155,21 @@ class ConfigurationOptionTests(unittest.TestCase):
 
     def test_invalid_pipeline_options_are_rejected(self):
         cases = [
-            (("execution", "runner"), "unknown"), (("execution", "image"), "bad image"),
-            (("execution", "timeout_seconds"), 0), (("execution", "env"), {"X": 1}),
-            (("execution", "env"), {"CI": "override"}), (("cancellation", "superseded"), "true"),
-            (("triggers", "push", "enabled"), 1), (("triggers", "manual", "enabled"), "yes"),
-            (("triggers", "push", "branches"), "main"), (("triggers", "pull_request", "branches"), [1]),
+            (("execution", "runner"), "unknown"),
+            (("execution", "image"), "bad image"),
+            (("execution", "timeout_seconds"), 0),
+            (("execution", "env"), {"X": 1}),
+            (("execution", "env"), {"CI": "override"}),
+            (("cancellation", "superseded"), "true"),
+            (("triggers", "push", "enabled"), 1),
+            (("triggers", "manual", "enabled"), "yes"),
+            (("triggers", "push", "branches"), "main"),
+            (("triggers", "pull_request", "branches"), [1]),
             (("triggers", "pull_request", "events"), ["invalid"]),
-            (("artifacts", "paths"), ["../private"]), (("artifacts", "when"), "invalid"),
-            (("notifications", "email", "mode"), "invalid"), (("notifications", "email", "recipients"), "ci@example.com"),
+            (("artifacts", "paths"), ["../private"]),
+            (("artifacts", "when"), "invalid"),
+            (("notifications", "email", "mode"), "invalid"),
+            (("notifications", "email", "recipients"), "ci@example.com"),
         ]
         for path, value in cases:
             document = self.document()
@@ -118,7 +179,9 @@ class ConfigurationOptionTests(unittest.TestCase):
 
     def test_step_and_git_file_options(self):
         document = self.document()
-        document["pipelines"][0]["steps"] = [{"name": "Compile", "run": "python -m compileall -q ."}]
+        document["pipelines"][0]["steps"] = [
+            {"name": "Compile", "run": "python -m compileall -q ."}
+        ]
         self.assertEqual(compile_document(document)["steps"], document["pipelines"][0]["steps"])
         document["pipelines"][0].pop("steps")
         document["pipelines"][0]["file"] = ".pygithost-ci.json"
@@ -132,6 +195,8 @@ class ConfigurationOptionTests(unittest.TestCase):
         other["name"] = "other"
         document["pipelines"].append(other)
         before = CIManager.pipelines(compile_document(document))[1]
-        document["pipelines"][0].update(execution={"runner": "docker", "env": {"ONLY_FIRST": "1"}},
-                                        triggers={"manual": {"enabled": True}})
+        document["pipelines"][0].update(
+            execution={"runner": "docker", "env": {"ONLY_FIRST": "1"}},
+            triggers={"manual": {"enabled": True}},
+        )
         self.assertEqual(CIManager.pipelines(compile_document(document))[1], before)

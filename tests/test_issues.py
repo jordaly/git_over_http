@@ -1,9 +1,8 @@
 import http.client
-from pathlib import Path
-import re
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from urllib.parse import urlencode
 
 from pygithost import database
@@ -13,7 +12,10 @@ from tests.test_server import ServerRunner, _which_git_backend
 
 class IssuesTests(unittest.TestCase):
     def setUp(self):
-        if not (subprocess.run(["git", "--version"], capture_output=True).returncode == 0 and _which_git_backend()):
+        if not (
+            subprocess.run(["git", "--version"], capture_output=True).returncode == 0
+            and _which_git_backend()
+        ):
             self.skipTest("requires Git HTTP backend")
         self.temp = tempfile.TemporaryDirectory(prefix="issues-")
         self.root = Path(self.temp.name)
@@ -37,14 +39,21 @@ class IssuesTests(unittest.TestCase):
         self.temp.cleanup()
 
     def git(self, *args):
-        return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.PIPE, text=True).strip()
+        return subprocess.check_output(
+            ["git", *map(str, args)], stderr=subprocess.PIPE, text=True
+        ).strip()
 
     def request(self, path, fields=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
         try:
-            connection.request("GET" if fields is None else "POST", path,
+            connection.request(
+                "GET" if fields is None else "POST",
+                path,
                 body=None if fields is None else urlencode(fields),
-                headers={} if fields is None else {"Content-Type": "application/x-www-form-urlencoded"})
+                headers={}
+                if fields is None
+                else {"Content-Type": "application/x-www-form-urlencoded"},
+            )
             response = connection.getresponse()
             body = response.read()
             return response.status, body.decode()
@@ -80,7 +89,7 @@ class IssuesTests(unittest.TestCase):
         self.assertIn("issue-first-post", page)
         self.assertIn('class="pr-comment-body md-body"', page)
         self.assertIn("/static/vendor/tui-editor/toastui-editor-all.min.js", page)
-        self.assertIn('data-markdown', page)
+        self.assertIn("data-markdown", page)
         self.assertIn("Close issue", page)
         self.assertIn('maxlength="1000000"', page)
 
@@ -101,7 +110,9 @@ class IssuesTests(unittest.TestCase):
 
     def test_comments_add_counts_and_management(self):
         issue_id = self.create_issue("Title only", "")
-        status, page = self.request(self.base + f"/issues/{issue_id}/comments", {"body": "First comment"})
+        status, page = self.request(
+            self.base + f"/issues/{issue_id}/comments", {"body": "First comment"}
+        )
         self.assertEqual(status, 200, page)
         self.assertIn("First comment", page)
         comments = database.db_issue_comment_list(issue_id)
@@ -128,7 +139,7 @@ class IssuesTests(unittest.TestCase):
         issue_id = self.create_issue("MD", "# Heading\n\n**bold**")
         status, page = self.request(self.base + f"/issues/{issue_id}")
         self.assertIn('class="pr-comment-body md-body"', page)
-        self.assertIn('# Heading', page)  # raw markdown escaped server-side; rendered client-side
+        self.assertIn("# Heading", page)  # raw markdown escaped server-side; rendered client-side
 
     def test_long_inline_image_comment_is_stored_intact(self):
         # Regression: bodies were clipped at 50,000 characters, cutting a
@@ -145,6 +156,7 @@ class IssuesTests(unittest.TestCase):
 
     def test_clip_markdown_never_splits_an_inline_image(self):
         from pygithost.application import MARKDOWN_BODY_LIMIT, _clip_markdown
+
         body = "x" * (MARKDOWN_BODY_LIMIT - 20) + "![logo](data:image/png;base64," + "A" * 100
         clipped = _clip_markdown(body)
         self.assertLessEqual(len(clipped), MARKDOWN_BODY_LIMIT)

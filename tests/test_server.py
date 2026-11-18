@@ -1,20 +1,19 @@
-import os
-import socket
 import asyncio
-import threading
 import http.client
-import subprocess
-import unittest
-import tempfile
-import shutil
 import json
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import unittest
 from contextlib import closing
 from dataclasses import replace
 
 # Import your server module
 import server as srv
 from pygithost import database
-
 
 # ---------- helpers ----------
 
@@ -66,9 +65,7 @@ class ServerRunner:
         self.allow_ips = set({"127.0.0.1"} if allow_ips is None else allow_ips)
         self.url_prefix = url_prefix
         self.trace_log = trace_log
-        self.project_root = project_root or tempfile.mkdtemp(
-            prefix="git-http-projroot-"
-        )
+        self.project_root = project_root or tempfile.mkdtemp(prefix="git-http-projroot-")
         self.backend_path = backend_path or _which_git_backend()
         self.port = None
         self.bind_host = bind_host
@@ -116,9 +113,7 @@ class ServerRunner:
             self.stop_event = asyncio.Event()
             try:
                 await asyncio.to_thread(database._db_init)
-                self.httpd = await asyncio.start_server(
-                    app.handle_client, self.bind_host, 0
-                )
+                self.httpd = await asyncio.start_server(app.handle_client, self.bind_host, 0)
                 self.port = self.httpd.sockets[0].getsockname()[1]
                 self.ready.set()
                 await self.stop_event.wait()
@@ -149,7 +144,6 @@ class ServerRunner:
 @unittest.skipUnless(_which_git(), "git not found in PATH")
 @unittest.skipUnless(_which_git_backend(), "git-http-backend not found")
 class GitHTTPServerRealBackendTests(unittest.TestCase):
-
     def setUp(self):
         self.git = _which_git()
         self.backend = _which_git_backend()
@@ -235,18 +229,14 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 self.assertIn('class="language-markdown"', body)
                 self.assertIn("# Project", body)
                 self.assertIn("prism-markdown.min.js", body)
-                self.assertIn(
-                    "&lt;script&gt;alert(&#x27;unsafe&#x27;)&lt;/script&gt;", body
-                )
+                self.assertIn("&lt;script&gt;alert(&#x27;unsafe&#x27;)&lt;/script&gt;", body)
                 self.assertNotIn("<script>alert('unsafe')</script>", body)
                 self.assertIn('data-path="/git/repo.git"', body)
                 self.assertIn('aria-label="Repository clone URL"', body)
                 self.assertNotIn("USERNAME:PASSWORD", body)
                 self.assertNotIn("TOKEN_VALUE", body)
                 self.assertIn('href="/r/root/repo/blob/main/source.txt"', body)
-                self.assertLess(
-                    body.index(">Files</h2>"), body.index(">README.md</h2>")
-                )
+                self.assertLess(body.index(">Files</h2>"), body.index(">README.md</h2>"))
             finally:
                 conn.close()
 
@@ -378,7 +368,6 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
             project_root=self.tmp_root,
             backend_path=self.backend,
         ) as srvrun:
-
             repo_url = f"http://127.0.0.1:{srvrun.port}/git/repo.git"
 
             with tempfile.TemporaryDirectory(prefix="git-http-client-") as clienttmp:
@@ -397,9 +386,7 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 git_local("config", "user.email", "test@example.com")
 
                 # Create file, add, commit
-                with open(
-                    os.path.join(clone_dir, "hello.txt"), "w", encoding="utf-8"
-                ) as f:
+                with open(os.path.join(clone_dir, "hello.txt"), "w", encoding="utf-8") as f:
                     f.write("hello over http\n")
                 git_local("add", "hello.txt")
                 git_local("commit", "-m", "Add hello.txt")
@@ -422,7 +409,6 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
             project_root=self.tmp_root,
             backend_path=self.backend,
         ) as srvrun:
-
             conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
             try:
                 conn.request("GET", "/git/repo.git/info/refs?service=git-receive-pack")
@@ -440,7 +426,6 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
             project_root=self.tmp_root,
             backend_path=self.backend,
         ) as srvrun:
-
             conn = http.client.HTTPConnection("127.0.0.1", srvrun.port, timeout=5)
             try:
                 conn.request("GET", "/nope/repo.git/info/refs?service=git-receive-pack")

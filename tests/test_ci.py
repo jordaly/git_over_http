@@ -12,18 +12,22 @@ from unittest import mock
 from unittest.mock import AsyncMock
 
 from pygithost import database
-from pygithost.application import AsyncGitServer, GitHTTPHandler, Headers, FLAT_OWNER_UI
-from pygithost.config import AppConfig
-from pygithost.context import AppContext
+from pygithost.application import FLAT_OWNER_UI, AsyncGitServer, GitHTTPHandler, Headers
 from pygithost.ci import CIManager, remove_checkout
 from pygithost.ci_windows_launcher import _exec_command, _shell_command
+from pygithost.config import AppConfig
+from pygithost.context import AppContext
 
 
 class WindowsExecutableLookupTests(unittest.TestCase):
     def test_checkout_cleanup_retries_transient_windows_file_lock(self):
         error = PermissionError("file is in use")
         error.winerror = 32
-        with mock.patch("pygithost.ci.os.name", "nt"), mock.patch("pygithost.ci.shutil.rmtree", side_effect=[error, None]) as remove, mock.patch("pygithost.ci.time.sleep") as sleep:
+        with (
+            mock.patch("pygithost.ci.os.name", "nt"),
+            mock.patch("pygithost.ci.shutil.rmtree", side_effect=[error, None]) as remove,
+            mock.patch("pygithost.ci.time.sleep") as sleep,
+        ):
             remove_checkout("job-directory")
         self.assertEqual(remove.call_count, 2)
         sleep.assert_called_once_with(0.1)
@@ -31,14 +35,18 @@ class WindowsExecutableLookupTests(unittest.TestCase):
     def test_checkout_cleanup_does_not_hide_persistent_errors(self):
         error = PermissionError("file is in use")
         error.winerror = 32
-        with mock.patch("pygithost.ci.os.name", "nt"), mock.patch("pygithost.ci.shutil.rmtree", side_effect=error) as remove, mock.patch("pygithost.ci.time.sleep"):
+        with (
+            mock.patch("pygithost.ci.os.name", "nt"),
+            mock.patch("pygithost.ci.shutil.rmtree", side_effect=error) as remove,
+            mock.patch("pygithost.ci.time.sleep"),
+        ):
             with self.assertRaises(PermissionError):
                 remove_checkout("job-directory")
         self.assertEqual(remove.call_count, 6)
 
     def test_shell_preserves_connection_string_quotes_and_chaining(self):
         command = (
-            'sqlpackage /Action:Extract '
+            "sqlpackage /Action:Extract "
             '/SourceConnectionString:"Data Source=localhost;Initial Catalog=Example;User ID=test" '
             '&& echo "next command"'
         )
@@ -119,9 +127,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         manager = CIManager(lambda *_: "")
         manager._execute = hold_run
         await manager.start()
-        started_ids = {
-            await asyncio.wait_for(started.get(), timeout=1) for _ in range(2)
-        }
+        started_ids = {await asyncio.wait_for(started.get(), timeout=1) for _ in range(2)}
         self.assertEqual(started_ids, {first_a, first_b})
         self.assertEqual(self._run_status("repo_a", second_a), "queued")
 
@@ -174,9 +180,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             for release in releases.values():
                 release.set()
             await manager.stop()
-        self.assertTrue(
-            all(self._run_status(row[2], row[0]) == "success" for row in rows)
-        )
+        self.assertTrue(all(self._run_status(row[2], row[0]) == "success" for row in rows))
 
     async def test_push_finalizer_queues_added_and_updated_refs_only(self):
         server = object.__new__(AsyncGitServer)
@@ -195,27 +199,19 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
 
         server._branch_refs = refs
 
-        await server._queue_push_changes(
-            "owner", "repo", {"main": "a" * 40, "deleted": "d" * 40}
-        )
+        await server._queue_push_changes("owner", "repo", {"main": "a" * 40, "deleted": "d" * 40})
         self.assertEqual(
             [(call[2], call[3], call[4]) for call in calls],
             [("push", "main", "b" * 40), ("push", "new", "c" * 40)],
         )
 
-    @unittest.skipUnless(
-        os.name == "posix" and shutil.which("git"), "requires POSIX and Git"
-    )
+    @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
     async def test_push_finalizer_failure_still_releases_repository_lock(self):
         root = Path(self.temp.name)
         bare = root / "repo.git"
-        subprocess.run(
-            ["git", "init", "--bare", str(bare)], check=True, capture_output=True
-        )
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
         backend = root / "git-http-backend"
-        backend.write_text(
-            "#!/bin/sh\nprintf 'Status: 200 OK\\r\\n\\r\\n'\n", encoding="utf-8"
-        )
+        backend.write_text("#!/bin/sh\nprintf 'Status: 200 OK\\r\\n\\r\\n'\n", encoding="utf-8")
         backend.chmod(0o755)
         config = AppConfig.from_mapping(
             {
@@ -283,19 +279,13 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(app.push_requests)
         await app.shutdown()
 
-    @unittest.skipUnless(
-        os.name == "posix" and shutil.which("git"), "requires POSIX and Git"
-    )
+    @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
     async def test_push_ref_change_is_queued_when_response_client_disconnects(self):
         root = Path(self.temp.name)
         source, bare = root / "source", root / "repo.git"
         source.mkdir()
-        subprocess.run(
-            ["git", "init", "-b", "main", str(source)], check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "-C", str(source), "config", "user.name", "CI test"], check=True
-        )
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "config", "user.name", "CI test"], check=True)
         subprocess.run(
             ["git", "-C", str(source), "config", "user.email", "ci@example.test"],
             check=True,
@@ -388,9 +378,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         handler._write_git_response = disconnected
         await handler._handle_git()
         for _ in range(100):
-            runs = await asyncio.to_thread(
-                database.db_ci_runs_list, FLAT_OWNER_UI, "repo", 10
-            )
+            runs = await asyncio.to_thread(database.db_ci_runs_list, FLAT_OWNER_UI, "repo", 10)
             if runs and runs[0][4] == "success":
                 break
             await asyncio.sleep(0.01)
@@ -408,15 +396,9 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             return ["main"]
 
         with (
-            mock.patch(
-                "pygithost.application._repo_bare_path", return_value=self.temp.name
-            ),
-            mock.patch(
-                "pygithost.application._git_list_branches", side_effect=branches
-            ),
-            mock.patch(
-                "pygithost.application._send_html", new_callable=AsyncMock
-            ) as send_html,
+            mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),
+            mock.patch("pygithost.application._git_list_branches", side_effect=branches),
+            mock.patch("pygithost.application._send_html", new_callable=AsyncMock) as send_html,
             mock.patch(
                 "pygithost.application._send_response", new_callable=AsyncMock
             ) as send_response,
@@ -447,9 +429,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         database.db_ci_run_update(
             matching, status="failed", output="unit-test exploded", return_code=1
         )
-        database.db_ci_run_update(
-            other, status="success", output="all green", return_code=0
-        )
+        database.db_ci_run_update(other, status="success", output="all green", return_code=0)
         handler = object.__new__(GitHTTPHandler)
         handler.path = "/r/owner/filtered/ci?status=failed&event=push&branch=main&q=exploded"
         handler.request = SimpleNamespace()
@@ -471,7 +451,9 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ci_configuration_is_on_its_own_page(self):
         handler = object.__new__(GitHTTPHandler)
-        handler.server = SimpleNamespace(ci_manager=CIManager(lambda *_: ""), settings_csrf_secret=b"settings-test")
+        handler.server = SimpleNamespace(
+            ci_manager=CIManager(lambda *_: ""), settings_csrf_secret=b"settings-test"
+        )
         handler.request = SimpleNamespace(peer_ip="127.0.0.1")
         handler.headers = {}
         handler.remote_is_admin = True
@@ -498,7 +480,9 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         with (
             mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),
             mock.patch("pygithost.application._send_html", new_callable=AsyncMock) as send_html,
-            mock.patch("pygithost.application._send_response", new_callable=AsyncMock) as send_response,
+            mock.patch(
+                "pygithost.application._send_response", new_callable=AsyncMock
+            ) as send_response,
         ):
             await handler._ui_ci("owner", "repo", run_id)
             page = send_html.await_args.args[2].decode("utf-8")
@@ -514,20 +498,14 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('id="ci-run-result"', fragment.decode("utf-8"))
             self.assertIn(("Cache-Control", "no-store"), headers)
 
-    @unittest.skipUnless(
-        os.name == "posix" and shutil.which("git"), "requires POSIX and Git"
-    )
+    @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
     async def test_timed_out_command_keeps_output_and_removes_worktree(self):
         root = Path(self.temp.name)
         source = root / "source"
         bare = root / "repo.git"
         source.mkdir()
-        subprocess.run(
-            ["git", "init", "-b", "main", str(source)], check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "-C", str(source), "config", "user.name", "CI test"], check=True
-        )
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "config", "user.name", "CI test"], check=True)
         subprocess.run(
             ["git", "-C", str(source), "config", "user.email", "ci@example.test"],
             check=True,
@@ -570,9 +548,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(worktrees.count("worktree "), 1)
 
-    @unittest.skipUnless(
-        os.name == "posix" and Path("/proc").is_dir(), "requires POSIX /proc"
-    )
+    @unittest.skipUnless(os.name == "posix" and Path("/proc").is_dir(), "requires POSIX /proc")
     async def test_timeout_kills_descendant_when_shell_exits_first(self):
         manager = CIManager(lambda *_: "")
         output, truncated = bytearray(), [False]
@@ -592,7 +568,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(100):
             try:
                 state = proc_stat.read_text(encoding="ascii").split()[2]
-            except (FileNotFoundError, ProcessLookupError):
+            except FileNotFoundError, ProcessLookupError:
                 break
             if state == "Z":
                 break
@@ -636,8 +612,14 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         restricted_env.pop("COMSPEC", None)
         restricted_env["PATH"] = ""
         result = await manager._capture_process(
-            "dir", shell=True, cwd=self.temp.name, env=restricted_env,
-            output=output, truncated=truncated, timeout=10)
+            "dir",
+            shell=True,
+            cwd=self.temp.name,
+            env=restricted_env,
+            output=output,
+            truncated=truncated,
+            timeout=10,
+        )
         self.assertEqual(result, 0)
         self.assertIn(b"listing.txt", output)
 
@@ -676,19 +658,38 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         source, bare = root / "source", root / "repo.git"
         subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
         (source / "fixture.txt").write_text("CI checkout fixture", encoding="utf-8")
-        subprocess.run(["git", "-C", str(source), "add", "fixture.txt"], check=True, capture_output=True)
-        subprocess.run([
-            "git", "-C", str(source), "-c", "user.name=CI test",
-            "-c", "user.email=ci@example.test", "commit", "-m", "fixture",
-        ], check=True, capture_output=True)
-        subprocess.run(["git", "clone", "--bare", str(source), str(bare)], check=True, capture_output=True)
-        commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(
+            ["git", "-C", str(source), "add", "fixture.txt"], check=True, capture_output=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "-c",
+                "user.name=CI test",
+                "-c",
+                "user.email=ci@example.test",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "clone", "--bare", str(source), str(bare)], check=True, capture_output=True
+        )
+        commit = subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+        ).strip()
         database.db_ci_config_set("owner", "windows", json.dumps({"command": "dir"}))
         run_id = self._queued_run("windows")
         manager = CIManager(lambda *_: str(bare))
-        await asyncio.wait_for(manager._execute(
-            (run_id, "owner", "windows", "manual", "main", commit, "{}")
-        ), timeout=30)
+        await asyncio.wait_for(
+            manager._execute((run_id, "owner", "windows", "manual", "main", commit, "{}")),
+            timeout=30,
+        )
         result = database.db_ci_run_get("owner", "windows", run_id)
         self.assertEqual(result[4], "success", result[5])
         self.assertIn("fixture.txt", result[5])

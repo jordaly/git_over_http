@@ -1,71 +1,135 @@
 """Server-owned SMTP settings; job environments never receive credentials."""
 
 import os
-import json
 import re
 import smtplib
 import ssl
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from html import escape
-from datetime import datetime, timezone
+from typing import TypeAlias, TypedDict, TypeGuard
 from urllib.parse import quote, urlsplit
 
 from . import database
+from .database_types import CIRunRow, decode_json_object
 
 
-def environment_settings():
+class EmailSettings(TypedDict):
+    """Validated SMTP settings; only the server process sees the password."""
+
+    host: str
+    port: str
+    tls: str
+    sender: str
+    username: str
+    password: str
+    public_url: str
+    ca_cert: str
+    trust_server_cert: bool
+
+
+class TLSConfig(TypedDict, total=False):
+    """Optional TLS material accepted by :func:`tls_context`."""
+
+    ca_cert: str
+    trust_server_cert: bool
+
+
+# The full ci_runs projection plus the shorter stub used by the admin
+# test-email form. Duration timestamps only exist on the full row.
+NotifiableRunRow: TypeAlias = CIRunRow | tuple[int, str, str, str, str, str, int, None]
+
+
+def _has_duration(run: NotifiableRunRow) -> TypeGuard[CIRunRow]:
+    return len(run) > 10
+
+
+def environment_settings() -> dict[str, str]:
     mode = os.environ.get("PYGITHOST_SMTP_TLS", "starttls")
-    return {"host": os.environ.get("PYGITHOST_SMTP_HOST", ""),
-            "port": os.environ.get("PYGITHOST_SMTP_PORT", "465" if mode == "ssl" else "587"),
-            "tls": mode, "sender": os.environ.get("PYGITHOST_SMTP_FROM", ""),
-            "username": os.environ.get("PYGITHOST_SMTP_USERNAME", ""),
-            "password": os.environ.get("PYGITHOST_SMTP_PASSWORD", ""),
-            "public_url": os.environ.get("PYGITHOST_PUBLIC_URL", "")}
+    return {
+        "host": os.environ.get("PYGITHOST_SMTP_HOST", ""),
+        "port": os.environ.get("PYGITHOST_SMTP_PORT", "465" if mode == "ssl" else "587"),
+        "tls": mode,
+        "sender": os.environ.get("PYGITHOST_SMTP_FROM", ""),
+        "username": os.environ.get("PYGITHOST_SMTP_USERNAME", ""),
+        "password": os.environ.get("PYGITHOST_SMTP_PASSWORD", ""),
+        "public_url": os.environ.get("PYGITHOST_PUBLIC_URL", ""),
+    }
 
 
-def load_settings():
+def load_settings() -> Mapping[str, object]:
     raw = database.db_email_settings_get()
-    return json.loads(raw) if raw else environment_settings()
+    result: Mapping[str, object] = decode_json_object(raw) if raw else environment_settings()
+    return result
 
 
-def validate_settings(raw):
-    result = {}
+def validate_settings(raw: Mapping[str, object]) -> EmailSettings:
+    values: dict[str, str] = {}
     for key in ("host", "port", "tls", "sender", "username", "password", "public_url"):
         value = raw.get(key, "")
-        if not isinstance(value, str) or len(value) > 8192 or any(c in value for c in ("\r", "\n", "\0")):
+        if (
+            not isinstance(value, str)
+            or len(value) > 8192
+            or any(c in value for c in ("\r", "\n", "\0"))
+        ):
             raise ValueError(f"Invalid SMTP {key}.")
-        result[key] = value if key == "password" else value.strip()
+        values[key] = value if key == "password" else value.strip()
     certificate = raw.get("ca_cert", "")
     if not isinstance(certificate, str) or len(certificate) > 65536 or "\0" in certificate:
         raise ValueError("Trusted SMTP certificate must be PEM text up to 64 KiB.")
-    result["ca_cert"] = certificate.strip()
-    if result["ca_cert"]:
-        if not re.fullmatch(r"(?:\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+", result["ca_cert"]):
+    ca_cert = certificate.strip()
+    if ca_cert:
+        if not re.fullmatch(
+            r"(?:\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+",
+            ca_cert,
+        ):
             raise ValueError("Paste PEM certificates only, never a private key.")
         try:
-            tls_context(result)
+            tls_context({"ca_cert": ca_cert})
         except (ssl.SSLError, ValueError) as exc:
             raise ValueError("Trusted SMTP certificate is not a valid PEM certificate.") from exc
     trust_server_cert = raw.get("trust_server_cert", False)
     if not isinstance(trust_server_cert, bool):
         raise ValueError("Trust server certificate must be true or false.")
-    result["trust_server_cert"] = trust_server_cert
-    if not result["host"] or any(c.isspace() for c in result["host"]) or "://" in result["host"]:
+    host = values["host"]
+    if not host or any(c.isspace() for c in host) or "://" in host:
         raise ValueError("Enter an SMTP hostname, not a URL.")
-    if result["tls"] not in ("starttls", "ssl"):
+    if values["tls"] not in ("starttls", "ssl"):
         raise ValueError("SMTP TLS must be starttls or ssl.")
-    if not result["port"].isascii() or not result["port"].isdigit() or not 1 <= int(result["port"]) <= 65535:
+    port = values["port"]
+    if not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
         raise ValueError("SMTP port must be between 1 and 65535.")
-    if validate_recipients(result["sender"]) != [result["sender"]]:
+    if validate_recipients(values["sender"]) != [values["sender"]]:
         raise ValueError("SMTP sender must be one plain email address.")
-    if result["public_url"]:
-        url = urlsplit(result["public_url"])
-        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
-            raise ValueError("Public URL must be an HTTP(S) URL without credentials, query, or fragment.")
-    return result
+    public_url = values["public_url"]
+    if public_url:
+        url = urlsplit(public_url)
+        if (
+            url.scheme not in ("http", "https")
+            or not url.hostname
+            or url.username
+            or url.password
+            or url.query
+            or url.fragment
+        ):
+            raise ValueError(
+                "Public URL must be an HTTP(S) URL without credentials, query, or fragment."
+            )
+    return EmailSettings(
+        host=host,
+        port=port,
+        tls=values["tls"],
+        sender=values["sender"],
+        username=values["username"],
+        password=values["password"],
+        public_url=public_url,
+        ca_cert=ca_cert,
+        trust_server_cert=trust_server_cert,
+    )
 
 
-def tls_context(settings):
+def tls_context(settings: Mapping[str, object]) -> ssl.SSLContext:
     context = ssl.create_default_context()
     if settings.get("trust_server_cert", False):
         # Explicit admin opt-in, limited to this SMTP connection. TLS remains
@@ -73,21 +137,29 @@ def tls_context(settings):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         return context
-    if settings.get("ca_cert"):
-        context.load_verify_locations(cadata=settings["ca_cert"])
+    ca_cert = settings.get("ca_cert")
+    if ca_cert:
+        if not isinstance(ca_cert, str):
+            raise ValueError("Trusted SMTP certificate must be PEM text.")
+        context.load_verify_locations(cadata=ca_cert)
     return context
 
 
-def validate_recipients(value):
+def validate_recipients(value: object) -> list[str]:
     if not isinstance(value, str) or len(value) > 2048:
         raise ValueError("Email recipients must be text up to 2048 characters.")
     addresses = [part.strip() for part in value.replace(",", "\n").splitlines() if part.strip()]
-    if len(addresses) > 20 or any(not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", address) for address in addresses):
+    if len(addresses) > 20 or any(
+        not re.fullmatch(
+            r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", address
+        )
+        for address in addresses
+    ):
         raise ValueError("Enter at most 20 plain email addresses, one per line.")
     return list(dict.fromkeys(addresses))
 
 
-def _notification_html(owner, repo, run, url):
+def _notification_html(owner: str, repo: str, run: NotifiableRunRow, url: str) -> str:
     """Self-contained email markup; interpolate escaped metadata only."""
     is_test = run[1] == "test"
     title, color, background = {
@@ -99,38 +171,61 @@ def _notification_html(owner, repo, run, url):
         "test": ("Email is connected", "#0369a1", "#f0f9ff"),
     }.get(run[4], ("CI run update", "#475569", "#f1f5f9"))
     if run[1] == "deployment":
-        title = {"success": "Deployment succeeded", "failed": "Deployment failed",
-                 "timed_out": "Deployment timed out", "interrupted": "Deployment interrupted"}.get(run[4], "Deployment update")
-    subtitle = "SMTP settings are working. CI notifications are ready to send." if is_test else f"{owner}/{repo} · Run #{run[0]}"
-    rows = []
+        title = {
+            "success": "Deployment succeeded",
+            "failed": "Deployment failed",
+            "timed_out": "Deployment timed out",
+            "interrupted": "Deployment interrupted",
+        }.get(run[4], "Deployment update")
+    subtitle = (
+        "SMTP settings are working. CI notifications are ready to send."
+        if is_test
+        else f"{owner}/{repo} · Run #{run[0]}"
+    )
+    rows: list[str] = []
     if not is_test:
-        fields = [("Repository", f"{owner}/{repo}"), ("Run", f"#{run[0]}"),
-                  ("Branch", run[2] or "—"), ("Commit", run[3] or "—"),
-                  ("Event", run[1].replace("_", " ")),
-                  ("Exit code", run[7] if run[7] is not None else "—")]
-        if len(run) > 10 and run[9] and run[10]:
-            try:
-                start = datetime.fromisoformat(run[9])
-                end = datetime.fromisoformat(run[10])
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=timezone.utc)
-                if end.tzinfo is None:
-                    end = end.replace(tzinfo=timezone.utc)
-                seconds = max(0, int((end - start).total_seconds()))
-                fields.append(("Duration", f"{seconds // 60}m {seconds % 60}s"))
-            except ValueError:
-                pass
+        fields: list[tuple[str, object]] = [
+            ("Repository", f"{owner}/{repo}"),
+            ("Run", f"#{run[0]}"),
+            ("Branch", run[2] or "—"),
+            ("Commit", run[3] or "—"),
+            ("Event", run[1].replace("_", " ")),
+            ("Exit code", run[7] if run[7] is not None else "—"),
+        ]
+        # Timestamps arrive only with the full row; the test-email stub stops early.
+        if _has_duration(run):
+            started_at, finished_at = run[9], run[10]
+            if started_at and finished_at:
+                try:
+                    start = datetime.fromisoformat(started_at)
+                    end = datetime.fromisoformat(finished_at)
+                    if start.tzinfo is None:
+                        start = start.replace(tzinfo=timezone.utc)
+                    if end.tzinfo is None:
+                        end = end.replace(tzinfo=timezone.utc)
+                    seconds = max(0, int((end - start).total_seconds()))
+                    fields.append(("Duration", f"{seconds // 60}m {seconds % 60}s"))
+                except ValueError:
+                    pass
         for label, value in fields:
-            rows.append(f'<tr><th scope="row" align="left" valign="top" style="width:100px;padding:12px 0;border-bottom:1px solid #e2e8f0;color:#64748b;font-size:12px;font-weight:500;">{escape(label)}</th>'
-                        f'<td style="padding:12px 0;border-bottom:1px solid #e2e8f0;color:#0f172a;font-size:13px;line-height:1.6;word-break:break-all;">{escape(str(value))}</td></tr>')
+            rows.append(
+                f'<tr><th scope="row" align="left" valign="top" style="width:100px;padding:12px 0;border-bottom:1px solid #e2e8f0;color:#64748b;font-size:12px;font-weight:500;">{escape(label)}</th>'
+                f'<td style="padding:12px 0;border-bottom:1px solid #e2e8f0;color:#0f172a;font-size:13px;line-height:1.6;word-break:break-all;">{escape(str(value))}</td></tr>'
+            )
     action = ""
     if url and not is_test:
         safe_url = escape(url, quote=True)
         action = f'<p style="margin:28px 0 12px;"><a href="{safe_url}" style="display:inline-block;padding:13px 22px;border-radius:8px;background:#0f172a;color:#ffffff;font-size:13px;font-weight:600;text-decoration:none;">View run &rarr;</a></p><p style="font-size:11px;line-height:1.7;word-break:break-all;color:#64748b;">Or open <a href="{safe_url}" style="color:#0369a1;">{safe_url}</a></p>'
     elif not is_test:
         action = '<p style="font-size:12px;line-height:1.7;color:#64748b;">Open this repository\'s CI page to view the run. Configure a public server URL in Email settings to include direct links.</p>'
-    details = '<table role="presentation" width="100%" cellspacing="0" cellpadding="0">' + "".join(rows) + "</table>" if rows else '<p style="font-size:14px;line-height:1.8;color:#475569;">This is a test email from pygithost. No action is required.</p>'
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)}</title></head>
+    details = (
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0">'
+        + "".join(rows)
+        + "</table>"
+        if rows
+        else '<p style="font-size:14px;line-height:1.8;color:#475569;">This is a test email from pygithost. No action is required.</p>'
+    )
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{escape(title)}</title></head>
 <body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f1f5f9;"><tr><td align="center" style="padding:32px 16px;">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:580px;"><tr><td style="padding:0 0 18px;font-size:12px;font-weight:700;letter-spacing:1px;color:#475569;">PYGITHOST <span style="font-weight:400;color:#94a3b8;">/ CONTINUOUS INTEGRATION</span></td></tr>
@@ -140,22 +235,29 @@ def _notification_html(owner, repo, run, url):
 <p style="margin:0 0 24px;color:#64748b;font-size:14px;line-height:1.7;word-break:break-word;">{escape(subtitle)}</p>
 {details}{action}</td></tr>
 <tr><td style="padding:18px 4px;font-size:11px;line-height:1.8;color:#64748b;">Sent by pygithost CI. Notifications contain run metadata only, never commands, logs, or environment values.</td></tr></table>
-</td></tr></table></body></html>'''
+</td></tr></table></body></html>"""
 
 
-def send_notification(owner, repo, run, recipients, settings=None):
+def send_notification(
+    owner: str,
+    repo: str,
+    run: NotifiableRunRow,
+    recipients: Sequence[str],
+    settings: Mapping[str, object] | None = None,
+) -> None:
     """Send a bounded metadata-only message. No commands, environment, or logs."""
-    settings = validate_settings(settings if settings is not None else environment_settings())
-    host = settings["host"]
-    sender = settings["sender"]
+    selected = settings if settings is not None else environment_settings()
+    parsed = validate_settings(selected)
+    host = parsed["host"]
+    sender = parsed["sender"]
     if not host or not sender:
         raise ValueError("SMTP host and sender are not configured")
     if len(validate_recipients(sender)) != 1:
         raise ValueError("SMTP sender must be one address")
-    mode = settings["tls"]
+    mode = parsed["tls"]
     if mode not in ("starttls", "ssl"):
         raise ValueError("SMTP TLS must be starttls or ssl")
-    port = int(settings["port"])
+    port = int(parsed["port"])
     message = EmailMessage()
     message["From"] = sender
     message["To"] = ", ".join(recipients)
@@ -165,7 +267,7 @@ def send_notification(owner, repo, run, recipients, settings=None):
         subject = f"[Deployment] {owner}/{repo} #{run[0]}: {run[4]}"
     message["Subject"] = subject.replace("\r", " ").replace("\n", " ")
     text = f"Repository: {owner}/{repo}\nRun: #{run[0]}\nStatus: {run[4]}\nEvent: {run[1]}\nBranch: {run[2]}\nCommit: {run[3]}\nExit code: {run[7]}\n"
-    base = settings["public_url"].rstrip("/")
+    base = parsed["public_url"].rstrip("/")
     url = ""
     if base and run[1] != "test":
         url = f"{base}/r/{quote(owner, safe='')}/{quote(repo, safe='')}/ci/runs/{run[0]}"
@@ -176,16 +278,20 @@ def send_notification(owner, repo, run, recipients, settings=None):
     message.set_content(text)
     message.add_alternative(_notification_html(owner, repo, run, url), subtype="html")
     message["Auto-Submitted"] = "auto-generated"
-    context = tls_context(settings)
-    client = smtplib.SMTP_SSL(host, port, timeout=15, context=context) if mode == "ssl" else smtplib.SMTP(host, port, timeout=15)
+    context = tls_context(parsed)
+    client = (
+        smtplib.SMTP_SSL(host, port, timeout=15, context=context)
+        if mode == "ssl"
+        else smtplib.SMTP(host, port, timeout=15)
+    )
     with client:
         if mode == "starttls":
             client.ehlo()
             client.starttls(context=context)
             client.ehlo()
-        username = settings["username"]
+        username = parsed["username"]
         if username:
-            client.login(username, settings["password"])
+            client.login(username, parsed["password"])
         refused = client.send_message(message)
         if refused:
             raise smtplib.SMTPException("Some recipients were refused")

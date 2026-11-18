@@ -31,8 +31,11 @@ class FormatterTests(unittest.TestCase):
         return record
 
     def test_json_record_has_timestamp_level_and_metadata(self):
-        payload = json.loads(JsonFormatter().format(self.record(
-            event="demo", request_id="abc", status=200, user="alice")))
+        payload = json.loads(
+            JsonFormatter().format(
+                self.record(event="demo", request_id="abc", status=200, user="alice")
+            )
+        )
         self.assertEqual(payload["level"], "INFO")
         self.assertEqual(payload["message"], "hello world")
         self.assertEqual(payload["event"], "demo")
@@ -42,8 +45,11 @@ class FormatterTests(unittest.TestCase):
         self.assertTrue(payload["ts"].endswith("Z"))
 
     def test_json_record_omits_unserializable_and_private_extras(self):
-        payload = json.loads(JsonFormatter().format(self.record(
-            private_object=object(), _secret="nope", detail="safe")))
+        payload = json.loads(
+            JsonFormatter().format(
+                self.record(private_object=object(), _secret="nope", detail="safe")
+            )
+        )
         self.assertNotIn("private_object", payload)
         self.assertNotIn("_secret", payload)
         self.assertEqual(payload["detail"], "safe")
@@ -53,6 +59,7 @@ class FormatterTests(unittest.TestCase):
             raise RuntimeError("boom")
         except RuntimeError:
             import sys
+
             record = logging.LogRecord(
                 "pygithost.test", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
             )
@@ -108,6 +115,7 @@ class ConfigurationTests(unittest.TestCase):
 class DocumentationTests(unittest.TestCase):
     def test_logging_example_and_in_page_guide_match_supported_settings(self):
         from pygithost.ci_docs import manual_content
+
         root = Path(__file__).resolve().parents[1]
         text = (root / "docs/logging.md").read_text(encoding="utf-8")
         example = json.loads(text.split("```json\n", 1)[1].split("```", 1)[0])
@@ -115,13 +123,18 @@ class DocumentationTests(unittest.TestCase):
         self.assertEqual(config.log_level, "INFO")
         self.assertEqual(config.log_backup_count, 5)
         rendered = str(manual_content("logging", None, "/r/root/project/ci/docs"))
-        for expected in ("0 disables rotation", "not an automatic secret-redaction",
-                         "Runner-token issuance", "source_cleanup_deferred",
-                         "Git smart-HTTP"):
+        for expected in (
+            "0 disables rotation",
+            "not an automatic secret-redaction",
+            "Runner-token issuance",
+            "source_cleanup_deferred",
+            "Git smart-HTTP",
+        ):
             self.assertIn(expected, rendered)
 
     def test_shared_guides_link_to_logging_inside_the_ui(self):
         from pygithost.ci_docs import manual_content
+
         base = "/r/root/project/ci/docs"
         for guide in ("operations", "getting-started", "settings"):
             with self.subTest(guide=guide):
@@ -130,6 +143,7 @@ class DocumentationTests(unittest.TestCase):
 
     def test_source_storage_and_limits_guides_explain_pending_cleanup_and_buffering(self):
         from pygithost.ci_docs import manual_content
+
         for guide in ("http-runner", "ci-limits"):
             with self.subTest(guide=guide):
                 rendered = str(manual_content(guide, None, "/r/root/project/ci/docs"))
@@ -176,8 +190,9 @@ class HandlerTests(unittest.TestCase):
 
     def test_rotation_keeps_bounded_backups(self):
         destination = self.path("rotating.log")
-        configure_logging(level="INFO", log_file=destination, max_bytes=1024,
-                          backup_count=2, console=False)
+        configure_logging(
+            level="INFO", log_file=destination, max_bytes=1024, backup_count=2, console=False
+        )
         logger = logging.getLogger("pygithost.test.handlers")
         for index in range(80):
             logger.info("record %03d %s", index, "x" * 80)
@@ -204,10 +219,22 @@ class AuditDatabaseTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_append_and_list_are_newest_first_and_bounded(self):
-        database.db_audit_append("login", "failure", actor="mallory", target="web",
-                                 detail="invalid_credentials", ip="127.0.0.1")
-        database.db_audit_append("token_create", "success", actor="alice",
-                                 actor_user_id=7, target="ci", detail="scopes=read")
+        database.db_audit_append(
+            "login",
+            "failure",
+            actor="mallory",
+            target="web",
+            detail="invalid_credentials",
+            ip="127.0.0.1",
+        )
+        database.db_audit_append(
+            "token_create",
+            "success",
+            actor="alice",
+            actor_user_id=7,
+            target="ci",
+            detail="scopes=read",
+        )
         rows = database.db_audit_list()
         self.assertEqual([row["action"] for row in rows], ["token_create", "login"])
         self.assertEqual(rows[0]["actor_user_id"], 7)
@@ -261,15 +288,22 @@ class ServerLoggingTests(unittest.TestCase):
 
     def login(self, username, password):
         body = urlencode({"username": username, "password": password})
-        return self.request("/login", method="POST", body=body, headers={
-            "Content-Type": "application/x-www-form-urlencoded"})
+        return self.request(
+            "/login",
+            method="POST",
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
 
     def records(self, logger_name, count=1):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             if self.log_path.exists():
-                rows = [json.loads(line) for line in
-                        self.log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                rows = [
+                    json.loads(line)
+                    for line in self.log_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
                 selected = [row for row in rows if row.get("logger") == logger_name]
                 if len(selected) >= count:
                     return selected
@@ -281,8 +315,8 @@ class ServerLoggingTests(unittest.TestCase):
         self.assertEqual(self.request("/").__getitem__(0), 200)
         self.assertEqual(self.request("/definitely-missing").__getitem__(0), 404)
         status, _headers, _body = self.request(
-            "/api/v1/user?access_token=" + secret,
-            headers={"Authorization": "Bearer " + secret})
+            "/api/v1/user?access_token=" + secret, headers={"Authorization": "Bearer " + secret}
+        )
         self.assertEqual(status, 401)
         rows = self.records("pygithost.access", count=3)
         home = [row for row in rows if row.get("path") == "/"]
@@ -301,8 +335,12 @@ class ServerLoggingTests(unittest.TestCase):
 
     def test_successful_git_responses_are_logged_at_info_with_status_and_body_size(self):
         repository = Path(self.server.project_root) / "access.git"
-        subprocess.run(["git", "init", "--bare", str(repository)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["git", "init", "--bare", str(repository)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         status, _, body = self.request("/git/access.git/info/refs?service=git-upload-pack")
         self.assertEqual(status, 200)
         records = self.records("pygithost.access")
@@ -318,8 +356,7 @@ class ServerLoggingTests(unittest.TestCase):
         database.db_create_user("rootadmin", "s3cret-pass", True)
         connection = database._db_connect()
         try:
-            user = connection.execute(
-                "SELECT id FROM users WHERE username='auditor'").fetchone()[0]
+            user = connection.execute("SELECT id FROM users WHERE username='auditor'").fetchone()[0]
         finally:
             connection.close()
 
@@ -330,40 +367,53 @@ class ServerLoggingTests(unittest.TestCase):
         self.assertTrue(cookie.startswith("pygithost_session="))
 
         status, _headers, _body = self.request(
-            "/tokens/create", method="POST",
+            "/tokens/create",
+            method="POST",
             body=urlencode({"name": "ci-token", "scopes": "read"}),
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie})
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+        )
         self.assertEqual(status, 200)
         connection = database._db_connect()
         try:
             token_id = connection.execute(
-                "SELECT id FROM tokens WHERE user_id=? ORDER BY id DESC", (user,)).fetchone()[0]
+                "SELECT id FROM tokens WHERE user_id=? ORDER BY id DESC", (user,)
+            ).fetchone()[0]
         finally:
             connection.close()
-        self.request("/tokens/revoke", method="POST",
-                     body=urlencode({"token_id": str(token_id)}),
-                     headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie})
+        self.request(
+            "/tokens/revoke",
+            method="POST",
+            body=urlencode({"token_id": str(token_id)}),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+        )
 
         _status, admin_headers, _body = self.login("rootadmin", "s3cret-pass")
         admin_cookie = admin_headers["Set-Cookie"].split(";", 1)[0]
-        self.request("/admin/users/create", method="POST",
-                     body=urlencode({"username": "newuser", "password": "another-pass",
-                                     "is_admin": "0"}),
-                     headers={"Content-Type": "application/x-www-form-urlencoded",
-                              "Cookie": admin_cookie})
-        self.request("/admin/settings", method="POST",
-                     body=urlencode({"action": "appearance", "display_name": "Audit UI"}),
-                     headers={"Content-Type": "application/x-www-form-urlencoded",
-                              "Cookie": admin_cookie})
+        self.request(
+            "/admin/users/create",
+            method="POST",
+            body=urlencode({"username": "newuser", "password": "another-pass", "is_admin": "0"}),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": admin_cookie},
+        )
+        self.request(
+            "/admin/settings",
+            method="POST",
+            body=urlencode({"action": "appearance", "display_name": "Audit UI"}),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": admin_cookie},
+        )
 
         rows = database.db_audit_list(limit=50)
         actions = [(row["action"], row["outcome"]) for row in rows]
-        for expected in (("login", "failure"), ("login", "success"),
-                         ("token_create", "success"), ("token_revoke", "success"),
-                         ("user_create", "success"), ("settings_save", "success")):
+        for expected in (
+            ("login", "failure"),
+            ("login", "success"),
+            ("token_create", "success"),
+            ("token_revoke", "success"),
+            ("user_create", "success"),
+            ("settings_save", "success"),
+        ):
             self.assertIn(expected, actions)
-        self.assertTrue(any(row["action"] == "login" and row["actor"] == "auditor"
-                            for row in rows))
+        self.assertTrue(any(row["action"] == "login" and row["actor"] == "auditor" for row in rows))
         serialized = json.dumps(rows)
         self.assertNotIn("s3cret-pass", serialized)
         self.assertNotIn("another-pass", serialized)
@@ -377,11 +427,17 @@ class ServerLoggingTests(unittest.TestCase):
 
     def test_logging_and_source_cleanup_documentation_are_accessible_in_page(self):
         repository = Path(self.server.project_root) / "example.git"
-        subprocess.run(["git", "init", "--bare", str(repository)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for guide, expected in (("logging", "0 disables rotation"),
-                                ("http-runner", "ci_remote_source_cleanup"),
-                                ("ci-limits", "SQLite stores")):
+        subprocess.run(
+            ["git", "init", "--bare", str(repository)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for guide, expected in (
+            ("logging", "0 disables rotation"),
+            ("http-runner", "ci_remote_source_cleanup"),
+            ("ci-limits", "SQLite stores"),
+        ):
             with self.subTest(guide=guide):
                 status, _, body = self.request("/r/root/example/ci/docs?guide=" + guide)
                 self.assertEqual(status, 200)

@@ -17,12 +17,42 @@ class APIDeploymentTests(unittest.TestCase):
     def setUp(self):
         read_tests.APITests.setUp(self)
         self.path = self.base + "/deployments"
-        database.db_deployment_claim(99999, "alice", "project", self.sha, json.dumps({
-            "deployment_name": "production", "pipeline_id": "checks", "deploy_branch": "main",
-            "deploy_script_content": "PRIVATE_SCRIPT", "env": {"KEY": "PRIVATE_SECRET"}}))
-        database.db_deployment_progress(99999, "production", "A漢B\n", json.dumps([
-            {"name": "Prepare", "run": "PRIVATE_COMMAND", "status": "failed", "output": "A漢B\n"},
-            {"name": "Release", "run": "PRIVATE_COMMAND", "status": "skipped", "output": ""}]))
+        database.db_deployment_claim(
+            99999,
+            "alice",
+            "project",
+            self.sha,
+            json.dumps(
+                {
+                    "deployment_name": "production",
+                    "pipeline_id": "checks",
+                    "deploy_branch": "main",
+                    "deploy_script_content": "PRIVATE_SCRIPT",
+                    "env": {"KEY": "PRIVATE_SECRET"},
+                }
+            ),
+        )
+        database.db_deployment_progress(
+            99999,
+            "production",
+            "A漢B\n",
+            json.dumps(
+                [
+                    {
+                        "name": "Prepare",
+                        "run": "PRIVATE_COMMAND",
+                        "status": "failed",
+                        "output": "A漢B\n",
+                    },
+                    {
+                        "name": "Release",
+                        "run": "PRIVATE_COMMAND",
+                        "status": "skipped",
+                        "output": "",
+                    },
+                ]
+            ),
+        )
         database.db_deployment_finish(99999, "failed", "A漢B\n", "production")
         self.identity = database.db_deployments_list("alice", "project")[0][0]
         self.detail = self.path + "/" + str(self.identity)
@@ -65,12 +95,21 @@ class APIDeploymentTests(unittest.TestCase):
         self.assertEqual(self.request(self.detail + "/steps/9/logs")[0], 404)
 
     def test_access_checks_on_each_endpoint_and_no_cross_repository_ids(self):
-        for suffix in ("", f"/{self.identity}", f"/{self.identity}/steps",
-                       f"/{self.identity}/logs", f"/{self.identity}/steps/0/logs"):
+        for suffix in (
+            "",
+            f"/{self.identity}",
+            f"/{self.identity}/steps",
+            f"/{self.identity}/logs",
+            f"/{self.identity}/steps/0/logs",
+        ):
             self.assertEqual(self.request(self.path + suffix, token=None)[0], 401)
             self.assertEqual(self.request(self.path + suffix, token=self.bob_token)[0], 404)
-        self.assertEqual(self.request(f"/api/v1/repos/bob/project/deployments/{self.identity}",
-                                      token=self.admin_token)[0], 404)
+        self.assertEqual(
+            self.request(
+                f"/api/v1/repos/bob/project/deployments/{self.identity}", token=self.admin_token
+            )[0],
+            404,
+        )
 
     def test_running_logs_are_not_complete_and_head_has_no_body(self):
         conn = database._db_connect()
@@ -86,10 +125,14 @@ class APIDeploymentTests(unittest.TestCase):
 
     def test_preflight_requires_admin_and_does_not_execute_scripts(self):
         from pygithost.ci import default_config
+
         marker = self.root / "preflight-must-not-run"
-        config = {**default_config(), "deploy_enabled": True,
-                  "deploy_script_content": "#!/bin/sh\ntouch " + str(marker),
-                  "deploy_interpreter": "missing-pygithost-runtime"}
+        config = {
+            **default_config(),
+            "deploy_enabled": True,
+            "deploy_script_content": "#!/bin/sh\ntouch " + str(marker),
+            "deploy_interpreter": "missing-pygithost-runtime",
+        }
         database.db_ci_config_set("alice", "project", json.dumps(config))
         self.assertEqual(self.request(self.path + "/preflight")[0], 403)
         status, _, result = self.request(self.path + "/preflight", token=self.admin_token)
@@ -100,8 +143,14 @@ class APIDeploymentTests(unittest.TestCase):
 
     def test_schema_and_documentation(self):
         schema = self.request("/api/v1/openapi.json")[2]
-        for suffix in ("", "/{id}", "/{id}/steps", "/{id}/logs",
-                       "/{id}/steps/{step_index}/logs", "/preflight"):
+        for suffix in (
+            "",
+            "/{id}",
+            "/{id}/steps",
+            "/{id}/logs",
+            "/{id}/steps/{step_index}/logs",
+            "/preflight",
+        ):
             self.assertIn("get", schema["paths"]["/repos/{owner}/{repo}/deployments" + suffix])
         page = self.request("/api/docs", token=None, decode=False)[2]
         self.assertIn(b"Deployment diagnostics and preflight", page)

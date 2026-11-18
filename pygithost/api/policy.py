@@ -2,23 +2,24 @@
 
 import time
 from collections import OrderedDict
+from collections.abc import Hashable
 
 from .errors import APIError
+from .types import Identity
 
 
-def can_read_repository(identity, owner, flat_owner):
-    return bool(identity["is_admin"] or (
-        owner != flat_owner and owner == identity["username"]))
+def can_read_repository(identity: Identity, owner: str, flat_owner: str) -> bool:
+    return bool(identity["is_admin"] or (owner != flat_owner and owner == identity["username"]))
 
 
 class RateLimiter:
     """Bounded, per-server fixed windows; accessed only from the server loop."""
 
-    def __init__(self, limit=120, window=60, max_keys=4096):
+    def __init__(self, limit: int = 120, window: int = 60, max_keys: int = 4096) -> None:
         self.limit, self.window, self.max_keys = limit, window, max_keys
-        self.windows = OrderedDict()
+        self.windows: OrderedDict[Hashable, tuple[float, int]] = OrderedDict()
 
-    def check(self, key):
+    def check(self, key: Hashable) -> None:
         now = time.monotonic()
         start, count = self.windows.pop(key, (now, 0))
         if now - start >= self.window:
@@ -28,5 +29,9 @@ class RateLimiter:
             self.windows.popitem(last=False)
         if count >= self.limit:
             retry = max(1, int(self.window - (now - start)) + 1)
-            raise APIError(429, "rate_limited", "Request limit exceeded.",
-                           headers=[("Retry-After", str(retry))])
+            raise APIError(
+                429,
+                "rate_limited",
+                "Request limit exceeded.",
+                headers=[("Retry-After", str(retry))],
+            )

@@ -51,9 +51,10 @@ EXTRA_FIELDS = (
     "delivery",
 )
 
-_RESERVED = frozenset(
-    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
-) | {"message", "asctime"}
+_RESERVED = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+    "message",
+    "asctime",
+}
 _HANDLER_MARK = "_pygithost_handler"
 _TARGET_LIMIT = 512
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -162,9 +163,7 @@ def configure_logging(
             except Exception:  # pragma: no cover - closing is best effort
                 pass
 
-    formatter: logging.Formatter = (
-        JsonFormatter() if log_format == "json" else TextFormatter()
-    )
+    formatter: logging.Formatter = JsonFormatter() if log_format == "json" else TextFormatter()
     root.setLevel(level)
 
     if console:

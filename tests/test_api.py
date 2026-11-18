@@ -3,11 +3,11 @@ import base64
 import http.client
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from pygithost import application, database
@@ -29,7 +29,9 @@ class APITests(unittest.TestCase):
         self.git("-C", self.source, "config", "user.email", "api@example.test")
         (self.source / "README.md").write_text("API fixture\n")
         self.git("-C", self.source, "add", ".")
-        self.git("-C", self.source, "commit", "-m", "Initial API fixture", "-m", "Multiline\ncommit body")
+        self.git(
+            "-C", self.source, "commit", "-m", "Initial API fixture", "-m", "Multiline\ncommit body"
+        )
         self.sha = self.git("-C", self.source, "rev-parse", "HEAD")
         for owner in ("alice", "bob"):
             (self.root / owner).mkdir()
@@ -49,11 +51,19 @@ class APITests(unittest.TestCase):
         self.base = "/api/v1/repos/alice/project"
         self.issue = database.db_issue_create("alice", "project", "Issue one", "Body", self.alice)
         self.comment = database.db_issue_comment_add(self.issue, self.alice, "Comment one")
-        self.pull = database.db_pr_create("alice", "project", "PR one", "PR body", "feature/api", "main", self.alice)
+        self.pull = database.db_pr_create(
+            "alice", "project", "PR one", "PR body", "feature/api", "main", self.alice
+        )
         database.db_pr_comment_add(self.pull, self.alice, "PR comment")
-        self.run = database.db_ci_run_create("alice", "project", "manual", "main", self.sha,
+        self.run = database.db_ci_run_create(
+            "alice",
+            "project",
+            "manual",
+            "main",
+            self.sha,
             json.dumps({"pipeline_id": "checks", "secret_payload": "DO_NOT_EXPOSE"}),
-            json.dumps({"env": {"SECRET": "DO_NOT_EXPOSE"}}))
+            json.dumps({"env": {"SECRET": "DO_NOT_EXPOSE"}}),
+        )
 
     def tearDown(self):
         self.server.__exit__(None, None, None)
@@ -61,34 +71,46 @@ class APITests(unittest.TestCase):
         self.temp.cleanup()
 
     def git(self, *args):
-        return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.PIPE, text=True).strip()
+        return subprocess.check_output(
+            ["git", *map(str, args)], stderr=subprocess.PIPE, text=True
+        ).strip()
 
     def user(self, name, admin=False):
         conn = database._db_connect()
         try:
             return conn.execute(
                 "INSERT INTO users(username,pass_salt,pass_hash,is_admin) VALUES(?,?,?,?)",
-                (name, b"test", b"test", int(admin))).lastrowid
+                (name, b"test", b"test", int(admin)),
+            ).lastrowid
         finally:
             conn.close()
 
     def request(self, path, *, method="GET", token=True, headers=None, body=None, decode=True):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=30)
         try:
-            request_headers = {} if token is None else {
-                "Authorization": "Bearer " + (self.token if token is True else token)}
+            request_headers = (
+                {}
+                if token is None
+                else {"Authorization": "Bearer " + (self.token if token is True else token)}
+            )
             request_headers.update(headers or {})
             connection.request(method, path, body=body, headers=request_headers)
             response = connection.getresponse()
             content = response.read()
-            return response.status, dict(response.getheaders()), json.loads(content) if decode and content else content
+            return (
+                response.status,
+                dict(response.getheaders()),
+                json.loads(content) if decode and content else content,
+            )
         finally:
             connection.close()
 
     def test_identity_and_bearer_required_even_when_web_auth_disabled(self):
         status, headers, value = self.request("/api/v1/user")
         self.assertEqual(status, 200)
-        self.assertEqual(value, {"id": self.alice, "login": "alice", "is_admin": False, "scopes": ["read"]})
+        self.assertEqual(
+            value, {"id": self.alice, "login": "alice", "is_admin": False, "scopes": ["read"]}
+        )
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
@@ -101,21 +123,31 @@ class APITests(unittest.TestCase):
                 self.assertNotIn("Location", headers)
         session = database.db_create_session(self.alice)
         basic = base64.b64encode(b"alice:password").decode()
-        for header in ({"Cookie": application.SESSION_COOKIE_NAME + "=" + session},
-                       {"Authorization": "Basic " + basic}, {"Authorization": "Bearer invalid"}):
+        for header in (
+            {"Cookie": application.SESSION_COOKIE_NAME + "=" + session},
+            {"Authorization": "Basic " + basic},
+            {"Authorization": "Bearer invalid"},
+        ):
             self.assertEqual(self.request("/api/v1/user", token=None, headers=header)[0], 401)
         self.assertEqual(self.request("/api/v1/user?token=" + self.token, token=None)[0], 401)
 
     def test_expired_revoked_disabled_and_insufficient_scope_tokens(self):
         conn = database._db_connect()
         try:
-            for field, value in (("expires_at", "2000-01-01 00:00:00"), ("is_active", 0),
-                                 ("revoked_at", "2020-01-01 00:00:00")):
+            for field, value in (
+                ("expires_at", "2000-01-01 00:00:00"),
+                ("is_active", 0),
+                ("revoked_at", "2020-01-01 00:00:00"),
+            ):
                 with self.subTest(field=field):
-                    conn.execute(f"UPDATE tokens SET {field}=? WHERE user_id=?", (value, self.alice))
+                    conn.execute(
+                        f"UPDATE tokens SET {field}=? WHERE user_id=?", (value, self.alice)
+                    )
                     self.assertEqual(self.request("/api/v1/user")[0], 401)
-                    conn.execute(f"UPDATE tokens SET {field}=? WHERE user_id=?",
-                                 (1 if field == "is_active" else None, self.alice))
+                    conn.execute(
+                        f"UPDATE tokens SET {field}=? WHERE user_id=?",
+                        (1 if field == "is_active" else None, self.alice),
+                    )
             conn.execute("UPDATE users SET is_active=0 WHERE id=?", (self.alice,))
             self.assertEqual(self.request("/api/v1/user")[0], 401)
             conn.execute("UPDATE users SET is_active=1 WHERE id=?", (self.alice,))
@@ -138,11 +170,17 @@ class APITests(unittest.TestCase):
         value = self.request(self.base)[2]
         self.assertEqual(value["default_branch"], "main")
         self.assertNotIn(str(self.root), json.dumps(value))
-        self.assertEqual(self.request("/api/v1/repos/%2e%2e/project", token=self.admin_token)[0], 404)
-        self.assertEqual(self.request("/api/v1/repos/alice%2Fbob/project", token=self.admin_token)[0], 404)
+        self.assertEqual(
+            self.request("/api/v1/repos/%2e%2e/project", token=self.admin_token)[0], 404
+        )
+        self.assertEqual(
+            self.request("/api/v1/repos/alice%2Fbob/project", token=self.admin_token)[0], 404
+        )
         self.assertEqual(self.request("/api/v1/repos/alice/.", token=self.admin_token)[0], 404)
         self.assertEqual(self.request("/api/v1/repos/alice/.git", token=self.admin_token)[0], 404)
-        self.assertEqual(self.request("/api/v1/repos/alice/project%0a", token=self.admin_token)[0], 404)
+        self.assertEqual(
+            self.request("/api/v1/repos/alice/project%0a", token=self.admin_token)[0], 404
+        )
 
     @unittest.skipUnless(os.name == "posix", "symlinks")
     def test_repository_symlink_outside_root_is_hidden(self):
@@ -151,7 +189,9 @@ class APITests(unittest.TestCase):
             self.git("clone", "--bare", self.source, target)
             (self.root / "alice/external.git").symlink_to(target)
             self.assertEqual(self.request("/api/v1/repos/alice/external")[0], 404)
-            self.assertNotIn("alice/external", [r["full_name"] for r in self.request("/api/v1/repos")[2]])
+            self.assertNotIn(
+                "alice/external", [r["full_name"] for r in self.request("/api/v1/repos")[2]]
+            )
         (self.root / "alice/alias.git").symlink_to(self.root / "bob/project.git")
         self.assertEqual(self.request("/api/v1/repos/alice/alias")[0], 404)
         self.assertNotIn("alice/alias", [r["full_name"] for r in self.request("/api/v1/repos")[2]])
@@ -167,8 +207,16 @@ class APITests(unittest.TestCase):
         self.assertEqual(rows[0]["name"], "project")
         self.assertIn('rel="prev"', headers["Link"])
         self.assertNotIn('rel="next"', headers["Link"])
-        for query in ("page=0", "per_page=101", "page=abc", "page=1&page=2",
-                      "unknown=1", "page=10000&per_page=100", "per_page=", "&".join("x=1" for _ in range(21))):
+        for query in (
+            "page=0",
+            "per_page=101",
+            "page=abc",
+            "page=1&page=2",
+            "unknown=1",
+            "page=10000&per_page=100",
+            "per_page=",
+            "&".join("x=1" for _ in range(21)),
+        ):
             with self.subTest(query=query):
                 self.assertEqual(self.request("/api/v1/repos?" + query)[0], 400)
         self.assertEqual(self.request(self.base + "/issues?state=invalid")[0], 400)
@@ -183,7 +231,9 @@ class APITests(unittest.TestCase):
         status, _headers, rows = self.request(self.base + "/commits?ref=feature%2Fapi")
         self.assertEqual(status, 200)
         self.assertEqual(rows[0]["sha"], self.sha)
-        self.assertEqual(rows[0]["commit"]["message"], "Initial API fixture\n\nMultiline\ncommit body")
+        self.assertEqual(
+            rows[0]["commit"]["message"], "Initial API fixture\n\nMultiline\ncommit body"
+        )
         self.assertTrue(rows[0]["commit"]["author"]["date"].endswith("Z"))
         self.assertEqual(self.request(self.base + "/commits/" + self.sha)[2], rows[0])
         self.assertEqual(self.request(self.base + "/commits?ref=--all")[0], 400)
@@ -209,7 +259,9 @@ class APITests(unittest.TestCase):
                 status, _headers, row = self.request(self.base + f"/{resource}/{identity}")
                 self.assertEqual(status, 200)
                 self.assertEqual(row, rows[0])
-                status, _headers, comments = self.request(self.base + f"/{resource}/{identity}/comments")
+                status, _headers, comments = self.request(
+                    self.base + f"/{resource}/{identity}/comments"
+                )
                 self.assertEqual(status, 200)
                 self.assertEqual(comments[0]["body"], comment)
                 wrong = f"/api/v1/repos/bob/project/{resource}/{identity}"
@@ -231,7 +283,10 @@ class APITests(unittest.TestCase):
         self.assertNotIn("DO_NOT_EXPOSE", json.dumps(runs))
         self.assertNotIn("config", runs[0])
         self.assertNotIn("output", runs[0])
-        self.assertEqual(self.request(f"/api/v1/repos/bob/project/ci/runs/{self.run}", token=self.bob_token)[0], 404)
+        self.assertEqual(
+            self.request(f"/api/v1/repos/bob/project/ci/runs/{self.run}", token=self.bob_token)[0],
+            404,
+        )
         status, _headers, pipelines = self.request(self.base + "/ci/pipelines")
         self.assertEqual(status, 200)
         self.assertEqual(pipelines[0]["repository_file"], "ci/config.json")
@@ -240,7 +295,9 @@ class APITests(unittest.TestCase):
     def test_methods_head_errors_and_ip_allowlist(self):
         for method in ("POST", "PUT", "PATCH", "DELETE"):
             with self.subTest(method=method):
-                status, headers, value = self.request(self.base + "/issues", method=method, body="{}")
+                status, headers, value = self.request(
+                    self.base + "/issues", method=method, body="{}"
+                )
                 self.assertEqual(status, 403)
                 self.assertEqual(value["code"], "insufficient_scope")
         self.assertEqual(self.request(self.base, method="OPTIONS")[0], 405)
@@ -250,8 +307,12 @@ class APITests(unittest.TestCase):
         self.assertGreater(int(headers["Content-Length"]), 0)
         self.assertEqual(self.request(self.base, body="unexpected")[0], 400)
         self.assertEqual(self.request("/api/v2/user")[0], 404)
-        self.assertEqual(self.request("/api/v1/user", headers={
-            "Transfer-Encoding": "chunked"}, body="0\r\n\r\n")[0], 400)
+        self.assertEqual(
+            self.request(
+                "/api/v1/user", headers={"Transfer-Encoding": "chunked"}, body="0\r\n\r\n"
+            )[0],
+            400,
+        )
         with mock.patch.object(self.server.app, "allowlist", set()):
             status, _headers, value = self.request("/api/v1/user")
             self.assertEqual(status, 403)
@@ -339,6 +400,7 @@ class APIFoundationTests(unittest.TestCase):
 class APIGitProcessTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_git_read_kills_and_reaps_subprocess(self):
         from pygithost.api.git import git
+
         started = asyncio.Event()
 
         async def read(_size):
@@ -350,7 +412,9 @@ class APIGitProcessTests(unittest.IsolatedAsyncioTestCase):
         process.stdout.read = mock.AsyncMock(side_effect=read)
         process.wait = mock.AsyncMock(return_value=-9)
         process.communicate = mock.AsyncMock(return_value=(b"", b""))
-        with mock.patch("pygithost.api.git.asyncio.create_subprocess_exec", mock.AsyncMock(return_value=process)):
+        with mock.patch(
+            "pygithost.api.git.asyncio.create_subprocess_exec", mock.AsyncMock(return_value=process)
+        ):
             task = asyncio.create_task(git("/unused", "log"))
             await started.wait()
             task.cancel()

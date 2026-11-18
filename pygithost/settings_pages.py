@@ -3,29 +3,46 @@
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+from typing import Any
 
 from .ci import default_config
 from .ci_preferences import RETENTION, validate
 from .config import AppConfig
-from .rendering import html_t, join_html, safe_html
+from .rendering import SafeHTML, html_t, join_html, safe_html
 
-RETENTION_FIELDS = (("artifact_retention_days", "Artifact retention (days; 0 = unlimited)", 7),
-                    ("artifact_retention_count", "Maximum artifact bundles (0 = unlimited)", 0),
-                    ("run_retention_count", "Maximum completed runs (0 = unlimited)", None))
+# CI settings are heterogeneous JSON: retention scalars, booleans, and nested
+# environment maps. ``ci_preferences.validate`` owns their schema.
+SettingsValues = Mapping[str, Any]
+
+RETENTION_FIELDS = (
+    ("artifact_retention_days", "Artifact retention (days; 0 = unlimited)", 7),
+    ("artifact_retention_count", "Maximum artifact bundles (0 = unlimited)", 0),
+    ("run_retention_count", "Maximum completed runs (0 = unlimited)", None),
+)
 
 
-def preferences_forms(action, token, global_values, local_values=None, *, legacy=None, pipelines=(), submitted=None):
+def preferences_forms(
+    action: str,
+    token: str,
+    global_values: SettingsValues,
+    local_values: SettingsValues | None = None,
+    *,
+    legacy: SettingsValues | None = None,
+    pipelines: Iterable[str] = (),
+    submitted: Mapping[str, str] | None = None,
+) -> SafeHTML:
     repository = local_values is not None
-    local = dict(local_values or {}) if repository else dict(global_values)
+    local: dict[str, Any] = dict(local_values or {}) if repository else dict(global_values)
     legacy = legacy or {}
     for key in RETENTION:
         if key not in local and key in legacy:
             local[key] = legacy[key]
-    forms = []
+    forms: list[str] = []
     for kind, title, fields in (("retention", "Runs and artifacts", RETENTION_FIELDS),):
-        controls = []
+        controls: list[str] = []
         for key, label, builtin in fields:
             builtin = default_config()[key] if builtin is None else builtin
             inherited = global_values.get(key)
@@ -39,47 +56,119 @@ def preferences_forms(action, token, global_values, local_values=None, *, legacy
                     value = value == "true"
             if value is None:
                 value = inherited if repository else builtin
-            inheritance = safe_html(html_t(t'<label class="settings-inherit"><input type="checkbox" name="inherit_{key}" data-inherits="{key}"{safe_html(" checked" if inherit else "")}> Use server default ({str(inherited)})</label>')) if repository else safe_html("")
+            inheritance = (
+                safe_html(
+                    html_t(
+                        t'<label class="settings-inherit"><input type="checkbox" name="inherit_{key}" data-inherits="{key}"{safe_html(" checked" if inherit else "")}> Use server default ({str(inherited)})</label>'
+                    )
+                )
+                if repository
+                else safe_html("")
+            )
             if key == "runner":
-                control = html_t(t'<select id="pref-{key}" name="{key}"><option value="docker"{safe_html(" selected" if value == "docker" else "")}>Docker</option><option value="remote-docker"{safe_html(" selected" if value == "remote-docker" else "")}>Remote Docker (HTTP runner)</option><option value="host"{safe_html(" selected" if value == "host" else "")}>Host (trusted code only)</option></select>')
+                control = html_t(
+                    t'<select id="pref-{key}" name="{key}"><option value="docker"{safe_html(" selected" if value == "docker" else "")}>Docker</option><option value="remote-docker"{safe_html(" selected" if value == "remote-docker" else "")}>Remote Docker (HTTP runner)</option><option value="host"{safe_html(" selected" if value == "host" else "")}>Host (trusted code only)</option></select>'
+                )
             elif key == "cancel_superseded":
-                control = html_t(t'<select id="pref-{key}" name="{key}"><option value="false"{safe_html(" selected" if not value else "")}>No</option><option value="true"{safe_html(" selected" if value else "")}>Yes</option></select>')
+                control = html_t(
+                    t'<select id="pref-{key}" name="{key}"><option value="false"{safe_html(" selected" if not value else "")}>No</option><option value="true"{safe_html(" selected" if value else "")}>Yes</option></select>'
+                )
             else:
                 kind_type = "text" if key == "image" else "number"
-                control = html_t(t'<input id="pref-{key}" name="{key}" type="{kind_type}" value="{value}">')
-            controls.append(html_t(t'<div class="settings-field" data-setting="{key}"><label for="pref-{key}">{label}</label>{safe_html(control)}{inheritance}</div>'))
-        confirmation = safe_html('<label><input type="checkbox" name="confirm_retention" value="yes" required> Apply retention limits; this may permanently delete existing data immediately (completed runs and artifacts).</label>') if kind == "retention" else safe_html("")
-        forms.append(html_t(t'<section class="box"><h2>{title}</h2><form method="POST" action="{action}" class="settings-page-form"><input type="hidden" name="action" value="ci_{kind}"><input type="hidden" name="csrf" value="{token}"><div class="settings-grid">{join_html(controls)}</div>{confirmation}<button type="submit">Save {title.lower()}</button></form></section>'))
-    values = local.get("env", legacy.get("env", {})) or {}
-    pipeline_values = local.get("pipeline_env", legacy.get("pipeline_env", {})) or {}
-    names = sorted(set(pipelines) | set(pipeline_values))
+                control = html_t(
+                    t'<input id="pref-{key}" name="{key}" type="{kind_type}" value="{value}">'
+                )
+            controls.append(
+                html_t(
+                    t'<div class="settings-field" data-setting="{key}"><label for="pref-{key}">{label}</label>{safe_html(control)}{inheritance}</div>'
+                )
+            )
+        confirmation = (
+            safe_html(
+                '<label><input type="checkbox" name="confirm_retention" value="yes" required> Apply retention limits; this may permanently delete existing data immediately (completed runs and artifacts).</label>'
+            )
+            if kind == "retention"
+            else safe_html("")
+        )
+        forms.append(
+            html_t(
+                t'<section class="box"><h2>{title}</h2><form method="POST" action="{action}" class="settings-page-form"><input type="hidden" name="action" value="ci_{kind}"><input type="hidden" name="csrf" value="{token}"><div class="settings-grid">{join_html(controls)}</div>{confirmation}<button type="submit">Save {title.lower()}</button></form></section>'
+            )
+        )
+    values: Mapping[str, str] = local.get("env", legacy.get("env", {})) or {}
+    pipeline_values: Mapping[str, Mapping[str, str]] = (
+        local.get("pipeline_env", legacy.get("pipeline_env", {})) or {}
+    )
+    names: list[str] = sorted(set(pipelines) | set(pipeline_values))
 
-    def row(index, name="", value="", pipeline=""):
-        options = join_html([html_t(t'<option value="{item}"{safe_html(" selected" if item == pipeline else "")}>{item}</option>') for item in names])
-        scope = safe_html(html_t(t'<label>Pipeline<select name="env_pipeline_{index}"><option value="">All pipelines</option>{options}</select></label>')) if repository else safe_html("")
-        return html_t(t'<div class="settings-env-row"><label>Name<input name="env_name_{index}" value="{name}" autocomplete="off" spellcheck="false"></label><label>Value<input class="settings-env-value" type="password" name="env_value_{index}" value="{value}" autocomplete="off" spellcheck="false"></label>{scope}<label class="settings-remove"><input type="checkbox" name="env_remove_{index}"> Remove</label></div>')
+    def row(index: int | str, name: str = "", value: str = "", pipeline: str = "") -> str:
+        options = join_html(
+            [
+                html_t(
+                    t'<option value="{item}"{safe_html(" selected" if item == pipeline else "")}>{item}</option>'
+                )
+                for item in names
+            ]
+        )
+        scope = (
+            safe_html(
+                html_t(
+                    t'<label>Pipeline<select name="env_pipeline_{index}"><option value="">All pipelines</option>{options}</select></label>'
+                )
+            )
+            if repository
+            else safe_html("")
+        )
+        return html_t(
+            t'<div class="settings-env-row"><label>Name<input name="env_name_{index}" value="{name}" autocomplete="off" spellcheck="false"></label><label>Value<input class="settings-env-value" type="password" name="env_value_{index}" value="{value}" autocomplete="off" spellcheck="false"></label>{scope}<label class="settings-remove"><input type="checkbox" name="env_remove_{index}"> Remove</label></div>'
+        )
 
+    rows: list[str]
     if submitted and submitted.get("action") == "ci_environment":
         try:
             count = min(256, max(0, int(submitted.get("env_count", "0"))))
         except ValueError:
             count = 0
-        rows = [row(index, submitted.get(f"env_name_{index}", ""), submitted.get(f"env_value_{index}", ""), submitted.get(f"env_pipeline_{index}", "")) for index in range(count)]
+        rows = [
+            row(
+                index,
+                submitted.get(f"env_name_{index}", ""),
+                submitted.get(f"env_value_{index}", ""),
+                submitted.get(f"env_pipeline_{index}", ""),
+            )
+            for index in range(count)
+        ]
     else:
-        rows = [row(index, name, value) for index, (name, value) in enumerate(sorted(values.items()))]
+        rows = [
+            row(index, name, value) for index, (name, value) in enumerate(sorted(values.items()))
+        ]
         for pipeline, env in sorted(pipeline_values.items()):
             for name, value in sorted(env.items()):
                 rows.append(row(len(rows), name, value, pipeline))
     if len(rows) < 256:
         rows.append(row(len(rows)))
     inherited_names = ", ".join(sorted(global_values.get("env") or {})) or "None"
-    inherited_note = safe_html(html_t(t'<p class="muted">Inherited server variables: {inherited_names}. Repository values override matching names; removing an override restores inheritance.</p>')) if repository else safe_html("")
-    forms.append(html_t(t'<section class="box"><h2>Environment variables</h2>{inherited_note}<form method="POST" action="{action}" class="settings-page-form settings-env-form"><input type="hidden" name="action" value="ci_environment"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="env_count" value="{len(rows)}"><div class="settings-env-rows">{join_html(rows)}</div><template>{safe_html(row("__index__"))}</template><div class="row"><button type="button" class="settings-add-env">Add variable</button><button type="button" class="settings-show-env">Show values</button><button type="submit">Save variables</button></div><p class="muted">Stored in plaintext. CI logs are not secret-redacted. Reserved runner variables are rejected.</p></form></section>'))
+    inherited_note = (
+        safe_html(
+            html_t(
+                t'<p class="muted">Inherited server variables: {inherited_names}. Repository values override matching names; removing an override restores inheritance.</p>'
+            )
+        )
+        if repository
+        else safe_html("")
+    )
+    forms.append(
+        html_t(
+            t'<section class="box"><h2>Environment variables</h2>{inherited_note}<form method="POST" action="{action}" class="settings-page-form settings-env-form"><input type="hidden" name="action" value="ci_environment"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="env_count" value="{len(rows)}"><div class="settings-env-rows">{join_html(rows)}</div><template>{safe_html(row("__index__"))}</template><div class="row"><button type="button" class="settings-add-env">Add variable</button><button type="button" class="settings-show-env">Show values</button><button type="submit">Save variables</button></div><p class="muted">Stored in plaintext. CI logs are not secret-redacted. Reserved runner variables are rejected.</p></form></section>'
+        )
+    )
     return safe_html(join_html(forms))
 
 
-def parse_preferences(form, previous, *, repository=False):
-    values = dict(previous)
+def parse_preferences(
+    form: Mapping[str, str], previous: SettingsValues, *, repository: bool = False
+) -> dict[str, Any]:
+    values: dict[str, Any] = dict(previous)
     action = form.get("action")
     if action == "ci_retention":
         if action == "ci_retention" and form.get("confirm_retention") != "yes":
@@ -103,11 +192,16 @@ def parse_preferences(form, previous, *, repository=False):
         count = int(form.get("env_count", "0"))
         if not 0 <= count <= 256:
             raise ValueError("At most 256 variable rows are supported.")
-        env, pipeline_env, seen = {}, {}, set()
+        env: dict[str, str] = {}
+        pipeline_env: dict[str, dict[str, str]] = {}
+        seen: set[tuple[str, str]] = set()
         for index in range(count):
             if form.get(f"env_remove_{index}"):
                 continue
-            name, value = form.get(f"env_name_{index}", "").strip(), form.get(f"env_value_{index}", "")
+            name, value = (
+                form.get(f"env_name_{index}", "").strip(),
+                form.get(f"env_value_{index}", ""),
+            )
             pipeline = form.get(f"env_pipeline_{index}", "") if repository else ""
             if not name and not value:
                 continue
@@ -125,47 +219,114 @@ def parse_preferences(form, previous, *, repository=False):
 
 BASIC_GROUPS = {
     "Network": ("host", "port", "url_prefix", "realm"),
-    "Storage and Git": ("git_project_root", "git_http_backend", "db_path", "trace_log", "flat_owner_ui"),
-    "Security": ("require_auth", "filter_ips", "allowed_client_ips", "session_cookie_secure", "session_ttl_seconds", "static_requires_auth"),
-    "Logging": ("log_level", "log_format", "log_file", "log_max_bytes", "log_backup_count", "access_log", "audit_log"),
-    "Advanced": ("session_cookie_name", "login_path", "static_url_prefix", "static_root", "static_cache_seconds", "pr_patch_max_bytes", "prism_diff_highlight_max_bytes", "max_header_bytes", "read_chunk"),
+    "Storage and Git": (
+        "git_project_root",
+        "git_http_backend",
+        "db_path",
+        "trace_log",
+        "flat_owner_ui",
+    ),
+    "Security": (
+        "require_auth",
+        "filter_ips",
+        "allowed_client_ips",
+        "session_cookie_secure",
+        "session_ttl_seconds",
+        "static_requires_auth",
+    ),
+    "Logging": (
+        "log_level",
+        "log_format",
+        "log_file",
+        "log_max_bytes",
+        "log_backup_count",
+        "access_log",
+        "audit_log",
+    ),
+    "Advanced": (
+        "session_cookie_name",
+        "login_path",
+        "static_url_prefix",
+        "static_root",
+        "static_cache_seconds",
+        "pr_patch_max_bytes",
+        "prism_diff_highlight_max_bytes",
+        "max_header_bytes",
+        "read_chunk",
+    ),
 }
-LABELS = {"host": "Bind address", "port": "HTTP port", "url_prefix": "Git URL prefix", "realm": "Authentication realm",
-          "git_project_root": "Repository storage directory", "git_http_backend": "Git HTTP backend executable",
-          "db_path": "Database path", "trace_log": "Git trace log (optional)", "require_auth": "Require authentication",
-          "filter_ips": "Restrict client IPs", "allowed_client_ips": "Allowed IP addresses (one per line)",
-          "session_cookie_secure": "HTTPS-only session cookies", "static_requires_auth": "Require authentication for static files",
-          "log_level": "Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
-          "log_format": "Log format (json or text)",
-          "log_file": "Log file (optional; empty logs to stderr only)",
-          "log_max_bytes": "Rotate after bytes (minimum 1024)",
-          "log_backup_count": "Rotated files to keep (0-100; 0 disables rotation)",
-          "access_log": "Write one access record per request",
-          "audit_log": "Record web security events in SQLite"}
+LABELS = {
+    "host": "Bind address",
+    "port": "HTTP port",
+    "url_prefix": "Git URL prefix",
+    "realm": "Authentication realm",
+    "git_project_root": "Repository storage directory",
+    "git_http_backend": "Git HTTP backend executable",
+    "db_path": "Database path",
+    "trace_log": "Git trace log (optional)",
+    "require_auth": "Require authentication",
+    "filter_ips": "Restrict client IPs",
+    "allowed_client_ips": "Allowed IP addresses (one per line)",
+    "session_cookie_secure": "HTTPS-only session cookies",
+    "static_requires_auth": "Require authentication for static files",
+    "log_level": "Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    "log_format": "Log format (json or text)",
+    "log_file": "Log file (optional; empty logs to stderr only)",
+    "log_max_bytes": "Rotate after bytes (minimum 1024)",
+    "log_backup_count": "Rotated files to keep (0-100; 0 disables rotation)",
+    "access_log": "Write one access record per request",
+    "audit_log": "Record web security events in SQLite",
+}
 
 
-def basic_form(action, token, running, config_path):
-    values = AppConfig.from_file(config_path).to_dict() if config_path else running
+def basic_form(
+    action: str, token: str, running: SettingsValues, config_path: str | Path | None
+) -> SafeHTML:
+    values: Mapping[str, Any] = (
+        AppConfig.from_file(config_path).to_dict() if config_path else running
+    )
     revision = hashlib.sha256(Path(config_path).read_bytes()).hexdigest() if config_path else ""
-    groups = []
+    groups: list[str] = []
     for title, fields in BASIC_GROUPS.items():
-        controls = []
+        controls: list[str] = []
         for key in fields:
             value = values[key]
             if isinstance(value, bool):
-                control = html_t(t'<input type="checkbox" name="basic_{key}" value="yes"{safe_html(" checked" if value else "")}>')
+                control = html_t(
+                    t'<input type="checkbox" name="basic_{key}" value="yes"{safe_html(" checked" if value else "")}>'
+                )
             elif key == "allowed_client_ips":
-                control = html_t(t'<textarea name="basic_{key}" rows="4">{"\n".join(value)}</textarea>')
+                control = html_t(
+                    t'<textarea name="basic_{key}" rows="4">{"\n".join(value)}</textarea>'
+                )
             else:
-                control = html_t(t'<input name="basic_{key}" type="{"number" if isinstance(value, int) else "text"}" value="{value if value is not None else ""}">')
-            controls.append(html_t(t'<label>{LABELS.get(key, key.replace("_", " ").capitalize())}{safe_html(control)}</label>'))
-        groups.append(html_t(t'<fieldset><legend>{title}</legend><div class="settings-grid">{join_html(controls)}</div></fieldset>'))
+                control = html_t(
+                    t'<input name="basic_{key}" type="{"number" if isinstance(value, int) else "text"}" value="{value if value is not None else ""}">'
+                )
+            controls.append(
+                html_t(
+                    t"<label>{LABELS.get(key, key.replace('_', ' ').capitalize())}{safe_html(control)}</label>"
+                )
+            )
+        groups.append(
+            html_t(
+                t'<fieldset><legend>{title}</legend><div class="settings-grid">{join_html(controls)}</div></fieldset>'
+            )
+        )
     disabled = safe_html("" if config_path else " disabled")
-    location = str(config_path) if config_path else "No startup configuration file was supplied (read-only)."
-    return safe_html(html_t(t'<section class="box"><h2>Basic server configuration</h2><p class="muted">{location}</p><p>Changes are written to the startup configuration file and require a server restart. They do not change the running listener, security settings, database or storage paths immediately.</p><form method="POST" action="{action}"><input type="hidden" name="action" value="basic"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="basic_revision" value="{revision}"><fieldset{disabled}>{join_html(groups)}<label><input type="checkbox" name="confirm_restart" value="yes" required> I will restart the server and have reviewed authentication, allowed IPs, paths and cookie settings.</label><button type="submit">Save configuration for next restart</button></fieldset></form></section>'))
+    location = (
+        str(config_path)
+        if config_path
+        else "No startup configuration file was supplied (read-only)."
+    )
+    return safe_html(
+        html_t(
+            t'<section class="box"><h2>Basic server configuration</h2><p class="muted">{location}</p><p>Changes are written to the startup configuration file and require a server restart. They do not change the running listener, security settings, database or storage paths immediately.</p><form method="POST" action="{action}"><input type="hidden" name="action" value="basic"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="basic_revision" value="{revision}"><fieldset{disabled}>{join_html(groups)}<label><input type="checkbox" name="confirm_restart" value="yes" required> I will restart the server and have reviewed authentication, allowed IPs, paths and cookie settings.</label><button type="submit">Save configuration for next restart</button></fieldset></form></section>'
+        )
+    )
 
 
-def save_basic(config_path, form):
+def save_basic(config_path: str | Path | None, form: Mapping[str, str]) -> None:
     if not config_path:
         raise ValueError("This server was not started with a configuration file.")
     if form.get("confirm_restart") != "yes":
@@ -187,12 +348,24 @@ def save_basic(config_path, form):
             current[key] = int(text)
         elif key == "allowed_client_ips":
             import ipaddress
-            current[key] = [str(ipaddress.ip_address(value.strip())) for value in text.splitlines() if value.strip()]
+
+            current[key] = [
+                str(ipaddress.ip_address(value.strip()))
+                for value in text.splitlines()
+                if value.strip()
+            ]
         else:
             if len(text) > 4096 or any(ord(char) < 32 for char in text):
                 raise ValueError(f"Invalid {key}.")
             current[key] = None if key in ("trace_log", "log_file") and not text else text
-    for key in ("git_project_root", "git_http_backend", "db_path", "static_root", "session_cookie_name", "flat_owner_ui"):
+    for key in (
+        "git_project_root",
+        "git_http_backend",
+        "db_path",
+        "static_root",
+        "session_cookie_name",
+        "flat_owner_ui",
+    ):
         if not current[key]:
             raise ValueError(f"{key} cannot be empty.")
     for key in ("session_ttl_seconds", "max_header_bytes", "read_chunk"):

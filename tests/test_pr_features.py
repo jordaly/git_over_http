@@ -1,11 +1,10 @@
-import asyncio
 import http.client
-from pathlib import Path
 import re
 import subprocess
 import tempfile
 import unittest
 import unittest.mock
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from pygithost import application, database
@@ -16,7 +15,10 @@ from tests.test_server import ServerRunner, _which_git_backend
 @unittest.skipUnless(True, "runs with local git")
 class PullRequestFeaturesTests(unittest.TestCase):
     def setUp(self):
-        if not (subprocess.run(["git", "--version"], capture_output=True).returncode == 0 and _which_git_backend()):
+        if not (
+            subprocess.run(["git", "--version"], capture_output=True).returncode == 0
+            and _which_git_backend()
+        ):
             self.skipTest("requires Git HTTP backend")
         self.temp = tempfile.TemporaryDirectory(prefix="pr-features-")
         self.root = Path(self.temp.name)
@@ -44,9 +46,15 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.git("-C", self.source, "add", ".")
         self.git("-C", self.source, "commit", "-m", "Feature edits")
         self.git("-C", self.source, "push", self.bare, "feature/pr:feature/pr")
-        status, page = self.request(self.base + "/pulls/create", {
-            "title": "Feature PR", "body": "A useful change",
-            "source_branch": "feature/pr", "target_branch": "main"})
+        status, page = self.request(
+            self.base + "/pulls/create",
+            {
+                "title": "Feature PR",
+                "body": "A useful change",
+                "source_branch": "feature/pr",
+                "target_branch": "main",
+            },
+        )
         self.assertEqual(status, 303, page)
         pr = database.db_pr_list(FLAT_OWNER_UI, "project")[0]
         self.pr = pr[0]
@@ -57,14 +65,21 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.temp.cleanup()
 
     def git(self, *args):
-        return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.PIPE, text=True).strip()
+        return subprocess.check_output(
+            ["git", *map(str, args)], stderr=subprocess.PIPE, text=True
+        ).strip()
 
     def request(self, path, fields=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=10)
         try:
-            connection.request("GET" if fields is None else "POST", path,
+            connection.request(
+                "GET" if fields is None else "POST",
+                path,
                 body=None if fields is None else urlencode(fields),
-                headers={} if fields is None else {"Content-Type": "application/x-www-form-urlencoded"})
+                headers={}
+                if fields is None
+                else {"Content-Type": "application/x-www-form-urlencoded"},
+            )
             response = connection.getresponse()
             body = response.read()
             return response.status, body.decode()
@@ -78,7 +93,12 @@ class PullRequestFeaturesTests(unittest.TestCase):
 
     def test_file_filter_shows_pill_link_not_escaped_html(self):
         page = self.page(quote("?file=" + "app.py", safe="=?&"))
-        self.assertIn('Diff — <code>app.py</code> <a class="pill" href="/r/root/project/pulls/' + str(self.pr) + '#diff">All files</a>', page)
+        self.assertIn(
+            'Diff — <code>app.py</code> <a class="pill" href="/r/root/project/pulls/'
+            + str(self.pr)
+            + '#diff">All files</a>',
+            page,
+        )
         self.assertNotIn("&lt;a", page)
 
     def test_pr_shows_merge_base_diff_excluding_target_changes(self):
@@ -109,14 +129,18 @@ class PullRequestFeaturesTests(unittest.TestCase):
             status, page = self.request(self.base + f"/pulls/{self.pr}/comments", {"body": "nope"})
             self.assertEqual(status, 403)
             self.assertEqual(database.db_pr_comment_count(self.pr), 0)
-        status, page = self.request(self.base + f"/pulls/{self.pr}/comments", {"body": "First comment"})
+        status, page = self.request(
+            self.base + f"/pulls/{self.pr}/comments", {"body": "First comment"}
+        )
         self.assertEqual(status, 200)
         self.assertIn("First comment", page)
         comments = database.db_pr_comment_list(self.pr)
         self.assertEqual(len(comments), 1)
         self.assertIsNone(comments[0][1])  # anonymous author preserved
         cid = comments[0][0]
-        status, page = self.request(self.base + f"/pulls/{self.pr}/comments/{cid}/edit", {"body": "Edited comment"})
+        status, page = self.request(
+            self.base + f"/pulls/{self.pr}/comments/{cid}/edit", {"body": "Edited comment"}
+        )
         self.assertEqual(status, 200)
         self.assertIn("Edited comment", page)
         self.assertIn("(edited)", page)
@@ -131,13 +155,17 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_edit_title_and_description(self):
-        status, page = self.request(self.base + f"/pulls/{self.pr}/update", {
-            "title": "Renamed PR", "body": "Updated description"})
+        status, page = self.request(
+            self.base + f"/pulls/{self.pr}/update",
+            {"title": "Renamed PR", "body": "Updated description"},
+        )
         self.assertEqual(status, 200)
         self.assertIn("Renamed PR", page)
         self.assertIn("Updated description", page)
         self.assertEqual(database.db_pr_get(self.pr)[3], "Renamed PR")
-        status, page = self.request(self.base + f"/pulls/{self.pr}/update", {"title": "", "body": ""})
+        status, page = self.request(
+            self.base + f"/pulls/{self.pr}/update", {"title": "", "body": ""}
+        )
         self.assertIn("Title is required.", page)
         self.assertEqual(database.db_pr_get(self.pr)[3], "Renamed PR")
 
@@ -165,7 +193,7 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertIn("just now", page)
         self.assertIn("pill-open", page)
         status, page = self.request(self.base + "/pulls?status=all")
-        self.assertIn('>All 1</a', page)
+        self.assertIn(">All 1</a", page)
         status, page = self.request(self.base + "/pulls/999/comments", {"body": "hi"})
         self.assertEqual(status, 404)
         # Creation moved to its own page.
@@ -183,11 +211,13 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertIn(self.base + f"/pulls/{self.pr}/resolve/ide", page)
         self.assertIn("Resolve conflicts in the web IDE", page)
 
-
     def test_deleted_author_keeps_comments_readable(self):
         conn = database._db_connect()
         try:
-            uid = conn.execute("INSERT INTO users(username,pass_salt,pass_hash) VALUES('commenter',?,?)", (b"s", b"h")).lastrowid
+            uid = conn.execute(
+                "INSERT INTO users(username,pass_salt,pass_hash) VALUES('commenter',?,?)",
+                (b"s", b"h"),
+            ).lastrowid
         finally:
             conn.close()
         database.db_pr_comment_add(self.pr, uid, "User comment")
@@ -229,6 +259,7 @@ class PullRequestFeaturesTests(unittest.TestCase):
     def test_resolve_ide_page_and_commit_endpoint(self):
         self._make_conflict()
         import json as jsonlib
+
         status, page = self.request(self.base + f"/pulls/{self.pr}/resolve/ide")
         self.assertEqual(status, 200, page)
         self.assertIn('data-mode="resolve"', page)
@@ -238,28 +269,43 @@ class PullRequestFeaturesTests(unittest.TestCase):
         token = re.search(r'data-csrf="([^"]+)"', page).group(1)
         commit_before = self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr")
         # Conflicted content (with markers) is served by the IDE conflict action.
-        status, body = self.request(self.base + f"/ide/conflict?branch=feature/pr&path=app.py&pr={self.pr}")
+        status, body = self.request(
+            self.base + f"/ide/conflict?branch=feature/pr&path=app.py&pr={self.pr}"
+        )
         self.assertEqual(status, 200, body)
         data = jsonlib.loads(body)
         self.assertEqual(data["kind"], "conflicts")
         self.assertIn("<<<<<<< HEAD (feature/pr)", data["content"])
         # Wrong branch is refused; unknown PR pages 404.
-        payload = {"branch": "main", "base": commit_before, "message": "x", "changes": {"app.py": "resolved\n"}}
-        status, body = self.request(self.base + f"/pulls/{self.pr}/resolve/ide/commit",
-                                    {"csrf": token, "payload": jsonlib.dumps(payload)})
+        payload = {
+            "branch": "main",
+            "base": commit_before,
+            "message": "x",
+            "changes": {"app.py": "resolved\n"},
+        }
+        status, body = self.request(
+            self.base + f"/pulls/{self.pr}/resolve/ide/commit",
+            {"csrf": token, "payload": jsonlib.dumps(payload)},
+        )
         self.assertEqual(status, 403)
         status, _ = self.request(self.base + "/pulls/999/resolve/ide")
         self.assertEqual(status, 404)
         payload["branch"] = "feature/pr"
-        status, body = self.request(self.base + f"/pulls/{self.pr}/resolve/ide/commit",
-                                    {"csrf": token, "payload": jsonlib.dumps(payload)})
+        status, body = self.request(
+            self.base + f"/pulls/{self.pr}/resolve/ide/commit",
+            {"csrf": token, "payload": jsonlib.dumps(payload)},
+        )
         self.assertEqual(status, 200, body)
         body_json = jsonlib.loads(body)
         commit = body_json["commit"]
-        self.assertEqual(self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr"), commit)
+        self.assertEqual(
+            self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr"), commit
+        )
         self.assertIn("warning", body_json)  # no pipelines configured in this fixture
         main_tip = self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/main")
-        self.assertEqual(self.git("--git-dir", str(self.bare), "merge-base", "main", "feature/pr"), main_tip)
+        self.assertEqual(
+            self.git("--git-dir", str(self.bare), "merge-base", "main", "feature/pr"), main_tip
+        )
         self.assertEqual(database.db_pr_comment_count(self.pr), 1)
         self.assertIn("web IDE", database.db_pr_comment_list(self.pr)[0][3])
         status, page = self.request(self.base + f"/pulls/{self.pr}")
@@ -268,49 +314,74 @@ class PullRequestFeaturesTests(unittest.TestCase):
     def test_resolve_apply_creates_merge_commit_then_ff_merge(self):
         self._make_conflict()
         name = self.git("--git-dir", self.bare, "rev-parse", "refs/heads/feature/pr")
-        status, page = self.request(self.base + f"/pulls/{self.pr}/resolve", {
-            "conflict_count": "1", "path_0": "app.py", "delete_0": "",
-            "content_0": "one\ntwo\nthree-edited\nfour\nfive\nsix\nconflicting target line\n",
-            "message": "Merge main into feature/pr"})
+        status, page = self.request(
+            self.base + f"/pulls/{self.pr}/resolve",
+            {
+                "conflict_count": "1",
+                "path_0": "app.py",
+                "delete_0": "",
+                "content_0": "one\ntwo\nthree-edited\nfour\nfive\nsix\nconflicting target line\n",
+                "message": "Merge main into feature/pr",
+            },
+        )
         self.assertEqual(status, 200, page)
         self.assertIn("Merge conflicts resolved", page)
         new_tip = self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr")
         self.assertNotEqual(new_tip, name)
         main_tip = self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/main")
-        self.assertEqual(self.git("--git-dir", str(self.bare), "merge-base", "main", "feature/pr"), main_tip)
+        self.assertEqual(
+            self.git("--git-dir", str(self.bare), "merge-base", "main", "feature/pr"), main_tip
+        )
         self.assertEqual(database.db_pr_comment_count(self.pr), 1)
         # The integrated branch can now be merged by the ff-only policy.
         status, page = self.request(self.base + f"/pulls/{self.pr}/merge", {})
         self.assertEqual(status, 200, page)
         pr = database.db_pr_get(self.pr)
         self.assertEqual(pr[8], "merged")
-        self.assertEqual(self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/main"), pr[13])
+        self.assertEqual(
+            self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/main"), pr[13]
+        )
 
     def test_resolve_apply_validates_paths_and_unknown_pr(self):
         self._make_conflict()
-        status, page = self.request(self.base + f"/pulls/{self.pr}/resolve", {
-            "conflict_count": "1", "path_0": "app.py", "content_0": "resolved\n", "message": "x"})
+        status, page = self.request(
+            self.base + f"/pulls/{self.pr}/resolve",
+            {"conflict_count": "1", "path_0": "app.py", "content_0": "resolved\n", "message": "x"},
+        )
         # The stale one-row resolution misses nothing else, but an unknown PR or
         # bad path must not commit anything.
         name = self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr")
-        self.assertEqual(name, self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr"))
+        self.assertEqual(
+            name, self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr")
+        )
         status, _ = self.request(self.base + "/pulls/999/resolve")
         self.assertEqual(status, 404)
 
     def test_resolver_unit_conflict_flow_and_race(self):
-        from pygithost import pr_resolver as resolver
         import shutil
         import tempfile as tempmod
+
+        from pygithost import pr_resolver as resolver
+
         root = Path(tempmod.mkdtemp(prefix="resolver-unit-"))
         try:
             work = root / "repo"
             subprocess.run(["git", "init", str(work)], capture_output=True, check=True)
+
             def run(*args):
-                result = subprocess.run(["git", "-C", str(work), *map(str, args)], capture_output=True, text=True, check=True)
+                result = subprocess.run(
+                    ["git", "-C", str(work), *map(str, args)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
                 return result.stdout.strip()
-            run("config", "user.name", "t"); run("config", "user.email", "t@t")
+
+            run("config", "user.name", "t")
+            run("config", "user.email", "t@t")
             (work / "app.py").write_text("base\n")
-            run("add", "-A"); run("commit", "-qm", "base")
+            run("add", "-A")
+            run("commit", "-qm", "base")
             run("checkout", "-qb", "feature")
             (work / "app.py").write_text("base\nsrc-side\n")
             run("commit", "-qam", "src")
@@ -327,18 +398,27 @@ class PullRequestFeaturesTests(unittest.TestCase):
             self.assertEqual(kind, "conflicts")
             self.assertIn("<<<<<<< HEAD (feature)", text.decode())
             self.assertIn(">>>>>>> target (maint)", text.decode())
-            commit = resolver.apply_resolution(repo_git, mb, src, tgt, "feature",
-                [("app.py", "base\nboth sides\n", False)], "integrated", "tester")
+            commit = resolver.apply_resolution(
+                repo_git,
+                mb,
+                src,
+                tgt,
+                "feature",
+                [("app.py", "base\nboth sides\n", False)],
+                "integrated",
+                "tester",
+            )
             self.assertEqual(run("rev-parse", "feature"), commit)
             # Race: the branch advanced after the page was opened.
             advanced = run("commit-tree", src + "^{tree}", "-p", src, "-m", "advanced")
             run("update-ref", "refs/heads/feature", advanced, commit)
             from pygithost import pr_resolver as resolver
+
             with self.assertRaises(resolver.ResolverError) as ctx:
-                resolver.apply_resolution(repo_git, mb, src, tgt, "feature",
-                    [("app.py", "x", False)], "stale", "tester")
+                resolver.apply_resolution(
+                    repo_git, mb, src, tgt, "feature", [("app.py", "x", False)], "stale", "tester"
+                )
             self.assertIn("changed", str(ctx.exception))
             self.assertEqual(run("rev-parse", "feature"), advanced)
         finally:
             shutil.rmtree(root, ignore_errors=True)
-

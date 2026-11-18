@@ -32,21 +32,27 @@ class AutomaticCISettingsTests(unittest.TestCase):
         self.assertIn('id="ci-config-editor"', page)
         self.assertIn('src="/static/ci-settings.js"', page)
         self.assertIn('name="configuration_json"', page)  # No-JS form still works.
-        text = unescape(re.search(r'<textarea id="ci-config-json"[^>]*>(.*?)</textarea>', page, re.S)[1])
+        text = unescape(
+            re.search(r'<textarea id="ci-config-json"[^>]*>(.*?)</textarea>', page, re.S)[1]
+        )
         doc = json.loads(text)
         self.assertEqual(doc, {"version": 1, "file": "ci/config.json"})
         status, page = self.fixture.request(self.fixture.base + "/ci")
         self.assertEqual(status, 200)
         self.assertIn('<option value="ci">ci</option>', page)
-        status, page = self.fixture.request(self.fixture.base + "/ci/run", {"pipeline": "ci", "branch": "main"})
+        status, page = self.fixture.request(
+            self.fixture.base + "/ci/run", {"pipeline": "ci", "branch": "main"}
+        )
         self.assertEqual(status, 200)
         self.assertIn("Add ci/config.json", page)
         self.assertEqual(database.db_ci_runs_list(application.FLAT_OWNER_UI, "project"), [])
         self.assertIsNone(database.db_ci_config_get(application.FLAT_OWNER_UI, "project"))
 
-    @unittest.skipUnless(os.environ.get("PYGITHOST_TEST_BROWSER"), "set PYGITHOST_TEST_BROWSER to Chromium")
+    @unittest.skipUnless(
+        os.environ.get("PYGITHOST_TEST_BROWSER"), "set PYGITHOST_TEST_BROWSER to Chromium"
+    )
     def test_monaco_settings_edit_format_validation_and_save(self):
-        script = r'''<script>
+        script = r"""<script>
 (async function () {
  const el = id => document.getElementById(id);
  const sleep = () => new Promise(resolve => setTimeout(resolve, 50));
@@ -79,24 +85,44 @@ class AutomaticCISettingsTests(unittest.TestCase):
   if (!posted || !(await posted).includes("Configuration saved")) throw Error("Settings save failed");
   document.documentElement.dataset.ciSettingsTest = "passed";
  } catch(error) { document.documentElement.dataset.ciSettingsTest = "failed"; document.documentElement.dataset.ciSettingsError = error.message; }
-})();</script>'''
+})();</script>"""
         original = application._html_page
 
         def page(title, body):
             result = original(title, body)
-            return result.replace(b"</body>", script.encode() + b"</body>") if title.startswith("CI settings") else result
+            return (
+                result.replace(b"</body>", script.encode() + b"</body>")
+                if title.startswith("CI settings")
+                else result
+            )
 
-        with tempfile.TemporaryDirectory(prefix="ci-settings-browser-", dir="/tmp/opencode") as profile:
+        with tempfile.TemporaryDirectory(
+            prefix="ci-settings-browser-", dir="/tmp/opencode"
+        ) as profile:
             with mock.patch.object(application, "_html_page", side_effect=page):
-                result = subprocess.run([os.environ["PYGITHOST_TEST_BROWSER"], "--headless", "--no-sandbox", "--disable-gpu",
-                    "--no-first-run", "--disable-dev-shm-usage", "--user-data-dir=" + profile,
-                    "--dump-dom", "--virtual-time-budget=15000",
-                    f"http://127.0.0.1:{self.fixture.server.port}{self.fixture.base}/ci/config"],
-                    capture_output=True, text=True, timeout=60)
+                result = subprocess.run(
+                    [
+                        os.environ["PYGITHOST_TEST_BROWSER"],
+                        "--headless",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--no-first-run",
+                        "--disable-dev-shm-usage",
+                        "--user-data-dir=" + profile,
+                        "--dump-dom",
+                        "--virtual-time-budget=15000",
+                        f"http://127.0.0.1:{self.fixture.server.port}{self.fixture.base}/ci/config",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
         error = re.search(r'data-ci-settings-error="([^"]*)"', result.stdout)
-        self.assertTrue('data-ci-settings-test="passed"' in result.stdout,
-                        unescape(error[1]) if error else result.stderr[-2000:])
+        self.assertTrue(
+            'data-ci-settings-test="passed"' in result.stdout,
+            unescape(error[1]) if error else result.stderr[-2000:],
+        )
         saved = json.loads(database.db_ci_config_get(application.FLAT_OWNER_UI, "project"))
         self.assertEqual(saved["pipeline_id"], "browser-settings")
         self.assertEqual(saved["timeout_seconds"], 123)

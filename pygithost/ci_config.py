@@ -1,32 +1,61 @@
 """The single administrator-facing JSON format for repository CI settings."""
 
 import json
+from collections.abc import Mapping
+from typing import Any
 
 from .ci import default_config, validate_config
 from .ci_email import validate_recipients
+from .runner_types import JsonObject
 
-
-SETTINGS = {"require_ci", "block_direct_pushes", "protected_branches",
-            "artifact_retention_days", "artifact_retention_count", "run_retention_count"}
-COMMON = {"runner", "image", "env", "events", "push_branches", "pr_branches",
-          "timeout_seconds", "cancel_superseded", "email_mode", "email_recipients",
-          "artifacts", "docker", "source_limit_mb", "limits", "image_build"}
-DEPLOYMENT = {"enabled": "deploy_enabled", "branch": "deploy_branch",
-              "script": "deploy_script", "script_content": "deploy_script_content",
-              "run_with": "deploy_interpreter", "timeout_seconds": "deploy_timeout", "steps": "deploy_steps"}
+SETTINGS = {
+    "require_ci",
+    "block_direct_pushes",
+    "protected_branches",
+    "artifact_retention_days",
+    "artifact_retention_count",
+    "run_retention_count",
+}
+COMMON = {
+    "runner",
+    "image",
+    "env",
+    "events",
+    "push_branches",
+    "pr_branches",
+    "timeout_seconds",
+    "cancel_superseded",
+    "email_mode",
+    "email_recipients",
+    "artifacts",
+    "docker",
+    "source_limit_mb",
+    "limits",
+    "image_build",
+}
+DEPLOYMENT = {
+    "enabled": "deploy_enabled",
+    "branch": "deploy_branch",
+    "script": "deploy_script",
+    "script_content": "deploy_script_content",
+    "run_with": "deploy_interpreter",
+    "timeout_seconds": "deploy_timeout",
+    "steps": "deploy_steps",
+}
 BRANCH_FILTERS = ("push_branches", "pr_branches")
 STRING_LISTS = (*BRANCH_FILTERS, "protected_branches", "email_recipients")
 
 
-def _execution_fields(raw, label):
+def _execution_fields(raw: Mapping[str, object], label: str) -> JsonObject:
     """Translate public string arrays to the legacy runner's line-based values."""
-    result = dict(raw)
+    result: JsonObject = dict(raw)
     for key in STRING_LISTS:
         if key not in result:
             continue
         patterns = result[key]
         if not isinstance(patterns, list) or any(
-            not isinstance(pattern, str) or not pattern.strip()
+            not isinstance(pattern, str)
+            or not pattern.strip()
             or any(char in pattern for char in ("\n", "\r", "\0"))
             for pattern in patterns
         ):
@@ -34,20 +63,23 @@ def _execution_fields(raw, label):
         if key == "email_recipients":
             for address in patterns:
                 if len(validate_recipients(address)) != 1:
-                    raise ValueError(f"{label}.email_recipients: use one email address per array entry.")
+                    raise ValueError(
+                        f"{label}.email_recipients: use one email address per array entry."
+                    )
         result[key] = "\n".join(patterns)
     return result
 
 
-def _export_filters(raw):
-    result = dict(raw)
+def _export_filters(raw: Mapping[str, object]) -> JsonObject:
+    result: JsonObject = dict(raw)
     for key in STRING_LISTS:
         if isinstance(result.get(key), str):
             value = result[key].replace(",", "\n") if key == "email_recipients" else result[key]
             result[key] = [line.strip() for line in value.splitlines() if line.strip()]
     return result
 
-EXAMPLE = {
+
+EXAMPLE: JsonObject = {
     "version": 1,
     "defaults": {"events": {"push": True}, "timeout_seconds": 600},
     "pipelines": {
@@ -57,28 +89,47 @@ EXAMPLE = {
 }
 
 
-def _object(value, allowed, label):
+def _object(value: object, allowed: set[str], label: str) -> JsonObject:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object.")
-    unknown = set(value) - allowed
+    result: JsonObject = value
+    unknown = set(result) - allowed
     if unknown:
         raise ValueError(f"{label}: unknown fields: {', '.join(sorted(unknown))}.")
-    return value
+    return result
 
 
-def compile_document(document):
-    from .ci_schema import flatten_document, is_grouped, split_named_document, _email
+def compile_document(document: object) -> JsonObject:
+    from .ci_schema import _email, flatten_document, is_grouped, split_named_document
+
     if isinstance(document, dict) and "file" in document:
         _object(document, {"version", "file"}, "Repository file reference")
         if type(document.get("version", 1)) is not int or document.get("version", 1) != 1:
             raise ValueError("Configuration version must be 1.")
-        result = compile_document({"version": 1, "pipelines": [{
-            "name": "ci", "file": document["file"],
-            "execution": {"runner": "docker", "image": "python:3.14-slim",
-                          "timeout_seconds": default_config()["timeout_seconds"]},
-            "triggers": {"push": {"enabled": True},
-                         "pull_request": {"enabled": True, "events": ["opened", "updated", "reopened"]}}
-        }], "deployments": []})
+        result = compile_document(
+            {
+                "version": 1,
+                "pipelines": [
+                    {
+                        "name": "ci",
+                        "file": document["file"],
+                        "execution": {
+                            "runner": "docker",
+                            "image": "python:3.14-slim",
+                            "timeout_seconds": default_config()["timeout_seconds"],
+                        },
+                        "triggers": {
+                            "push": {"enabled": True},
+                            "pull_request": {
+                                "enabled": True,
+                                "events": ["opened", "updated", "reopened"],
+                            },
+                        },
+                    }
+                ],
+                "deployments": [],
+            }
+        )
         result["document"] = {"version": 1, "file": document["file"]}
         return result
     if isinstance(document, dict) and isinstance(document.get("pipelines"), list):
@@ -91,8 +142,12 @@ def compile_document(document):
                 raise ValueError(f"deployments.{name}: use script or script_content, not both.")
             fields.update(deployment_name=name, deploy_enabled=target.get("enabled", True))
             email = _email(target.get("notifications", {}), f"deployments.{name}.notifications")
-            fields.update(email_mode=email.get("email_mode", "off"),
-                          email_recipients=_execution_fields(email, f"deployments.{name}").get("email_recipients", ""))
+            fields.update(
+                email_mode=email.get("email_mode", "off"),
+                email_recipients=_execution_fields(email, f"deployments.{name}").get(
+                    "email_recipients", ""
+                ),
+            )
             pipeline.setdefault("deployment_targets", []).append(fields)
         result = _compile_flat_document(flat)
         result["document"] = json.loads(json.dumps(document))
@@ -104,16 +159,18 @@ def compile_document(document):
     return _compile_flat_document(document)
 
 
-def editor_document(config):
+def editor_document(config: Mapping[str, Any]) -> JsonObject:
     from .ci_schema import group_document
+
     if "file" in config.get("document", {}):
-        return json.loads(json.dumps(config["document"]))
+        document: JsonObject = json.loads(json.dumps(config["document"]))
+        return document
     return group_document(export_document(config))
 
 
-def _compile_flat_document(document):
+def _compile_flat_document(document: object) -> JsonObject:
     """Validate and expand shared defaults into execution snapshots."""
-    _object(document, {"version", "defaults", "pipelines", "settings"}, "Configuration")
+    document = _object(document, {"version", "defaults", "pipelines", "settings"}, "Configuration")
     if type(document.get("version", 1)) is not int or document.get("version", 1) != 1:
         raise ValueError("Configuration version must be 1.")
     defaults = _object(document.get("defaults", {}), COMMON, "defaults")
@@ -125,9 +182,13 @@ def _compile_flat_document(document):
     pipelines = document.get("pipelines")
     if not isinstance(pipelines, dict) or len(pipelines) > 16:
         raise ValueError("pipelines must be an object with at most 16 named pipelines.")
-    compiled = []
+    compiled: list[JsonObject] = []
     for identity, raw in pipelines.items():
-        _object(raw, COMMON | {"steps", "deployment", "file", "deployment_targets"}, f"pipelines.{identity}")
+        _object(
+            raw,
+            COMMON | {"steps", "deployment", "file", "deployment_targets"},
+            f"pipelines.{identity}",
+        )
         effective = {**defaults, **raw, "pipeline_id": identity}
         # Merge mappings so a pipeline can override one variable or event without
         # restating shared values. Other fields replace their shared value.
@@ -156,17 +217,24 @@ def _compile_flat_document(document):
             raise ValueError(f"pipelines.{identity}: {exc}") from exc
     # Reuse the existing persistence layout without requiring a special default
     # pipeline in the administrator document.
-    root = next((item for item in compiled if item["pipeline_id"] == "default"), compiled[0] if compiled else default_config())
-    root = {**root, **settings, "pipelines": [item for item in compiled if item["pipeline_id"] != root["pipeline_id"]]}
+    root = next(
+        (item for item in compiled if item["pipeline_id"] == "default"),
+        compiled[0] if compiled else default_config(),
+    )
+    root = {
+        **root,
+        **settings,
+        "pipelines": [item for item in compiled if item["pipeline_id"] != root["pipeline_id"]],
+    }
     result = validate_config(root)
     result["document"] = json.loads(json.dumps(document))
     return result
 
 
-def export_document(config):
+def export_document(config: Mapping[str, Any]) -> JsonObject:
     """Expose existing settings without dropping legacy commands or Git sources."""
     if "document" in config:
-        document = json.loads(json.dumps(config["document"]))
+        document: JsonObject = json.loads(json.dumps(config["document"]))
         if "file" in document:
             return document
         if isinstance(document.get("pipelines"), list):
@@ -175,25 +243,41 @@ def export_document(config):
             document["defaults"] = _export_filters(document["defaults"])
         if "settings" in document:
             document["settings"] = _export_filters(document["settings"])
-        document["pipelines"] = {name: _export_filters(item) for name, item in document["pipelines"].items()}
+        document["pipelines"] = {
+            name: _export_filters(item) for name, item in document["pipelines"].items()
+        }
         return document
     baseline = default_config()
-    pipelines = {}
+    pipelines: dict[str, JsonObject] = {}
     for item in [{**config, "pipelines": []}, *config.get("pipelines", [])]:
-        if not (item.get("steps") or item.get("command") or item.get("repository_config") or item.get("deploy_enabled")):
+        if not (
+            item.get("steps")
+            or item.get("command")
+            or item.get("repository_config")
+            or item.get("deploy_enabled")
+        ):
             continue
-        pipeline = {key: item[key] for key in sorted(COMMON) if key in item and item[key] != baseline.get(key)}
+        pipeline: JsonObject = {
+            key: item[key]
+            for key in sorted(COMMON)
+            if key in item and item[key] != baseline.get(key)
+        }
         if item.get("repository_config"):
             pipeline["file"] = item.get("repository_file", ".pygithost-ci.json")
         else:
-            pipeline["steps"] = item.get("steps") or [{"name": "Run", "run": item.get("command", "")}]
-        deployment = {key: item[field] for key, field in DEPLOYMENT.items()
-                      if field in item and item[field] != baseline.get(field)}
+            pipeline["steps"] = item.get("steps") or [
+                {"name": "Run", "run": item.get("command", "")}
+            ]
+        deployment = {
+            key: item[field]
+            for key, field in DEPLOYMENT.items()
+            if field in item and item[field] != baseline.get(field)
+        }
         if deployment:
             deployment["enabled"] = item.get("deploy_enabled", False)
             pipeline["deployment"] = deployment
         pipelines[item.get("pipeline_id", "default")] = _export_filters(pipeline)
-    shared = {}
+    shared: JsonObject = {}
     if len(pipelines) > 1:
         entries = list(pipelines.values())
         for key in sorted(COMMON):
@@ -202,7 +286,15 @@ def export_document(config):
         for item in entries:
             for key in shared:
                 item.pop(key)
-    settings = {key: config[key] for key in sorted(SETTINGS) if key in config and config[key] != baseline.get(key)}
+    settings = {
+        key: config[key]
+        for key in sorted(SETTINGS)
+        if key in config and config[key] != baseline.get(key)
+    }
     settings = _export_filters(settings)
-    return {"version": 1, **({"defaults": shared} if shared else {}),
-            "pipelines": pipelines, **({"settings": settings} if settings else {})}
+    return {
+        "version": 1,
+        **({"defaults": shared} if shared else {}),
+        "pipelines": pipelines,
+        **({"settings": settings} if settings else {}),
+    }

@@ -3,18 +3,27 @@
 import asyncio
 import base64
 import binascii
-from pathlib import Path
 import re
+from collections.abc import Mapping, MutableMapping
+from pathlib import Path
+from typing import cast
 from urllib.parse import unquote
 
 from .. import database, webide
 from ..ci import protected_branch
 from . import data, git, text_mutations
 from .errors import APIError
+from .types import (
+    APIContext,
+    BranchReference,
+    DynamicJSONObject,
+    Issue,
+    Pull,
+)
 from .validation import fields, name, sha, text
 
 
-async def branch(path, value):
+async def branch(path: str, value: object) -> str:
     if not isinstance(value, str) or not value or len(value) > 256 or value.startswith("-"):
         raise APIError(422, "validation_error", "Invalid branch name.")
     code, _ = await git.git(path, "check-ref-format", "refs/heads/" + value)
@@ -23,58 +32,87 @@ async def branch(path, value):
     return value
 
 
-async def branch_head(path, value):
+async def branch_head(path: str, value: str) -> str:
     await branch(path, value)
-    code, out = await git.git(path, "rev-parse", "--verify", "--end-of-options", "refs/heads/" + value + "^{commit}")
+    code, out = await git.git(
+        path, "rev-parse", "--verify", "--end-of-options", "refs/heads/" + value + "^{commit}"
+    )
     if code:
         raise APIError(404, "not_found", "Branch not found.")
     return out.decode("ascii").strip()
 
 
-async def unprotected(api, owner, repo, value):
+async def unprotected(api: APIContext, owner: str, repo: str, value: str) -> None:
     config = await api.handler.server.ci_manager.config(owner, repo)
     if protected_branch(config, value):
-        raise APIError(403, "protected_branch", "Direct changes to this protected branch are blocked. Use a pull request.")
+        raise APIError(
+            403,
+            "protected_branch",
+            "Direct changes to this protected branch are blocked. Use a pull request.",
+        )
 
 
-async def notify(api, owner, repo, before, result):
+async def notify(
+    api: APIContext,
+    owner: str,
+    repo: str,
+    before: dict[str, str] | None,
+    result: MutableMapping[str, object],
+) -> MutableMapping[str, object]:
     try:
         await api.handler.server._queue_push_changes(owner, repo, before)
     except Exception as exc:
         # The Git mutation succeeded; never encourage a blind retry of it.
         api.log_failure(exc)
-        result["warnings"] = ["Git changed, but CI scheduling failed. Inspect CI before proceeding."]
+        result["warnings"] = [
+            "Git changed, but CI scheduling failed. Inspect CI before proceeding."
+        ]
     return result
 
 
-async def file_content(path, filename, branch_name):
-    await branch(path, branch_name)
+async def file_content(path: str, filename: str, branch_name: object) -> DynamicJSONObject:
+    branch_name = await branch(path, branch_name)
     head = await branch_head(path, branch_name)
 
-    def read():
+    def read() -> DynamicJSONObject:
         try:
             webide.path(filename)
             info = webide.entry(path, head, filename)
             if not info:
                 raise APIError(404, "not_found", "File not found.")
             content = webide._blob(path, info).encode("utf-8")
-            return {"path": filename, "sha": info["oid"], "commit_sha": head, "branch": branch_name,
-                    "encoding": "base64", "content": base64.b64encode(content).decode("ascii"),
-                    "size": len(content)}
+            return {
+                "path": filename,
+                "sha": info["oid"],
+                "commit_sha": head,
+                "branch": branch_name,
+                "encoding": "base64",
+                "content": base64.b64encode(content).decode("ascii"),
+                "size": len(content),
+            }
         except webide.IDEError:
-            raise APIError(422, "unsupported_file", "Only regular UTF-8 text files up to 1 MiB are supported.") from None
+            raise APIError(
+                422, "unsupported_file", "Only regular UTF-8 text files up to 1 MiB are supported."
+            ) from None
+
     return await asyncio.to_thread(read)
 
 
-async def authorize(api):
+async def authorize(api: APIContext) -> tuple[str, str | None, str | None, str]:
     """Reauthorize before looking up cached results, including after role changes."""
     if "write" not in api.identity["scopes"]:
         raise APIError(403, "insufficient_scope", "Token requires write scope.")
     if api.path == "/api/v1/user/repos" and api.request.method == "POST":
         owner = api.identity["username"]
-        if (owner == api.app.FLAT_OWNER_UI or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", owner)
-                or not api.app._safe_seg(owner) or owner in (".", ".git")):
-            raise APIError(403, "forbidden", "This account cannot create an owner-namespace repository.")
+        if (
+            owner == api.app.FLAT_OWNER_UI
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", owner)
+            or not api.app._safe_seg(owner)
+            or owner in (".", ".git")
+        ):
+            raise APIError(
+                403, "forbidden", "This account cannot create an owner-namespace repository."
+            )
         return owner, None, None, "create_repository"
     match = re.fullmatch(r"/api/v1/repos/([^/]+)/([^/]+)(?:/(.*))?", api.path)
     if not match:
@@ -83,11 +121,15 @@ async def authorize(api):
     path = await api.repository(owner, repo)
     if tail == "ci/settings":
         from . import settings
+
         settings.authorize(api)
     return owner, repo, path, tail
 
 
-async def route(api, target):
+async def route(
+    api: APIContext,
+    target: tuple[str, str | None, str | None, str],
+) -> tuple[int, Mapping[str, object]]:
     owner, repo, path, tail = target
     doc, method = api.document, api.request.method
     if tail == "create_repository":
@@ -96,19 +138,27 @@ async def route(api, target):
         lock = api.handler.server.push_locks.setdefault((owner, repo), asyncio.Lock())
         async with lock:
             return 201, await create_repository(api, owner, repo, doc)
+    assert path is not None
+    assert repo is not None
     lock = api.handler.server.push_locks.setdefault((owner, repo), asyncio.Lock())
     async with lock:
         # Validate the current path again after waiting for the repository lock.
         path = await api.repository(owner, repo)
         if tail == "ci/settings":
             from . import settings
+
             return await settings.update(api, owner, repo)
         if tail == "discussions" or tail.startswith("discussions/"):
             from . import discussions
-            return await asyncio.to_thread(discussions.mutate, owner, repo, tail, method, doc, api.identity)
-        if method == "POST" and (tail == "ci/runs" or re.fullmatch(
-                r"ci/runs/[0-9]{1,18}/(cancel|rerun)", tail)):
+
+            return await asyncio.to_thread(
+                discussions.mutate, owner, repo, tail, method, doc, api.identity
+            )
+        if method == "POST" and (
+            tail == "ci/runs" or re.fullmatch(r"ci/runs/[0-9]{1,18}/(cancel|rerun)", tail)
+        ):
             from . import ci_operations
+
             return await ci_operations.mutate(api, owner, repo, path, tail)
         if tail == "branches" and method == "POST":
             fields(doc, {"name", "sha"}, {"name", "sha"})
@@ -116,14 +166,18 @@ async def route(api, target):
             await unprotected(api, owner, repo, value)
             source = await git.resolve(path, sha(doc, "sha"))
             before = await api.handler.server._branch_refs(owner, repo)
-            code, _ = await git.git(path, "update-ref", "refs/heads/" + value, source, "0" * len(source))
+            code, _ = await git.git(
+                path, "update-ref", "refs/heads/" + value, source, "0" * len(source)
+            )
             if code:
-                raise APIError(409, "branch_conflict", "Branch already exists or its creation was rejected.")
-            result = {"name": value, "commit": {"sha": source}}
-            return 201, await notify(api, owner, repo, before, result)
+                raise APIError(
+                    409, "branch_conflict", "Branch already exists or its creation was rejected."
+                )
+            branch_result: dict[str, object] = {"name": value, "commit": {"sha": source}}
+            return 201, await notify(api, owner, repo, before, branch_result)
         if tail.startswith("branches/") and method == "DELETE":
             fields(doc, {"expected_head"}, {"expected_head"})
-            value = await branch(path, unquote(tail[len("branches/"):]))
+            value = await branch(path, unquote(tail[len("branches/") :]))
             await unprotected(api, owner, repo, value)
             if value == await git.default_branch(path):
                 raise APIError(403, "protected_branch", "The default branch cannot be deleted.")
@@ -136,77 +190,145 @@ async def route(api, target):
                 raise APIError(409, "revision_conflict", "Branch changed or deletion was rejected.")
             return 200, {"deleted": True, "name": value}
         if tail.startswith("contents/") and method in ("PUT", "DELETE"):
-            return await change_file(api, owner, repo, path, unquote(tail[len("contents/"):]), doc, method)
+            return await change_file(
+                api, owner, repo, path, unquote(tail[len("contents/") :]), doc, method
+            )
         merge = re.fullmatch(r"pulls/([0-9]{1,18})/merge", tail)
         if merge and method == "PUT":
             return await merge_pull(api, owner, repo, path, int(merge[1]), doc)
-        entity = re.fullmatch(r"(issues|pulls)(?:/([0-9]{1,18})(?:/comments(?:/([0-9]{1,18}))?)?)?", tail)
+        entity = re.fullmatch(
+            r"(issues|pulls)(?:/([0-9]{1,18})(?:/comments(?:/([0-9]{1,18}))?)?)?", tail
+        )
         if entity:
             kind, identity, comment_id = entity.groups()
             if identity is None and method == "POST":
                 return await create_entity(api, owner, repo, path, kind, doc)
             if identity is not None:
                 identity = int(identity)
-                read = data.issues if kind == "issues" else data.pulls
-                parents = await asyncio.to_thread(read, owner, repo, "all", 1, 0, identity)
+                parents: list[Issue] | list[Pull]
+                if kind == "issues":
+                    parents = await asyncio.to_thread(
+                        data.issues, owner, repo, "all", 1, 0, identity
+                    )
+                else:
+                    parents = await asyncio.to_thread(
+                        data.pulls, owner, repo, "all", 1, 0, identity
+                    )
                 if not parents:
                     raise APIError(404, "not_found", "Resource not found.")
                 if tail.endswith("/comments") and method == "POST":
                     fields(doc, {"body"}, {"body"})
                     body = text(doc, "body")
                     if kind == "pulls" and parents[0]["state"] != "open":
-                        raise APIError(409, "state_conflict", "Comments require an open pull request.")
-                    add = database.db_issue_comment_add if kind == "issues" else database.db_pr_comment_add
+                        raise APIError(
+                            409, "state_conflict", "Comments require an open pull request."
+                        )
+                    add = (
+                        database.db_issue_comment_add
+                        if kind == "issues"
+                        else database.db_pr_comment_add
+                    )
                     comment = await asyncio.to_thread(add, identity, api.identity["user_id"], body)
-                    result = await asyncio.to_thread(data.comments, kind, owner, repo, identity, 1, 0, comment)
-                    return 201, result[0]
+                    comment_result = await asyncio.to_thread(
+                        data.comments, kind, owner, repo, identity, 1, 0, comment
+                    )
+                    return 201, comment_result[0]
                 if (comment_id and method in ("PATCH", "DELETE")) or (
-                        not comment_id and not tail.endswith("/comments") and method == "PATCH"):
+                    not comment_id and not tail.endswith("/comments") and method == "PATCH"
+                ):
                     if kind == "pulls" and doc.get("state") == "open":
-                        await branch_head(path, parents[0]["head"]["ref"])
-                        await branch_head(path, parents[0]["base"]["ref"])
-                    result = await asyncio.to_thread(
-                        text_mutations.edit, kind, owner, repo, identity, doc, api.identity,
-                        comment_id=int(comment_id) if comment_id else None, delete=method == "DELETE")
-                    if kind == "pulls" and not comment_id and parents[0]["state"] == "closed" and result["state"] == "open":
-                        await queue_pull(api, owner, repo, path, result, "pull_request_reopened")
-                    return 200, result
-        raise APIError(405, "method_not_allowed", "This mutation is not supported at this endpoint.")
+                        parent_pull = cast(Pull, parents[0])
+                        await branch_head(path, parent_pull["head"]["ref"])
+                        await branch_head(path, parent_pull["base"]["ref"])
+                    edit_result = await asyncio.to_thread(
+                        text_mutations.edit,
+                        kind,
+                        owner,
+                        repo,
+                        identity,
+                        doc,
+                        api.identity,
+                        comment_id=int(comment_id) if comment_id else None,
+                        delete=method == "DELETE",
+                    )
+                    if (
+                        kind == "pulls"
+                        and not comment_id
+                        and cast(Pull, parents[0])["state"] == "closed"
+                        and edit_result["state"] == "open"
+                    ):
+                        await queue_pull(
+                            api, owner, repo, path, edit_result, "pull_request_reopened"
+                        )
+                    return 200, edit_result
+        raise APIError(
+            405, "method_not_allowed", "This mutation is not supported at this endpoint."
+        )
 
 
-async def create_repository(api, owner, repo, doc):
+async def create_repository(
+    api: APIContext,
+    owner: str,
+    repo: str,
+    doc: Mapping[str, object],
+) -> DynamicJSONObject:
     root = Path(api.handler.server.context.config.git_project_root).absolute()
     directory = root / owner
     # Do not create repositories underneath an existing flat worktree or aliases.
-    if (directory.is_symlink() or directory.is_junction()
-            or api.app._is_git_dir(directory) or api.app._is_worktree_repo_dir(directory)):
-        raise APIError(409, "repository_conflict", "Owner namespace conflicts with an existing repository or alias.")
+    if (
+        directory.is_symlink()
+        or directory.is_junction()
+        or api.app._is_git_dir(directory)
+        or api.app._is_worktree_repo_dir(directory)
+    ):
+        raise APIError(
+            409,
+            "repository_conflict",
+            "Owner namespace conflicts with an existing repository or alias.",
+        )
     directory.mkdir(exist_ok=True)
     target = directory / (repo + ".git")
     if (directory / repo).exists() or (directory / repo).is_symlink():
         raise APIError(409, "repository_conflict", "Repository already exists.")
-    default = doc.get("default_branch", "main")
-    await branch(str(directory), default)
+    default = await branch(str(directory), doc.get("default_branch", "main"))
     try:
         target.mkdir()
     except FileExistsError:
         raise APIError(409, "repository_conflict", "Repository already exists.") from None
-    code, _ = await git.git(str(target), "init", "--bare", "--initial-branch=" + default, str(target))
+    code, _ = await git.git(
+        str(target), "init", "--bare", "--initial-branch=" + default, str(target)
+    )
     if code:
-        raise APIError(503, "repository_unavailable", "Repository initialization failed. Inspect the owner namespace.")
+        raise APIError(
+            503,
+            "repository_unavailable",
+            "Repository initialization failed. Inspect the owner namespace.",
+        )
     code, _ = await git.git(str(target), "config", "http.receivepack", "true")
     if code:
-        raise APIError(503, "repository_unavailable", "Repository exists but push configuration failed.")
+        raise APIError(
+            503, "repository_unavailable", "Repository exists but push configuration failed."
+        )
     return {**api.repo_object(owner, repo), "default_branch": default}
 
 
-async def create_entity(api, owner, repo, path, kind, doc):
+async def create_entity(
+    api: APIContext,
+    owner: str,
+    repo: str,
+    path: str,
+    kind: str,
+    doc: Mapping[str, object],
+) -> tuple[int, Mapping[str, object]]:
     required = {"title"} | ({"head", "base"} if kind == "pulls" else set())
     fields(doc, required | {"body"}, required)
     title = text(doc, "title", maximum=256)
     body = text(doc, "body", empty=True) if "body" in doc else ""
+    result: list[Issue] | list[Pull]
     if kind == "issues":
-        identity = await asyncio.to_thread(database.db_issue_create, owner, repo, title, body, api.identity["user_id"])
+        identity = await asyncio.to_thread(
+            database.db_issue_create, owner, repo, title, body, api.identity["user_id"]
+        )
         result = await asyncio.to_thread(data.issues, owner, repo, "all", 1, 0, identity)
     else:
         head, base = await branch(path, doc["head"]), await branch(path, doc["base"])
@@ -215,31 +337,65 @@ async def create_entity(api, owner, repo, path, kind, doc):
         await branch_head(path, head)
         await branch_head(path, base)
         identity = await asyncio.to_thread(
-            database.db_pr_create, owner, repo, title, body, head, base, api.identity["user_id"])
+            database.db_pr_create, owner, repo, title, body, head, base, api.identity["user_id"]
+        )
         result = await asyncio.to_thread(data.pulls, owner, repo, "all", 1, 0, identity)
         await queue_pull(api, owner, repo, path, result[0], "pull_request")
     return 201, result[0]
 
 
-async def queue_pull(api, owner, repo, path, result, event):
+async def queue_pull(
+    api: APIContext,
+    owner: str,
+    repo: str,
+    path: str,
+    result: Mapping[str, object],
+    event: str,
+) -> None:
     try:
-        head, base = result["head"]["ref"], result["base"]["ref"]
+        head = cast(BranchReference, result["head"])["ref"]
+        base = cast(BranchReference, result["base"])["ref"]
         source, target = await branch_head(path, head), await branch_head(path, base)
-        await api.handler.server.ci_manager.enqueue(owner, repo, event, base, target, {
-            "pr_number": result["id"], "base_branch": base, "head_branch": head,
-            "base_commit": target, "head_commit": source})
+        await api.handler.server.ci_manager.enqueue(
+            owner,
+            repo,
+            event,
+            base,
+            target,
+            {
+                "pr_number": result["id"],
+                "base_branch": base,
+                "head_branch": head,
+                "base_commit": target,
+                "head_commit": source,
+            },
+        )
     except Exception as exc:
         api.log_failure(exc)
-        result["warnings"] = ["Pull request changed, but CI scheduling failed. Inspect CI before proceeding."]
+        cast(MutableMapping[str, object], result)["warnings"] = [
+            "Pull request changed, but CI scheduling failed. Inspect CI before proceeding."
+        ]
 
 
-async def not_checked_out(path, value):
+async def not_checked_out(path: str, value: str) -> None:
     code, output = await git.git(path, "worktree", "list", "--porcelain")
     if code or ("branch refs/heads/" + value + "\n").encode() in output:
-        raise APIError(409, "checked_out_branch", "This branch is checked out on the server or its worktree state is unavailable.")
+        raise APIError(
+            409,
+            "checked_out_branch",
+            "This branch is checked out on the server or its worktree state is unavailable.",
+        )
 
 
-async def change_file(api, owner, repo, path, filename, doc, method):
+async def change_file(
+    api: APIContext,
+    owner: str,
+    repo: str,
+    path: str,
+    filename: str,
+    doc: Mapping[str, object],
+    method: str,
+) -> tuple[int, Mapping[str, object]]:
     required = {"branch", "expected_head", "message"} | ({"content"} if method == "PUT" else set())
     fields(doc, required, required)
     value = await branch(path, doc["branch"])
@@ -257,22 +413,44 @@ async def change_file(api, owner, repo, path, filename, doc, method):
         try:
             raw = base64.b64decode(encoded, validate=True)
             content = raw.decode("utf-8")
-        except (ValueError, binascii.Error, UnicodeError):
-            raise APIError(422, "validation_error", "Content must be base64-encoded UTF-8 text.") from None
+        except ValueError, binascii.Error, UnicodeError:
+            raise APIError(
+                422, "validation_error", "Content must be base64-encoded UTF-8 text."
+            ) from None
         if len(raw) > webide.MAX_FILE or "\0" in content:
             raise APIError(422, "unsupported_file", "Only UTF-8 text up to 1 MiB is supported.")
     old = await asyncio.to_thread(webide.entry, path, expected, filename)
     before = await api.handler.server._branch_refs(owner, repo)
     try:
         commit = await asyncio.to_thread(
-            webide.commit_changes, path, value, expected, {filename: content}, message, api.identity["username"])
+            webide.commit_changes,
+            path,
+            value,
+            expected,
+            {filename: content},
+            message,
+            api.identity["username"],
+        )
     except webide.IDEError:
-        raise APIError(409, "git_rejected", "File change was rejected. Check the branch, file type, changes and receive hooks.") from None
+        raise APIError(
+            409,
+            "git_rejected",
+            "File change was rejected. Check the branch, file type, changes and receive hooks.",
+        ) from None
     result = {"commit": {"sha": commit}, "path": filename, "deleted": method == "DELETE"}
-    return (201 if method == "PUT" and old is None else 200), await notify(api, owner, repo, before, result)
+    return (201 if method == "PUT" and old is None else 200), await notify(
+        api, owner, repo, before, result
+    )
 
 
-async def merge_pull(api, owner, repo, path, identity, doc):
+async def merge_pull(
+    api: APIContext,
+    owner: str,
+    repo: str,
+    path: str,
+    identity: int,
+    doc: Mapping[str, object],
+) -> tuple[int, Mapping[str, object]]:
     fields(doc, {"sha", "expected_base_sha"}, {"sha", "expected_base_sha"})
     expected_source, expected_target = sha(doc, "sha"), sha(doc, "expected_base_sha")
     rows = await asyncio.to_thread(data.pulls, owner, repo, "all", 1, 0, identity)
@@ -284,26 +462,49 @@ async def merge_pull(api, owner, repo, path, identity, doc):
     head, base = pull["head"]["ref"], pull["base"]["ref"]
     source, target = await branch_head(path, head), await branch_head(path, base)
     if (source, target) != (expected_source, expected_target):
-        raise APIError(409, "revision_conflict", "Pull request branches changed. Refresh both SHAs.")
+        raise APIError(
+            409, "revision_conflict", "Pull request branches changed. Refresh both SHAs."
+        )
     await not_checked_out(path, base)
     manager = api.handler.server.ci_manager
     policy = await manager.config(owner, repo)
     if policy["require_ci"]:
         check = await manager.merge_check(owner, repo, identity, target, source, base)
         if not check or check[1] != "success":
-            raise APIError(409, "ci_required", "Successful CI is required for the current source and target commits.")
+            raise APIError(
+                409,
+                "ci_required",
+                "Successful CI is required for the current source and target commits.",
+            )
     before = await api.handler.server._branch_refs(owner, repo)
     # Shared with the web UI: ff-only ancestry and both refs are checked in one
     # Git transaction, so external pushes cannot invalidate a successful CI gate.
-    ok, _message, merged_sha = await api.app._git_ff_merge(path, base, head, expected=(target, source))
+    ok, _message, merged_sha = await api.app._git_ff_merge(
+        path, base, head, expected=(target, source)
+    )
     if not ok or not merged_sha:
-        raise APIError(409, "merge_conflict", "Only fast-forward merges are supported; branches may also have changed or the reference transaction was rejected.")
+        raise APIError(
+            409,
+            "merge_conflict",
+            "Only fast-forward merges are supported; branches may also have changed or the reference transaction was rejected.",
+        )
     await asyncio.to_thread(database.db_pr_mark_merged, identity, "ff-only", source)
     result = {"merged": True, "sha": source, "merge_method": "ff-only"}
     await notify(api, owner, repo, before, result)
     try:
-        await manager.enqueue(owner, repo, "pull_request_merged", base, source, {
-            "pr_number": identity, "base_branch": base, "head_branch": head, "base_commit": source})
+        await manager.enqueue(
+            owner,
+            repo,
+            "pull_request_merged",
+            base,
+            source,
+            {
+                "pr_number": identity,
+                "base_branch": base,
+                "head_branch": head,
+                "base_commit": source,
+            },
+        )
     except Exception as exc:
         api.log_failure(exc)
         result["warnings"] = ["Merge succeeded, but merged-event CI scheduling failed."]

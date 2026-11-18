@@ -1,0 +1,43 @@
+minimum_pre_commit_version: "4.0.0"
+default_language_version:
+  python: python3.14
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        entry: python -m mypy
+        language: python
+        additional_dependencies: [mypy==2.4.1]
+        types: [python]
+        pass_filenames: false
+        # Check the entire application even for configuration-only commits.
+        always_run: true
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-ast
+      - id: check-json
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+        exclude: ^static/(vendor|assets/prismjs)/
+      - id: end-of-file-fixer
+        exclude: ^static/(vendor|assets/prismjs)/
+      - id: mixed-line-ending
+        args: [--fix=lf]
+        exclude: ^static/(vendor|assets/prismjs)/
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: detect-private-key

@@ -1,19 +1,30 @@
 """Page-managed CI defaults, repository overrides and legacy compatibility."""
 
 import copy
-import json
 import re
+import sqlite3
+from collections.abc import Mapping
+from typing import Any
 
-RETENTION = {"artifact_retention_days": 36500, "artifact_retention_count": 1000000,
-             "run_retention_count": 1000000}
+from .database_types import JSONObject, RetentionConfig, decode_json_object
+from .runner_types import JsonObject
+
+RETENTION = {
+    "artifact_retention_days": 36500,
+    "artifact_retention_count": 1000000,
+    "run_retention_count": 1000000,
+}
 EXECUTION = {"runner", "image", "timeout_seconds", "cancel_superseded"}
 
 
-def validate(values):
+def validate(values: object) -> JsonObject:
     from .ci import validate_config
-    if not isinstance(values, dict) or set(values) - (set(RETENTION) | EXECUTION | {"env", "pipeline_env"}):
+
+    if not isinstance(values, dict) or set(values) - (
+        set(RETENTION) | EXECUTION | {"env", "pipeline_env"}
+    ):
         raise ValueError("Invalid CI preferences.")
-    result = copy.deepcopy(values)
+    result: JsonObject = copy.deepcopy(values)
     for key, value in result.items():
         if value is None:
             continue
@@ -21,7 +32,9 @@ def validate(values):
             if not isinstance(value, dict) or len(value) > 16:
                 raise ValueError("Invalid pipeline environment variables.")
             for name, env in value.items():
-                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+                if not isinstance(name, str) or not re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name
+                ):
                     raise ValueError("Invalid pipeline name in variables.")
                 validate_config({"env": env})
         else:
@@ -29,32 +42,51 @@ def validate(values):
     return result
 
 
-def read(conn, owner=None, repo=None):
-    global_row = conn.execute("SELECT value FROM server_settings WHERE key='ci_defaults'").fetchone()
-    global_values = json.loads(global_row[0]) if global_row else {}
-    row = conn.execute("SELECT settings_json FROM repository_ci_settings WHERE owner=? AND repo=?", (owner, repo)).fetchone() if owner is not None else None
-    return global_values, json.loads(row[0]) if row else {}
+def read(
+    conn: sqlite3.Connection, owner: str | None = None, repo: str | None = None
+) -> tuple[JSONObject, JSONObject]:
+    global_row = conn.execute(
+        "SELECT value FROM server_settings WHERE key='ci_defaults'"
+    ).fetchone()
+    global_values: JSONObject = decode_json_object(global_row[0]) if global_row else {}
+    row = (
+        conn.execute(
+            "SELECT settings_json FROM repository_ci_settings WHERE owner=? AND repo=?",
+            (owner, repo),
+        ).fetchone()
+        if owner is not None
+        else None
+    )
+    repository_values: JSONObject = decode_json_object(row[0]) if row else {}
+    return global_values, repository_values
 
 
-def legacy_retention(config):
+def legacy_retention(config: Mapping[str, Any]) -> JsonObject:
     document = config.get("document")
     if document is None:
         return {key: config[key] for key in RETENTION if key in config}
     settings = document.get("settings", {})
     result = {key: settings[key] for key in RETENTION if key in settings}
-    retention = document.get("retention", {})
-    for key, section, name in (("artifact_retention_days", "artifacts", "days"),
-                               ("artifact_retention_count", "artifacts", "max_count"),
-                               ("run_retention_count", "runs", "max_count")):
-        if name in retention.get(section, {}):
-            result[key] = retention[section][name]
+    retention_document = document.get("retention", {})
+    for key, section, name in (
+        ("artifact_retention_days", "artifacts", "days"),
+        ("artifact_retention_count", "artifacts", "max_count"),
+        ("run_retention_count", "runs", "max_count"),
+    ):
+        if name in retention_document.get(section, {}):
+            result[key] = retention_document[section][name]
     return result
 
 
-def retention(global_values, repository_values, legacy):
+def retention(
+    global_values: Mapping[str, Any],
+    repository_values: Mapping[str, Any],
+    legacy: Mapping[str, Any],
+) -> RetentionConfig:
     from .ci import default_config
+
     defaults = default_config()
-    result = {}
+    result: dict[str, Any] = {}
     for key in RETENTION:
         inherited = global_values.get(key)
         if inherited is None:
@@ -62,13 +94,22 @@ def retention(global_values, repository_values, legacy):
         result[key] = legacy.get(key, inherited)
         if key in repository_values:
             result[key] = inherited if repository_values[key] is None else repository_values[key]
-    return result
+    return RetentionConfig(
+        artifact_retention_days=result["artifact_retention_days"],
+        artifact_retention_count=result["artifact_retention_count"],
+        run_retention_count=result["run_retention_count"],
+    )
 
 
-def environment(global_values, repository_values, legacy, pipeline):
+def environment(
+    global_values: Mapping[str, Any],
+    repository_values: Mapping[str, Any],
+    legacy: Mapping[str, Any],
+    pipeline: str,
+) -> dict[str, str]:
     # A saved variables form owns the repository's variables, including an empty
     # form used to remove old JSON values. Otherwise retain legacy definitions.
-    result = dict(global_values.get("env") or {})
+    result: dict[str, str] = dict(global_values.get("env") or {})
     if "env" not in repository_values and "pipeline_env" not in repository_values:
         result.update(legacy)
     result.update(repository_values.get("env") or {})
@@ -76,23 +117,33 @@ def environment(global_values, repository_values, legacy, pipeline):
     return result
 
 
-def explicit_execution(document, identity, key):
+def explicit_execution(document: Mapping[str, Any], identity: str, key: str) -> bool:
     public_key = "superseded" if key == "cancel_superseded" else key
     section = "cancellation" if key == "cancel_superseded" else "execution"
     if "file" in document:
         return False
     pipelines = document.get("pipelines", [])
     if isinstance(pipelines, list):
-        item = next((item for item in pipelines if item.get("name") == identity), {})
+        item: JsonObject = next((item for item in pipelines if item.get("name") == identity), {})
         return public_key in item.get(section, {})
     item = pipelines.get(identity, {})
     defaults = document.get("defaults", {})
-    return key in item or key in defaults or public_key in item.get(section, {}) or public_key in defaults.get(section, {})
+    return (
+        key in item
+        or key in defaults
+        or public_key in item.get(section, {})
+        or public_key in defaults.get(section, {})
+    )
 
 
-def apply(config, global_values, repository_values):
+def apply(
+    config: JsonObject,
+    global_values: Mapping[str, Any],
+    repository_values: Mapping[str, Any],
+) -> JsonObject:
     from .ci import default_config
-    builtins = {**default_config(), "runner": "docker"}
+
+    builtins: JsonObject = {**default_config(), "runner": "docker"}
     document = config.get("document")
     for item in [config, *config.get("pipelines", [])]:
         identity = item.get("pipeline_id", "default")
@@ -105,7 +156,7 @@ def apply(config, global_values, repository_values):
     return config
 
 
-def editor_document(document):
+def editor_document(document: JsonObject) -> JsonObject:
     """Hide page-managed settings without mutating the persisted source."""
     document = copy.deepcopy(document)
     document.pop("retention", None)

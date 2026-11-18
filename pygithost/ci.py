@@ -4,26 +4,33 @@ import asyncio
 import contextlib
 import fnmatch
 import hashlib
+import io
 import json
 import logging
 import os
 import re
-import signal
-import shutil
 import shlex
-import stat
+import shutil
+import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import time
-import io
 import zipfile
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import IO, Any, ParamSpec, TextIO, TypeVar
 
 from . import database
 from .ci_email import load_settings, send_notification, validate_recipients
+from .database_types import CIRunStatusRow
+from .runner_types import JsonObject, RunIdentity, RunRow, StepState
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
 
 MAX_OUTPUT = 1024 * 1024
 JOB_TIMEOUT = 30 * 60
@@ -46,19 +53,23 @@ BUILTINS = {
 }
 
 
-def _thread_call(func, *args, **kwargs):
-    """Return a non-None result so executor completion is reliable on all runtimes."""
-    return (func(*args, **kwargs),)
+async def _db_call(func: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    """Run a blocking database helper with its exact signature preserved."""
 
+    def invoke() -> tuple[_T]:
+        return (func(*args, **kwargs),)
 
-async def _db_call(func, *args, **kwargs):
-    (result,) = await asyncio.to_thread(_thread_call, func, *args, **kwargs)
+    (result,) = await asyncio.to_thread(invoke)
     return result
 
 
-def deployment_prefix(value):
+def deployment_prefix(value: object) -> list[str]:
     """Parse an administrator-controlled runner without using a command shell."""
-    if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in ("\0", "\n", "\r")):
+    if (
+        not isinstance(value, str)
+        or len(value) > 4096
+        or any(c in value for c in ("\0", "\n", "\r"))
+    ):
         raise ValueError("Run with must be a single command line up to 4096 characters.")
     if value.strip() in ("", "direct"):
         return []
@@ -74,7 +85,7 @@ def deployment_prefix(value):
     return parts
 
 
-def default_config():
+def default_config() -> JsonObject:
     return {
         "pipeline_id": "default",
         "deployment_name": "",
@@ -117,21 +128,24 @@ def default_config():
         "artifacts": {"paths": [], "when": "always"},
         "artifact_retention_days": 7,
         "artifact_retention_count": 0,
-        "run_retention_count": max(0, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100")))),
+        "run_retention_count": max(
+            0, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100")))
+        ),
     }
 
 
-def unconfigured_repository_config():
+def unconfigured_repository_config() -> JsonObject:
     """Safe discovery preset; never overrides a saved repository configuration."""
     from .ci_config import compile_document
-    config = compile_document({"version": 1, "file": "ci/config.json"})
+
+    config: JsonObject = compile_document({"version": 1, "file": "ci/config.json"})
     # Ephemeral server-only marker. Saving settings makes the reference explicit,
     # so missing files then produce configuration failures rather than idle CI.
     config["_autodetect_repository_config"] = True
     return config
 
 
-def validate_config(raw, *, nested=False):
+def validate_config(raw: object, *, nested: bool = False) -> JsonObject:
     if not isinstance(raw, dict):
         raise ValueError("CI configuration must be a mapping.")
     command = raw.get("command", "")
@@ -150,12 +164,18 @@ def validate_config(raw, *, nested=False):
         if not isinstance(value, str) or "\0" in value or len(value) > 8192:
             raise ValueError(f"Invalid value for {key}.")
     defaults = default_config()
-    for key, maximum in (("artifact_retention_days", 36500), ("artifact_retention_count", 1000000), ("run_retention_count", 1000000)):
+    for key, maximum in (
+        ("artifact_retention_days", 36500),
+        ("artifact_retention_count", 1000000),
+        ("run_retention_count", 1000000),
+    ):
         value = raw.get(key, defaults[key])
         if isinstance(value, str) and value.isascii() and value.isdecimal():
             value = int(value)
         if type(value) is not int or not 0 <= value <= maximum:
-            raise ValueError(f"{key} must be a whole number from 0 to {maximum}; 0 means unlimited.")
+            raise ValueError(
+                f"{key} must be a whole number from 0 to {maximum}; 0 means unlimited."
+            )
         defaults[key] = value
     if type(raw.get("deploy_enabled", False)) is not bool:
         raise ValueError("Deployment enabled must be true or false.")
@@ -168,13 +188,29 @@ def validate_config(raw, *, nested=False):
     if content:
         content = content.replace("\r\n", "\n")
         if os.name != "nt" and not deployment_prefix(interpreter) and not content.startswith("#!"):
-            raise ValueError("Uploaded deployment scripts require a shebang, for example #!/bin/sh.")
+            raise ValueError(
+                "Uploaded deployment scripts require a shebang, for example #!/bin/sh."
+            )
         # Pipeline-form validation must carry unsaved contents through to save_config.
         defaults["deploy_script_content"] = content
     branch = raw.get("deploy_branch", "main")
-    if not isinstance(script, str) or "\0" in script or len(script) > 4096 or (script and not os.path.isabs(script)):
+    if (
+        not isinstance(script, str)
+        or "\0" in script
+        or len(script) > 4096
+        or (script and not os.path.isabs(script))
+    ):
         raise ValueError("Deployment script must be an absolute path outside the repository.")
-    if not isinstance(branch, str) or not branch or len(branch) > 255 or re.search(r"[\s~^:?*\[\\\x00-\x1f]", branch) or ".." in branch or "@{" in branch or branch.startswith(("-", "/")) or branch.endswith(("/", ".", ".lock")):
+    if (
+        not isinstance(branch, str)
+        or not branch
+        or len(branch) > 255
+        or re.search(r"[\s~^:?*\[\\\x00-\x1f]", branch)
+        or ".." in branch
+        or "@{" in branch
+        or branch.startswith(("-", "/"))
+        or branch.endswith(("/", ".", ".lock"))
+    ):
         raise ValueError("Enter a single valid deployment branch name.")
     deploy_timeout = raw.get("deploy_timeout", 600)
     if isinstance(deploy_timeout, str) and deploy_timeout.isascii() and deploy_timeout.isdecimal():
@@ -185,13 +221,25 @@ def validate_config(raw, *, nested=False):
     if not isinstance(deploy_steps, list) or len(deploy_steps) > 64:
         raise ValueError("Deployment steps must be an array of at most 64 steps.")
     for step in deploy_steps:
-        if not isinstance(step, dict) or set(step) - {"name", "run"} or any(not isinstance(step.get(key), str) or not step[key].strip() or "\0" in step[key] for key in ("name", "run")):
+        if (
+            not isinstance(step, dict)
+            or set(step) - {"name", "run"}
+            or any(
+                not isinstance(step.get(key), str) or not step[key].strip() or "\0" in step[key]
+                for key in ("name", "run")
+            )
+        ):
             raise ValueError("Each deployment step requires a name and run command.")
     defaults["deploy_steps"] = deploy_steps
     if raw.get("deploy_enabled", False) and not script and not content and not deploy_steps:
         raise ValueError("Automatic deployment requires a script path or new script contents.")
-    defaults.update(deploy_enabled=raw.get("deploy_enabled", False), deploy_branch=branch,
-                    deploy_script=script, deploy_timeout=deploy_timeout, deploy_interpreter=interpreter)
+    defaults.update(
+        deploy_enabled=raw.get("deploy_enabled", False),
+        deploy_branch=branch,
+        deploy_script=script,
+        deploy_timeout=deploy_timeout,
+        deploy_interpreter=interpreter,
+    )
     timeout = raw.get("timeout_seconds", JOB_TIMEOUT)
     if isinstance(timeout, str) and timeout.isascii() and timeout.isdecimal():
         timeout = int(timeout)
@@ -203,16 +251,24 @@ def validate_config(raw, *, nested=False):
     if runner not in ("host", "docker", "remote-docker"):
         raise ValueError("Runner must be host, docker or remote-docker.")
     from .docker_profile import profile
+
     defaults["docker"] = profile(raw.get("docker"))
     from .ci_limits import DEFAULT_SOURCE_LIMIT_MB, source_limit_mb
-    defaults["source_limit_mb"] = source_limit_mb(raw.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB))
+
+    defaults["source_limit_mb"] = source_limit_mb(
+        raw.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB)
+    )
     from .ci_limits import execution_limits
+
     defaults["limits"] = execution_limits(raw.get("limits"))
     from .image_build import configuration as build_configuration
+
     defaults["image_build"] = build_configuration(raw.get("image_build"))
     if defaults["image_build"] and runner == "host":
         raise ValueError("Image builds require a remote Docker worker.")
-    if not isinstance(image, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@-]{0,255}", image):
+    if not isinstance(image, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_./:@-]{0,255}", image
+    ):
         raise ValueError("Enter a valid Docker image name.")
     if defaults["image_build"] and "@" in image:
         raise ValueError("A build fallback requires an image tag, not an immutable image digest.")
@@ -221,7 +277,9 @@ def validate_config(raw, *, nested=False):
     recipients = validate_recipients(raw.get("email_recipients", ""))
     if mode != "off" and not recipients:
         raise ValueError("Email notifications require at least one recipient.")
-    if runner in ("docker", "remote-docker") and any("\n" in value or "\r" in value for value in env.values()):
+    if runner in ("docker", "remote-docker") and any(
+        "\n" in value or "\r" in value for value in env.values()
+    ):
         raise ValueError("Docker environment values cannot contain newlines.")
     events = raw.get("events", {})
     if not isinstance(events, dict):
@@ -239,7 +297,9 @@ def validate_config(raw, *, nested=False):
         events={k: k == "manual" or bool(events.get(k, False)) for k in defaults["events"]},
         push_branches=raw.get("push_branches", ""),
         pr_branches=raw.get("pr_branches", ""),
-        runner=runner, image=image, email_mode=mode,
+        runner=runner,
+        image=image,
+        email_mode=mode,
         email_recipients="\n".join(recipients),
         cancel_superseded=bool(raw.get("cancel_superseded", False)),
     )
@@ -261,7 +321,12 @@ def validate_config(raw, *, nested=False):
             raise ValueError("Each step requires only name and run fields.")
         if not isinstance(step["name"], str) or not 1 <= len(step["name"].strip()) <= 120:
             raise ValueError("Step names must contain 1–120 characters.")
-        if not isinstance(step["run"], str) or not step["run"].strip() or len(step["run"]) > 8192 or "\0" in step["run"]:
+        if (
+            not isinstance(step["run"], str)
+            or not step["run"].strip()
+            or len(step["run"]) > 8192
+            or "\0" in step["run"]
+        ):
             raise ValueError("Step commands must contain 1–8192 characters.")
     if steps and command:
         raise ValueError("Use either command or steps, not both.")
@@ -277,26 +342,44 @@ def validate_config(raw, *, nested=False):
     if not isinstance(paths, list) or len(paths) > 32:
         raise ValueError("Artifact paths must be a list of at most 32 patterns.")
     for path in paths:
-        if not isinstance(path, str) or not path or len(path) > 256 or "\\" in path or "\0" in path or ":" in path or path.startswith("/") or any(part in ("..", ".git") for part in path.split("/")):
+        if (
+            not isinstance(path, str)
+            or not path
+            or len(path) > 256
+            or "\\" in path
+            or "\0" in path
+            or ":" in path
+            or path.startswith("/")
+            or any(part in ("..", ".git") for part in path.split("/"))
+        ):
             raise ValueError("Artifact patterns must stay inside the checkout and exclude .git.")
     when = artifacts.get("when", "always")
     if when not in ("always", "success", "failure"):
         raise ValueError("Artifact when must be always, success, or failure.")
     defaults["artifacts"] = {"paths": paths, "when": when}
     identity = raw.get("pipeline_id", "default")
-    if not isinstance(identity, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", identity):
+    if not isinstance(identity, str) or not re.fullmatch(
+        r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", identity
+    ):
         raise ValueError("Pipeline IDs must contain 1–64 letters, digits, underscores or hyphens.")
     defaults["pipeline_id"] = identity
     deployment_name = raw.get("deployment_name", "")
-    if not isinstance(deployment_name, str) or (deployment_name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", deployment_name)):
+    if not isinstance(deployment_name, str) or (
+        deployment_name and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", deployment_name)
+    ):
         raise ValueError("Invalid deployment name.")
     defaults["deployment_name"] = deployment_name
     filename = raw.get("repository_file", ".pygithost-ci.json")
-    if (not isinstance(filename, str) or len(filename) > 256
-            or not re.fullmatch(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]{1,128}\.json", filename)
-            or any(part in (".", "..", ".git") for part in filename.split("/"))
-            or ".." in filename):
-        raise ValueError("Repository pipeline file must be a checkout-relative JSON path without traversal or .git components.")
+    if (
+        not isinstance(filename, str)
+        or len(filename) > 256
+        or not re.fullmatch(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]{1,128}\.json", filename)
+        or any(part in (".", "..", ".git") for part in filename.split("/"))
+        or ".." in filename
+    ):
+        raise ValueError(
+            "Repository pipeline file must be a checkout-relative JSON path without traversal or .git components."
+        )
     defaults["repository_file"] = filename
     pipelines = raw.get("pipelines", [])
     if not isinstance(pipelines, list) or len(pipelines) > 15 or (nested and pipelines):
@@ -306,7 +389,9 @@ def validate_config(raw, *, nested=False):
     for item in pipelines:
         if not isinstance(item, dict) or "pipeline_id" not in item:
             raise ValueError("Each additional pipeline requires a pipeline_id.")
-        if set(item) - (set(default_config()) | {"pipeline_id", "pipeline_mode", "deploy_script_content"}):
+        if set(item) - (
+            set(default_config()) | {"pipeline_id", "pipeline_mode", "deploy_script_content"}
+        ):
             raise ValueError("Unknown additional pipeline field.")
         if any(item.get(key) for key in ("require_ci", "block_direct_pushes")):
             raise ValueError("Merge and branch protections belong to repository settings.")
@@ -316,27 +401,59 @@ def validate_config(raw, *, nested=False):
         seen.add(child["pipeline_id"])
         defaults["pipelines"].append(child)
     targets = raw.get("deployment_targets", [])
-    target_fields = {"deployment_name", "deploy_enabled", "deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter", "deploy_steps", "email_mode", "email_recipients"}
+    target_fields = {
+        "deployment_name",
+        "deploy_enabled",
+        "deploy_branch",
+        "deploy_script",
+        "deploy_script_content",
+        "deploy_timeout",
+        "deploy_interpreter",
+        "deploy_steps",
+        "email_mode",
+        "email_recipients",
+    }
     if not isinstance(targets, list) or len(targets) > 32:
         raise ValueError("Use at most 32 deployment targets.")
     seen_targets = set()
     for target in targets:
-        if not isinstance(target, dict) or set(target) - target_fields or not isinstance(target.get("deployment_name"), str) or not target["deployment_name"]:
+        if (
+            not isinstance(target, dict)
+            or set(target) - target_fields
+            or not isinstance(target.get("deployment_name"), str)
+            or not target["deployment_name"]
+        ):
             raise ValueError("Deployment targets require a name and deployment fields only.")
         if target["deployment_name"] in seen_targets:
             raise ValueError("Deployment names must be unique.")
         seen_targets.add(target["deployment_name"])
         checked = validate_config({**defaults, **target, "pipelines": [], "deployment_targets": []})
-        defaults["deployment_targets"].append({key: checked[key] for key in target_fields if key in checked})
+        defaults["deployment_targets"].append(
+            {key: checked[key] for key in target_fields if key in checked}
+        )
     return defaults
 
 
-def pipeline_config(raw, config, *, enforce_timeout=True):
+def pipeline_config(
+    raw: object, config: Mapping[str, Any], *, enforce_timeout: bool = True
+) -> JsonObject:
     """Validate the shared pipeline format without accepting server policy fields."""
     allowed = {"version", "command", "steps", "env", "artifacts", "timeout_seconds"}
-    if not isinstance(raw, dict) or set(raw) - allowed or type(raw.get("version", 1)) is not int or raw.get("version", 1) != 1:
-        raise ValueError("Pipeline version must be 1; only command, steps, env, artifacts and timeout_seconds are allowed.")
-    merged = {**config, "command": "", "steps": [], **{key: value for key, value in raw.items() if key != "version"}}
+    if (
+        not isinstance(raw, dict)
+        or set(raw) - allowed
+        or type(raw.get("version", 1)) is not int
+        or raw.get("version", 1) != 1
+    ):
+        raise ValueError(
+            "Pipeline version must be 1; only command, steps, env, artifacts and timeout_seconds are allowed."
+        )
+    merged: JsonObject = {
+        **config,
+        "command": "",
+        "steps": [],
+        **{key: value for key, value in raw.items() if key != "version"},
+    }
     merged = validate_config(merged)
     if enforce_timeout and merged["timeout_seconds"] > config["timeout_seconds"]:
         raise ValueError("Repository timeout exceeds the server-configured limit.")
@@ -345,11 +462,11 @@ def pipeline_config(raw, config, *, enforce_timeout=True):
     return merged
 
 
-def render_command(command, env):
+def render_command(command: str, env: Mapping[str, str]) -> str:
     """Single-pass {{ env.NAME }} substitution, without expression evaluation."""
     reference = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
-    def replace(match):
+    def replace(match: re.Match[str]) -> str:
         name = match.group(1)
         if name not in env:
             raise ValueError(f"Undefined CI environment variable: {name}")
@@ -359,33 +476,43 @@ def render_command(command, env):
     # template-like text are always treated literally and never expanded again.
     for expression in re.finditer(r"\{\{\s*env\b.*?\}\}", command, re.DOTALL):
         if not reference.fullmatch(expression.group()):
-            raise ValueError("CI templates support only {{ env.NAME }} references; expressions and filters are not supported.")
+            raise ValueError(
+                "CI templates support only {{ env.NAME }} references; expressions and filters are not supported."
+            )
     if re.search(r"\{\{\s*env\b", reference.sub("", command)):
         raise ValueError("Invalid CI environment placeholder; use {{ env.NAME }}.")
     return reference.sub(replace, command)
 
 
-def protected_branch(config, branch):
+def protected_branch(config: Mapping[str, Any], branch: str) -> bool:
     return config.get("block_direct_pushes", False) and any(
         fnmatch.fnmatchcase(branch, pattern.strip())
-        for pattern in config.get("protected_branches", "main").splitlines() if pattern.strip()
+        for pattern in config.get("protected_branches", "main").splitlines()
+        if pattern.strip()
     )
 
 
-def collect_artifacts(worktree, patterns, limits=None):
+def collect_artifacts(
+    worktree: str, patterns: Sequence[str], limits: Mapping[str, Any] | None = None
+) -> bytes | None:
     """Collect regular, non-symlink files only; never follow paths outside checkout."""
-    from .ci_limits import execution_limits, MIB
+    from .ci_limits import MIB, execution_limits
+
     limits = execution_limits(limits)
     maximum = limits["artifact_uncompressed_mb"] * MIB
     root = Path(worktree)
-    files, total, visited = {}, 0, 0
+    files: dict[str, Path] = {}
+    total = 0
+    visited = 0
     for pattern in patterns:
         for path in root.glob(pattern):
             visited += 1
             if visited > max(10000, limits["artifact_files"] * 10):
                 raise ValueError("Artifact patterns match too many entries.")
             relative = path.relative_to(root)
-            if ".git" in relative.parts or any(part.is_symlink() or part.is_junction() for part in (path, *path.parents)):
+            if ".git" in relative.parts or any(
+                part.is_symlink() or part.is_junction() for part in (path, *path.parents)
+            ):
                 continue
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -400,18 +527,26 @@ def collect_artifacts(worktree, patterns, limits=None):
             if os.name == "posix":
                 # Walk with directory descriptors so replacing a parent with a
                 # symlink cannot redirect collection outside the checkout.
-                directory = os.open(root.absolute().anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                directory = os.open(
+                    root.absolute().anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
                 try:
                     for part in root.absolute().parts[1:]:
-                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                        child = os.open(
+                            part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
+                        )
                         os.close(directory)
                         directory = child
                     parts = Path(name).parts
                     for part in parts[:-1]:
-                        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                        child = os.open(
+                            part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory
+                        )
                         os.close(directory)
                         directory = child
-                    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                    fd = os.open(
+                        parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+                    )
                 finally:
                     os.close(directory)
             else:
@@ -425,26 +560,38 @@ def collect_artifacts(worktree, patterns, limits=None):
                 data = stream.read(min(maximum - total + 1, info.st_size + 1))
             total += len(data)
             if total > maximum:
-                raise ValueError(f"Artifacts exceed the {limits['artifact_uncompressed_mb']} MiB limit.")
+                raise ValueError(
+                    f"Artifacts exceed the {limits['artifact_uncompressed_mb']} MiB limit."
+                )
             archive.writestr(name.replace(os.sep, "/"), data)
     if buffer.tell() > limits["artifact_mb"] * MIB:
         raise ValueError(f"Artifact ZIP exceeds the {limits['artifact_mb']} MiB limit.")
     return buffer.getvalue() if files else None
 
 
-def runner_environment(home):
+def runner_environment(home: str) -> dict[str, str]:
     """Do not pass server credentials, Python hooks, or Git overrides to jobs."""
     allowed = ("PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL")
     env = {key: os.environ[key] for key in allowed if key in os.environ}
-    env.update(HOME=home, USERPROFILE=home, TMPDIR=home, TMP=home, TEMP=home,
-               GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-               GIT_TERMINAL_PROMPT="0", GIT_AUTHOR_NAME="CI", GIT_AUTHOR_EMAIL="ci@localhost",
-               GIT_COMMITTER_NAME="CI", GIT_COMMITTER_EMAIL="ci@localhost")
+    env.update(
+        HOME=home,
+        USERPROFILE=home,
+        TMPDIR=home,
+        TMP=home,
+        TEMP=home,
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_TERMINAL_PROMPT="0",
+        GIT_AUTHOR_NAME="CI",
+        GIT_AUTHOR_EMAIL="ci@localhost",
+        GIT_COMMITTER_NAME="CI",
+        GIT_COMMITTER_EMAIL="ci@localhost",
+    )
     return env
 
 
 @contextlib.contextmanager
-def deployment_workspace():
+def deployment_workspace() -> Iterator[str]:
     """Create the deployment home, removing Git's read-only objects reliably."""
     path = tempfile.mkdtemp(prefix="pygithost-deploy-")
     try:
@@ -454,33 +601,66 @@ def deployment_workspace():
             remove_checkout(path)
         except OSError as exc:
             logging.getLogger(__name__).warning(
-                "Cannot remove deployment directory %s (%s)", path, type(exc).__name__)
+                "Cannot remove deployment directory %s (%s)", path, type(exc).__name__
+            )
 
 
-def docker_command(name, worktree, env_file, config):
-    from .docker_profile import authorize
+def docker_command(name: str, worktree: str, env_file: str, config: Mapping[str, Any]) -> list[str]:
     from .ci_limits import execution_limits
-    options, secrets = authorize(config.get("docker"), config.get("_worker_policy"),
-                                 timeout=config["timeout_seconds"] if "_worker_policy" in config else JOB_TIMEOUT,
-                                 repository=config.get("_repository", ""), event=config.get("_event", ""),
-                                 image_pull_timeout=(execution_limits(config.get("limits"))["image_pull_timeout_seconds"]
-                                                     if "_worker_policy" in config else 600))
-    command = ["docker", "run", "--name", name, "--init", "--network=" + options["network"],
-               "--pull=never", "--log-driver=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-               "--memory=" + (f"{options['memory_mb'] // 1024}g" if options["memory_mb"] % 1024 == 0 else f"{options['memory_mb']}m"),
-               f"--cpus={options['cpus']}",
-               f"--pids-limit={options['pids_limit']}", "--tmpfs",
-               f"/tmp:rw,nosuid,nodev,size={options['tmpfs_mb']}m",
-               "--mount", f"type=bind,src={worktree},dst={options['checkout_path']}" +
-               (",readonly" if options["checkout_read_only"] else ""),
-               "--workdir", options["workdir"],
-               "--env-file", env_file, "--entrypoint", "/bin/sh"]
+    from .docker_profile import authorize
+
+    options, secrets = authorize(
+        config.get("docker"),
+        config.get("_worker_policy"),
+        timeout=config["timeout_seconds"] if "_worker_policy" in config else JOB_TIMEOUT,
+        repository=config.get("_repository", ""),
+        event=config.get("_event", ""),
+        image_pull_timeout=(
+            execution_limits(config.get("limits"))["image_pull_timeout_seconds"]
+            if "_worker_policy" in config
+            else 600
+        ),
+    )
+    command = [
+        "docker",
+        "run",
+        "--name",
+        name,
+        "--init",
+        "--network=" + options["network"],
+        "--pull=never",
+        "--log-driver=none",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--memory="
+        + (
+            f"{options['memory_mb'] // 1024}g"
+            if options["memory_mb"] % 1024 == 0
+            else f"{options['memory_mb']}m"
+        ),
+        f"--cpus={options['cpus']}",
+        f"--pids-limit={options['pids_limit']}",
+        "--tmpfs",
+        f"/tmp:rw,nosuid,nodev,size={options['tmpfs_mb']}m",
+        "--mount",
+        f"type=bind,src={worktree},dst={options['checkout_path']}"
+        + (",readonly" if options["checkout_read_only"] else ""),
+        "--workdir",
+        options["workdir"],
+        "--env-file",
+        env_file,
+        "--entrypoint",
+        "/bin/sh",
+    ]
     if options["read_only"]:
         command.append("--read-only")
     uid = 0 if options["user"] == "root" else os.getuid() if os.name == "posix" else 1000
     gid = 0 if options["user"] == "root" else os.getgid() if os.name == "posix" else 1000
     for mount in options["tmpfs"]:
-        command += ["--tmpfs", f"{mount['target']}:rw,nosuid,nodev,size={mount['size_mb']}m,uid={uid},gid={gid},mode=0700"]
+        command += [
+            "--tmpfs",
+            f"{mount['target']}:rw,nosuid,nodev,size={mount['size_mb']}m,uid={uid},gid={gid},mode=0700",
+        ]
     for mount in options["mounts"]:
         if mount["source"] == "checkout":
             source = worktree
@@ -494,8 +674,11 @@ def docker_command(name, worktree, env_file, config):
             source = secrets[mount["source"].split(":", 1)[1]]
         if "," in source:
             raise ValueError("Docker bind paths cannot contain commas.")
-        command += ["--mount", f"type=bind,src={source},dst={mount['target']}" +
-                    (",readonly" if mount["read_only"] else "")]
+        command += [
+            "--mount",
+            f"type=bind,src={source},dst={mount['target']}"
+            + (",readonly" if mount["read_only"] else ""),
+        ]
     if config.get("_http_attempt"):
         command += ["--label", "pygithost.http-attempt=" + config["_http_attempt"]]
     if os.name == "posix":
@@ -505,8 +688,8 @@ def docker_command(name, worktree, env_file, config):
     return [*command, config["image"], "-c", config["command"]]
 
 
-def remove_checkout(path):
-    def writable(func, target, error):
+def remove_checkout(path: str) -> None:
+    def writable(func: Callable[[str], object], target: str, error: BaseException) -> None:
         if os.name != "nt" or not isinstance(error, PermissionError):
             raise error
         # Git objects can have the Windows read-only attribute. Do not follow
@@ -524,36 +707,47 @@ def remove_checkout(path):
                 return
             raise
         except OSError as exc:
-            if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33, 145) or attempt == 5:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None) not in (5, 32, 33, 145)
+                or attempt == 5
+            ):
                 raise
             time.sleep(0.1 * (attempt + 1))
 
 
 class CIManager:
-    def __init__(self, repo_path):
+    # Set by the local runner or HTTP worker before image build preparation runs.
+    # Bare annotations keep ``hasattr`` checks truthful for hosts without workers.
+    http_attempt: str
+    docker_policy: dict[str, Any]
+    image_cache_dir: Path | None
+
+    def __init__(self, repo_path: Callable[[str, str], str]) -> None:
         self.repo_path = repo_path
-        self.pending = {}
-        self.active = {}
-        self.dispatcher = None
+        self.pending: dict[int, RunRow] = {}
+        self.active: dict[int, tuple[RunRow, asyncio.Task[None]]] = {}
+        self.dispatcher: asyncio.Task[None] | None = None
         self.wakeup = asyncio.Event()
         self.lifecycle_lock = asyncio.Lock()
         self.started = False
         self.stopping = False
         self.enqueue_lock = asyncio.Lock()
-        self.cancelled = set()
-        self.notification_tasks = set()
+        self.cancelled: set[int] = set()
+        self.notification_tasks: set[asyncio.Task[None]] = set()
         self.notification_slots = asyncio.Semaphore(2)
-        self.runner_lock = None
+        self.runner_lock: IO[bytes] | None = None
         self.max_concurrency = max(1, int(os.environ.get("PYGITHOST_CI_CONCURRENCY", "2")))
         self.queue_limit = max(1, int(os.environ.get("PYGITHOST_CI_QUEUE_LIMIT", "100")))
 
-    async def start(self):
+    async def start(self) -> None:
         async with self.lifecycle_lock:
             if self.started:
                 return
             self._acquire_runner_lock()
             try:
                 from .remote_ci import recover_jobs
+
                 await _db_call(recover_jobs)
                 await _db_call(database.db_ci_recover_runs)
                 await _db_call(database.db_deployment_recover)
@@ -568,18 +762,19 @@ class CIManager:
             self.started = True
             self.dispatcher = asyncio.create_task(self._dispatch())
             for row in notifications:
-                self._schedule_notification(row)
+                self._schedule_notification((row[0], row[1], row[2]))
             for run_id, owner, repo in deployment_notifications:
                 if run_id not in {row[0] for row in notifications}:
                     self._schedule_notification((run_id, owner, repo))
 
-    def _acquire_runner_lock(self):
+    def _acquire_runner_lock(self) -> None:
         """One scheduler per database; OS releases the lock after a crash."""
         path = Path(str(database.DB_PATH) + ".ci.lock")
         handle = path.open("a+b")
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
+
                 if handle.tell() == 0:
                     handle.write(b"0")
                     handle.flush()
@@ -587,18 +782,19 @@ class CIManager:
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
+
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             handle.close()
             raise RuntimeError("Another CI scheduler already owns this database.") from exc
         self.runner_lock = handle
 
-    def _release_runner_lock(self):
+    def _release_runner_lock(self) -> None:
         if self.runner_lock:
             self.runner_lock.close()
             self.runner_lock = None
 
-    async def stop(self):
+    async def stop(self) -> None:
         async with self.lifecycle_lock:
             if not self.started:
                 return
@@ -624,7 +820,7 @@ class CIManager:
             self.started = False
             self._release_runner_lock()
 
-    async def wait_idle(self):
+    async def wait_idle(self) -> None:
         while self.active or self.pending:
             if not self.active:
                 await asyncio.sleep(0.01)
@@ -634,7 +830,7 @@ class CIManager:
                 return_exceptions=True,
             )
 
-    async def config(self, owner, repo):
+    async def config(self, owner: str, repo: str) -> JsonObject:
         raw = await _db_call(database.db_ci_config_get, owner, repo)
         if not raw:
             config = unconfigured_repository_config()
@@ -644,42 +840,64 @@ class CIManager:
             if "document" in parsed:
                 config["document"] = parsed["document"]
         from .ci_preferences import apply
-        preferences = await _db_call(database.db_ci_preferences_get, owner, repo)
-        return apply(config, *preferences)
 
-    async def save_document(self, owner, repo, document, *, preserve_page_settings=False):
+        preferences = await _db_call(database.db_ci_preferences_get, owner, repo)
+        merged: JsonObject = apply(config, *preferences)
+        return merged
+
+    async def save_document(
+        self, owner: str, repo: str, document: object, *, preserve_page_settings: bool = False
+    ) -> JsonObject:
         from .ci_config import compile_document
-        config = compile_document(document)
-        preferences = None
+
+        config: JsonObject = compile_document(document)
+        preferences: dict[str, Any] | None = None
         if preserve_page_settings:
             from .ci_preferences import legacy_retention
-            old = await _db_call(database.db_ci_config_get, owner, repo)
-            old = json.loads(old) if old else {}
-            _global, preferences = await _db_call(database.db_ci_preferences_get, owner, repo)
+
+            stored = await _db_call(database.db_ci_config_get, owner, repo)
+            old: JsonObject = json.loads(stored) if stored else {}
+            _global_preferences: dict[str, Any]
+            repository_preferences: dict[str, Any]
+            _global_preferences, repository_preferences = await _db_call(
+                database.db_ci_preferences_get, owner, repo
+            )
+            preferences = repository_preferences
             for key, value in legacy_retention(old).items():
                 if key not in legacy_retention(config):
                     preferences.setdefault(key, value)
             previous = self.pipelines(old) if old else []
-            if not any(item.get("env") for item in self.pipelines(config)) and "env" not in preferences:
+            if (
+                not any(item.get("env") for item in self.pipelines(config))
+                and "env" not in preferences
+            ):
                 env = old.get("env", {})
-                pipeline_env = {item.get("pipeline_id", "default"): item["env"] for item in previous if item.get("env") and item["env"] != env}
+                pipeline_env = {
+                    item.get("pipeline_id", "default"): item["env"]
+                    for item in previous
+                    if item.get("env") and item["env"] != env
+                }
                 if env or pipeline_env:
                     preferences.update(env=env, pipeline_env=pipeline_env)
-        await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config), preferences=preferences)
+        await _db_call(
+            database.db_ci_config_set, owner, repo, json.dumps(config), preferences=preferences
+        )
         return config
 
-    async def save_config(self, owner, repo, config):
+    async def save_config(self, owner: str, repo: str, config: Mapping[str, Any]) -> JsonObject:
         if config.get("deploy_script_content"):
             config = {**config, "deploy_script": ""}
-        config = validate_config(config)
-        await _db_call(database.db_ci_config_set, owner, repo, json.dumps(config))
-        return config
+        validated = validate_config(config)
+        await _db_call(database.db_ci_config_set, owner, repo, json.dumps(validated))
+        return validated
 
     @staticmethod
-    def pipelines(config):
-        root = {key: value for key, value in config.items() if key not in ("document", "pipelines")}
+    def pipelines(config: Mapping[str, Any]) -> list[JsonObject]:
+        root: JsonObject = {
+            key: value for key, value in config.items() if key not in ("document", "pipelines")
+        }
         root["pipelines"] = []
-        items = [root, *config.get("pipelines", [])]
+        items: list[JsonObject] = [root, *config.get("pipelines", [])]
         if "document" in config:
             names = config["document"].get("pipelines", [{"name": "ci"}])
             if isinstance(names, list):
@@ -687,33 +905,42 @@ class CIManager:
             items = [item for item in items if item.get("pipeline_id", "default") in names]
         return items
 
-    async def merge_check(self, owner, repo, pr_id, base, head, branch):
+    async def merge_check(
+        self, owner: str, repo: str, pr_id: int, base: str, head: str, branch: str
+    ) -> CIRunStatusRow | None:
         config = await self.config(owner, repo)
-        checks = []
+        checks: list[CIRunStatusRow] = []
         for item in self.pipelines(config):
             if item["pipeline_id"] != "default" or "document" in config:
                 if not (item["command"] or item["steps"] or item["repository_config"]):
                     continue
                 if not self._matches(item["pr_branches"], branch):
                     continue
-                if not any(item["events"].get(key) for key in ("pr_opened", "pr_updated", "pr_reopened")):
+                if not any(
+                    item["events"].get(key) for key in ("pr_opened", "pr_updated", "pr_reopened")
+                ):
                     continue
-            check = await _db_call(database.db_ci_merge_check, owner, repo, pr_id, base, head, item["pipeline_id"])
+            check: CIRunStatusRow | None = await _db_call(
+                database.db_ci_merge_check, owner, repo, pr_id, base, head, item["pipeline_id"]
+            )
             if not check or check[1] != "success":
                 return check
             checks.append(check)
         return checks[-1] if checks else None
 
-    async def deployment_script_content(self, owner, repo, config):
+    async def deployment_script_content(
+        self, owner: str, repo: str, config: Mapping[str, Any]
+    ) -> str:
         """Return database-backed contents, or a verified legacy upload."""
         if config.get("deploy_script_content"):
-            return config["deploy_script_content"]
+            content: str = config["deploy_script_content"]
+            return content
         directory = Path(database.DB_PATH).resolve().parent / "deployment-scripts"
         path = Path(config.get("deploy_script", ""))
         if path.parent != directory or not re.fullmatch(r"[0-9a-f]{64}", path.name):
             return ""
 
-        def read_script():
+        def read_script() -> str:
             try:
                 if path.is_symlink() or not path.is_file():
                     return ""
@@ -722,21 +949,38 @@ class CIManager:
                 if len(data) > 65536:
                     return ""
                 content = data.decode("utf-8")
-                expected = hashlib.sha256((owner + "/" + repo + "\0" + content).encode()).hexdigest()
+                expected = hashlib.sha256(
+                    (owner + "/" + repo + "\0" + content).encode()
+                ).hexdigest()
                 return content if expected == path.name else ""
-            except (OSError, UnicodeError):
+            except OSError, UnicodeError:
                 return ""
+
         return await asyncio.to_thread(read_script)
 
-    async def repository_pipeline(self, owner, repo, commit, config, *, missing_ok=False):
+    async def repository_pipeline(
+        self,
+        owner: str,
+        repo: str,
+        commit: str,
+        config: Mapping[str, Any],
+        *,
+        missing_ok: bool = False,
+    ) -> JsonObject | None:
         """Read a bounded blob at an immutable SHA, never from the working tree."""
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
             raise ValueError("Repository pipeline requires an exact commit SHA.")
-        async def git(*args):
+
+        async def git(*args: str) -> bytes:
             process = await asyncio.create_subprocess_exec(
-                "git", "--git-dir", self.repo_path(owner, repo), *args,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=runner_environment(tempfile.gettempdir()))
+                "git",
+                "--git-dir",
+                self.repo_path(owner, repo),
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=runner_environment(tempfile.gettempdir()),
+            )
             try:
                 stdout, _stderr = await asyncio.wait_for(process.communicate(), 10)
             except BaseException:
@@ -747,6 +991,7 @@ class CIManager:
             if process.returncode:
                 raise ValueError("Cannot read the repository pipeline at the recorded commit.")
             return stdout
+
         filename = config.get("repository_file", ".pygithost-ci.json")
         tree = (await git("ls-tree", "--full-tree", commit, "--", filename)).decode().split()
         if not tree and missing_ok:
@@ -760,34 +1005,59 @@ class CIManager:
         return pipeline_config(raw, config)
 
     @staticmethod
-    def _matches(filters, branch):
+    def _matches(filters: str, branch: str) -> bool:
         patterns = [line.strip() for line in filters.splitlines() if line.strip()]
-        return not patterns or any(
-            fnmatch.fnmatchcase(branch, pattern) for pattern in patterns
-        )
+        return not patterns or any(fnmatch.fnmatchcase(branch, pattern) for pattern in patterns)
 
-    async def enqueue(self, owner, repo, event, branch="", commit="", payload=None, *, pipeline=None):
+    async def enqueue(
+        self,
+        owner: str,
+        repo: str,
+        event: str,
+        branch: str = "",
+        commit: str = "",
+        payload: Mapping[str, Any] | None = None,
+        *,
+        pipeline: str | None = None,
+    ) -> int | None:
         async with self.enqueue_lock:
             configs = self.pipelines(await self.config(owner, repo))
             if pipeline is not None:
                 configs = [item for item in configs if item["pipeline_id"] == pipeline]
                 if not configs:
                     raise ValueError("Unknown pipeline.")
-            first = None
+            first: int | None = None
             for config in configs:
                 identity = config["pipeline_id"]
-                run_payload = {**(payload or {})}
+                run_payload: JsonObject = {**(payload or {})}
                 if identity != "default":
                     run_payload["pipeline_id"] = identity
                 else:
                     run_payload.pop("pipeline_id", None)
-                run = await self._enqueue(owner, repo, event, branch, commit,
-                    run_payload, selected=config)
+                run = await self._enqueue(
+                    owner, repo, event, branch, commit, run_payload, selected=config
+                )
                 first = first or run
             return first
 
-    async def _enqueue(self, owner, repo, event, branch="", commit="", payload=None, snapshot=None, selected=None):
-        config = snapshot or selected or await self.config(owner, repo)
+    async def _enqueue(
+        self,
+        owner: str,
+        repo: str,
+        event: str,
+        branch: str = "",
+        commit: str = "",
+        payload: Mapping[str, Any] | None = None,
+        snapshot: Mapping[str, Any] | None = None,
+        selected: Mapping[str, Any] | None = None,
+    ) -> int | None:
+        config: JsonObject
+        if snapshot:
+            config = dict(snapshot)
+        elif selected:
+            config = dict(selected)
+        else:
+            config = await self.config(owner, repo)
         key = {
             "push": "push",
             "pull_request": "pr_opened",
@@ -796,7 +1066,9 @@ class CIManager:
             "pull_request_merged": "pr_merged",
             "manual": "manual",
         }.get(event, event)
-        if (not config["command"] and not config["steps"] and not config["repository_config"]) or (snapshot is None and event != "manual" and not config["events"].get(key, False)):
+        if (not config["command"] and not config["steps"] and not config["repository_config"]) or (
+            snapshot is None and event != "manual" and not config["events"].get(key, False)
+        ):
             return None
         if event == "push" and not self._matches(config["push_branches"], branch):
             return None
@@ -808,16 +1080,30 @@ class CIManager:
         if snapshot is None and config["repository_config"]:
             try:
                 # PR code cannot change its own pipeline before review/merge.
-                config = await self.repository_pipeline(owner, repo, commit, config,
-                    missing_ok=config.get("_autodetect_repository_config", False))
-                if config is None:
+                repository_pipeline = await self.repository_pipeline(
+                    owner,
+                    repo,
+                    commit,
+                    config,
+                    missing_ok=config.get("_autodetect_repository_config", False),
+                )
+                if repository_pipeline is None:
                     return None
+                config = repository_pipeline
             except (ValueError, UnicodeError, OSError, RecursionError, asyncio.TimeoutError) as exc:
                 config_error = f"Repository pipeline configuration: {exc}"
         if snapshot is None and not config_error:
             from .ci_preferences import environment
-            global_values, repository_values = await _db_call(database.db_ci_preferences_get, owner, repo)
-            config["env"] = environment(global_values, repository_values, config.get("env", {}), config.get("pipeline_id", "default"))
+
+            global_values, repository_values = await _db_call(
+                database.db_ci_preferences_get, owner, repo
+            )
+            config["env"] = environment(
+                global_values,
+                repository_values,
+                config.get("env", {}),
+                config.get("pipeline_id", "default"),
+            )
             try:
                 config = validate_config(config)
             except ValueError as exc:
@@ -829,11 +1115,16 @@ class CIManager:
         if config["cancel_superseded"] and event != "manual":
             for old in list(self.pending.values()) + [r for r, _ in self.active.values()]:
                 old_payload = json.loads(old[6] or "{}")
-                if old[1:5] == (owner, repo, event, branch) and old_payload.get("pr_number") == (payload or {}).get("pr_number") and old_payload.get("pipeline_id", "default") == config.get("pipeline_id", "default"):
+                if (
+                    old[1:5] == (owner, repo, event, branch)
+                    and old_payload.get("pr_number") == (payload or {}).get("pr_number")
+                    and old_payload.get("pipeline_id", "default")
+                    == config.get("pipeline_id", "default")
+                ):
                     await self._cancel(owner, repo, old[0])
         queue_full = len(self.pending) >= self.queue_limit
         payload = payload or {}
-        run_id = await _db_call(
+        run_id: int = await _db_call(
             database.db_ci_run_create,
             owner,
             repo,
@@ -846,44 +1137,69 @@ class CIManager:
         )
         row = (run_id, owner, repo, event, branch, commit, json.dumps(payload))
         if config_error:
-            await _db_call(database.db_ci_run_update, run_id, status="failed", phase="configuration",
-                output=config_error, reason=config_error, return_code=-1,
-                finished_at=datetime.now(timezone.utc).isoformat())
-            self._schedule_notification(row)
+            await _db_call(
+                database.db_ci_run_update,
+                run_id,
+                status="failed",
+                phase="configuration",
+                output=config_error,
+                reason=config_error,
+                return_code=-1,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self._schedule_notification((run_id, owner, repo))
             return run_id
         if queue_full:
-            await _db_call(database.db_ci_run_update, run_id, status="failed", phase="queue",
-                reason="CI queue is full; retry after a job finishes.", return_code=-1,
-                finished_at=datetime.now(timezone.utc).isoformat())
-            self._schedule_notification(row)
+            await _db_call(
+                database.db_ci_run_update,
+                run_id,
+                status="failed",
+                phase="queue",
+                reason="CI queue is full; retry after a job finishes.",
+                return_code=-1,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self._schedule_notification((run_id, owner, repo))
             return run_id
         self.pending[run_id] = row
         self.wakeup.set()
         return run_id
 
-    async def rerun(self, owner, repo, run_id):
+    async def rerun(self, owner: str, repo: str, run_id: int) -> int | None:
         async with self.enqueue_lock:
             run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
             meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
             if not run or not meta or not meta["config"]:
                 raise ValueError("This run has no configuration snapshot; queue a new run instead.")
-            return await self._enqueue(owner, repo, run[1], run[2], run[3], json.loads(meta["payload"]), validate_config(json.loads(meta["config"])))
+            return await self._enqueue(
+                owner,
+                repo,
+                run[1],
+                run[2],
+                run[3],
+                json.loads(meta["payload"]),
+                validate_config(json.loads(meta["config"])),
+            )
 
-    async def cancel(self, owner, repo, run_id):
+    async def cancel(self, owner: str, repo: str, run_id: int) -> bool:
         async with self.enqueue_lock:
             return await self._cancel(owner, repo, run_id)
 
-    async def retry_email(self, owner, repo, run_id):
+    async def retry_email(self, owner: str, repo: str, run_id: int) -> None:
         async with self.enqueue_lock:
             run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
             meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
-            if not run or not meta or not meta["notification"].startswith(("failed", "delivery unknown")):
+            if (
+                not run
+                or not meta
+                or not meta["notification"].startswith(("failed", "delivery unknown"))
+            ):
                 raise ValueError("Only failed or uncertain email deliveries can be retried.")
             await _db_call(database.db_ci_run_update, run_id, notification="queued")
-            self._schedule_notification((run_id, owner, repo, run[1], run[2], run[3], meta["payload"]))
+            self._schedule_notification((run_id, owner, repo))
 
-    async def _cancel(self, owner, repo, run_id):
-        row = self.pending.get(run_id)
+    async def _cancel(self, owner: str, repo: str, run_id: int) -> bool:
+        row: RunRow | None = self.pending.get(run_id)
         active = self.active.get(run_id)
         if row is None and active:
             row = active[0]
@@ -897,17 +1213,29 @@ class CIManager:
             # A task cancelled before its first instruction never enters its finally block.
             self.active.pop(run_id, None)
             if not completed or completed[4] != "success":
-                await _db_call(database.db_ci_run_update, run_id, status="cancelled", reason="Cancelled by user or superseded.", finished_at=datetime.now(timezone.utc).isoformat())
+                await _db_call(
+                    database.db_ci_run_update,
+                    run_id,
+                    status="cancelled",
+                    reason="Cancelled by user or superseded.",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
         else:
             self.pending.pop(run_id, None)
-            await _db_call(database.db_ci_run_update, run_id, status="cancelled", reason="Cancelled by user or superseded.", finished_at=datetime.now(timezone.utc).isoformat())
+            await _db_call(
+                database.db_ci_run_update,
+                run_id,
+                status="cancelled",
+                reason="Cancelled by user or superseded.",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
             self.cancelled.discard(run_id)
-            self._schedule_notification(row)
+            self._schedule_notification((row[0], row[1], row[2]))
         self.cancelled.discard(run_id)
         self.wakeup.set()
         return True
 
-    async def _dispatch(self):
+    async def _dispatch(self) -> None:
         while True:
             active_repos = {(row[1], row[2]) for row, _task in self.active.values()}
             for run_id, row in sorted(tuple(self.pending.items())):
@@ -932,7 +1260,7 @@ class CIManager:
                 except Exception:
                     logging.getLogger(__name__).exception("CI queue reconciliation failed")
 
-    async def _run_one(self, row):
+    async def _run_one(self, row: RunRow) -> None:
         ci_finished = False
         try:
             await self._execute(row)
@@ -950,7 +1278,9 @@ class CIManager:
         except Exception as exc:
             logging.getLogger(__name__).exception("CI coordinator failed for run #%s", row[0])
             if ci_finished:
-                logging.getLogger(__name__).exception("Deployment processing failed for run #%s", row[0])
+                logging.getLogger(__name__).exception(
+                    "Deployment processing failed for run #%s", row[0]
+                )
                 return
             await _db_call(
                 database.db_ci_run_coordinator_error,
@@ -962,23 +1292,28 @@ class CIManager:
             self.cancelled.discard(row[0])
             self.active.pop(row[0], None)
             self.wakeup.set()
-            self._schedule_notification(row)
+            self._schedule_notification((row[0], row[1], row[2]))
 
-    def _schedule_notification(self, row):
-        task = asyncio.create_task(self._notify(row))
+    def _schedule_notification(self, identity: RunIdentity) -> None:
+        task = asyncio.create_task(self._notify(identity))
         self.notification_tasks.add(task)
         task.add_done_callback(self.notification_tasks.discard)
 
-    async def _deploy(self, row):
+    async def _deploy(self, row: RunRow) -> None:
         """Run each independently named target linked to this pipeline."""
         run_id, owner, repo, event, branch, commit, _payload = row
         repository_config = await self.config(owner, repo)
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
-        snapshot = json.loads(meta["config"] or "{}") if meta else {}
+        snapshot: JsonObject = json.loads(meta["config"] or "{}") if meta else {}
         identity = snapshot.get("pipeline_id", "default")
-        config = next((item for item in self.pipelines(repository_config) if item["pipeline_id"] == identity), default_config())
+        config: JsonObject = next(
+            (item for item in self.pipelines(repository_config) if item["pipeline_id"] == identity),
+            default_config(),
+        )
         if snapshot.get("deployment_targets"):
-            current = {target["deployment_name"]: target for target in config.get("deployment_targets", [])}
+            current = {
+                target["deployment_name"]: target for target in config.get("deployment_targets", [])
+            }
             for target in snapshot["deployment_targets"]:
                 name = target["deployment_name"]
                 effective = current.get(name, {"deploy_enabled": False})
@@ -986,31 +1321,65 @@ class CIManager:
         else:
             # Preserve queued pre-migration snapshots by matching their original
             # pipeline ID to the migration-generated target name.
-            current = next((target for target in config.get("deployment_targets", [])
-                            if target["deployment_name"] == identity), {})
+            current = next(
+                (
+                    target
+                    for target in config.get("deployment_targets", [])
+                    if target["deployment_name"] == identity
+                ),
+                {},
+            )
             await self._deploy_target(row, {**config, **current}, snapshot)
 
-    async def _deploy_target(self, row, config, snapshot):
+    async def _deploy_target(
+        self, row: RunRow, config: Mapping[str, Any], snapshot: Mapping[str, Any]
+    ) -> None:
         """Run one trusted host script in a pinned checkout of the tested commit."""
         run_id, owner, repo, event, branch, commit, _payload = row
         identity = snapshot.get("pipeline_id", "default")
         deployment_key = snapshot.get("deployment_name") or identity
         run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
-        if not run or run[4] != "success" or not (config["deploy_enabled"] or snapshot.get("deploy_enabled")):
+        if (
+            not run
+            or run[4] != "success"
+            or not (config["deploy_enabled"] or snapshot.get("deploy_enabled"))
+        ):
             return
-        async def skip(reason):
-            await _db_call(database.db_ci_run_update, run_id, reason="Deployment skipped: " + deployment_key + ": " + reason)
+
+        async def skip(reason: str) -> None:
+            await _db_call(
+                database.db_ci_run_update,
+                run_id,
+                reason="Deployment skipped: " + deployment_key + ": " + reason,
+            )
+
         if event not in ("push", "pull_request_merged"):
             await skip("only Push and PR merged runs deploy; manual runs and PR checks do not.")
             return
         if not config["deploy_enabled"] or not snapshot.get("deploy_enabled"):
-            await skip("deployment must be enabled both when the run is queued and when it finishes.")
+            await skip(
+                "deployment must be enabled both when the run is queued and when it finishes."
+            )
             return
         if branch != config["deploy_branch"]:
-            await skip(f"branch {branch!r} does not match deployment branch {config['deploy_branch']!r}.")
+            await skip(
+                f"branch {branch!r} does not match deployment branch {config['deploy_branch']!r}."
+            )
             return
-        if any(config.get(k, "") != snapshot.get(k, "direct" if k == "deploy_interpreter" else "") for k in ("deploy_branch", "deploy_script", "deploy_script_content", "deploy_timeout", "deploy_interpreter", "deploy_steps")):
-            await skip("deployment settings changed since this run was queued; push a new commit with the saved settings.")
+        if any(
+            config.get(k, "") != snapshot.get(k, "direct" if k == "deploy_interpreter" else "")
+            for k in (
+                "deploy_branch",
+                "deploy_script",
+                "deploy_script_content",
+                "deploy_timeout",
+                "deploy_interpreter",
+                "deploy_steps",
+            )
+        ):
+            await skip(
+                "deployment settings changed since this run was queued; push a new commit with the saved settings."
+            )
             return
         output, truncated = bytearray(), [False]
         claimed = False
@@ -1020,42 +1389,76 @@ class CIManager:
                 bare = str(Path(self.repo_path(owner, repo)).resolve())
                 rc = await self._capture_process(
                     ["git", "--git-dir", bare, "rev-parse", "--verify", f"refs/heads/{branch}"],
-                    shell=False, cwd=None, env=env, output=output, truncated=truncated, timeout=30)
+                    shell=False,
+                    cwd=None,
+                    env=env,
+                    output=output,
+                    truncated=truncated,
+                    timeout=30,
+                )
                 if rc or output.decode().strip() != commit:
-                    await skip("the tested commit is no longer the branch tip, or the branch cannot be resolved.")
+                    await skip(
+                        "the tested commit is no longer the branch tip, or the branch cannot be resolved."
+                    )
                     return
                 output.clear()
-                if await _db_call(database.db_deployment_attempted, owner, repo, commit, deployment_key):
-                    await skip("this repository/deployment/commit already has a deployment attempt; see Deployments.")
+                if await _db_call(
+                    database.db_deployment_attempted, owner, repo, commit, deployment_key
+                ):
+                    await skip(
+                        "this repository/deployment/commit already has a deployment attempt; see Deployments."
+                    )
                     return
                 deadline = asyncio.get_running_loop().time() + config["deploy_timeout"]
                 worktree = str(Path(home) / "checkout")
                 checkout_log, checkout_truncated = bytearray(), [False]
 
-                async def checkout(*args):
+                async def checkout(*args: str) -> int:
                     return await self._capture_process(
-                        ["git", *args], shell=False, cwd=None, env=env,
-                        output=checkout_log, truncated=checkout_truncated,
-                        timeout=deadline - asyncio.get_running_loop().time())
+                        ["git", *args],
+                        shell=False,
+                        cwd=None,
+                        env=env,
+                        output=checkout_log,
+                        truncated=checkout_truncated,
+                        timeout=deadline - asyncio.get_running_loop().time(),
+                    )
 
                 # Mirror the CI checkout: clone the local bare repository, pin the
                 # tested commit, then remove the origin so deployment code cannot
                 # fetch a newer tip. Checkout output stays out of the deployment log.
-                rc = await checkout("clone", "--no-hardlinks", "--no-checkout", "--", bare, worktree)
+                rc = await checkout(
+                    "clone", "--no-hardlinks", "--no-checkout", "--", bare, worktree
+                )
                 if rc == 0:
                     rc = await checkout("-C", worktree, "checkout", "--detach", commit)
                 if rc == 0:
                     rc = await checkout("-C", worktree, "remote", "remove", "origin")
                 if rc:
-                    raise ValueError("Cannot check out the tested commit for deployment; Git data or the deployment timeout is insufficient.")
-                claimed = await _db_call(database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config))
+                    raise ValueError(
+                        "Cannot check out the tested commit for deployment; Git data or the deployment timeout is insufficient."
+                    )
+                claimed = await _db_call(
+                    database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config)
+                )
                 if not claimed:
-                    await skip("this repository/deployment/commit already has a deployment attempt; see Deployments.")
+                    await skip(
+                        "this repository/deployment/commit already has a deployment attempt; see Deployments."
+                    )
                     return
+                script: Path | None
                 if config.get("deploy_script_content"):
                     prefix = deployment_prefix(config["deploy_interpreter"])
                     runtime = Path(prefix[0]).stem.lower() if prefix else ""
-                    suffix = ".py" if "python" in runtime else ".ps1" if runtime in ("pwsh", "powershell") else ".js" if runtime in ("node", "nodejs") else ".sh"
+                    suffix = (
+                        ".py"
+                        if "python" in runtime
+                        else ".ps1"
+                        if runtime in ("pwsh", "powershell")
+                        else ".js"
+                        if runtime in ("node", "nodejs")
+                        else ".sh"
+                    )
                     script = Path(home) / ("deployment" + suffix)
                     descriptor = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
                     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
@@ -1066,36 +1469,70 @@ class CIManager:
                         raise ValueError("Deployment script must exist outside the repository.")
                 else:
                     script = None
-                env.update(PYGITHOST_OWNER=owner, PYGITHOST_REPO=repo,
-                    PYGITHOST_BRANCH=branch, PYGITHOST_COMMIT=commit, PYGITHOST_PIPELINE=identity,
-                    PYGITHOST_DEPLOYMENT=deployment_key, PYGITHOST_WORKTREE=worktree, CI="true")
+                env.update(
+                    PYGITHOST_OWNER=owner,
+                    PYGITHOST_REPO=repo,
+                    PYGITHOST_BRANCH=branch,
+                    PYGITHOST_COMMIT=commit,
+                    PYGITHOST_PIPELINE=identity,
+                    PYGITHOST_DEPLOYMENT=deployment_key,
+                    PYGITHOST_WORKTREE=worktree,
+                    CI="true",
+                )
                 if script is not None:
                     # Named commands explicitly invoke the shared helper. Do not
                     # also execute it implicitly before/after the named steps.
                     env["PYGITHOST_DEPLOY_SCRIPT"] = str(script)
-                steps = [{"name": step["name"], "run": step["run"], "status": "queued", "output": ""}
-                         for step in config.get("deploy_steps", [])]
+                steps: list[StepState] = [
+                    StepState(name=step["name"], run=step["run"], status="queued", output="")
+                    for step in config.get("deploy_steps", [])
+                ]
                 if not steps:
-                    steps = [{"name": "Deploy", "status": "queued", "output": ""}]
-                async def publish():
-                    await _db_call(database.db_deployment_progress, run_id, deployment_key,
-                                   output.decode("utf-8", "replace"), json.dumps(steps))
+                    steps = [StepState(name="Deploy", status="queued", output="")]
+
+                async def publish() -> None:
+                    await _db_call(
+                        database.db_deployment_progress,
+                        run_id,
+                        deployment_key,
+                        output.decode("utf-8", "replace"),
+                        json.dumps(steps),
+                    )
+
                 await publish()
                 for step in steps:
                     step["status"] = "running"
                     start = len(output)
-                    async def progress():
+
+                    async def progress() -> None:
                         step["output"] = output[start:].decode("utf-8", "replace")
                         await publish()
+
                     await progress()
-                    command = step.get("run") or deployment_prefix(config["deploy_interpreter"]) + [str(script), commit]
+                    command = step.get("run") or deployment_prefix(config["deploy_interpreter"]) + [
+                        str(script),
+                        commit,
+                    ]
                     try:
-                        rc = await self._capture_process(command, shell="run" in step,
-                            cwd=worktree, env=env, output=output, truncated=truncated,
-                            timeout=deadline - asyncio.get_running_loop().time(), on_output=progress)
+                        rc = await self._capture_process(
+                            command,
+                            shell="run" in step,
+                            cwd=worktree,
+                            env=env,
+                            output=output,
+                            truncated=truncated,
+                            timeout=deadline - asyncio.get_running_loop().time(),
+                            on_output=progress,
+                        )
                         step["status"] = "success" if rc == 0 else "failed"
                     except BaseException as exc:
-                        step["status"] = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "interrupted" if isinstance(exc, asyncio.CancelledError) else "failed"
+                        step["status"] = (
+                            "timed_out"
+                            if isinstance(exc, asyncio.TimeoutError)
+                            else "interrupted"
+                            if isinstance(exc, asyncio.CancelledError)
+                            else "failed"
+                        )
                         raise
                     finally:
                         if step["status"] != "success":
@@ -1108,95 +1545,189 @@ class CIManager:
                 status = "success" if rc == 0 else "failed"
         except asyncio.CancelledError:
             if claimed:
-                await _db_call(database.db_deployment_finish, run_id, "interrupted", output.decode("utf-8", "replace"), deployment_key)
+                await _db_call(
+                    database.db_deployment_finish,
+                    run_id,
+                    "interrupted",
+                    output.decode("utf-8", "replace"),
+                    deployment_key,
+                )
             raise
         except Exception as exc:
             status = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed"
-            output.extend((f"\nDeployment error: {exc}\n").encode()[:MAX_OUTPUT - len(output)])
+            output.extend((f"\nDeployment error: {exc}\n").encode()[: MAX_OUTPUT - len(output)])
             if not claimed:
                 # A checkout/staging failure before the claim must not consume the
                 # one attempt for this commit; leave the failure visible on the run.
-                await _db_call(database.db_ci_run_update, run_id,
-                    reason="Deployment did not start: " + deployment_key + ": checkout or staging failed.")
+                await _db_call(
+                    database.db_ci_run_update,
+                    run_id,
+                    reason="Deployment did not start: "
+                    + deployment_key
+                    + ": checkout or staging failed.",
+                )
         if claimed:
-            await _db_call(database.db_deployment_finish, run_id, status, output.decode("utf-8", "replace"), deployment_key)
+            await _db_call(
+                database.db_deployment_finish,
+                run_id,
+                status,
+                output.decode("utf-8", "replace"),
+                deployment_key,
+            )
 
-    async def _notify(self, row):
+    async def _notify(self, identity: RunIdentity) -> None:
         async with self.notification_slots:
-            await self._deliver_notification(row)
-            await self._deliver_deployment_notification(row)
+            await self._deliver_notification(identity)
+            await self._deliver_deployment_notification(identity)
 
-    async def _deliver_deployment_notification(self, row):
-        records = await _db_call(database.db_deployments_for_run, row[0])
+    async def _deliver_deployment_notification(self, identity: RunIdentity) -> None:
+        records = await _db_call(database.db_deployments_for_run, identity[0])
         for record in records:
-            await self._deliver_target_notification(row, record[1])
+            await self._deliver_target_notification(identity, record[1])
 
-    async def _deliver_target_notification(self, row, deployment_key):
-        record = await _db_call(database.db_deployment_email_record, row[0], deployment_key)
+    async def _deliver_target_notification(
+        self, identity: RunIdentity, deployment_key: str
+    ) -> None:
+        record = await _db_call(database.db_deployment_email_record, identity[0], deployment_key)
         if not record or record[6] != "queued" or record[4] == "running":
             return
         run_id, owner, repo, commit, status, raw, _notification, started, finished = record
         config = json.loads(raw or "{}")
         mode = config.get("email_mode", "off")
-        previous = await _db_call(database.db_deployment_previous_result, owner, repo, run_id, deployment_key)
-        if mode == "off" or (status == "success" and mode != "all" and not
-                (mode == "recovery" and previous in ("failed", "timed_out", "interrupted"))):
-            await _db_call(database.db_deployment_email_update, run_id, "skipped", False, deployment_key)
+        previous = await _db_call(
+            database.db_deployment_previous_result, owner, repo, run_id, deployment_key
+        )
+        if mode == "off" or (
+            status == "success"
+            and mode != "all"
+            and not (mode == "recovery" and previous in ("failed", "timed_out", "interrupted"))
+        ):
+            await _db_call(
+                database.db_deployment_email_update, run_id, "skipped", False, deployment_key
+            )
             return
-        if not await _db_call(database.db_deployment_email_update, run_id, "sending", True, deployment_key):
+        if not await _db_call(
+            database.db_deployment_email_update, run_id, "sending", True, deployment_key
+        ):
             return
         try:
-            run = (run_id, "deployment", config.get("deploy_branch", ""), commit,
-                   status, "", 0, None, started, started, finished)
+            run = (
+                run_id,
+                "deployment",
+                config.get("deploy_branch", ""),
+                commit,
+                status,
+                "",
+                0,
+                None,
+                started,
+                started,
+                finished,
+            )
             settings = await _db_call(load_settings)
-            await _db_call(send_notification, owner, repo, run,
-                validate_recipients(config.get("email_recipients", "")), settings)
-            await _db_call(database.db_deployment_email_update, run_id, "sent", False, deployment_key)
+            await _db_call(
+                send_notification,
+                owner,
+                repo,
+                run,
+                validate_recipients(config.get("email_recipients", "")),
+                settings,
+            )
+            await _db_call(
+                database.db_deployment_email_update, run_id, "sent", False, deployment_key
+            )
         except Exception as exc:
-            logging.getLogger(__name__).warning("Deployment email failed for run #%s (%s)", run_id, type(exc).__name__)
-            await _db_call(database.db_deployment_email_update, run_id, f"failed ({type(exc).__name__}; check server SMTP settings)", False, deployment_key)
+            logging.getLogger(__name__).warning(
+                "Deployment email failed for run #%s (%s)", run_id, type(exc).__name__
+            )
+            await _db_call(
+                database.db_deployment_email_update,
+                run_id,
+                f"failed ({type(exc).__name__}; check server SMTP settings)",
+                False,
+                deployment_key,
+            )
 
-    async def _deliver_notification(self, row):
+    async def _deliver_notification(self, identity: RunIdentity) -> None:
         try:
-            meta = await _db_call(database.db_ci_run_metadata, row[1], row[2], row[0])
+            meta = await _db_call(
+                database.db_ci_run_metadata, identity[1], identity[2], identity[0]
+            )
             if not meta:
                 return  # A retained-history limit may have removed an old run.
             config = json.loads(meta["config"] or "{}")
             mode = config.get("email_mode", "off")
             if mode == "off":
                 return
-            run = await _db_call(database.db_ci_run_get, row[1], row[2], row[0])
+            run = await _db_call(database.db_ci_run_get, identity[1], identity[2], identity[0])
             if not run or run[4] in ("queued", "running", "cancelled", "interrupted"):
-                await _db_call(database.db_ci_run_update, row[0], notification="skipped")
+                await _db_call(database.db_ci_run_update, identity[0], notification="skipped")
                 return
-            previous = await _db_call(database.db_ci_previous_result, row[1], row[2], run[2], run[1], run[0], json.loads(meta["payload"]).get("pr_number"))
-            if mode != "all" and run[4] == "success" and not (mode == "recovery" and previous in ("failed", "timed_out")):
-                await _db_call(database.db_ci_run_update, row[0], notification="skipped")
+            previous = await _db_call(
+                database.db_ci_previous_result,
+                identity[1],
+                identity[2],
+                run[2],
+                run[1],
+                run[0],
+                json.loads(meta["payload"]).get("pr_number"),
+            )
+            if (
+                mode != "all"
+                and run[4] == "success"
+                and not (mode == "recovery" and previous in ("failed", "timed_out"))
+            ):
+                await _db_call(database.db_ci_run_update, identity[0], notification="skipped")
                 return
-            await _db_call(database.db_ci_run_update, row[0], notification="sending")
+            await _db_call(database.db_ci_run_update, identity[0], notification="sending")
             settings = await _db_call(load_settings)
-            await _db_call(send_notification, row[1], row[2], run, validate_recipients(config["email_recipients"]), settings)
-            await _db_call(database.db_ci_run_update, row[0], notification="sent")
+            await _db_call(
+                send_notification,
+                identity[1],
+                identity[2],
+                run,
+                validate_recipients(config["email_recipients"]),
+                settings,
+            )
+            await _db_call(database.db_ci_run_update, identity[0], notification="sent")
         except Exception as exc:
             error_type = type(exc).__name__
-            logging.getLogger(__name__).warning("CI email delivery failed for run #%s (%s); check SMTP configuration and server connectivity", row[0], error_type)
+            logging.getLogger(__name__).warning(
+                "CI email delivery failed for run #%s (%s); check SMTP configuration and server connectivity",
+                identity[0],
+                error_type,
+            )
             # Never leak SMTP credentials or turn a passing build into a failure.
             with contextlib.suppress(Exception):
-                await _db_call(database.db_ci_run_update, row[0], notification=f"failed ({error_type}; check server SMTP settings)")
+                await _db_call(
+                    database.db_ci_run_update,
+                    identity[0],
+                    notification=f"failed ({error_type}; check server SMTP settings)",
+                )
 
     async def _capture_process(
-        self, command, *, shell, cwd, env, output, truncated, timeout, on_output=None,
-        max_output=MAX_OUTPUT
-    ):
+        self,
+        command: Sequence[str] | str,
+        *,
+        shell: bool,
+        cwd: str | None,
+        env: Mapping[str, str] | None,
+        output: bytearray,
+        truncated: list[bool],
+        timeout: float,
+        on_output: Callable[[], Awaitable[None]] | None = None,
+        max_output: int = MAX_OUTPUT,
+    ) -> int:
         if timeout <= 0:
             raise asyncio.TimeoutError
         if os.name == "nt":
             launcher = str(Path(__file__).with_name("ci_windows_launcher.py"))
-            invocation = (
-                [sys.executable, launcher, "--shell", command]
-                if shell
-                else [sys.executable, launcher, "--exec", *command]
-            )
+            if shell:
+                if not isinstance(command, str):
+                    raise TypeError("Shell commands must be text.")
+                invocation = [sys.executable, launcher, "--shell", command]
+            else:
+                invocation = [sys.executable, launcher, "--exec", *command]
             process = await asyncio.create_subprocess_exec(
                 *invocation,
                 cwd=cwd,
@@ -1206,6 +1737,8 @@ class CIManager:
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
         elif shell:
+            if not isinstance(command, str):
+                raise TypeError("Shell commands must be text.")
             process = await asyncio.create_subprocess_shell(
                 command,
                 cwd=cwd,
@@ -1224,9 +1757,12 @@ class CIManager:
                 start_new_session=True,
             )
 
-        async def drain_and_wait():
+        async def drain_and_wait() -> int:
+            stdout = process.stdout
+            if stdout is None:  # pragma: no cover - PIPE always provides a reader
+                raise RuntimeError("Subprocess stdout pipe is unavailable.")
             while True:
-                chunk = await process.stdout.read(65536)
+                chunk = await stdout.read(65536)
                 if not chunk:
                     break
                 available = max_output - len(output)
@@ -1240,7 +1776,7 @@ class CIManager:
 
         try:
             return await asyncio.wait_for(drain_and_wait(), timeout=timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError, asyncio.CancelledError:
             if os.name == "nt":
                 if process.returncode is None:
                     process.kill()  # Killing the launcher closes its Job Object and its child tree.
@@ -1252,18 +1788,52 @@ class CIManager:
                 await process.wait()
             raise
 
-    async def _execute(self, row, *, initial_output=b"", initial_truncated=False, started_at=None):
+    async def _execute(
+        self,
+        row: RunRow,
+        *,
+        initial_output: bytes = b"",
+        initial_truncated: bool = False,
+        started_at: str | None = None,
+    ) -> None:
         run_id, owner, repo, event, branch, commit, payload_json = row
         payload = json.loads(payload_json or "{}")
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
-        config = validate_config(json.loads(meta["config"])) if meta and meta["config"] else await self.config(owner, repo)
+        config: JsonObject = (
+            validate_config(json.loads(meta["config"]))
+            if meta and meta["config"]
+            else await self.config(owner, repo)
+        )
         if config["runner"] == "remote-docker":
             from .remote_ci import execute_remote
-            return await execute_remote(self, row, config)
-        maximum_output = config["limits"]["log_mb"] * 1024 * 1024
 
-        async def capture(*args, **kwargs):
-            return await self._capture_process(*args, **kwargs, max_output=maximum_output)
+            await execute_remote(self, row, config)
+            return
+        maximum_output: int = config["limits"]["log_mb"] * 1024 * 1024
+
+        async def capture(
+            command: Sequence[str] | str,
+            *,
+            shell: bool,
+            cwd: str | None,
+            env: Mapping[str, str] | None,
+            output: bytearray,
+            truncated: list[bool],
+            timeout: float,
+            on_output: Callable[[], Awaitable[None]] | None = None,
+        ) -> int:
+            return await self._capture_process(
+                command,
+                shell=shell,
+                cwd=cwd,
+                env=env,
+                output=output,
+                truncated=truncated,
+                timeout=timeout,
+                on_output=on_output,
+                max_output=maximum_output,
+            )
+
         if not config["command"] and not config["steps"]:
             await _db_call(
                 database.db_ci_run_update,
@@ -1283,23 +1853,32 @@ class CIManager:
             started_at=started_at or datetime.now(timezone.utc).isoformat(),
         )
         output = bytearray(initial_output[:maximum_output])
-        truncated = [initial_truncated or len(initial_output) > maximum_output]
+        truncated: list[bool] = [initial_truncated or len(initial_output) > maximum_output]
         temp_root = tempfile.mkdtemp(prefix="pygithost-ci-")
         worktree = str(Path(temp_root) / "checkout")
         bare = self.repo_path(owner, repo)
         rc, status, cancelled = -1, "failed", False
-        deadline = asyncio.get_running_loop().time() + config["timeout_seconds"]
+        deadline: float = asyncio.get_running_loop().time() + config["timeout_seconds"]
         phase = "checkout"
-        container = None
-        image_guard = None
+        container: str | None = None
+        image_guard: TextIO | None = None
         env = runner_environment(temp_root)
-        step_states = [dict(name=step["name"], status="pending", started_at=None,
-                            finished_at=None, return_code=None, output="", duration="—")
-                       for step in config["steps"]]
-        current_step = None
+        step_states: list[StepState] = [
+            StepState(
+                name=step["name"],
+                status="pending",
+                started_at=None,
+                finished_at=None,
+                return_code=None,
+                output="",
+                duration="—",
+            )
+            for step in config["steps"]
+        ]
+        current_step: StepState | None = None
         step_start = 0
 
-        async def save_steps():
+        async def save_steps() -> None:
             if current_step is not None:
                 current_step["output"] = bytes(output[step_start:]).decode("utf-8", "replace")
             if step_states:
@@ -1309,8 +1888,8 @@ class CIManager:
 
         logs_done = asyncio.Event()
 
-        async def flush_logs():
-            previous = None
+        async def flush_logs() -> None:
+            previous: tuple[int, bool, str] | None = None
             warned = False
             while not logs_done.is_set():
                 try:
@@ -1322,13 +1901,22 @@ class CIManager:
                 if state == previous:
                     continue
                 try:
-                    await _db_call(database.db_ci_run_update, run_id,
-                        output=bytes(output).decode("utf-8", "replace"), truncated=int(truncated[0]), phase=phase)
+                    await _db_call(
+                        database.db_ci_run_update,
+                        run_id,
+                        output=bytes(output).decode("utf-8", "replace"),
+                        truncated=int(truncated[0]),
+                        phase=phase,
+                    )
                     await save_steps()
                     previous, warned = state, False
                 except Exception as exc:
                     if not warned:
-                        logging.getLogger(__name__).warning("Cannot persist live CI logs for run #%s (%s); will retry", run_id, type(exc).__name__)
+                        logging.getLogger(__name__).warning(
+                            "Cannot persist live CI logs for run #%s (%s); will retry",
+                            run_id,
+                            type(exc).__name__,
+                        )
                         warned = True
 
         logger = asyncio.create_task(flush_logs())
@@ -1344,19 +1932,25 @@ class CIManager:
             )
             if rc == 0:
                 rc = await capture(
-                    ["git", "-C", worktree, "checkout", "--detach", commit], shell=False,
-                    cwd=None, env=env, output=output, truncated=truncated,
-                    timeout=deadline - asyncio.get_running_loop().time())
+                    ["git", "-C", worktree, "checkout", "--detach", commit],
+                    shell=False,
+                    cwd=None,
+                    env=env,
+                    output=output,
+                    truncated=truncated,
+                    timeout=deadline - asyncio.get_running_loop().time(),
+                )
             if rc == 0:
                 rc = await capture(
-                    ["git", "-C", worktree, "remote", "remove", "origin"], shell=False,
-                    cwd=None, env=env, output=output, truncated=truncated,
-                    timeout=deadline - asyncio.get_running_loop().time())
-            if (
-                rc == 0
-                and event.startswith("pull_request")
-                and payload.get("head_commit")
-            ):
+                    ["git", "-C", worktree, "remote", "remove", "origin"],
+                    shell=False,
+                    cwd=None,
+                    env=env,
+                    output=output,
+                    truncated=truncated,
+                    timeout=deadline - asyncio.get_running_loop().time(),
+                )
+            if rc == 0 and event.startswith("pull_request") and payload.get("head_commit"):
                 phase = "merge"
                 rc = await capture(
                     [
@@ -1378,14 +1972,26 @@ class CIManager:
             if rc == 0:
                 if config.get("image_build"):
                     if not hasattr(self, "docker_policy"):
-                        raise ValueError("Image builds require an explicitly authorized HTTP worker.")
+                        raise ValueError(
+                            "Image builds require an explicitly authorized HTTP worker."
+                        )
                     from .image_build import prepare
+
                     phase = "image build"
-                    async def publish_image():
-                        await _db_call(database.db_ci_run_update, run_id,
-                            output=output.decode("utf-8", "replace"), truncated=int(truncated[0]), phase=phase)
+
+                    async def publish_image() -> None:
+                        await _db_call(
+                            database.db_ci_run_update,
+                            run_id,
+                            output=output.decode("utf-8", "replace"),
+                            truncated=int(truncated[0]),
+                            phase=phase,
+                        )
+
                     preparation_started = asyncio.get_running_loop().time()
-                    image_guard = await prepare(self, row, config, worktree, output, truncated, publish_image)
+                    image_guard = await prepare(
+                        self, row, config, worktree, output, truncated, publish_image
+                    )
                     # Build preparation has its own budget, not the test-step budget.
                     deadline += asyncio.get_running_loop().time() - preparation_started
                 phase = "command"
@@ -1412,11 +2018,22 @@ class CIManager:
                 if config["runner"] == "docker":
                     if any("\n" in value or "\r" in value for value in config["env"].values()):
                         raise ValueError("Docker environment values cannot contain newlines.")
-                    container_env = {key: value for key, value in env.items() if key in BUILTINS or key in config["env"]}
-                    container_env.update(PYGITHOST_WORKTREE=config["docker"]["checkout_path"],
-                                         HOME="/tmp", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+                    container_env = {
+                        key: value
+                        for key, value in env.items()
+                        if key in BUILTINS or key in config["env"]
+                    }
+                    container_env.update(
+                        PYGITHOST_WORKTREE=config["docker"]["checkout_path"],
+                        HOME="/tmp",
+                        GIT_CONFIG_GLOBAL="/dev/null",
+                        GIT_CONFIG_NOSYSTEM="1",
+                    )
                     env_file = str(Path(temp_root) / "container.env")
-                    Path(env_file).write_text("\n".join(f"{key}={value}" for key, value in container_env.items()), encoding="utf-8")
+                    Path(env_file).write_text(
+                        "\n".join(f"{key}={value}" for key, value in container_env.items()),
+                        encoding="utf-8",
+                    )
                 commands = config["steps"] or [{"name": "Command", "run": config["command"]}]
                 for index, step in enumerate(commands):
                     current_step = step_states[index] if step_states else None
@@ -1424,33 +2041,69 @@ class CIManager:
                     step_clock = asyncio.get_running_loop().time()
                     if current_step is not None:
                         phase = f"step {index + 1}: {step['name']}"
-                        current_step.update(status="running", started_at=datetime.now(timezone.utc).isoformat())
+                        current_step["status"] = "running"
+                        current_step["started_at"] = datetime.now(timezone.utc).isoformat()
                         await save_steps()
-                    substitutions = {key: value for key, value in env.items() if key in BUILTINS or key in config["env"]}
+                    substitutions = {
+                        key: value
+                        for key, value in env.items()
+                        if key in BUILTINS or key in config["env"]
+                    }
                     if config["runner"] == "docker":
                         substitutions["PYGITHOST_WORKTREE"] = config["docker"]["checkout_path"]
+                    command: Sequence[str] | str
+                    shell: bool
                     command, shell = render_command(step["run"], substitutions), True
                     if config["runner"] == "docker":
                         container = f"pygithost-ci-{os.getpid()}-{run_id}-{index}"
-                        command, shell = docker_command(container, worktree, env_file, {
-                            **config, "command": command,
-                            "_http_attempt": getattr(self, "http_attempt", ""),
-                            **({"_worker_policy": self.docker_policy} if hasattr(self, "docker_policy") else {}),
-                            "_repository": f"{owner}/{repo}", "_event": event}), False
+                        command, shell = (
+                            docker_command(
+                                container,
+                                worktree,
+                                env_file,
+                                {
+                                    **config,
+                                    "command": command,
+                                    "_http_attempt": getattr(self, "http_attempt", ""),
+                                    **(
+                                        {"_worker_policy": self.docker_policy}
+                                        if hasattr(self, "docker_policy")
+                                        else {}
+                                    ),
+                                    "_repository": f"{owner}/{repo}",
+                                    "_event": event,
+                                },
+                            ),
+                            False,
+                        )
                     rc = await capture(
-                        command, shell=shell, cwd=worktree,
+                        command,
+                        shell=shell,
+                        cwd=worktree,
                         env=os.environ.copy() if not shell else env.copy(),
-                        output=output, truncated=truncated,
-                        timeout=deadline - asyncio.get_running_loop().time())
+                        output=output,
+                        truncated=truncated,
+                        timeout=deadline - asyncio.get_running_loop().time(),
+                    )
                     if current_step is not None:
-                        current_step.update(status="success" if rc == 0 else "failed", return_code=rc,
-                            finished_at=datetime.now(timezone.utc).isoformat(),
-                            duration=f"{asyncio.get_running_loop().time() - step_clock:.2f}s")
+                        current_step["status"] = "success" if rc == 0 else "failed"
+                        current_step["return_code"] = rc
+                        current_step["finished_at"] = datetime.now(timezone.utc).isoformat()
+                        current_step["duration"] = (
+                            f"{asyncio.get_running_loop().time() - step_clock:.2f}s"
+                        )
                         await save_steps()
                         current_step = None
                     if container and index < len(commands) - 1 and rc == 0:
-                        remove_rc = await capture(["docker", "rm", "--force", container], shell=False,
-                            cwd=None, env=os.environ.copy(), output=output, truncated=truncated, timeout=30)
+                        remove_rc = await capture(
+                            ["docker", "rm", "--force", container],
+                            shell=False,
+                            cwd=None,
+                            env=os.environ.copy(),
+                            output=output,
+                            truncated=truncated,
+                            timeout=30,
+                        )
                         if remove_rc:
                             raise ValueError("Container cleanup failed between steps.")
                         container = None
@@ -1459,9 +2112,12 @@ class CIManager:
             status = "success" if rc == 0 else "failed"
         except asyncio.TimeoutError:
             rc, status = -1, "timed_out"
-            timeout_label = ("Image build preparation" if phase == "image build" else "CI execution")
-            timeout_budget = (config["image_build"]["timeout_seconds"] if phase == "image build"
-                              else config["timeout_seconds"])
+            timeout_label = "Image build preparation" if phase == "image build" else "CI execution"
+            timeout_budget = (
+                config["image_build"]["timeout_seconds"]
+                if phase == "image build"
+                else config["timeout_seconds"]
+            )
             output.extend(
                 f"{timeout_label} exceeded the {timeout_budget} second limit.\n".encode()[
                     : maximum_output - len(output)
@@ -1476,9 +2132,12 @@ class CIManager:
         finally:
             cleanup_error = None
             if current_step is not None:
-                current_step.update(status="cancelled" if cancelled and run_id in self.cancelled else status,
-                    return_code=rc, finished_at=datetime.now(timezone.utc).isoformat(),
-                    duration=f"{asyncio.get_running_loop().time() - step_clock:.2f}s")
+                current_step["status"] = (
+                    "cancelled" if cancelled and run_id in self.cancelled else status
+                )
+                current_step["return_code"] = rc
+                current_step["finished_at"] = datetime.now(timezone.utc).isoformat()
+                current_step["duration"] = f"{asyncio.get_running_loop().time() - step_clock:.2f}s"
             for step in step_states:
                 if step["status"] == "pending":
                     step["status"] = "skipped"
@@ -1502,29 +2161,44 @@ class CIManager:
                 except Exception as exc:
                     cleanup_error = f"Container cleanup failed: {exc}"
             artifacts = config["artifacts"]
-            if artifacts["paths"] and not cancelled and (artifacts["when"] == "always" or
-                    (artifacts["when"] == "success") == (status == "success")):
+            if (
+                artifacts["paths"]
+                and not cancelled
+                and (
+                    artifacts["when"] == "always"
+                    or (artifacts["when"] == "success") == (status == "success")
+                )
+            ):
                 try:
-                    archive = await _db_call(collect_artifacts, worktree, artifacts["paths"], config["limits"])
+                    archive = await _db_call(
+                        collect_artifacts, worktree, artifacts["paths"], config["limits"]
+                    )
                     if archive:
                         await _db_call(database.db_ci_artifact_set, run_id, archive)
                 except Exception as exc:
                     status, rc, phase = "failed", -1, "artifacts"
-                    output.extend(f"Artifact collection failed: {exc}\n".encode()[:maximum_output - len(output)])
+                    output.extend(
+                        f"Artifact collection failed: {exc}\n".encode()[
+                            : maximum_output - len(output)
+                        ]
+                    )
             try:
-                await asyncio.wait_for(
-                    _db_call(remove_checkout, temp_root), timeout=120
-                )
+                await asyncio.wait_for(_db_call(remove_checkout, temp_root), timeout=120)
             except Exception as exc:
-                detail = ("cleanup exceeded the 120 second limit" if isinstance(exc, asyncio.TimeoutError)
-                          else f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
-                cleanup_error = (f"Temporary directory cleanup failed: {detail}. Directory: {temp_root}. "
-                                 "Check for processes holding files open and server account permissions; "
-                                 "remove this job directory only after its processes have stopped.")
-            if cleanup_error:
-                output.extend(
-                    (cleanup_error + "\n").encode()[: maximum_output - len(output)]
+                detail = (
+                    "cleanup exceeded the 120 second limit"
+                    if isinstance(exc, asyncio.TimeoutError)
+                    else f"{type(exc).__name__}: {exc}"
+                    if str(exc)
+                    else type(exc).__name__
                 )
+                cleanup_error = (
+                    f"Temporary directory cleanup failed: {detail}. Directory: {temp_root}. "
+                    "Check for processes holding files open and server account permissions; "
+                    "remove this job directory only after its processes have stopped."
+                )
+            if cleanup_error:
+                output.extend((cleanup_error + "\n").encode()[: maximum_output - len(output)])
             logs_done.set()
             await asyncio.gather(logger, return_exceptions=True)
             if image_guard:
@@ -1539,11 +2213,17 @@ class CIManager:
             finished_at=datetime.now(timezone.utc).isoformat(),
             phase=phase,
             warnings=cleanup_error or "",
-            reason=("Cancelled by user or superseded." if cancelled and run_id in self.cancelled else
-                    f"Interrupted during {phase}." if cancelled else
-                    f"Timed out during {phase}." if status == "timed_out" else
-                    f"{phase.capitalize()} failed (exit {rc})." if status == "failed" else
-                    cleanup_error or ""),
+            reason=(
+                "Cancelled by user or superseded."
+                if cancelled and run_id in self.cancelled
+                else f"Interrupted during {phase}."
+                if cancelled
+                else f"Timed out during {phase}."
+                if status == "timed_out"
+                else f"{phase.capitalize()} failed (exit {rc})."
+                if status == "failed"
+                else cleanup_error or ""
+            ),
         )
         if cancelled:
             raise asyncio.CancelledError

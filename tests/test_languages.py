@@ -1,9 +1,9 @@
 import json
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from pygithost import database
@@ -16,22 +16,33 @@ def entry(path, size, mode="100644", kind="blob"):
 
 class LanguageDetectionTests(unittest.TestCase):
     def test_source_sizes_group_extensions_and_exclude_dependencies(self):
-        tree = b"".join([
-            entry("src/Foo.cs", 300), entry("src/test.PY", 100),
-            entry("src/Generated.Designer.cs", 10000), entry("node_modules/test.js", 10000),
-            entry("packages/Package/test.cs", 10000), entry("bin/test.cs", 10000),
-            entry("obj/test.cs", 10000), entry("static/assets/prismjs/prism.js", 10000),
-            entry("main.min.js", 10000), entry("README.md", 10000),
-            entry("image.png", 10000), entry("empty.py", 0),
-            entry("link.py", 3000, mode="120000"), entry("submodule", "-", mode="160000", kind="commit"),
-        ])
+        tree = b"".join(
+            [
+                entry("src/Foo.cs", 300),
+                entry("src/test.PY", 100),
+                entry("src/Generated.Designer.cs", 10000),
+                entry("node_modules/test.js", 10000),
+                entry("packages/Package/test.cs", 10000),
+                entry("bin/test.cs", 10000),
+                entry("obj/test.cs", 10000),
+                entry("static/assets/prismjs/prism.js", 10000),
+                entry("main.min.js", 10000),
+                entry("README.md", 10000),
+                entry("image.png", 10000),
+                entry("empty.py", 0),
+                entry("link.py", 3000, mode="120000"),
+                entry("submodule", "-", mode="160000", kind="commit"),
+            ]
+        )
         result = language_totals(tree)
         self.assertEqual([item["name"] for item in result], ["C#", "Python"])
         self.assertEqual([item["percentage"] for item in result], [75, 25])
         self.assertEqual([item["files"] for item in result], [1, 1])
 
     def test_extensionless_files_and_unusual_paths(self):
-        tree = entry("src/tab\tname\nfile.py", 100) + entry("Dockerfile", 50) + entry("Makefile", 50)
+        tree = (
+            entry("src/tab\tname\nfile.py", 100) + entry("Dockerfile", 50) + entry("Makefile", 50)
+        )
         result = language_totals(tree)
         self.assertEqual({item["name"] for item in result}, {"Python", "Dockerfile", "Makefile"})
         self.assertEqual(sum(item["percentage"] for item in result), 100)
@@ -52,7 +63,9 @@ class LanguageCacheTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     def git(self, *args):
-        return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.PIPE, text=True).strip()
+        return subprocess.check_output(
+            ["git", *map(str, args)], stderr=subprocess.PIPE, text=True
+        ).strip()
 
     async def test_cache_is_per_repository_and_commit_and_avoids_repeat_scans(self):
         source = self.root / "source"
@@ -67,7 +80,10 @@ class LanguageCacheTests(unittest.IsolatedAsyncioTestCase):
         first = self.git("-C", source, "rev-parse", "HEAD")
         stats = await repository_languages("owner", "repo", str(bare), first)
         self.assertEqual(stats[0]["name"], "Python")
-        with mock.patch("pygithost.languages.asyncio.create_subprocess_exec", side_effect=AssertionError("Cache must avoid Git")):
+        with mock.patch(
+            "pygithost.languages.asyncio.create_subprocess_exec",
+            side_effect=AssertionError("Cache must avoid Git"),
+        ):
             self.assertEqual(await repository_languages("owner", "repo", str(bare), first), stats)
         self.assertIsNone(database.db_repository_languages_get("other", "repo", first))
         (source / "main.cs").write_text("class Example {}\n" * 10)

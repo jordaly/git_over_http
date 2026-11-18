@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 from pygithost import database
 from pygithost.application import GitHTTPHandler
 from pygithost.ci import CIManager, validate_config
-from pygithost.ci_email import load_settings, validate_settings, tls_context, send_notification
+from pygithost.ci_email import load_settings, send_notification, tls_context, validate_settings
 
 
 class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
@@ -27,14 +27,25 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.handler.request = SimpleNamespace()
         self.handler.remote_is_admin = True
         self.handler._forbidden = AsyncMock()
-        self.settings = {"host": "smtp.example.test", "port": "587", "tls": "starttls", "sender": "ci@example.test", "username": "ci", "password": "private-password", "public_url": "https://git.example.test", "ca_cert": ""}
+        self.settings = {
+            "host": "smtp.example.test",
+            "port": "587",
+            "tls": "starttls",
+            "sender": "ci@example.test",
+            "username": "ci",
+            "password": "private-password",
+            "public_url": "https://git.example.test",
+            "ca_cert": "",
+        }
 
     def tearDown(self):
         database.DB_PATH = self.old_db
         self.temp.cleanup()
 
     async def post(self, form, test=False):
-        self.handler._read_form_urlencoded = AsyncMock(return_value={**form, "csrf": self.handler._email_csrf_token()})
+        self.handler._read_form_urlencoded = AsyncMock(
+            return_value={**form, "csrf": self.handler._email_csrf_token()}
+        )
         with mock.patch("pygithost.application._send_response", new_callable=AsyncMock) as send:
             await self.handler._ui_admin_email_save(test=test)
         return send.await_args.args[2].decode()
@@ -46,7 +57,9 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(load_settings()["password"], "private-password")
         if os.name == "posix":
             self.assertEqual(Path(database.DB_PATH).stat().st_mode & 0o777, 0o600)
-        page = await self.post({**self.settings, "password": "", "host": "new.example.test", "port": "2525"})
+        page = await self.post(
+            {**self.settings, "password": "", "host": "new.example.test", "port": "2525"}
+        )
         self.assertEqual(load_settings()["password"], "private-password")
         self.assertEqual(load_settings()["host"], "new.example.test")
         self.assertEqual(load_settings()["port"], "2525")
@@ -94,7 +107,13 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.handler._forbidden.await_count, 3)
 
     async def test_web_settings_override_environment_and_initial_password_can_be_preserved(self):
-        with mock.patch.dict(os.environ, {"PYGITHOST_SMTP_HOST": "environment.example.test", "PYGITHOST_SMTP_PASSWORD": "environment-password"}):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYGITHOST_SMTP_HOST": "environment.example.test",
+                "PYGITHOST_SMTP_PASSWORD": "environment-password",
+            },
+        ):
             self.assertEqual(load_settings()["host"], "environment.example.test")
             await self.post({**self.settings, "password": ""})
             self.assertEqual(load_settings()["host"], "smtp.example.test")
@@ -103,11 +122,15 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
     async def test_test_email_uses_saved_settings_and_failure_does_not_expose_secrets(self):
         database.db_email_settings_set(json.dumps(self.settings))
         with mock.patch("pygithost.application.send_notification") as send:
-            page = await self.post({"recipient": "dev@example.test", "host": "ignored.example.test"}, test=True)
+            page = await self.post(
+                {"recipient": "dev@example.test", "host": "ignored.example.test"}, test=True
+            )
             self.assertIn("accepted by SMTP server", page)
             self.assertEqual(send.call_args.args[-1], self.settings)
             self.assertEqual(send.call_args.args[-2], ["dev@example.test"])
-        with mock.patch("pygithost.application.send_notification", side_effect=OSError("private-password")):
+        with mock.patch(
+            "pygithost.application.send_notification", side_effect=OSError("private-password")
+        ):
             page = await self.post({"recipient": "dev@example.test"}, test=True)
             self.assertIn("Test email failed (OSError)", page)
             self.assertNotIn("private-password", page)
@@ -120,20 +143,38 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-password", send.await_args.args[2].decode())
 
     async def test_ci_notification_uses_web_settings_without_restart(self):
-        config = validate_config({"command": "echo hello", "email_mode": "all", "email_recipients": "dev@example.test"})
-        run_id = database.db_ci_run_create("owner", "repo", "manual", "main", "a" * 40, "{}", json.dumps(config))
+        config = validate_config(
+            {"command": "echo hello", "email_mode": "all", "email_recipients": "dev@example.test"}
+        )
+        run_id = database.db_ci_run_create(
+            "owner", "repo", "manual", "main", "a" * 40, "{}", json.dumps(config)
+        )
         database.db_ci_run_update(run_id, status="success")
         database.db_email_settings_set(json.dumps(self.settings))
         manager = CIManager(lambda *_: "")
         with mock.patch("pygithost.ci.send_notification") as send:
             await manager._notify((run_id, "owner", "repo", "manual", "main", "a" * 40, "{}"))
             self.assertEqual(send.call_args.args[-1], self.settings)
-            database.db_email_settings_set(json.dumps({**self.settings, "host": "updated.example.test"}))
+            database.db_email_settings_set(
+                json.dumps({**self.settings, "host": "updated.example.test"})
+            )
             await manager._notify((run_id, "owner", "repo", "manual", "main", "a" * 40, "{}"))
             self.assertEqual(send.call_args.args[-1]["host"], "updated.example.test")
 
     async def test_validation_rejects_unsafe_values(self):
-        for change in ({"host": "smtp://host"}, {"sender": "a@b,b@c"}, {"tls": "none"}, {"port": "65536"}, {"public_url": "https://user:password@host"}, {"public_url": "javascript:alert(1)"}, {"password": "bad\nvalue"}, {"ca_cert": "not a certificate"}, {"ca_cert": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}, {"ca_cert": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"}):
+        for change in (
+            {"host": "smtp://host"},
+            {"sender": "a@b,b@c"},
+            {"tls": "none"},
+            {"port": "65536"},
+            {"public_url": "https://user:password@host"},
+            {"public_url": "javascript:alert(1)"},
+            {"password": "bad\nvalue"},
+            {"ca_cert": "not a certificate"},
+            # Construct a dummy key marker without looking like a stored key.
+            {"ca_cert": "-----BEGIN " + "PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"},
+            {"ca_cert": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"},
+        ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_settings({**self.settings, **change})
 
@@ -146,25 +187,61 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unverified_trust_applies_to_both_smtp_transports_without_pem(self):
         for mode, transport in (("starttls", "SMTP"), ("ssl", "SMTP_SSL")):
-            with self.subTest(mode=mode), mock.patch(f"pygithost.ci_email.smtplib.{transport}") as smtp:
+            with (
+                self.subTest(mode=mode),
+                mock.patch(f"pygithost.ci_email.smtplib.{transport}") as smtp,
+            ):
                 smtp.return_value.send_message.return_value = {}
                 settings = {**self.settings, "tls": mode, "trust_server_cert": True}
-                send_notification("server", "email-test", (0, "test", "", "", "test", "", 0, None), ["dev@example.test"], settings)
-                context = smtp.call_args.kwargs["context"] if mode == "ssl" else smtp.return_value.starttls.call_args.kwargs["context"]
+                send_notification(
+                    "server",
+                    "email-test",
+                    (0, "test", "", "", "test", "", 0, None),
+                    ["dev@example.test"],
+                    settings,
+                )
+                context = (
+                    smtp.call_args.kwargs["context"]
+                    if mode == "ssl"
+                    else smtp.return_value.starttls.call_args.kwargs["context"]
+                )
                 self.assertEqual(context.verify_mode, ssl.CERT_NONE)
                 self.assertFalse(context.check_hostname)
 
 
-@unittest.skipUnless(shutil.which("openssl"), "requires OpenSSL for a temporary self-signed certificate")
+@unittest.skipUnless(
+    shutil.which("openssl"), "requires OpenSSL for a temporary self-signed certificate"
+)
 class TrustedCertificateTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         cls.cert = str(Path(cls.temp.name) / "certificate.pem")
         cls.key = str(Path(cls.temp.name) / "key.pem")
-        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                        "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
-                        "-addext", "basicConstraints=critical,CA:TRUE", "-keyout", cls.key, "-out", cls.cert], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-addext",
+                "basicConstraints=critical,CA:TRUE",
+                "-keyout",
+                cls.key,
+                "-out",
+                cls.cert,
+            ],
+            check=True,
+            capture_output=True,
+        )
         cls.pem = Path(cls.cert).read_text()
 
     @classmethod
@@ -172,7 +249,14 @@ class TrustedCertificateTests(unittest.IsolatedAsyncioTestCase):
         cls.temp.cleanup()
 
     def settings(self, **extra):
-        return {"host": "localhost", "port": "587", "tls": "starttls", "sender": "ci@example.test", "ca_cert": self.pem, **extra}
+        return {
+            "host": "localhost",
+            "port": "587",
+            "tls": "starttls",
+            "sender": "ci@example.test",
+            "ca_cert": self.pem,
+            **extra,
+        }
 
     async def test_self_signed_certificate_can_be_trusted_without_disabling_verification(self):
         import asyncio
@@ -192,7 +276,15 @@ class TrustedCertificateTests(unittest.IsolatedAsyncioTestCase):
 
         server = await asyncio.start_server(connected, "127.0.0.1", 0, ssl=server_context)
         async with server:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", server.sockets[0].getsockname()[1], ssl=context, server_hostname="localhost"), timeout=5)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    "127.0.0.1",
+                    server.sockets[0].getsockname()[1],
+                    ssl=context,
+                    server_hostname="localhost",
+                ),
+                timeout=5,
+            )
             self.assertEqual(await reader.readline(), b"trusted\n")
             writer.close()
             await writer.wait_closed()
@@ -200,12 +292,27 @@ class TrustedCertificateTests(unittest.IsolatedAsyncioTestCase):
     async def test_both_smtp_transports_receive_the_custom_trust_context(self):
         run = (0, "test", "", "", "test", "", 0, None)
         for mode, transport in (("starttls", "SMTP"), ("ssl", "SMTP_SSL")):
-            with self.subTest(mode=mode), mock.patch(f"pygithost.ci_email.smtplib.{transport}") as smtp:
+            with (
+                self.subTest(mode=mode),
+                mock.patch(f"pygithost.ci_email.smtplib.{transport}") as smtp,
+            ):
                 smtp.return_value.send_message.return_value = {}
                 port = "2525" if mode == "starttls" else "1465"
-                send_notification("server", "email-test", run, ["dev@example.test"], self.settings(tls=mode, port=port))
+                send_notification(
+                    "server",
+                    "email-test",
+                    run,
+                    ["dev@example.test"],
+                    self.settings(tls=mode, port=port),
+                )
                 self.assertEqual(smtp.call_args.args[1], int(port))
-                context = smtp.call_args.kwargs["context"] if mode == "ssl" else smtp.return_value.starttls.call_args.kwargs["context"]
+                context = (
+                    smtp.call_args.kwargs["context"]
+                    if mode == "ssl"
+                    else smtp.return_value.starttls.call_args.kwargs["context"]
+                )
                 self.assertTrue(context.check_hostname)
                 self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
-                self.assertIn(ssl.PEM_cert_to_DER_cert(self.pem), context.get_ca_certs(binary_form=True))
+                self.assertIn(
+                    ssl.PEM_cert_to_DER_cert(self.pem), context.get_ca_certs(binary_form=True)
+                )

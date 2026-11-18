@@ -1,108 +1,109 @@
 import argparse
 import asyncio
-import gzip
-import json
 import base64
 import contextlib
+import gzip
 import hashlib
-from contextvars import ContextVar
 import ipaddress
+import json
 import logging
 import mimetypes
 import os
 import platform
 import re
 import secrets
+import signal
 import sqlite3
 import sys
-import signal
 import tempfile
 import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse, urlencode
+from typing import IO, TYPE_CHECKING, Any, BinaryIO, ParamSpec, TypedDict, TypeVar, cast, overload
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
+
+from . import pr_resolver
+from .ci import CIManager, protected_branch
+from .ci import default_config as ci_default_config
+from .ci_documentation import ci_configuration_guide
+from .ci_email import load_settings as load_email_settings
+from .ci_email import send_notification, validate_recipients
+from .ci_email import validate_settings as validate_email_settings
+from .ci_protection import prepare_hooks
 from .config import AppConfig
 from .context import AppContext
-from .logging_setup import access as log_access
-from .logging_setup import configure_logging, safe_target
-from .ci import CIManager, default_config as ci_default_config, protected_branch
-from .ci_protection import prepare_hooks
-from .ci_documentation import ci_configuration_guide
-from .languages import repository_languages
-from .repository_info import repository_overview
-from .readme import render_readme
-from . import pr_resolver
-from .ci_email import load_settings as load_email_settings, validate_settings as validate_email_settings, validate_recipients, send_notification
 from .database import (
     _db_init,
     _ensure_dir,
-    configure as configure_database,
+    db_audit_append,
+    db_ci_artifact_get,
+    db_ci_artifacts_list,
+    db_ci_config_get,
+    db_ci_latest_run,
+    db_ci_merge_check,
+    db_ci_run_get,
+    db_ci_run_metadata,
+    db_ci_runs_list,
+    db_ci_steps_get,
     db_create_session,
     db_create_token,
     db_create_user,
+    db_discussion_comment_add,
+    db_discussion_comment_count,
+    db_discussion_comment_counts,
+    db_discussion_comment_delete,
+    db_discussion_comment_get,
+    db_discussion_comment_list,
+    db_discussion_comment_update,
+    db_discussion_count,
+    db_discussion_create,
+    db_discussion_get,
+    db_discussion_list,
+    db_discussion_set_answer,
+    db_discussion_set_locked,
+    db_discussion_update_text,
+    db_email_settings_set,
     db_ensure_default_admin,
+    db_favicon_clear,
+    db_favicon_get,
+    db_favicon_set,
     db_get_user_by_id,
+    db_issue_close,
+    db_issue_comment_add,
+    db_issue_comment_count,
+    db_issue_comment_delete,
+    db_issue_comment_get,
+    db_issue_comment_list,
+    db_issue_comment_update,
+    db_issue_count,
+    db_issue_create,
+    db_issue_get,
+    db_issue_list,
+    db_issue_reopen,
+    db_issue_update_text,
     db_list_tokens_for_user,
     db_list_users,
     db_pr_close,
-    db_pr_reopen,
+    db_pr_comment_add,
+    db_pr_comment_count,
+    db_pr_comment_delete,
+    db_pr_comment_get,
+    db_pr_comment_list,
+    db_pr_comment_update,
     db_pr_create,
     db_pr_get,
     db_pr_list,
     db_pr_mark_merged,
-    db_pr_comment_add,
-    db_pr_comment_list,
-    db_pr_comment_count,
-    db_pr_comment_get,
-    db_pr_comment_update,
-    db_pr_comment_delete,
+    db_pr_reopen,
     db_pr_update_text,
-    db_issue_create,
-    db_issue_get,
-    db_issue_list,
-    db_issue_count,
-    db_issue_close,
-    db_issue_reopen,
-    db_issue_update_text,
-    db_issue_comment_add,
-    db_issue_comment_list,
-    db_issue_comment_count,
-    db_issue_comment_get,
-    db_issue_comment_update,
-    db_issue_comment_delete,
-    db_discussion_create,
-    db_discussion_get,
-    db_discussion_list,
-    db_discussion_count,
-    db_discussion_update_text,
-    db_discussion_set_locked,
-    db_discussion_set_answer,
-    db_discussion_comment_add,
-    db_discussion_comment_list,
-    db_discussion_comment_counts,
-    db_discussion_comment_count,
-    db_discussion_comment_get,
-    db_discussion_comment_update,
-    db_discussion_comment_delete,
-    db_ci_runs_list,
-    db_ci_run_get,
-    db_ci_latest_run,
     db_prs_for_source,
     db_prs_for_target,
-    db_ci_run_metadata,
-    db_ci_config_get,
-    db_ci_steps_get,
-    db_ci_artifact_get,
-    db_ci_artifacts_list,
-    db_ci_merge_check,
-    db_email_settings_set,
-    db_favicon_get,
-    db_favicon_set,
-    db_favicon_clear,
     db_reset_password,
     db_revoke_session,
     db_revoke_token,
@@ -111,33 +112,102 @@ from .database import (
     db_verify_session,
     db_verify_token,
     db_verify_token_any_user,
-    db_audit_append,
 )
+from .database import (
+    configure as configure_database,
+)
+from .database_types import CommentIdentityRow, DiscussionRow, IssueRow
+from .languages import LanguageStat, repository_languages
+from .logging_setup import access as log_access
+from .logging_setup import configure_logging, safe_target
+from .readme import render_readme
+from .repository_info import RepositoryOverview, repository_overview
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    # Compatibility globals populated by ``apply_config`` at import time.  They
+    # mirror ``CONFIG_GLOBAL_MAP`` and are declared here so the rest of the
+    # module can be checked without ``Any``-typed lookups.
+    HOST: str
+    PORT: int
+    GIT_PROJECT_ROOT: str
+    GIT_HTTP_BACKEND: str
+    TRACE_LOG: str | None
+    DB_PATH: str
+    URL_PREFIX: str
+    REQUIRE_AUTH: bool
+    FILTER_IPS: bool
+    REALM: str
+    FLAT_OWNER_UI: str
+    PR_PATCH_MAX_BYTES: int
+    PRISM_DIFF_HIGHLIGHT_MAX_BYTES: int
+    MAX_HEADER_BYTES: int
+    READ_CHUNK: int
+    SESSION_COOKIE_NAME: str
+    SESSION_TTL_SECONDS: int
+    SESSION_COOKIE_SECURE: bool
+    LOGIN_PATH: str
+    STATIC_URL_PREFIX: str
+    STATIC_ROOT: str
+    STATIC_CACHE_SECONDS: int
+    STATIC_REQUIRES_AUTH: bool
+    LOG_LEVEL: str
+    LOG_FORMAT: str
+    LOG_FILE: str | None
+    LOG_MAX_BYTES: int
+    LOG_BACKUP_COUNT: int
+    ACCESS_LOG: bool
+    AUDIT_LOG: bool
+    ALLOWED_CLIENT_IPS: set[str]
 
 
 _display_name = ContextVar("display_name", default="pygithost")
 
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
 
-def _thread_call(func, *args, **kwargs):
+
+class CommitInfo(TypedDict):
+    """Metadata for one commit produced by :func:`pygithost.repository_info.repository_overview`."""
+
+    hash: str
+    author: str
+    date: str
+    subject: str
+
+
+class ChangedFile(TypedDict):
+    """One entry from :func:`_git_diff_files`."""
+
+    path: str
+    added: int
+    deleted: int
+    kind: str
+
+
+def _thread_call(func: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> tuple[_T]:
     """Keep executor results non-None, including database misses and void writes."""
     return (func(*args, **kwargs),)
 
 
-def _ci_elapsed(start, end=None):
+def _ci_elapsed(start: str | None, end: str | None = None) -> str:
     if not start:
         return "—"
     try:
         begin = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
-        finish = datetime.fromisoformat(end).replace(tzinfo=timezone.utc) if end else datetime.now(timezone.utc)
+        finish = (
+            datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+            if end
+            else datetime.now(timezone.utc)
+        )
         seconds = max(0, int((finish - begin).total_seconds()))
         return f"{seconds // 60}m {seconds % 60}s"
     except ValueError:
         return "—"
 
 
-def _relative_time(value):
+def _relative_time(value: object) -> str:
     """Humanize Git ISO-8601 or SQLite UTC timestamps."""
     try:
         # Git emits 2026-11-02T14:59:40-04:00; SQLite emits 2026-11-02 14:59:40.
@@ -145,44 +215,80 @@ def _relative_time(value):
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         seconds = max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return str(value) if value else "—"
-    for unit, length in (("year", 31536000), ("month", 2592000), ("week", 604800),
-                         ("day", 86400), ("hour", 3600), ("minute", 60)):
+    for unit, length in (
+        ("year", 31536000),
+        ("month", 2592000),
+        ("week", 604800),
+        ("day", 86400),
+        ("hour", 3600),
+        ("minute", 60),
+    ):
         if seconds >= length:
             count = seconds // length
             return f"{count} {unit}{'s' if count != 1 else ''} ago"
     return "just now"
 
 
-def _page_number(params):
+def _page_number(params: Mapping[str, list[str]]) -> int:
     value = (params.get("page") or ["1"])[0]
-    return max(1, min(1000000, int(value))) if value.isascii() and value.isdecimal() and len(value) <= 7 else 1
+    return (
+        max(1, min(1000000, int(value)))
+        if value.isascii() and value.isdecimal() and len(value) <= 7
+        else 1
+    )
 
 
-def _page_size(params, default=25):
+def _page_size(params: Mapping[str, list[str]], default: int = 25) -> int:
     value = (params.get("per_page") or [str(default)])[0]
     return int(value) if value in ("10", "25", "50", "100") else default
 
 
-def _clamp_page(page, total, size):
+def _clamp_page(page: int, total: int, size: int) -> int:
     return min(page, max(1, (total + size - 1) // size))
 
 
-def _pagination(base, params, page, has_next, *, total=None, per_page=25):
+def _pagination(
+    base: str,
+    params: Mapping[str, str | list[str]],
+    page: int,
+    has_next: bool,
+    *,
+    total: int | None = None,
+    per_page: int = 25,
+) -> SafeHTML:
     if total is not None:
         page = _clamp_page(page, total, per_page)
         has_next = page * per_page < total
-    params = {key: value for key, value in params.items() if key not in ("page", "partial", "skip", "per_page")}
+    params = {
+        key: value
+        for key, value in params.items()
+        if key not in ("page", "partial", "skip", "per_page")
+    }
     pages = max(1, (total + per_page - 1) // per_page) if total is not None else None
-    links = []
+    links: list[str] = []
 
-    def control(label, destination, enabled, *, rel="", aria="", numbered=False):
+    def control(
+        label: str,
+        destination: int,
+        enabled: bool,
+        *,
+        rel: str = "",
+        aria: str = "",
+        numbered: bool = False,
+    ) -> str:
         cls = "pagination-number" if numbered else "pagination-control"
         if enabled:
-            href = base + "?" + urlencode({**params, "page": destination, "per_page": per_page})
+            href = (
+                base
+                + "?"
+                + urlencode({**params, "page": str(destination), "per_page": str(per_page)})
+            )
             relationship = safe_html(html_t(t' rel="{rel}"')) if rel else safe_html("")
-            return html_t(t'<a class="{cls}"{relationship} href="{href}" aria-label="{aria or label}">{label}</a>')
+            return html_t(
+                t'<a class="{cls}"{relationship} href="{href}" aria-label="{aria or label}">{label}</a>'
+            )
         return html_t(t'<span class="{cls} is-disabled" aria-disabled="true">{label}</span>')
 
     links.append(control("« First", 1, page > 1, aria="Go to first page"))
@@ -196,101 +302,192 @@ def _pagination(base, params, page, has_next, *, total=None, per_page=25):
         if previous and number - previous > 1:
             links.append(safe_html('<span class="pagination-ellipsis" aria-hidden="true">…</span>'))
         if number == page:
-            links.append(html_t(t'<span class="pagination-current" aria-current="page">Page {page}</span>'))
+            links.append(
+                html_t(t'<span class="pagination-current" aria-current="page">Page {page}</span>')
+            )
         else:
-            links.append(control(str(number), number, True, aria=f"Go to page {number}", numbered=True))
+            links.append(
+                control(str(number), number, True, aria=f"Go to page {number}", numbered=True)
+            )
         previous = number
     links.append(control("Next →", page + 1, has_next, rel="next"))
     if pages is not None:
         links.append(control("Last »", pages, page < pages, aria="Go to last page"))
-    summary = f"{total:,} results · Page {page:,} of {pages:,}" if total is not None else f"Page {page:,}"
+    summary = (
+        f"{total:,} results · Page {page:,} of {pages:,}" if total is not None else f"Page {page:,}"
+    )
     if total:
         summary = f"Showing {(page - 1) * per_page + 1:,}–{min(page * per_page, total):,} of {total:,} · Page {page:,} of {pages:,}"
-    return safe_html(html_t(t'''<nav class="pagination" aria-label="Pagination">
-<p class="pagination-summary" role="status">{summary}</p><div class="pagination-links">{join_html(links)}</div></nav>'''))
+    return safe_html(
+        html_t(t"""<nav class="pagination" aria-label="Pagination">
+<p class="pagination-summary" role="status">{summary}</p><div class="pagination-links">{join_html(links)}</div></nav>""")
+    )
 
 
-def _paginate_items(items, url, base=None):
+def _paginate_items(
+    items: list[_T], url: str, base: str | None = None
+) -> tuple[list[_T], SafeHTML, int]:
     parsed = urlparse(url)
     params = parse_qs(parsed.query or "")
     size = _page_size(params)
     page = _clamp_page(_page_number(params), len(items), size)
     query = {key: values[0] for key, values in params.items() if key not in ("page", "partial")}
-    return items[(page - 1) * size:page * size], _pagination(base or parsed.path, query, page, page * size < len(items), total=len(items), per_page=size), page
+    return (
+        items[(page - 1) * size : page * size],
+        _pagination(
+            base or parsed.path,
+            query,
+            page,
+            page * size < len(items),
+            total=len(items),
+            per_page=size,
+        ),
+        page,
+    )
 
 
-def _ci_tabs(base, active):
-    links = []
-    for key, suffix, label in (("runs", "/ci", "Runs"), ("deployments", "/ci/deployments", "Deployments"), ("settings", "/ci/config", "Settings"), ("docs", "/ci/docs", "Documentation")):
+def _ci_tabs(base: str, active: str) -> SafeHTML:
+    links: list[str] = []
+    for key, suffix, label in (
+        ("runs", "/ci", "Runs"),
+        ("deployments", "/ci/deployments", "Deployments"),
+        ("settings", "/ci/config", "Settings"),
+        ("docs", "/ci/docs", "Documentation"),
+    ):
         current = safe_html(' aria-current="page"' if key == active else "")
         links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
-    return safe_html(html_t(t'<div class="repo-ci-navigation">{_repo_tabs(base, "ci")}<nav class="ci-tabs" aria-label="CI navigation">{join_html(links)}</nav></div>'))
+    return safe_html(
+        html_t(
+            t'<div class="repo-ci-navigation">{_repo_tabs(base, "ci")}<nav class="ci-tabs" aria-label="CI navigation">{join_html(links)}</nav></div>'
+        )
+    )
 
 
-def _pr_create_form_html(base, opt_src, opt_tgt, warn_merge):
+def _pr_create_form_html(base: str, opt_src: str, opt_tgt: str, warn_merge: str) -> SafeHTML:
     """The pull-request creation form, shared by the dedicated page and any embeds."""
-    return safe_html(html_t(
-        t'''<form method="POST" action="{base}/pulls/create">
+    return safe_html(
+        html_t(
+            t'''<form method="POST" action="{base}/pulls/create">
 <div class="row"><div style="min-width:220px"><label>Source branch</label><select name="source_branch" required>{opt_src}</select></div>
 <div style="min-width:220px"><label>Target branch</label><select name="target_branch" required>{opt_tgt}</select></div></div>
 <div class="row" style="margin-top:10px"><div style="flex:1;min-width:260px"><label>Title</label><input name="title" placeholder="Add feature X" required style="width:100%"/></div></div>
 <div style="margin-top:10px"><label>Description</label><textarea name="body" data-markdown placeholder="What does this change?"></textarea></div>
 <div style="margin-top:10px"><button type="submit">Create PR</button></div></form>{warn_merge}'''
-    ))
+        )
+    )
 
 
-def _repo_tabs(base, active):
+def _repo_tabs(base: str, active: str) -> SafeHTML:
     owner, repo = [unquote(part) for part in base.rstrip("/").split("/")[-2:]]
-    links = []
-    for key, suffix, label in (("code", "", "Code"), ("branches", "/branches", "Branches"),
-                              ("issues", "/issues", "Issues"), ("pulls", "/pulls", "Pull requests"),
-                              ("discussions", "/discussions", "Discussions"), ("ci", "/ci", "CI"),
-                              ("artifacts", "/artifacts", "Artifacts")):
+    links: list[str] = []
+    for key, suffix, label in (
+        ("code", "", "Code"),
+        ("branches", "/branches", "Branches"),
+        ("issues", "/issues", "Issues"),
+        ("pulls", "/pulls", "Pull requests"),
+        ("discussions", "/discussions", "Discussions"),
+        ("ci", "/ci", "CI"),
+        ("artifacts", "/artifacts", "Artifacts"),
+    ):
         current = safe_html(' aria-current="page"' if key == active else "")
         links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
-    return safe_html(html_t(t'<div class="repo-navigation"><header class="repo-header"><div class="repo-eyebrow"><a href="/">Repositories</a></div><h1><a href="{base}">{owner} / <strong>{repo}</strong></a></h1></header><nav class="ci-tabs repo-tabs" aria-label="Repository navigation">{join_html(links)}</nav></div>'))
+    return safe_html(
+        html_t(
+            t'<div class="repo-navigation"><header class="repo-header"><div class="repo-eyebrow"><a href="/">Repositories</a></div><h1><a href="{base}">{owner} / <strong>{repo}</strong></a></h1></header><nav class="ci-tabs repo-tabs" aria-label="Repository navigation">{join_html(links)}</nav></div>'
+        )
+    )
 
 
-def _repo_breadcrumbs(owner, repo, ref, path="", *, is_file=False):
+def _repo_breadcrumbs(
+    owner: str, repo: str, ref: str, path: str = "", *, is_file: bool = False
+) -> SafeHTML:
     base = str_t(t"/r/{q(owner)}/{q(repo)}")
-    crumbs = [html_t(t'<a href="{base}/tree/{q(ref)}/">{repo}</a>') if path else html_t(t'<strong>{repo}</strong>')]
+    crumbs: list[str] = [
+        html_t(t'<a href="{base}/tree/{q(ref)}/">{repo}</a>')
+        if path
+        else html_t(t"<strong>{repo}</strong>")
+    ]
     parts = path.split("/") if path else []
     for index, part in enumerate(parts):
         if index < len(parts) - 1:
-            folder = "/".join(parts[:index + 1])
-            crumbs.append(html_t(t'<a href="{base}/tree/{q(ref)}/{q(folder, safe="/")}/">{part}</a>'))
+            folder = "/".join(parts[: index + 1])
+            crumbs.append(
+                html_t(t'<a href="{base}/tree/{q(ref)}/{q(folder, safe="/")}/">{part}</a>')
+            )
         else:
             crumbs.append(html_t(t'<strong aria-current="page">{part}</strong>'))
-    result = []
+    result: list[str] = []
     for crumb in crumbs:
         if result:
             result.append(safe_html('<span aria-hidden="true">/</span>'))
         result.append(crumb)
     label = "File path" if is_file else "Folder path"
-    return safe_html(html_t(t'<nav class="repo-file-breadcrumbs" aria-label="{label}">{join_html(result)}</nav>'))
+    return safe_html(
+        html_t(t'<nav class="repo-file-breadcrumbs" aria-label="{label}">{join_html(result)}</nav>')
+    )
 
 
-def _language_panel(languages, branch):
+def _language_panel(languages: Sequence[LanguageStat] | None, branch: str) -> SafeHTML:
     if languages is None:
         content = safe_html('<p class="muted">Language statistics are temporarily unavailable.</p>')
     elif not languages:
         content = safe_html('<p class="muted">No recognized source files found.</p>')
     else:
-        segments = join_html([html_t(t'<span style="width:{item["percentage"]:.6f}%;background:{item["color"]}" title="{item["name"]}: {item["percentage"]:.1f}%"></span>') for item in languages])
-        entries = []
+        segments = join_html(
+            [
+                html_t(
+                    t'<span style="width:{item["percentage"]:.6f}%;background:{item["color"]}" title="{item["name"]}: {item["percentage"]:.1f}%"></span>'
+                )
+                for item in languages
+            ]
+        )
+        entries: list[str] = []
         for item in languages:
-            percentage = "<0.1%" if item["percentage"] < .1 else f'{item["percentage"]:.1f}%'
-            entries.append(html_t(t'<li><span class="repo-language-dot" style="background:{item["color"]}" aria-hidden="true"></span><strong>{item["name"]}</strong><span class="muted">{percentage}</span></li>'))
-        content = safe_html(html_t(t'<div class="repo-language-bar" aria-hidden="true">{segments}</div><ul class="repo-language-list">{join_html(entries)}</ul>'))
-    return safe_html(html_t(t'<section class="box repo-language-panel" aria-labelledby="repo-languages-title"><h2 id="repo-languages-title">Languages</h2>{content}<p class="muted repo-language-note">Estimated from tracked source bytes on <code>{branch}</code>. Common generated files and dependencies are excluded.</p></section>'))
+            percentage = "<0.1%" if item["percentage"] < 0.1 else f"{item['percentage']:.1f}%"
+            entries.append(
+                html_t(
+                    t'<li><span class="repo-language-dot" style="background:{item["color"]}" aria-hidden="true"></span><strong>{item["name"]}</strong><span class="muted">{percentage}</span></li>'
+                )
+            )
+        content = safe_html(
+            html_t(
+                t'<div class="repo-language-bar" aria-hidden="true">{segments}</div><ul class="repo-language-list">{join_html(entries)}</ul>'
+            )
+        )
+    return safe_html(
+        html_t(
+            t'<section class="box repo-language-panel" aria-labelledby="repo-languages-title"><h2 id="repo-languages-title">Languages</h2>{content}<p class="muted repo-language-note">Estimated from tracked source bytes on <code>{branch}</code>. Common generated files and dependencies are excluded.</p></section>'
+        )
+    )
 
 
-def _repo_code_menu(owner, repo, ref, *, can_edit=False, path="", is_file=False):
+def _repo_code_menu(
+    owner: str,
+    repo: str,
+    ref: str,
+    *,
+    can_edit: bool = False,
+    path: str = "",
+    is_file: bool = False,
+) -> SafeHTML:
     base = str_t(t"/r/{q(owner)}/{q(repo)}")
     ide_query = urlencode({"branch": ref, "path" if is_file else "folder": path})
-    ide_link = safe_html(html_t(t'<a class="repo-zip-link repo-open-ide" href="{base}/ide?{ide_query}"><strong>Open in Web IDE</strong><small>Edit multiple files in a browser workspace <kbd>.</kbd></small></a>')) if can_edit else safe_html("")
-    clone_path = str_t(t"{URL_PREFIX}/{q(repo)}.git") if owner == FLAT_OWNER_UI else str_t(t"{URL_PREFIX}/{q(owner)}/{q(repo)}.git")
-    return safe_html(html_t(t'''<details class="repo-code-menu"><summary>〈〉 Code <span aria-hidden="true">▾</span></summary><div class="repo-code-popover">
+    ide_link = (
+        safe_html(
+            html_t(
+                t'<a class="repo-zip-link repo-open-ide" href="{base}/ide?{ide_query}"><strong>Open in Web IDE</strong><small>Edit multiple files in a browser workspace <kbd>.</kbd></small></a>'
+            )
+        )
+        if can_edit
+        else safe_html("")
+    )
+    clone_path = (
+        str_t(t"{URL_PREFIX}/{q(repo)}.git")
+        if owner == FLAT_OWNER_UI
+        else str_t(t"{URL_PREFIX}/{q(owner)}/{q(repo)}.git")
+    )
+    return safe_html(
+        html_t(t'''<details class="repo-code-menu"><summary>〈〉 Code <span aria-hidden="true">▾</span></summary><div class="repo-code-popover">
 <div class="repo-panel-heading"><strong>Clone repository</strong><span class="repo-clone-protocol">HTTP(S)</span></div><div class="repo-clone-body">
 <label>Clone URL</label><div class="repo-copy-row"><input class="repo-clone-url" data-path="{clone_path}" value="{clone_path}" readonly aria-label="Repository clone URL"><button class="repo-copy-button" type="button">Copy</button></div><p class="muted repo-copy-status" role="status" aria-live="polite">Use Git to clone the full repository and its history.</p><p class="muted">If authentication is enabled, enter your username and password or access token when Git asks. Never share a URL containing credentials.</p></div>
 {ide_link}<a class="repo-zip-link" href="{base}/archive.zip?{urlencode({"ref": ref})}"><strong>↓ Download ZIP</strong><small>Source snapshot of <code>{ref}</code>; no Git history.</small></a></div></details>
@@ -317,12 +514,18 @@ def _repo_code_menu(owner, repo, ref, *, can_edit=False, path="", is_file=False)
  }});
  document.addEventListener("click", event => {{ if (!menu.contains(event.target)) menu.open = false; }});
  menu.addEventListener("keydown", event => {{ if (event.key === "Escape") {{ menu.open = false; menu.querySelector("summary").focus(); }} }});
-}})();</script>'''))
+}})();</script>''')
+    )
 
 
-async def _call_in_thread(func, *args, **kwargs):
-    result, = await asyncio.to_thread(_thread_call, func, *args, **kwargs)
+async def _call_in_thread(func: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    def invoke() -> tuple[_T]:
+        return _thread_call(func, *args, **kwargs)
+
+    (result,) = await asyncio.to_thread(invoke)
     return result
+
+
 from .rendering import SafeHTML, html_t, join_html, q, safe_html, str_t
 
 # ============================================================
@@ -416,11 +619,13 @@ def apply_config(config: dict[str, object] | AppConfig) -> None:
     for json_key, global_name in CONFIG_GLOBAL_MAP.items():
         globals()[global_name] = config[json_key]
 
-    ALLOWED_CLIENT_IPS = set(str(ip) for ip in config.get("allowed_client_ips", []))
+    ALLOWED_CLIENT_IPS = set(config_model.allowed_client_ips)
     configure_database(config_model)
 
 
-def write_config_file(path: str | os.PathLike[str], target_platform: str | None = None, overwrite: bool = False) -> Path:
+def write_config_file(
+    path: str | os.PathLike[str], target_platform: str | None = None, overwrite: bool = False
+) -> Path:
     return AppConfig.default_for_platform(target_platform).write(path, overwrite=overwrite)
 
 
@@ -490,7 +695,13 @@ SAFE_SEG = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _safe_seg(s: str) -> bool:
-    return bool(s) and SAFE_SEG.match(s) is not None and ".." not in s and "/" not in s and "\\" not in s
+    return (
+        bool(s)
+        and SAFE_SEG.match(s) is not None
+        and ".." not in s
+        and "/" not in s
+        and "\\" not in s
+    )
 
 
 def _safe_branch_name(name: str) -> bool:
@@ -509,12 +720,7 @@ def _safe_branch_name(name: str) -> bool:
     if name.endswith(".lock"):
         return False
     for ch in name:
-        ok = (
-            ("a" <= ch <= "z")
-            or ("A" <= ch <= "Z")
-            or ("0" <= ch <= "9")
-            or ch in "._-/"
-        )
+        ok = ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in "._-/"
         if not ok:
             return False
     return True
@@ -527,7 +733,9 @@ def _has_write_scope(handler: object) -> bool:
     if not REQUIRE_AUTH:
         return True
 
-    scopes = getattr(handler, "remote_scopes", set()) or set()
+    scopes = getattr(handler, "remote_scopes", None) or set()
+    if not isinstance(scopes, (set, frozenset, list, tuple)):
+        scopes = set()
     if getattr(handler, "remote_is_admin", False):
         return True
     return "write" in {str(s).lower() for s in scopes}
@@ -628,7 +836,9 @@ def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
             continue
 
         try:
-            repo_dirs = sorted([x for x in owner_dir.iterdir() if x.is_dir()], key=lambda x: x.name.lower())
+            repo_dirs = sorted(
+                [x for x in owner_dir.iterdir() if x.is_dir()], key=lambda x: x.name.lower()
+            )
         except OSError:
             continue
 
@@ -794,6 +1004,7 @@ def _map_git_http_path_info(path_info: str) -> str:
 
     return path_info
 
+
 async def _run_cmd(cmd: list[str], cwd: str | None = None) -> tuple[int, bytes, bytes]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -820,7 +1031,9 @@ async def _git_default_branch(repo_git: str) -> str:
 
 
 async def _git_list_branches(repo_git: str) -> list[str]:
-    code, out, _ = await _run_git(repo_git, ["for-each-ref", "refs/heads", "--format=%(refname:short)"])
+    code, out, _ = await _run_git(
+        repo_git, ["for-each-ref", "refs/heads", "--format=%(refname:short)"]
+    )
     if code != 0:
         return []
     branches = [ln.strip() for ln in out.decode("utf-8", "replace").splitlines() if ln.strip()]
@@ -842,13 +1055,17 @@ async def _git_create_branch(repo_git: str, new_branch: str, from_ref: str) -> t
     existing = await _git_resolve_commit(repo_git, "refs/heads/" + new_branch)
     if existing:
         return False, "Branch already exists."
-    code, _out, err = await _run_git(repo_git, ["update-ref", "refs/heads/" + new_branch, commit, "0" * len(commit)])
+    code, _out, err = await _run_git(
+        repo_git, ["update-ref", "refs/heads/" + new_branch, commit, "0" * len(commit)]
+    )
     if code != 0:
         return False, err.decode("utf-8", "replace").strip() or "git update-ref failed."
     return True, "Branch created."
 
 
-async def _git_delete_branch(repo_git: str, branch: str, expected_commit: str | None = None) -> tuple[bool, str]:
+async def _git_delete_branch(
+    repo_git: str, branch: str, expected_commit: str | None = None
+) -> tuple[bool, str]:
     args = ["update-ref", "-d", "refs/heads/" + branch]
     if expected_commit:
         args.append(expected_commit)
@@ -892,7 +1109,9 @@ async def _git_commit_name_status(repo_git: str, commit: str) -> list[tuple[str,
     return rows
 
 
-async def _git_commit_patch(repo_git: str, commit: str, max_bytes: int = 600_000) -> tuple[str, bool]:
+async def _git_commit_patch(
+    repo_git: str, commit: str, max_bytes: int = 600_000
+) -> tuple[str, bool]:
     code, out, _ = await _run_git(repo_git, ["show", "--no-color", "--format=", commit])
     if code != 0:
         return "Could not render patch.", False
@@ -902,18 +1121,33 @@ async def _git_commit_patch(repo_git: str, commit: str, max_bytes: int = 600_000
 
 
 async def _git_is_ancestor(repo_git: str, maybe_ancestor: str, maybe_descendant: str) -> bool:
-    code, _out, _err = await _run_git(repo_git, ["merge-base", "--is-ancestor", maybe_ancestor, maybe_descendant])
+    code, _out, _err = await _run_git(
+        repo_git, ["merge-base", "--is-ancestor", maybe_ancestor, maybe_descendant]
+    )
     return code == 0
 
 
-async def _git_commit_count(repo_git, revision, path=""):
-    code, output, _ = await _run_git(repo_git, ["--literal-pathspecs", "rev-list", "--count", revision] + (["--", path] if path else []))
+async def _git_commit_count(repo_git: str, revision: str, path: str = "") -> int | None:
+    code, output, _ = await _run_git(
+        repo_git,
+        ["--literal-pathspecs", "rev-list", "--count", revision] + (["--", path] if path else []),
+    )
     return int(output.strip()) if code == 0 and output.strip().isdigit() else None
 
 
-async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100, skip: int = 0, path: str = "") -> list[dict[str, str]]:
+async def _git_list_commits(
+    repo_git: str, rev_range: str, limit: int = 100, skip: int = 0, path: str = ""
+) -> list[dict[str, str]]:
     fmt = "%H%x00%an%x00%ae%x00%ad%x00%s"
-    args = ["--literal-pathspecs", "log", "--date=iso", "--format=" + fmt, "-n" + str(limit), "--skip=" + str(max(0, skip)), rev_range]
+    args = [
+        "--literal-pathspecs",
+        "log",
+        "--date=iso",
+        "--format=" + fmt,
+        "-n" + str(limit),
+        "--skip=" + str(max(0, skip)),
+        rev_range,
+    ]
     if path:
         args += ["--", path]
     code, out, _err = await _run_git(repo_git, args)
@@ -936,7 +1170,9 @@ async def _git_list_commits(repo_git: str, rev_range: str, limit: int = 100, ski
     return commits
 
 
-async def _git_diff_between(repo_git: str, base: str, head: str, max_bytes: int = PR_PATCH_MAX_BYTES, path: str = "") -> tuple[str, bool]:
+async def _git_diff_between(
+    repo_git: str, base: str, head: str, max_bytes: int = PR_PATCH_MAX_BYTES, path: str = ""
+) -> tuple[str, bool]:
     args = ["diff", "--no-color", base + ".." + head]
     if path:
         args += ["--", path]
@@ -948,12 +1184,14 @@ async def _git_diff_between(repo_git: str, base: str, head: str, max_bytes: int 
     return out.decode("utf-8", "replace"), False
 
 
-async def _git_diff_files(repo_git: str, base: str, head: str) -> list[dict[str, object]]:
+async def _git_diff_files(repo_git: str, base: str, head: str) -> list[ChangedFile]:
     """Return added/deleted line counts and change kinds per changed file."""
-    code, out, _err = await _run_git(repo_git, ["--literal-pathspecs", "diff", "--numstat", "--no-color", base + ".." + head])
+    code, out, _err = await _run_git(
+        repo_git, ["--literal-pathspecs", "diff", "--numstat", "--no-color", base + ".." + head]
+    )
     if code != 0:
         return []
-    files = []
+    files: list[ChangedFile] = []
     for ln in out.decode("utf-8", "replace").splitlines():
         if not ln.strip():
             continue
@@ -968,12 +1206,14 @@ async def _git_diff_files(repo_git: str, base: str, head: str) -> list[dict[str,
             kind = "deleted"
         elif dels == "0":
             kind = "added"
-        files.append({
-            "path": name,
-            "added": 0 if adds == "-" else int(adds),
-            "deleted": 0 if dels == "-" else int(dels),
-            "kind": kind,
-        })
+        files.append(
+            {
+                "path": name,
+                "added": 0 if adds == "-" else int(adds),
+                "deleted": 0 if dels == "-" else int(dels),
+                "kind": kind,
+            }
+        )
     return files
 
 
@@ -986,7 +1226,9 @@ async def _git_merge_base(repo_git: str, a: str, b: str) -> str | None:
 
 async def _git_merge_conflicts(repo_git: str, target_ref: str, source_ref: str) -> list[str]:
     """Detect whether merging source into target would conflict."""
-    code, out, _err = await _run_git(repo_git, ["merge-tree", "--write-tree", target_ref, source_ref])
+    code, out, _err = await _run_git(
+        repo_git, ["merge-tree", "--write-tree", target_ref, source_ref]
+    )
     if code == 0:
         return []
     if code not in (1, 2):
@@ -1003,7 +1245,13 @@ async def _git_merge_conflicts(repo_git: str, target_ref: str, source_ref: str) 
     return []
 
 
-async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str, *, expected=None) -> tuple[bool, str, str | None]:
+async def _git_ff_merge(
+    repo_git: str,
+    target_branch: str,
+    source_branch: str,
+    *,
+    expected: tuple[str | None, str | None] | None = None,
+) -> tuple[bool, str, str | None]:
     tgt_ref = "refs/heads/" + target_branch
     src_ref = "refs/heads/" + source_branch
 
@@ -1023,11 +1271,22 @@ async def _git_ff_merge(repo_git: str, target_branch: str, source_branch: str, *
         return False, "Non fast-forward merge required (this server supports ff-only merges).", None
 
     # Lock and verify both refs in one transaction, preventing a stale CI decision.
-    process = await asyncio.create_subprocess_exec("git", "--git-dir=" + repo_git, "update-ref", "--stdin",
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "--git-dir=" + repo_git,
+        "update-ref",
+        "--stdin",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     try:
-        _out, err = await asyncio.wait_for(process.communicate(
-            f"start\nverify {src_ref} {src}\nupdate {tgt_ref} {src} {tgt}\nprepare\ncommit\n".encode()), 10)
+        _out, err = await asyncio.wait_for(
+            process.communicate(
+                f"start\nverify {src_ref} {src}\nupdate {tgt_ref} {src} {tgt}\nprepare\ncommit\n".encode()
+            ),
+            10,
+        )
     finally:
         if process.returncode is None:
             process.kill()
@@ -1076,7 +1335,7 @@ def _clip_markdown(body: str) -> str:
     if marker != -1:
         tail = clipped[marker:]
         open_paren = tail.find("](")
-        if open_paren != -1 and ")" not in tail[open_paren + 2:]:
+        if open_paren != -1 and ")" not in tail[open_paren + 2 :]:
             clipped = clipped[:marker].rstrip()
     return clipped
 
@@ -1177,11 +1436,19 @@ def _prism_diff_patch_html(text: str, truncated: bool, truncated_label: str = "D
     Large/truncated diffs stay as plain escaped text to avoid freezing the browser.
     """
     patch_bytes = len((text or "").encode("utf-8", "replace"))
-    can_highlight = bool((text or "").strip()) and not truncated and patch_bytes <= PRISM_DIFF_HIGHLIGHT_MAX_BYTES
+    can_highlight = (
+        bool((text or "").strip())
+        and not truncated
+        and patch_bytes <= PRISM_DIFF_HIGHLIGHT_MAX_BYTES
+    )
 
     notes: list[str] = []
     if truncated:
-        notes.append(html_t(t"""<div class="warn" style="margin-bottom:12px">{truncated_label} truncated because it is too large.</div>"""))
+        notes.append(
+            html_t(
+                t"""<div class="warn" style="margin-bottom:12px">{truncated_label} truncated because it is too large.</div>"""
+            )
+        )
     elif patch_bytes > PRISM_DIFF_HIGHLIGHT_MAX_BYTES:
         notes.append(
             html_t(
@@ -1267,13 +1534,22 @@ class Headers:
         for k, v in pairs:
             self._map.setdefault(k.lower(), []).append(v)
 
+    @overload
+    def get(self, name: str) -> str | None: ...
+
+    @overload
+    def get(self, name: str, default: str) -> str: ...
+
+    @overload
+    def get(self, name: str, default: str | None) -> str | None: ...
+
     def get(self, name: str, default: str | None = None) -> str | None:
         vals = self._map.get(name.lower())
         if not vals:
             return default
         return vals[-1]
 
-    def items(self):
+    def items(self) -> list[tuple[str, str]]:
         return list(self._pairs)
 
 
@@ -1379,10 +1655,25 @@ async def _read_http_request(reader: asyncio.StreamReader, writer: asyncio.Strea
     ip = peer[0] if peer else ""
     if ip == "::1":
         ip = "127.0.0.1"
-    return Request(method=method.upper(), target=target, version=version, headers=Headers(pairs), reader=BodyReader(reader, rest), writer=writer, peer_ip=ip)
+    return Request(
+        method=method.upper(),
+        target=target,
+        version=version,
+        headers=Headers(pairs),
+        reader=BodyReader(reader, rest),
+        writer=writer,
+        peer_ip=ip,
+    )
 
 
-async def _send_response(req: Request, status: int, body: bytes = b"", headers: list[tuple[str, str]] | None = None, reason: str | None = None, include_body: bool = True) -> None:
+async def _send_response(
+    req: Request,
+    status: int,
+    body: bytes = b"",
+    headers: list[tuple[str, str]] | None = None,
+    reason: str | None = None,
+    include_body: bool = True,
+) -> None:
     req.status = status
     req.response_size = len(body)
     reason = reason or _STATUS_REASONS.get(status, "OK")
@@ -1404,7 +1695,7 @@ async def _send_response(req: Request, status: int, body: bytes = b"", headers: 
         if include_body and body:
             req.writer.write(body)
         await req.writer.drain()
-    except (ConnectionResetError, BrokenPipeError, OSError):
+    except ConnectionResetError, BrokenPipeError, OSError:
         # The client closed the TCP connection before we could send the response.
         # This commonly happens with browser preconnects, health checks, aborted Git
         # clients, and port scanners. It is not a server error.
@@ -1415,14 +1706,26 @@ async def _send_response(req: Request, status: int, body: bytes = b"", headers: 
 async def _send_html(req: Request, status: int, body: bytes) -> None:
     # Rendered pages may embed fresh asset versions; never let the browser
     # serve a stale page from heuristic caching.
-    await _send_response(req, status, body, [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+    await _send_response(
+        req,
+        status,
+        body,
+        [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+    )
 
 
 async def _send_text(req: Request, status: int, text: str) -> None:
-    await _send_response(req, status, text.encode("utf-8", "replace"), [("Content-Type", "text/plain; charset=utf-8")])
+    await _send_response(
+        req,
+        status,
+        text.encode("utf-8", "replace"),
+        [("Content-Type", "text/plain; charset=utf-8")],
+    )
 
 
-async def _send_redirect(req: Request, location: str, headers: list[tuple[str, str]] | None = None) -> None:
+async def _send_redirect(
+    req: Request, location: str, headers: list[tuple[str, str]] | None = None
+) -> None:
     response_headers = [("Location", location)]
     if headers:
         response_headers.extend(headers)
@@ -1505,8 +1808,11 @@ _FAVICON_TYPES = {
 def _default_favicon_path() -> Path | None:
     """Prefer favicon.ico next to static/, then static/, then the package root."""
     root = _static_root()
-    for path in (root.parent / "favicon.ico", root / "favicon.ico",
-                 Path(__file__).resolve().parent.parent / "favicon.ico"):
+    for path in (
+        root.parent / "favicon.ico",
+        root / "favicon.ico",
+        Path(__file__).resolve().parent.parent / "favicon.ico",
+    ):
         if path.is_file():
             return path
     return None
@@ -1583,15 +1889,12 @@ def _static_content_type(path: Path) -> str:
         content_type = "application/octet-stream"
 
     lower_type = content_type.lower()
-    text_like = (
-        lower_type.startswith("text/")
-        or lower_type in {
-            "application/javascript",
-            "application/json",
-            "application/xml",
-            "image/svg+xml",
-        }
-    )
+    text_like = lower_type.startswith("text/") or lower_type in {
+        "application/javascript",
+        "application/json",
+        "application/xml",
+        "image/svg+xml",
+    }
     if text_like and "charset=" not in lower_type:
         content_type += "; charset=utf-8"
     return content_type
@@ -1685,19 +1988,29 @@ class GitHTTPHandler:
         )
         return False
 
-    def _apply_auth_info(self, info: dict[str, object]) -> None:
+    def _apply_auth_info(self, info: Mapping[str, object]) -> None:
         self.remote_user = str(info["username"])
-        self.remote_user_id = int(info["user_id"])
+        self.remote_user_id = int(cast(int | str, info["user_id"]))
         self.remote_is_admin = bool(info.get("is_admin"))
-        self.remote_scopes = set(info.get("scopes", {"read"}))
+        raw_scopes = info.get("scopes")
+        if not isinstance(raw_scopes, (set, frozenset, list, tuple)):
+            raw_scopes = {"read"}
+        self.remote_scopes = {str(scope) for scope in raw_scopes}
         self.request.remote_user = self.remote_user
         self.request.remote_user_id = self.remote_user_id
         self.request.remote_is_admin = self.remote_is_admin
         self.request.remote_scopes = self.remote_scopes
 
-    async def _audit(self, action: str, outcome: str = "success", *, target: str | None = None,
-                     detail: str | None = None, actor: str | None = None,
-                     actor_user_id: int | None = None) -> None:
+    async def _audit(
+        self,
+        action: str,
+        outcome: str = "success",
+        *,
+        target: str | None = None,
+        detail: str | None = None,
+        actor: str | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
         """Append a security event without letting audit failures break requests."""
         if not self.server.audit_log:
             return
@@ -1716,8 +2029,11 @@ class GitHTTPHandler:
         except Exception as exc:
             logger.warning(
                 "Audit write failed",
-                extra={"event": "audit_failure", "action": action,
-                       "error_type": type(exc).__name__},
+                extra={
+                    "event": "audit_failure",
+                    "action": action,
+                    "error_type": type(exc).__name__,
+                },
             )
 
     async def _require_session_auth(self) -> bool:
@@ -1735,7 +2051,7 @@ class GitHTTPHandler:
         await _send_redirect(self.request, str_t(t"{LOGIN_PATH}?next={q(next_url)}"))
         return False
 
-    async def _ui_login(self, notice: str = "", notice_kind: str = "warn"):
+    async def _ui_login(self, notice: str = "", notice_kind: str = "warn") -> None:
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query or "")
         next_url = _safe_next_url((qs.get("next") or ["/"])[0])
@@ -1746,7 +2062,9 @@ class GitHTTPHandler:
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
 
         body = html_t(
             t"""<div style="max-width:440px;margin:80px auto">
@@ -1766,7 +2084,7 @@ class GitHTTPHandler:
         )
         await _send_html(self.request, 200, _html_page("Sign in", safe_html(body)))
 
-    async def _ui_do_login(self):
+    async def _ui_do_login(self) -> None:
         ctype = (self.headers.get("Content-Type") or "").lower()
         if "application/x-www-form-urlencoded" not in ctype:
             return await _send_text(self.request, 415, "Unsupported Media Type\n")
@@ -1777,19 +2095,21 @@ class GitHTTPHandler:
         next_url = _safe_next_url(form.get("next") or "/")
 
         if not _safe_seg(username):
-            await self._audit("login", "failure", actor=username or None, target="web",
-                              detail="invalid_username")
+            await self._audit(
+                "login", "failure", actor=username or None, target="web", detail="invalid_username"
+            )
             return await self._ui_login("Invalid username or password.", "warn")
 
         info = await asyncio.to_thread(db_verify_password, username, password)
         if not info:
-            await self._audit("login", "failure", actor=username, target="web",
-                              detail="invalid_credentials")
+            await self._audit(
+                "login", "failure", actor=username, target="web", detail="invalid_credentials"
+            )
             return await self._ui_login("Invalid username or password.", "warn")
 
         session_token = await asyncio.to_thread(
             db_create_session,
-            int(info["user_id"]),
+            int(cast(int | str, info["user_id"])),
             self._client_ip(),
             self.headers.get("User-Agent") or "",
         )
@@ -1801,7 +2121,7 @@ class GitHTTPHandler:
             [("Set-Cookie", _session_cookie_header(session_token))],
         )
 
-    async def _ui_logout(self):
+    async def _ui_logout(self) -> None:
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
         await self._audit("logout", "success", target="web")
         await asyncio.to_thread(db_revoke_session, cookies.get(SESSION_COOKIE_NAME))
@@ -1811,13 +2131,13 @@ class GitHTTPHandler:
             [("Set-Cookie", _delete_session_cookie_header())],
         )
 
-    async def _forbidden(self, msg: bytes = b"403 Forbidden\n"):
+    async def _forbidden(self, msg: bytes = b"403 Forbidden\n") -> None:
         await _send_text(self.request, 403, msg.decode("utf-8", "replace"))
 
-    async def _not_found(self):
+    async def _not_found(self) -> None:
         await _send_text(self.request, 404, "404 Not Found\n")
 
-    async def _serve_static(self, include_body: bool = True):
+    async def _serve_static(self, include_body: bool = True) -> None:
         parsed = urlparse(self.path)
         static_path = _static_path_from_url(parsed.path)
         if static_path is None:
@@ -1840,9 +2160,11 @@ class GitHTTPHandler:
         except OSError as e:
             return await _send_text(self.request, 500, str_t(t"500 Static file error: {e}\n"))
 
-        return await _send_response(self.request, 200, body, _static_headers(static_path), include_body=include_body)
+        return await _send_response(
+            self.request, 200, body, _static_headers(static_path), include_body=include_body
+        )
 
-    async def _serve_favicon(self, include_body: bool = True):
+    async def _serve_favicon(self, include_body: bool = True) -> None:
         custom = await _call_in_thread(db_favicon_get)
         if custom:
             content_type, body = custom
@@ -1855,16 +2177,29 @@ class GitHTTPHandler:
             except OSError:
                 return await self._not_found()
             content_type = _FAVICON_TYPES.get(path.suffix.lower(), "image/x-icon")
-        headers = [("Content-Type", content_type), ("Cache-Control", "no-cache"),
-                   ("X-Content-Type-Options", "nosniff")]
+        headers = [
+            ("Content-Type", content_type),
+            ("Cache-Control", "no-cache"),
+            ("X-Content-Type-Options", "nosniff"),
+        ]
         etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
         headers.append(("ETag", etag))
         if content_type == "image/svg+xml":
             # An SVG opened directly must not be able to run scripts.
-            headers.append(("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'"))
+            headers.append(
+                (
+                    "Content-Security-Policy",
+                    "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+                )
+            )
         if self.headers.get("If-None-Match") == etag:
-            return await _send_response(self.request, 304, b"",
-                [("ETag", etag), ("Cache-Control", "no-cache")], include_body=False)
+            return await _send_response(
+                self.request,
+                304,
+                b"",
+                [("ETag", etag), ("Cache-Control", "no-cache")],
+                include_body=False,
+            )
         return await _send_response(self.request, 200, body, headers, include_body=include_body)
 
     async def _read_form_urlencoded(self) -> dict[str, str]:
@@ -1876,10 +2211,13 @@ class GitHTTPHandler:
         qs = parse_qs(text, keep_blank_values=True)
         return {k: (v[0] if v else "") for k, v in qs.items()}
 
-    async def _read_multipart_form(self, *, max_bytes: int) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    async def _read_multipart_form(
+        self, *, max_bytes: int
+    ) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
         """Read one small multipart form without the removed cgi module."""
         from email.parser import BytesParser
         from email.policy import default as email_policy
+
         content_type = self.headers.get("Content-Type") or ""
         if not content_type.lower().startswith("multipart/form-data"):
             raise ValueError("Expected a multipart form.")
@@ -1891,7 +2229,11 @@ class GitHTTPHandler:
         body = await self.request.reader.readexactly(clen)
         try:
             message = BytesParser(policy=email_policy).parsebytes(
-                f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1", "replace") + body)
+                f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode(
+                    "latin-1", "replace"
+                )
+                + body
+            )
         except Exception as exc:
             raise ValueError("Malformed multipart form.") from exc
         if not message.is_multipart():
@@ -1900,9 +2242,10 @@ class GitHTTPHandler:
         files: dict[str, tuple[str, bytes]] = {}
         for part in message.iter_parts():
             name = part.get_param("name", header="content-disposition")
-            if not name:
+            if not isinstance(name, str) or not name:
                 continue
-            payload = part.get_payload(decode=True) or b""
+            raw_payload = part.get_payload(decode=True)
+            payload = raw_payload if isinstance(raw_payload, bytes) else b""
             filename = part.get_filename()
             if filename is not None:
                 files[name] = (filename, payload)
@@ -1913,35 +2256,67 @@ class GitHTTPHandler:
     # ========================================================
     # UI: Home / Tokens / Create Repo
     # ========================================================
-    async def _ui_home(self, notice: str = "", notice_kind: str = "ok"):
-        all_repos = await _call_in_thread(lambda: sorted(_scan_repos(GIT_PROJECT_ROOT), key=lambda item: (item[0].casefold(), item[1].casefold())))
+    async def _ui_home(self, notice: str = "", notice_kind: str = "ok") -> None:
+        all_repos = await _call_in_thread(
+            lambda: sorted(
+                _scan_repos(GIT_PROJECT_ROOT),
+                key=lambda item: (item[0].casefold(), item[1].casefold()),
+            )
+        )
         params = parse_qs(urlparse(self.path).query or "")
         search = (params.get("q") or [""])[0].strip()[:128]
-        repos = [item for item in all_repos if search.casefold() in f"{item[0]}/{item[1]} {item[2]}".casefold()]
+        repos = [
+            item
+            for item in all_repos
+            if search.casefold() in f"{item[0]}/{item[1]} {item[2]}".casefold()
+        ]
         total = len(repos)
         size = _page_size(params)
         page = _clamp_page(_page_number(params), total, size)
-        repos = repos[(page - 1) * size:page * size]
-        pagination = _pagination("/", {"q": search} if search else {}, page, page * size < total, total=total, per_page=size)
+        repos = repos[(page - 1) * size : page * size]
+        pagination = _pagination(
+            "/",
+            {"q": search} if search else {},
+            page,
+            page * size < total,
+            total=total,
+            per_page=size,
+        )
 
-        rows = []
+        rows: list[str] = []
         for owner, repo, rel in repos:
             rows.append(
-                html_t(t'''<article class="repo-list-item"><div><h2><a href="/r/{q(owner)}/{q(repo)}"><span class="muted">{owner} / </span>{repo}</a></h2><p class="muted"><code>{rel}</code></p></div><nav aria-label="Links for {owner}/{repo}"><a href="/r/{q(owner)}/{q(repo)}">Code</a><a href="/r/{q(owner)}/{q(repo)}/branches">Branches</a><a href="/r/{q(owner)}/{q(repo)}/ci">CI</a><a href="/r/{q(owner)}/{q(repo)}/artifacts">Artifacts</a></nav></article>''')
+                html_t(
+                    t"""<article class="repo-list-item"><div><h2><a href="/r/{q(owner)}/{q(repo)}"><span class="muted">{owner} / </span>{repo}</a></h2><p class="muted"><code>{rel}</code></p></div><nav aria-label="Links for {owner}/{repo}"><a href="/r/{q(owner)}/{q(repo)}">Code</a><a href="/r/{q(owner)}/{q(repo)}/branches">Branches</a><a href="/r/{q(owner)}/{q(repo)}/ci">CI</a><a href="/r/{q(owner)}/{q(repo)}/artifacts">Artifacts</a></nav></article>"""
+                )
             )
 
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
 
         admin_link = safe_html("")
         if _require_admin(self):
-            admin_link = safe_html('<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/users">Admin: Users</a> <a class="pill" href="/admin/email">Admin: Email</a>')
+            admin_link = safe_html(
+                '<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/users">Admin: Users</a> <a class="pill" href="/admin/email">Admin: Email</a>'
+            )
         elif not REQUIRE_AUTH:
-            admin_link = safe_html('<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/email">Admin: Email</a>')
+            admin_link = safe_html(
+                '<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/email">Admin: Email</a>'
+            )
 
-        rows_html = join_html(rows) if rows else safe_html(html_t(t'<div class="repo-empty"><h2>{"No matching repositories" if search else "No repositories yet"}</h2><p class="muted">{"Try a different name or clear your search." if search else "Create a repository to get started."}</p></div>'))
+        rows_html = (
+            join_html(rows)
+            if rows
+            else safe_html(
+                html_t(
+                    t'<div class="repo-empty"><h2>{"No matching repositories" if search else "No repositories yet"}</h2><p class="muted">{"Try a different name or clear your search." if search else "Create a repository to get started."}</p></div>'
+                )
+            )
+        )
         clear = safe_html('<a class="pill" href="/">Clear search</a>') if search else safe_html("")
         body = html_t(
             t"""<main class="repo-page"><div class="topbar">
@@ -1964,7 +2339,9 @@ class GitHTTPHandler:
         )
         await _send_html(self.request, 200, _html_page("Repos", safe_html(body)))
 
-    async def _ui_tokens(self, notice: str = "", notice_kind: str = "ok", new_token: str = ""):
+    async def _ui_tokens(
+        self, notice: str = "", notice_kind: str = "ok", new_token: str = ""
+    ) -> None:
         user_id = int(self.remote_user_id or 0)
         tokens = await asyncio.to_thread(db_list_tokens_for_user, user_id)
         tokens, pagination, _page = _paginate_items(tokens, self.path, "/tokens")
@@ -1972,7 +2349,9 @@ class GitHTTPHandler:
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
 
         new_token_html = safe_html("")
         if new_token:
@@ -1998,7 +2377,9 @@ class GitHTTPHandler:
             revoked_display = revoked_at or ""
             revoked_html = safe_html("")
             if revoked_display:
-                revoked_html = safe_html(html_t(t"<br><small class=\"muted\">Revoked: {revoked_display}</small>"))
+                revoked_html = safe_html(
+                    html_t(t'<br><small class="muted">Revoked: {revoked_display}</small>')
+                )
 
             if status == "active":
                 action_html = safe_html(
@@ -2010,7 +2391,7 @@ class GitHTTPHandler:
                     )
                 )
             else:
-                action_html = safe_html("<span class=\"muted\">No action</span>")
+                action_html = safe_html('<span class="muted">No action</span>')
 
             rows.append(
                 html_t(
@@ -2024,7 +2405,13 @@ class GitHTTPHandler:
                 )
             )
 
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No tokens yet.</td><td></td><td></td><td></td><td></td></tr>')
+        rows_html = (
+            join_html(rows)
+            if rows
+            else safe_html(
+                '<tr><td class="muted">No tokens yet.</td><td></td><td></td><td></td><td></td></tr>'
+            )
+        )
 
         body = html_t(
             t"""<div class="topbar">
@@ -2056,7 +2443,7 @@ class GitHTTPHandler:
         )
         await _send_html(self.request, 200, _html_page("Tokens", safe_html(body)))
 
-    async def _ui_create_token(self):
+    async def _ui_create_token(self) -> None:
         form = await self._read_form_urlencoded()
         name = (form.get("name") or "").strip()
         scopes = (form.get("scopes") or "read,write").strip() or "read,write"
@@ -2064,7 +2451,9 @@ class GitHTTPHandler:
         if not name:
             return await self._ui_tokens("Token name is required.", "warn")
         try:
-            token = await asyncio.to_thread(db_create_token, int(self.remote_user_id or 0), name, scopes, expires_at)
+            token = await asyncio.to_thread(
+                db_create_token, int(self.remote_user_id or 0), name, scopes, expires_at
+            )
         except ValueError as e:
             await self._audit("token_create", "failure", target=name, detail=str(e))
             return await self._ui_tokens(str(e), "warn")
@@ -2074,7 +2463,7 @@ class GitHTTPHandler:
         await self._audit("token_create", "success", target=name, detail=f"scopes={scopes}")
         return await self._ui_tokens("Token created.", "ok", token)
 
-    async def _ui_revoke_token(self):
+    async def _ui_revoke_token(self) -> None:
         form = await self._read_form_urlencoded()
         try:
             token_id = int((form.get("token_id") or "0").strip())
@@ -2088,7 +2477,7 @@ class GitHTTPHandler:
         await self._audit("token_revoke", "success", target=str(token_id))
         return await self._ui_tokens("Token revoked.", "ok")
 
-    async def _ui_create_repo(self):
+    async def _ui_create_repo(self) -> None:
         if not _has_write_scope(self):
             return await self._ui_home("You need write scope to create repos.", "warn")
 
@@ -2119,35 +2508,47 @@ class GitHTTPHandler:
             msg = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
             return await self._ui_home(str_t(t"git init --bare failed: {msg}"), "warn")
 
-        code, out, err = await _run_cmd([
-            "git",
-            "--git-dir=" + repo_git,
-            "config",
-            "http.receivepack",
-            "true",
-        ])
+        code, out, err = await _run_cmd(
+            [
+                "git",
+                "--git-dir=" + repo_git,
+                "config",
+                "http.receivepack",
+                "true",
+            ]
+        )
         if code != 0:
             msg = err.decode("utf-8", "replace").strip() or out.decode("utf-8", "replace").strip()
-            return await self._ui_home(str_t(t"Repo created, but failed to enable push: {msg}"), "warn")
+            return await self._ui_home(
+                str_t(t"Repo created, but failed to enable push: {msg}"), "warn"
+            )
 
         return await self._ui_home(str_t(t"Repo created: {owner_ui}/{repo}"), "ok")
 
     # ========================================================
     # UI: Admin Users
     # ========================================================
-    async def _ui_admin_settings(self, *, save=False, notice_message: str = "", notice_kind: str = "ok"):
-        from .database import db_display_name_set
-        from .database import db_ci_preferences_get, db_ci_preferences_set
-        from .settings_pages import preferences_forms, parse_preferences, basic_form, save_basic
+    async def _ui_admin_settings(
+        self, *, save: bool = False, notice_message: str = "", notice_kind: str = "ok"
+    ) -> None:
+        from .database import db_ci_preferences_get, db_ci_preferences_set, db_display_name_set
+        from .settings_pages import basic_form, parse_preferences, preferences_forms, save_basic
+
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
         params = parse_qs(urlparse(self.path).query or "")
         favicon_flash = (params.get("favicon") or [""])[0]
         if not notice_message:
-            notice_message = {"updated": "Favicon updated.",
-                              "reset": "Default favicon restored."}.get(favicon_flash, "")
-        notice = safe_html(html_t(t'<p class="{notice_kind}" role="status">{notice_message}</p>')) if notice_message else safe_html("")
-        submitted_preferences = None
+            notice_message = {
+                "updated": "Favicon updated.",
+                "reset": "Default favicon restored.",
+            }.get(favicon_flash, "")
+        notice = (
+            safe_html(html_t(t'<p class="{notice_kind}" role="status">{notice_message}</p>'))
+            if notice_message
+            else safe_html("")
+        )
+        submitted_preferences: dict[str, str] | None = None
         value = await self.server.display_name()
         if save:
             form = await self._read_form_urlencoded()
@@ -2170,19 +2571,23 @@ class GitHTTPHandler:
                 elif action == "appearance":
                     value = form.get("display_name", "").strip() or "pygithost"
                     if len(value) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in value):
-                        raise ValueError("Display name must be at most 80 characters without control characters.")
+                        raise ValueError(
+                            "Display name must be at most 80 characters without control characters."
+                        )
                     await _call_in_thread(db_display_name_set, value)
                     self.server._display_name = value
                     _display_name.set(value)
                     message = "Settings saved."
                 else:
                     raise ValueError("Unknown settings action.")
-                await self._audit("settings_save", "success", target=action,
-                                  detail=f"fields={len(form)}")
+                await self._audit(
+                    "settings_save", "success", target=action, detail=f"fields={len(form)}"
+                )
                 notice = safe_html(html_t(t'<p class="ok" role="status">{message}</p>'))
             except (ValueError, OSError) as exc:
-                await self._audit("settings_save", "failure", target=action,
-                                  detail=type(exc).__name__)
+                await self._audit(
+                    "settings_save", "failure", target=action, detail=type(exc).__name__
+                )
                 notice = safe_html(html_t(t'<p class="warn" role="alert">{str(exc)}</p>'))
                 submitted_preferences = form if action.startswith("ci_") else None
         global_values, _repo = await _call_in_thread(db_ci_preferences_get)
@@ -2191,27 +2596,49 @@ class GitHTTPHandler:
         if custom_favicon:
             favicon_type, favicon_data = custom_favicon
             favicon_digest = hashlib.sha256(favicon_data).hexdigest()[:12]
-            favicon_status = safe_html(html_t(t'<p class="muted">Current: uploaded {favicon_type}, {len(favicon_data)} bytes.</p><p><img src="/favicon.ico?v={favicon_digest}" alt="Current favicon" width="32" height="32"></p>'))
+            favicon_status = safe_html(
+                html_t(
+                    t'<p class="muted">Current: uploaded {favicon_type}, {len(favicon_data)} bytes.</p><p><img src="/favicon.ico?v={favicon_digest}" alt="Current favicon" width="32" height="32"></p>'
+                )
+            )
         else:
             has_default = _default_favicon_path() is not None
             favicon_status = safe_html(
                 '<p class="muted">Current: the bundled default favicon.</p>'
-                + ('<p><img src="/favicon.ico" alt="Current favicon" width="32" height="32"></p>' if has_default else ""))
-        favicon_html = safe_html(html_t(t'''<form method="POST" action="/admin/settings/favicon" enctype="multipart/form-data" style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px">
+                + (
+                    '<p><img src="/favicon.ico" alt="Current favicon" width="32" height="32"></p>'
+                    if has_default
+                    else ""
+                )
+            )
+        favicon_html = safe_html(
+            html_t(t'''<form method="POST" action="/admin/settings/favicon" enctype="multipart/form-data" style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px">
 <input type="hidden" name="csrf" value="{token}">
 <label for="favicon-file">Favicon image</label><input id="favicon-file" type="file" name="favicon" accept=".ico,.png,.gif,.jpg,.jpeg,.webp,.svg,image/x-icon,image/png,image/gif,image/jpeg,image/webp,image/svg+xml">
 {favicon_status}<p class="muted">Shown in browser tabs and bookmarks on every page. ICO, PNG, GIF, JPEG, WebP or SVG up to 512 KiB. <strong>Use default</strong> restores the bundled favicon.ico.</p>
-<div class="row"><button type="submit" name="action" value="upload">Upload favicon</button><button type="submit" name="action" value="reset" formnovalidate>Use default</button></div></form>'''))
+<div class="row"><button type="submit" name="action" value="upload">Upload favicon</button><button type="submit" name="action" value="reset" formnovalidate>Use default</button></div></form>''')
+        )
         try:
-            basic = basic_form("/admin/settings", token, self.server.context.config.to_dict(), self.server.config_path)
+            basic = basic_form(
+                "/admin/settings",
+                token,
+                self.server.context.config.to_dict(),
+                self.server.config_path,
+            )
         except (ValueError, OSError) as exc:
-            basic = safe_html(html_t(t'<p class="warn">Could not read the startup configuration: {str(exc)}</p>{basic_form("/admin/settings", token, self.server.context.config.to_dict(), None)}'))
-        preferences = preferences_forms("/admin/settings", token, global_values, submitted=submitted_preferences)
+            basic = safe_html(
+                html_t(
+                    t'<p class="warn">Could not read the startup configuration: {str(exc)}</p>{basic_form("/admin/settings", token, self.server.context.config.to_dict(), None)}'
+                )
+            )
+        preferences = preferences_forms(
+            "/admin/settings", token, global_values, submitted=submitted_preferences
+        )
         body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><nav class="row"><a class="pill" href="/admin/email">Email delivery</a><a class="pill" href="/admin/users">Users</a><a class="pill" href="/">Home</a></nav></div>{notice}
 <section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form>{favicon_html}</section>{basic}{preferences}<script src="/static/settings-pages.js" defer></script></main>''')
         return await _send_html(self.request, 200, _html_page("Server settings", safe_html(body)))
 
-    async def _ui_favicon_save(self):
+    async def _ui_favicon_save(self) -> None:
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
         try:
@@ -2232,24 +2659,33 @@ class GitHTTPHandler:
                 raise ValueError("Unknown favicon action.")
         except ValueError as exc:
             return await self._ui_admin_settings(notice_message=str(exc), notice_kind="warn")
-        return await _send_redirect(self.request,
-            "/admin/settings?favicon=" + ("reset" if action == "reset" else "updated"))
+        return await _send_redirect(
+            self.request, "/admin/settings?favicon=" + ("reset" if action == "reset" else "updated")
+        )
 
-    def _settings_csrf_token(self):
+    def _settings_csrf_token(self) -> str:
         import hashlib
         import hmac
+
         session = _parse_cookie_header(self.headers.get("Cookie")).get(SESSION_COOKIE_NAME, "")
         identity = session if REQUIRE_AUTH else "ip:" + self._client_ip()
-        return hmac.new(self.server.settings_csrf_secret, identity.encode(), hashlib.sha256).hexdigest()
+        return hmac.new(
+            self.server.settings_csrf_secret, identity.encode(), hashlib.sha256
+        ).hexdigest()
 
-    def _valid_settings_csrf(self, form):
-        return secrets.compare_digest(form.get("csrf", "").encode(), self._settings_csrf_token().encode())
+    def _valid_settings_csrf(self, form: dict[str, str]) -> bool:
+        return secrets.compare_digest(
+            form.get("csrf", "").encode(), self._settings_csrf_token().encode()
+        )
 
-    async def _ui_ci_preferences_save(self, owner, repo):
+    async def _ui_ci_preferences_save(self, owner: str, repo: str) -> None:
         from .database import db_ci_preferences_get, db_ci_preferences_set
         from .settings_pages import parse_preferences
+
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
@@ -2262,26 +2698,42 @@ class GitHTTPHandler:
                 values = parse_preferences(form, values, repository=True)
                 await _call_in_thread(db_ci_preferences_set, values, owner, repo)
         except (ValueError, OSError) as exc:
-            return await self._ui_ci_config(owner, repo, notice=str(exc), error=True, preferences_submitted=form)
-        message = "Repository settings saved. Retention limits apply to stored runs and artifacts immediately." if form["action"] == "ci_retention" else "Repository settings saved. New runs use the updated settings."
+            return await self._ui_ci_config(
+                owner, repo, notice=str(exc), error=True, preferences_submitted=form
+            )
+        message = (
+            "Repository settings saved. Retention limits apply to stored runs and artifacts immediately."
+            if form["action"] == "ci_retention"
+            else "Repository settings saved. New runs use the updated settings."
+        )
         return await self._ui_ci_config(owner, repo, notice=message)
 
-    async def _ui_admin_users(self, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_admin_users(self, notice: str = "", notice_kind: str = "ok") -> None:
         if not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin only.\n")
 
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
 
         users = await asyncio.to_thread(db_list_users)
         all_users = users
         users, pagination, _page = _paginate_items(users, self.path, "/admin/users")
-        rows = []
+        rows: list[str] = []
         for uid, uname, is_admin, is_active, created_at in users:
-            pill_admin = safe_html('<span class="pill">admin</span>' if is_admin else '<span class="pill muted">user</span>')
-            pill_active = safe_html('<span class="pill">active</span>' if is_active else '<span class="pill muted">disabled</span>')
+            pill_admin = safe_html(
+                '<span class="pill">admin</span>'
+                if is_admin
+                else '<span class="pill muted">user</span>'
+            )
+            pill_active = safe_html(
+                '<span class="pill">active</span>'
+                if is_active
+                else '<span class="pill muted">disabled</span>'
+            )
             toggle_label = "Disable" if is_active else "Enable"
             toggle_btn_class = "danger" if is_active else ""
             disable_self_guard = safe_html("")
@@ -2302,8 +2754,12 @@ class GitHTTPHandler:
 </tr>"""
                 )
             )
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No users.</td></tr>')
-        options_html = join_html([html_t(t'<option value="{uid}">{uname}</option>') for uid, uname, *_rest in all_users])
+        rows_html = (
+            join_html(rows) if rows else safe_html('<tr><td class="muted">No users.</td></tr>')
+        )
+        options_html = join_html(
+            [html_t(t'<option value="{uid}">{uname}</option>') for uid, uname, *_rest in all_users]
+        )
 
         body = html_t(
             t"""<div class="topbar"><h1 style="margin:0">Admin · Users</h1><div><a class="pill" href="/">Home</a></div></div>
@@ -2333,7 +2789,7 @@ class GitHTTPHandler:
         )
         await _send_html(self.request, 200, _html_page("Admin · Users", safe_html(body)))
 
-    async def _ui_admin_users_create(self):
+    async def _ui_admin_users_create(self) -> None:
         if not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin only.\n")
         form = await self._read_form_urlencoded()
@@ -2352,10 +2808,12 @@ class GitHTTPHandler:
         except Exception as e:
             await self._audit("user_create", "failure", target=username, detail=type(e).__name__)
             return await self._ui_admin_users(str_t(t"Failed to create user: {e}"), "warn")
-        await self._audit("user_create", "success", target=username, detail=f"admin={bool(is_admin)}")
+        await self._audit(
+            "user_create", "success", target=username, detail=f"admin={bool(is_admin)}"
+        )
         return await self._ui_admin_users(str_t(t"User created: {username}"), "ok")
 
-    async def _ui_admin_users_reset(self):
+    async def _ui_admin_users_reset(self) -> None:
         if not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin only.\n")
         form = await self._read_form_urlencoded()
@@ -2372,12 +2830,14 @@ class GitHTTPHandler:
         try:
             await asyncio.to_thread(db_reset_password, user_id, new_password)
         except Exception as e:
-            await self._audit("user_password_reset", "failure", target=u[1], detail=type(e).__name__)
+            await self._audit(
+                "user_password_reset", "failure", target=u[1], detail=type(e).__name__
+            )
             return await self._ui_admin_users(str_t(t"Failed to reset password: {e}"), "warn")
         await self._audit("user_password_reset", "success", target=u[1])
         return await self._ui_admin_users(str_t(t"Password updated for: {u[1]}"), "ok")
 
-    async def _ui_admin_users_toggle(self):
+    async def _ui_admin_users_toggle(self) -> None:
         if not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin only.\n")
         form = await self._read_form_urlencoded()
@@ -2390,7 +2850,9 @@ class GitHTTPHandler:
         if not u:
             return await self._ui_admin_users("User not found.", "warn")
         if int(user_id) == int(self.remote_user_id or -1) and not make_active:
-            return await self._ui_admin_users("You cannot disable your own account from the UI.", "warn")
+            return await self._ui_admin_users(
+                "You cannot disable your own account from the UI.", "warn"
+            )
         try:
             await asyncio.to_thread(db_set_user_active, user_id, make_active)
         except Exception as e:
@@ -2403,7 +2865,7 @@ class GitHTTPHandler:
     # ========================================================
     # UI: Repo + Branches + PRs
     # ========================================================
-    async def _ui_repo(self, owner: str, repo: str):
+    async def _ui_repo(self, owner: str, repo: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -2416,11 +2878,21 @@ class GitHTTPHandler:
         query_params = {key: values[0] for key, values in query.items()}
 
         default_branch, branches = await asyncio.gather(
-            _git_default_branch(repo_git), _git_list_branches(repo_git))
+            _git_default_branch(repo_git), _git_list_branches(repo_git)
+        )
         default_commit = await _git_resolve_commit(repo_git, "refs/heads/" + default_branch)
 
-        async def load_files():
-            code, output, _ = await _run_git(repo_git, ["ls-tree", "-z", f"{default_commit or default_branch}:"])
+        async def load_files() -> tuple[
+            list[tuple[str, str]],
+            list[tuple[str, str]],
+            RepositoryOverview,
+            int,
+            int,
+            int,
+        ]:
+            code, output, _ = await _run_git(
+                repo_git, ["ls-tree", "-z", f"{default_commit or default_branch}:"]
+            )
             entries = []
             if code == 0:
                 for line in output.decode("utf-8", "replace").split("\0"):
@@ -2437,17 +2909,26 @@ class GitHTTPHandler:
             if total > REPO_FILES_PAGE_SIZE:
                 size = _page_size(query, default=REPO_FILES_PAGE_SIZE)
                 page = _clamp_page(_page_number(query), total, size)
-                page_entries = entries[(page - 1) * size:page * size]
-            overview = await repository_overview(
-                owner, repo, repo_git, default_commit, page_entries,
-                page=page if total > REPO_FILES_PAGE_SIZE else None, page_size=size)
+                page_entries = entries[(page - 1) * size : page * size]
+            overview: RepositoryOverview = await repository_overview(
+                owner,
+                repo,
+                repo_git,
+                default_commit,
+                page_entries,
+                page=page if total > REPO_FILES_PAGE_SIZE else None,
+                page_size=size,
+            )
             return entries, page_entries, overview, page, total, size
 
         languages, readme, latest_ci, tags_result, files = await asyncio.gather(
             repository_languages(owner, repo, repo_git, default_commit),
             _run_git(repo_git, ["show", f"{default_commit or default_branch}:README.md"]),
             _call_in_thread(db_ci_latest_run, owner, repo, default_branch),
-            _run_git(repo_git, ["for-each-ref", "refs/tags", "--sort=-creatordate", "--format=%(refname:short)"]),
+            _run_git(
+                repo_git,
+                ["for-each-ref", "refs/tags", "--sort=-creatordate", "--format=%(refname:short)"],
+            ),
             load_files(),
         )
         root_entries, page_entries, overview, files_page, files_total, files_size = files
@@ -2482,15 +2963,23 @@ document.addEventListener("DOMContentLoaded", function() {{
             current_commit = default_commit
             if current_commit != latest_ci[4]:
                 ci_status = "stale"
-            ci_badge = safe_html(html_t(t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'))
+            ci_badge = safe_html(
+                html_t(
+                    t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'
+                )
+            )
         else:
             ci_badge = safe_html(html_t(t'<a class="pill" href="{base}/ci">CI: no runs</a>'))
         latest = overview["latest"]
         latest_html = safe_html("")
         if latest:
             initials = "".join(part[0] for part in latest["author"].split()[:2]).upper() or "?"
-            latest_html = safe_html(html_t(t'<div class="repo-latest-commit"><span class="repo-avatar" aria-hidden="true">{initials}</span><strong>{latest["author"]}</strong><a class="repo-latest-subject" href="{base}/commit/{latest["hash"]}">{latest["subject"]}</a><a href="{base}/commit/{latest["hash"]}"><code>{latest["hash"][:7]}</code></a><time class="muted" datetime="{latest["date"]}" title="{latest["date"]}">{_relative_time(latest["date"])}</time></div>'))
-        file_rows = []
+            latest_html = safe_html(
+                html_t(
+                    t'<div class="repo-latest-commit"><span class="repo-avatar" aria-hidden="true">{initials}</span><strong>{latest["author"]}</strong><a class="repo-latest-subject" href="{base}/commit/{latest["hash"]}">{latest["subject"]}</a><a href="{base}/commit/{latest["hash"]}"><code>{latest["hash"][:7]}</code></a><time class="muted" datetime="{latest["date"]}" title="{latest["date"]}">{_relative_time(latest["date"])}</time></div>'
+                )
+            )
+        file_rows: list[str] = []
         for kind, name in page_entries:
             if kind == "tree":
                 href = str_t(t"{base}/tree/{q(default_branch)}/{q(name, safe='/')}/")
@@ -2499,39 +2988,143 @@ document.addEventListener("DOMContentLoaded", function() {{
                 href = str_t(t"{base}/blob/{q(default_branch)}/{q(name, safe='/')}")
                 icon = TREE_FILE_ICON
             change = overview["entries"].get(name)
-            message = safe_html(html_t(t'<a href="{base}/commit/{change["hash"]}" title="{change["subject"]}">{change["subject"]}</a>')) if change else safe_html('<span class="muted">—</span>')
-            changed_at = safe_html(html_t(t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>')) if change else safe_html("—")
-            file_rows.append(html_t(t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'))
-        files_html = join_html(file_rows) if file_rows else safe_html('<tr><td colspan="3" class="muted">No files on the default branch.</td></tr>')
-        files_pagination = _pagination(base, query_params, files_page, files_page * files_size < files_total,
-                                       total=files_total, per_page=files_size) if files_total > REPO_FILES_PAGE_SIZE else safe_html("")
+            message = (
+                safe_html(
+                    html_t(
+                        t'<a href="{base}/commit/{change["hash"]}" title="{change["subject"]}">{change["subject"]}</a>'
+                    )
+                )
+                if change
+                else safe_html('<span class="muted">—</span>')
+            )
+            changed_at = (
+                safe_html(
+                    html_t(
+                        t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>'
+                    )
+                )
+                if change
+                else safe_html("—")
+            )
+            file_rows.append(
+                html_t(
+                    t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'
+                )
+            )
+        files_html = (
+            join_html(file_rows)
+            if file_rows
+            else safe_html(
+                '<tr><td colspan="3" class="muted">No files on the default branch.</td></tr>'
+            )
+        )
+        files_pagination = (
+            _pagination(
+                base,
+                query_params,
+                files_page,
+                files_page * files_size < files_total,
+                total=files_total,
+                per_page=files_size,
+            )
+            if files_total > REPO_FILES_PAGE_SIZE
+            else safe_html("")
+        )
         tags = tag_output.decode("utf-8", "replace").splitlines() if tag_code == 0 else []
-        tags_html = join_html([html_t(t'<li><a href="{base}/tree/{q(tag)}/">{tag}</a><a href="{base}/archive.zip?{urlencode({"ref": tag})}" aria-label="Download source for tag {tag}">ZIP ↓</a></li>') for tag in tags[:5]]) if tags else safe_html('<li class="muted">No tags yet.</li>')
+        tags_html = (
+            join_html(
+                [
+                    html_t(
+                        t'<li><a href="{base}/tree/{q(tag)}/">{tag}</a><a href="{base}/archive.zip?{urlencode({"ref": tag})}" aria-label="Download source for tag {tag}">ZIP ↓</a></li>'
+                    )
+                    for tag in tags[:5]
+                ]
+            )
+            if tags
+            else safe_html('<li class="muted">No tags yet.</li>')
+        )
         contributors = overview["contributors"]
-        contributors_html = join_html([html_t(t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>') for person in contributors[:5]]) if contributors else safe_html('<li class="muted">No contributors found.</li>')
+        contributors_html = (
+            join_html(
+                [
+                    html_t(
+                        t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>'
+                    )
+                    for person in contributors[:5]
+                ]
+            )
+            if contributors
+            else safe_html('<li class="muted">No contributors found.</li>')
+        )
         more_contributors = safe_html("")
         if len(contributors) > 5:
-            remaining = join_html([html_t(t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>') for person in contributors[5:]])
-            more_contributors = safe_html(html_t(t'<details class="repo-contributors-more"><summary>Show all {len(contributors)} contributors</summary><ul class="repo-summary-list">{remaining}</ul></details>'))
-        summary = next((line.strip() for line in readme_text.splitlines() if line.strip() and not line.lstrip().startswith(("#", "```", "-", "*", "|", "!"))), "")
+            remaining = join_html(
+                [
+                    html_t(
+                        t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>'
+                    )
+                    for person in contributors[5:]
+                ]
+            )
+            more_contributors = safe_html(
+                html_t(
+                    t'<details class="repo-contributors-more"><summary>Show all {len(contributors)} contributors</summary><ul class="repo-summary-list">{remaining}</ul></details>'
+                )
+            )
+        summary = next(
+            (
+                line.strip()
+                for line in readme_text.splitlines()
+                if line.strip() and not line.lstrip().startswith(("#", "```", "-", "*", "|", "!"))
+            ),
+            "",
+        )
         summary = summary[:240] + ("…" if len(summary) > 240 else "")
         license_html, license_link = safe_html(""), safe_html("")
         for kind, filename in root_entries:
-            if kind == "blob" and filename.casefold() in ("license", "license.md", "license.txt", "copying", "copying.txt"):
-                license_code, license_bytes, _ = await _run_git(repo_git, ["show", f"{default_commit}:{filename}"])
+            if kind == "blob" and filename.casefold() in (
+                "license",
+                "license.md",
+                "license.txt",
+                "copying",
+                "copying.txt",
+            ):
+                license_code, license_bytes, _ = await _run_git(
+                    repo_git, ["show", f"{default_commit}:{filename}"]
+                )
                 if license_code == 0:
                     license_text = license_bytes[:65536].decode("utf-8", "replace")
-                    license_label = "MIT license" if "Permission is hereby granted, free of charge" in license_text else "License"
+                    license_label = (
+                        "MIT license"
+                        if "Permission is hereby granted, free of charge" in license_text
+                        else "License"
+                    )
                     license_link = safe_html(html_t(t'<a href="#repo-license">{license_label}</a>'))
-                    license_html = safe_html(html_t(t'<section id="repo-license" class="box repo-document"><h2>{license_label}</h2><pre>{license_text}</pre><a href="{base}/blob/{q(default_branch)}/{q(filename)}">View full license file</a></section>'))
+                    license_html = safe_html(
+                        html_t(
+                            t'<section id="repo-license" class="box repo-document"><h2>{license_label}</h2><pre>{license_text}</pre><a href="{base}/blob/{q(default_branch)}/{q(filename)}">View full license file</a></section>'
+                        )
+                    )
                 break
-        document_nav = safe_html(html_t(t'<nav class="repo-document-nav" aria-label="Repository files navigation">{safe_html("<a href=\"#repo-readme\">README</a>") if readme_text else safe_html("")}{license_link}</nav>')) if readme_text or license_html else safe_html("")
-        about_html = safe_html(html_t(t'<section class="box"><h2>About</h2><p class="muted">{summary or "No description available in README."}</p><div class="repo-about-counts"><a href="{base}/commits?ref={q(default_branch)}">{overview["commit_count"] if overview["commit_count"] is not None else "—"} commits</a><a href="{base}/branches">{len(branches)} branches</a><a href="#repo-tags">{len(tags)} tags</a></div>{license_link}</section><section id="repo-tags" class="box"><h2>Tags</h2><ul class="repo-summary-list">{tags_html}</ul></section><section class="box"><h2>Contributors <span class="muted">{len(contributors)}</span></h2><ul class="repo-summary-list">{contributors_html}</ul>{more_contributors}</section>'))
+        document_nav = (
+            safe_html(
+                html_t(
+                    t'<nav class="repo-document-nav" aria-label="Repository files navigation">{safe_html('<a href="#repo-readme">README</a>') if readme_text else safe_html("")}{license_link}</nav>'
+                )
+            )
+            if readme_text or license_html
+            else safe_html("")
+        )
+        about_html = safe_html(
+            html_t(
+                t'<section class="box"><h2>About</h2><p class="muted">{summary or "No description available in README."}</p><div class="repo-about-counts"><a href="{base}/commits?ref={q(default_branch)}">{overview["commit_count"] if overview["commit_count"] is not None else "—"} commits</a><a href="{base}/branches">{len(branches)} branches</a><a href="#repo-tags">{len(tags)} tags</a></div>{license_link}</section><section id="repo-tags" class="box"><h2>Tags</h2><ul class="repo-summary-list">{tags_html}</ul></section><section class="box"><h2>Contributors <span class="muted">{len(contributors)}</span></h2><ul class="repo-summary-list">{contributors_html}</ul>{more_contributors}</section>'
+            )
+        )
 
-        options = []
+        options: list[str] = []
         for b in branches:
             selected = safe_html(" selected") if b == default_branch else safe_html("")
-            options.append(html_t(t"<option value=\"{b}\"{selected}>{b}</option>"))
+            options.append(html_t(t'<option value="{b}"{selected}>{b}</option>'))
         options_html = join_html(options) if options else safe_html("<option>(none)</option>")
 
         body = html_t(
@@ -2546,9 +3139,18 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div>{files_pagination}</div>
 {document_nav}{readme_html}{license_html}</div><aside class="repo-sidebar">{about_html}{language_html}</aside></div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"{owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"{owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_branches(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_branches(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -2564,9 +3166,15 @@ document.addEventListener("DOMContentLoaded", function() {{
         view = view if view in ("all", "protected", "merged") else "all"
         sort = (params.get("sort") or ["updated"])[0]
         sort = sort if sort in ("updated", "name") else "updated"
-        code, output, _ = await _run_git(repo_git, ["for-each-ref", "refs/heads",
-            "--sort=" + ("refname" if sort == "name" else "-committerdate"),
-            "--format=%(refname:strip=2)%00%(objectname)%00%(subject)%00%(authorname)%00%(committerdate:iso8601-strict)"])
+        code, output, _ = await _run_git(
+            repo_git,
+            [
+                "for-each-ref",
+                "refs/heads",
+                "--sort=" + ("refname" if sort == "name" else "-committerdate"),
+                "--format=%(refname:strip=2)%00%(objectname)%00%(subject)%00%(authorname)%00%(committerdate:iso8601-strict)",
+            ],
+        )
         branch_data = []
         for line in output.decode("utf-8", "replace").splitlines() if code == 0 else []:
             fields = line.split("\0")
@@ -2576,24 +3184,44 @@ document.addEventListener("DOMContentLoaded", function() {{
         # GitHub marks branches whose commits are all contained in the default
         # branch with a purple "Merged" label, so leftover head branches are
         # easy to spot and delete after their pull request lands.
-        code, merged_output, _ = await _run_git(repo_git, ["for-each-ref",
-            "--merged=" + default_branch, "--format=%(refname:strip=2)", "refs/heads"])
-        merged_branches = {line.strip() for line in merged_output.decode("utf-8", "replace").splitlines()
-                           if line.strip()} if code == 0 else set()
+        code, merged_output, _ = await _run_git(
+            repo_git,
+            [
+                "for-each-ref",
+                "--merged=" + default_branch,
+                "--format=%(refname:strip=2)",
+                "refs/heads",
+            ],
+        )
+        merged_branches = (
+            {
+                line.strip()
+                for line in merged_output.decode("utf-8", "replace").splitlines()
+                if line.strip()
+            }
+            if code == 0
+            else set()
+        )
         policy = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
         can_write = _has_write_scope(self)
 
-        rows, default_rows = [], []
+        rows: list[str] = []
+        default_rows: list[str] = []
         for b, sha, subject, author, updated in branch_data:
             is_protected = protected_branch(policy, b)
             is_merged = b != default_branch and b in merged_branches
-            if search.casefold() not in b.casefold() or (view == "protected" and not is_protected) \
-                    or (view == "merged" and not is_merged):
+            if (
+                search.casefold() not in b.casefold()
+                or (view == "protected" and not is_protected)
+                or (view == "merged" and not is_merged)
+            ):
                 continue
             browse = str_t(t"{base}/tree/{q(b)}/")
             if can_write and b != default_branch and not is_protected:
@@ -2607,11 +3235,28 @@ document.addEventListener("DOMContentLoaded", function() {{
                 del_html = safe_html('<span class="muted repo-lock">Deletion blocked</span>')
             else:
                 del_html = safe_html('<span class="muted repo-lock">Read only</span>')
-            default_pill = safe_html(' <span class="pill repo-default">Default</span>' if b == default_branch else "")
-            protected_pill = safe_html(' <span class="pill">Protected</span>' if is_protected else "")
-            merged_pill = safe_html(html_t(t' <span class="pill pill-merged" title="Every commit is contained in {default_branch}">Merged</span>')
-                                    if b != default_branch and b in merged_branches else "")
-            compare_link = safe_html(html_t(t'<a class="pill" href="{base}/pulls/new?{urlencode({"source": b, "target": default_branch})}">New pull request</a>')) if b != default_branch else safe_html("")
+            default_pill = safe_html(
+                ' <span class="pill repo-default">Default</span>' if b == default_branch else ""
+            )
+            protected_pill = safe_html(
+                ' <span class="pill">Protected</span>' if is_protected else ""
+            )
+            merged_pill = safe_html(
+                html_t(
+                    t' <span class="pill pill-merged" title="Every commit is contained in {default_branch}">Merged</span>'
+                )
+                if b != default_branch and b in merged_branches
+                else ""
+            )
+            compare_link = (
+                safe_html(
+                    html_t(
+                        t'<a class="pill" href="{base}/pulls/new?{urlencode({"source": b, "target": default_branch})}">New pull request</a>'
+                    )
+                )
+                if b != default_branch
+                else safe_html("")
+            )
             row = html_t(t'''<article class="repo-branch-row"><div class="repo-branch-info"><div class="repo-branch-name"><a href="{browse}"><code>{b}</code></a>{default_pill}{protected_pill}{merged_pill}</div>
 <p class="repo-commit-subject"><a href="{base}/commit/{sha}" title="{subject}">{subject or "Untitled commit"}</a></p><p class="muted"><a href="{base}/commit/{sha}"><code>{sha[:8]}</code></a> · {author} · <time datetime="{updated}">{updated.replace("T", " ")}</time></p></div>
 <div class="repo-branch-actions"><a class="pill" href="{base}/commits?ref={q(b)}">Commits</a>{compare_link}{del_html}</div></article>''')
@@ -2629,7 +3274,9 @@ document.addEventListener("DOMContentLoaded", function() {{
                 )
             )
         else:
-            create_box = safe_html('<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope, so branch create/delete is disabled.</div>')
+            create_box = safe_html(
+                '<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope, so branch create/delete is disabled.</div>'
+            )
         rows, pagination, _page = _paginate_items(rows, self.path, base + "/branches")
         if search:
             rows_heading = "Matching branches"
@@ -2642,12 +3289,26 @@ document.addEventListener("DOMContentLoaded", function() {{
         if rows:
             rows_html = join_html(rows)
         elif view == "merged" and not search:
-            rows_html = safe_html('<div class="repo-empty"><h2>No merged branches</h2><p class="muted">Branches whose commits are all in the default branch appear here after a merge.</p></div>')
+            rows_html = safe_html(
+                '<div class="repo-empty"><h2>No merged branches</h2><p class="muted">Branches whose commits are all in the default branch appear here after a merge.</p></div>'
+            )
         elif search or view != "all":
-            rows_html = safe_html('<div class="repo-empty"><h2>No matching branches</h2><p class="muted">Try a different search or filter.</p></div>')
+            rows_html = safe_html(
+                '<div class="repo-empty"><h2>No matching branches</h2><p class="muted">Try a different search or filter.</p></div>'
+            )
         else:
-            rows_html = safe_html('<div class="repo-empty"><h2>No other branches yet</h2><p class="muted">Create a branch to work on changes without updating the default branch.</p></div>')
-        default_html = safe_html(html_t(t'<section class="box repo-list"><div class="repo-panel-heading"><h2>Default branch</h2></div>{join_html(default_rows)}</section>')) if default_rows else safe_html("")
+            rows_html = safe_html(
+                '<div class="repo-empty"><h2>No other branches yet</h2><p class="muted">Create a branch to work on changes without updating the default branch.</p></div>'
+            )
+        default_html = (
+            safe_html(
+                html_t(
+                    t'<section class="box repo-list"><div class="repo-panel-heading"><h2>Default branch</h2></div>{join_html(default_rows)}</section>'
+                )
+            )
+            if default_rows
+            else safe_html("")
+        )
         body = html_t(
             t"""<main class="repo-page">{_repo_tabs(base, "branches")}<div class="topbar"><div><h2>Branches</h2><p class="muted">Manage development branches and open pull requests.</p></div><span class="pill">{len(branches)} branches</span></div>
 {notice_html}
@@ -2656,13 +3317,17 @@ document.addEventListener("DOMContentLoaded", function() {{
 <select name="sort" aria-label="Branch sort"><option value="updated"{safe_html(" selected" if sort == "updated" else "")}>Recently updated</option><option value="name"{safe_html(" selected" if sort == "name" else "")}>Name</option></select><button type="submit">Find branches</button><a class="pill" href="{base}/branches">Reset</a></div></form>
 {create_box}{default_html}<section class="box repo-list"><div class="repo-panel-heading"><h2>{rows_heading}</h2><span class="muted">{len(rows)} shown</span></div>{rows_html}{pagination}</section></main>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Branches · {owner}/{repo}"), safe_html(body)))
+        await _send_html(
+            self.request, 200, _html_page(str_t(t"Branches · {owner}/{repo}"), safe_html(body))
+        )
 
-    async def _ui_branch_create(self, owner: str, repo: str):
+    async def _ui_branch_create(self, owner: str, repo: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
-            return await self._ui_branches(owner, repo, "You need write scope to create branches.", "warn")
+            return await self._ui_branches(
+                owner, repo, "You need write scope to create branches.", "warn"
+            )
         form = await self._read_form_urlencoded()
         new_branch = (form.get("new_branch") or "").strip()
         from_ref = (form.get("from_ref") or "").strip()
@@ -2671,35 +3336,55 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not from_ref:
             return await self._ui_branches(owner, repo, "From ref is required.", "warn")
         if protected_branch(await self.server.ci_manager.config(owner, repo), new_branch):
-            return await self._ui_branches(owner, repo, "Protected branch creation is blocked; change protection settings first.", "warn")
+            return await self._ui_branches(
+                owner,
+                repo,
+                "Protected branch creation is blocked; change protection settings first.",
+                "warn",
+            )
         ok, msg = await _git_create_branch(_repo_bare_path(owner, repo), new_branch, from_ref)
         return await self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
 
-    async def _ui_branch_delete(self, owner: str, repo: str):
+    async def _ui_branch_delete(self, owner: str, repo: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
-            return await self._ui_branches(owner, repo, "You need write scope to delete branches.", "warn")
+            return await self._ui_branches(
+                owner, repo, "You need write scope to delete branches.", "warn"
+            )
         form = await self._read_form_urlencoded()
         branch = (form.get("branch") or "").strip()
         if not _safe_branch_name(branch):
             return await self._ui_branches(owner, repo, "Invalid branch name.", "warn")
         if protected_branch(await self.server.ci_manager.config(owner, repo), branch):
-            return await self._ui_branches(owner, repo, "Protected branches cannot be deleted.", "warn")
+            return await self._ui_branches(
+                owner, repo, "Protected branches cannot be deleted.", "warn"
+            )
         repo_git = _repo_bare_path(owner, repo)
         default_branch = await _git_default_branch(repo_git)
         if branch == default_branch:
-            return await self._ui_branches(owner, repo, "Default branch is protected and cannot be deleted.", "warn")
+            return await self._ui_branches(
+                owner, repo, "Default branch is protected and cannot be deleted.", "warn"
+            )
         expected = (form.get("expected_commit") or "").strip()
         if expected and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", expected):
-            return await self._ui_branches(owner, repo, "Invalid branch revision. Refresh and try again.", "warn")
+            return await self._ui_branches(
+                owner, repo, "Invalid branch revision. Refresh and try again.", "warn"
+            )
         current = await _git_resolve_commit(repo_git, "refs/heads/" + branch)
         if not current or (expected and expected != current):
-            return await self._ui_branches(owner, repo, "Branch changed or no longer exists. Refresh before deleting it.", "warn")
+            return await self._ui_branches(
+                owner,
+                repo,
+                "Branch changed or no longer exists. Refresh before deleting it.",
+                "warn",
+            )
         ok, msg = await _git_delete_branch(repo_git, branch, expected_commit=expected or current)
         return await self._ui_branches(owner, repo, msg, "ok" if ok else "warn")
 
-    async def _ui_pulls(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_pulls(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -2713,28 +3398,47 @@ document.addEventListener("DOMContentLoaded", function() {{
         status = (qs.get("status") or ["open"])[0].strip().lower()
         if status not in ("open", "closed", "merged", "all"):
             status = "open"
-        from .database import db_pr_count, db_pr_comment_counts
+        from .database import db_pr_comment_counts, db_pr_count
+
         size = _page_size(qs)
-        totals = {}
+        totals: dict[str, int] = {}
         for tab in ("open", "merged", "closed"):
             totals[tab] = await asyncio.to_thread(db_pr_count, owner, repo, tab)
         totals["all"] = await asyncio.to_thread(db_pr_count, owner, repo)
         total = totals.get(status, 0)
         page = _clamp_page(_page_number(qs), total, size)
-        rows_db = await asyncio.to_thread(db_pr_list, owner, repo, None if status == "all" else status, limit=size, offset=(page - 1) * size)
-        pagination = _pagination(str_t(t"/r/{q(owner)}/{q(repo)}/pulls"), {key: values[0] for key, values in qs.items() if key != "page"}, page, page * size < total, total=total, per_page=size)
+        rows_db = await asyncio.to_thread(
+            db_pr_list,
+            owner,
+            repo,
+            None if status == "all" else status,
+            limit=size,
+            offset=(page - 1) * size,
+        )
+        pagination = _pagination(
+            str_t(t"/r/{q(owner)}/{q(repo)}/pulls"),
+            {key: values[0] for key, values in qs.items() if key != "page"},
+            page,
+            page * size < total,
+            total=total,
+            per_page=size,
+        )
         comment_counts = await asyncio.to_thread(db_pr_comment_counts, [row[0] for row in rows_db])
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
 
-        rows = []
+        rows: list[str] = []
         for pr_id, title, src, tgt, st, created_at in rows_db:
             count = comment_counts.get(pr_id, 0)
             when = _relative_time(created_at) or created_at
-            count_suffix = safe_html(f'<small title="{count} comment(s)">💬 {count}</small>' if count else "")
+            count_suffix = safe_html(
+                f'<small title="{count} comment(s)">💬 {count}</small>' if count else ""
+            )
             icon = "&#10003;" if st == "merged" else "…" if st == "open" else "—"
             rows.append(
                 html_t(
@@ -2744,23 +3448,44 @@ document.addEventListener("DOMContentLoaded", function() {{
 <td><span class="pill pill-{st}">{st}</span></td><td class="muted"><small title="{created_at}">{when}</small></td></tr>"""
                 )
             )
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No pull requests.</td><td></td><td></td><td></td></tr>')
+        rows_html = (
+            join_html(rows)
+            if rows
+            else safe_html(
+                '<tr><td class="muted">No pull requests.</td><td></td><td></td><td></td></tr>'
+            )
+        )
         body = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Pull requests</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="/">Home</a></div></div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>
-<a class="pill pull-tab{' pull-tab-active' if status == 'open' else ''}" href="{base}/pulls?status=open">Open {totals['open']}</a> <a class="pill pull-tab{' pull-tab-active' if status == 'merged' else ''}" href="{base}/pulls?status=merged">Merged {totals['merged']}</a> <a class="pill pull-tab{' pull-tab-active' if status == 'closed' else ''}" href="{base}/pulls?status=closed">Closed {totals['closed']}</a> <a class="pill pull-tab{' pull-tab-active' if status == 'all' else ''}" href="{base}/pulls?status=all">All {totals['all']}</a>
+<a class="pill pull-tab{" pull-tab-active" if status == "open" else ""}" href="{base}/pulls?status=open">Open {totals["open"]}</a> <a class="pill pull-tab{" pull-tab-active" if status == "merged" else ""}" href="{base}/pulls?status=merged">Merged {totals["merged"]}</a> <a class="pill pull-tab{" pull-tab-active" if status == "closed" else ""}" href="{base}/pulls?status=closed">Closed {totals["closed"]}</a> <a class="pill pull-tab{" pull-tab-active" if status == "all" else ""}" href="{base}/pulls?status=all">All {totals["all"]}</a>
 </div><div><a class="pill pull-tab-active" href="{base}/pulls/new">+ New pull request</a></div></div></div>
 <div class="box"><table>{rows_html}</table>{pagination}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Pull requests · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-list">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Pull requests · {owner}/{repo}"),
+                safe_html(
+                    html_t(
+                        t'<main class="repo-page review-page review-list">{safe_html(body)}</main>'
+                    )
+                ),
+            ),
+        )
 
-    async def _ui_pulls_new(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_pulls_new(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         """Dedicated pull-request creation page (linked from '+ New pull request')."""
         owner = unquote(owner)
         repo = unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
@@ -2770,18 +3495,38 @@ document.addEventListener("DOMContentLoaded", function() {{
         default_branch = await _git_default_branch(repo_git)
         branches = await _git_list_branches(repo_git)
         if not branches:
-            return await self._ui_pulls(owner, repo, "Create a branch before opening a pull request.", "warn")
+            return await self._ui_pulls(
+                owner, repo, "Create a branch before opening a pull request.", "warn"
+            )
         selected_source = (qs.get("source") or [""])[0]
         selected_target = (qs.get("target") or [default_branch])[0]
         if selected_target not in branches:
             selected_target = default_branch
-        opt_src = join_html([html_t(t'<option value="{b}"{safe_html(" selected" if b == selected_source else "")}>{b}</option>') for b in branches])
-        opt_tgt = join_html([html_t(t'<option value="{b}"{safe_html(" selected" if b == selected_target else "")}>{b}</option>') for b in branches])
-        warn_merge = safe_html('<div class="warn" style="margin-top:10px">Merging is <b>fast-forward only</b> on this server.</div>')
+        opt_src = join_html(
+            [
+                html_t(
+                    t'<option value="{b}"{safe_html(" selected" if b == selected_source else "")}>{b}</option>'
+                )
+                for b in branches
+            ]
+        )
+        opt_tgt = join_html(
+            [
+                html_t(
+                    t'<option value="{b}"{safe_html(" selected" if b == selected_target else "")}>{b}</option>'
+                )
+                for b in branches
+            ]
+        )
+        warn_merge = safe_html(
+            '<div class="warn" style="margin-top:10px">Merging is <b>fast-forward only</b> on this server.</div>'
+        )
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         body = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Open a pull request</h2>
@@ -2789,9 +3534,20 @@ document.addEventListener("DOMContentLoaded", function() {{
 {notice_html}
 <div class="box" style="margin-bottom:14px">{_pr_create_form_html(base, opt_src, opt_tgt, warn_merge)}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Open a pull request · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}{self._issue_editor_assets()}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Open a pull request · {owner}/{repo}"),
+                safe_html(
+                    html_t(
+                        t'<main class="repo-page">{safe_html(body)}{self._issue_editor_assets()}</main>'
+                    )
+                ),
+            ),
+        )
 
-    async def _ui_pulls_create(self, owner: str, repo: str):
+    async def _ui_pulls_create(self, owner: str, repo: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -2811,26 +3567,69 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not (_safe_branch_name(source_branch) and _safe_branch_name(target_branch)):
             return await self._ui_pulls_new(owner, repo, "Invalid branch name.", "warn")
         if source_branch == target_branch:
-            return await self._ui_pulls_new(owner, repo, "Source and target must be different.", "warn")
+            return await self._ui_pulls_new(
+                owner, repo, "Source and target must be different.", "warn"
+            )
         src = await _git_resolve_commit(repo_git, "refs/heads/" + source_branch)
         tgt = await _git_resolve_commit(repo_git, "refs/heads/" + target_branch)
         if not src:
-            return await self._ui_pulls_new(owner, repo, str_t(t"Source branch not found: {source_branch}"), "warn")
+            return await self._ui_pulls_new(
+                owner, repo, str_t(t"Source branch not found: {source_branch}"), "warn"
+            )
         if not tgt:
-            return await self._ui_pulls_new(owner, repo, str_t(t"Target branch not found: {target_branch}"), "warn")
-        pr_id = await asyncio.to_thread(db_pr_create, owner, repo, title, body, source_branch, target_branch, self.remote_user_id)
-        await self.server.ci_manager.enqueue(owner, repo, "pull_request", target_branch, tgt,
-            {"pr_number": pr_id, "base_branch": target_branch, "head_branch": source_branch,
-             "base_commit": tgt, "head_commit": src})
+            return await self._ui_pulls_new(
+                owner, repo, str_t(t"Target branch not found: {target_branch}"), "warn"
+            )
+        pr_id = await asyncio.to_thread(
+            db_pr_create,
+            owner,
+            repo,
+            title,
+            body,
+            source_branch,
+            target_branch,
+            self.remote_user_id,
+        )
+        await self.server.ci_manager.enqueue(
+            owner,
+            repo,
+            "pull_request",
+            target_branch,
+            tgt,
+            {
+                "pr_number": pr_id,
+                "base_branch": target_branch,
+                "head_branch": source_branch,
+                "base_commit": tgt,
+                "head_commit": src,
+            },
+        )
         await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/pulls/{pr_id}"))
 
-    async def _ui_pull_view(self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_pull_view(
+        self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         row = await asyncio.to_thread(db_pr_get, pr_id)
         if not row:
             return await self._not_found()
-        (_id, db_owner, db_repo, title, body, src_branch, tgt_branch, author_user_id, status, created_at, closed_at, merged_at, merge_method, merge_commit) = row
+        (
+            _id,
+            db_owner,
+            db_repo,
+            title,
+            body,
+            src_branch,
+            tgt_branch,
+            author_user_id,
+            status,
+            created_at,
+            closed_at,
+            merged_at,
+            merge_method,
+            merge_commit,
+        ) = row
         if db_owner != owner or db_repo != repo:
             return await self._not_found()
         repo_git = _repo_bare_path(owner, repo)
@@ -2839,50 +3638,86 @@ document.addEventListener("DOMContentLoaded", function() {{
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         src_commit = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
         tgt_commit = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
-        commits = []
+        commits: list[dict[str, str]] = []
         params = parse_qs(urlparse(self.path).query or "")
         page = _page_number(params)
         size = _page_size(params)
-        total = 0
-        merge_base = await _git_merge_base(repo_git, tgt_commit, src_commit) if (src_commit and tgt_commit) else None
+        total: int | None = 0
+        merge_base = (
+            await _git_merge_base(repo_git, tgt_commit, src_commit)
+            if (src_commit and tgt_commit)
+            else None
+        )
         if src_commit and tgt_commit and src_commit != tgt_commit:
             total = await _git_commit_count(repo_git, tgt_commit + ".." + src_commit)
             if total is not None:
                 page = _clamp_page(page, total, size)
-            commits = await _git_list_commits(repo_git, tgt_commit + ".." + src_commit, limit=size + 1, skip=(page - 1) * size)
-        commits_pagination = _pagination(base + f"/pulls/{pr_id}", {}, page, len(commits) > size, total=total, per_page=size)
+            commits = await _git_list_commits(
+                repo_git, tgt_commit + ".." + src_commit, limit=size + 1, skip=(page - 1) * size
+            )
+        commits_pagination = _pagination(
+            base + f"/pulls/{pr_id}", {}, page, len(commits) > size, total=total, per_page=size
+        )
         commits = commits[:size]
-        changed_files = await _git_diff_files(repo_git, merge_base, src_commit) if (merge_base and src_commit and merge_base != src_commit) else []
+        changed_files: list[ChangedFile] = (
+            await _git_diff_files(repo_git, merge_base, src_commit)
+            if (merge_base and src_commit and merge_base != src_commit)
+            else []
+        )
         selected_file = (params.get("file") or [""])[0]
         if selected_file and not any(f["path"] == selected_file for f in changed_files):
             selected_file = ""
         if src_commit and tgt_commit and src_commit != tgt_commit:
             # Three-dot diff: show what this PR adds relative to the merge base,
             # not unrelated target-branch changes.
-            diff_text, diff_trunc = await _git_diff_between(repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES)
+            diff_text, diff_trunc = await _git_diff_between(
+                repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES
+            )
         elif src_commit and tgt_commit and src_commit == tgt_commit:
             diff_text, diff_trunc = "(No changes; branches point to the same commit.)", False
         else:
             diff_text, diff_trunc = "(Could not resolve one or both branches.)", False
-        if selected_file:
-            diff_text, diff_trunc = await _git_diff_between(repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES, path=selected_file)
+        if selected_file and (merge_base or tgt_commit) and src_commit:
+            diff_text, diff_trunc = await _git_diff_between(
+                repo_git,
+                merge_base or tgt_commit or "",
+                src_commit,
+                max_bytes=PR_PATCH_MAX_BYTES,
+                path=selected_file,
+            )
 
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
         can_write = _has_write_scope(self)
         merge_box = safe_html("")
         ci_policy = await self.server.ci_manager.config(owner, repo)
-        check = await self.server.ci_manager.merge_check(owner, repo, pr_id, tgt_commit or "", src_commit or "", tgt_branch)
+        check = await self.server.ci_manager.merge_check(
+            owner, repo, pr_id, tgt_commit or "", src_commit or "", tgt_branch
+        )
         ci_passed = bool(check and check[1] == "success" and src_commit and tgt_commit)
-        ci_label = check[1].replace("_", " ") if check else "not run for current commits (missing or outdated)"
+        ci_label = (
+            check[1].replace("_", " ")
+            if check
+            else "not run for current commits (missing or outdated)"
+        )
         ci_requirement = "required" if ci_policy["require_ci"] else "informational"
-        ci_panel = safe_html(html_t(t'<div class="box" style="margin-bottom:14px"><h2>CI checks</h2><p>CI is {ci_requirement}: {ci_label}.</p><a href="{base}/ci">View CI runs</a></div>'))
+        ci_panel = safe_html(
+            html_t(
+                t'<div class="box" style="margin-bottom:14px"><h2>CI checks</h2><p>CI is {ci_requirement}: {ci_label}.</p><a href="{base}/ci">View CI runs</a></div>'
+            )
+        )
         merge_note = safe_html("")
         if status == "merged":
             short_commit = (merge_commit or "")[:8]
-            merge_note = safe_html(html_t(t"<div class=\"ok\" style=\"margin-top:10px\">Merged ({merge_method or ''}). Target now at <code>{short_commit}</code>.</div>"))
+            merge_note = safe_html(
+                html_t(
+                    t'<div class="ok" style="margin-top:10px">Merged ({merge_method or ""}). Target now at <code>{short_commit}</code>.</div>'
+                )
+            )
         elif status == "closed":
             merge_note = safe_html('<div class="warn" style="margin-top:10px">Closed.</div>')
 
@@ -2891,20 +3726,36 @@ document.addEventListener("DOMContentLoaded", function() {{
             if merge_base is None:
                 conflicts = None  # incompatible histories; simulate unavailable
             elif merge_base != tgt_commit:
-                conflicts = await _git_merge_conflicts(repo_git, "refs/heads/" + tgt_branch, "refs/heads/" + src_branch)
+                conflicts = await _git_merge_conflicts(
+                    repo_git, "refs/heads/" + tgt_branch, "refs/heads/" + src_branch
+                )
             else:
                 conflicts = []  # fast-forward possible; no conflict simulation needed
         conflict_html = safe_html("")
         if status == "open" and can_write:
             if conflicts is None:
-                conflict_html = safe_html('<div class="warn" style="margin-top:10px">Cannot simulate a merge (incompatible histories); a fast-forward merge will still verify the current commits.</div>')
+                conflict_html = safe_html(
+                    '<div class="warn" style="margin-top:10px">Cannot simulate a merge (incompatible histories); a fast-forward merge will still verify the current commits.</div>'
+                )
             elif merge_base == tgt_commit:
-                conflict_html = safe_html('<div class="muted" style="margin-top:10px">The target is an ancestor of this branch; a clean fast-forward merge is possible.</div>')
+                conflict_html = safe_html(
+                    '<div class="muted" style="margin-top:10px">The target is an ancestor of this branch; a clean fast-forward merge is possible.</div>'
+                )
             elif conflicts:
-                conflict_html = safe_html(html_t(t'<div class="warn" style="margin-top:10px"><b>Merge conflict:</b> <code>{tgt_branch}</code> has advanced past the merge base, and merging this branch now would conflict. <a class="pill" href="{base}/pulls/{pr_id}/resolve/ide">Resolve conflicts in the web IDE</a> creates a merge commit on <code>{src_branch}</code>, or update the branch with Git (merge/rebase, resolve, push).</div>'))
+                conflict_html = safe_html(
+                    html_t(
+                        t'<div class="warn" style="margin-top:10px"><b>Merge conflict:</b> <code>{tgt_branch}</code> has advanced past the merge base, and merging this branch now would conflict. <a class="pill" href="{base}/pulls/{pr_id}/resolve/ide">Resolve conflicts in the web IDE</a> creates a merge commit on <code>{src_branch}</code>, or update the branch with Git (merge/rebase, resolve, push).</div>'
+                    )
+                )
             else:
-                conflict_html = safe_html('<div class="muted" style="margin-top:10px">The target has advanced past the merge base, but the simulated merge reports no conflicts. Fast-forward merges still verify both commits at merge time.</div>')
-        merge_disabled = safe_html(' disabled title="Successful CI for the current PR commits is required"' if ci_policy["require_ci"] and not ci_passed else "")
+                conflict_html = safe_html(
+                    '<div class="muted" style="margin-top:10px">The target has advanced past the merge base, but the simulated merge reports no conflicts. Fast-forward merges still verify both commits at merge time.</div>'
+                )
+        merge_disabled = safe_html(
+            ' disabled title="Successful CI for the current PR commits is required"'
+            if ci_policy["require_ci"] and not ci_passed
+            else ""
+        )
         if status == "open":
             if can_write:
                 merge_box = safe_html(
@@ -2917,78 +3768,145 @@ document.addEventListener("DOMContentLoaded", function() {{
                     )
                 )
             else:
-                merge_box = safe_html('<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope. You can’t merge/close this PR from the UI.</div>')
+                merge_box = safe_html(
+                    '<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope. You can’t merge/close this PR from the UI.</div>'
+                )
         elif status == "closed" and can_write:
-            merge_box = safe_html(html_t(t'<div class="box"><form method="POST" action="{base}/pulls/{pr_id}/reopen"><button type="submit">Reopen PR</button></form></div>'))
+            merge_box = safe_html(
+                html_t(
+                    t'<div class="box"><form method="POST" action="{base}/pulls/{pr_id}/reopen"><button type="submit">Reopen PR</button></form></div>'
+                )
+            )
 
-        commit_rows = []
+        commit_rows: list[str] = []
         for c in commits:
             ch = c["hash"]
             commit_rows.append(
                 html_t(
                     t"""<tr><td style="width:110px"><a href="{base}/commit/{q(ch)}"><code>{ch[:8]}</code></a></td>
-<td>{c['subject']}</td><td class="muted">{c['author_name']}</td><td class="muted"><small>{c['date']}</small></td></tr>"""
+<td>{c["subject"]}</td><td class="muted">{c["author_name"]}</td><td class="muted"><small>{c["date"]}</small></td></tr>"""
                 )
             )
-        commits_html = join_html(commit_rows) if commit_rows else safe_html('<tr><td class="muted">No commits (or branches not resolvable).</td></tr>')
+        commits_html = (
+            join_html(commit_rows)
+            if commit_rows
+            else safe_html(
+                '<tr><td class="muted">No commits (or branches not resolvable).</td></tr>'
+            )
+        )
         diff_html = _prism_diff_patch_html(diff_text, diff_trunc, "Diff")
         if selected_file:
-            heading = safe_html(html_t(t'Diff — <code>{selected_file}</code> <a class="pill" href="{base}/pulls/{pr_id}#diff">All files</a>'))
+            heading = safe_html(
+                html_t(
+                    t'Diff — <code>{selected_file}</code> <a class="pill" href="{base}/pulls/{pr_id}#diff">All files</a>'
+                )
+            )
         else:
             heading = safe_html("Diff")
-        description = safe_html(html_t(t'<div class="md-body">{body}</div>')) if (body or "").strip() else safe_html('<span class="muted">(no description)</span>')
+        description = (
+            safe_html(html_t(t'<div class="md-body">{body}</div>'))
+            if (body or "").strip()
+            else safe_html('<span class="muted">(no description)</span>')
+        )
         src_short = (src_commit or "")[:8]
         tgt_short = (tgt_commit or "")[:8]
-        file_rows = []
+        file_rows: list[str] = []
         for f in changed_files:
-            path, kind, adds, dels = f["path"], f["kind"], f["added"], f["deleted"]
-            meta = {"added": ("A", "ok"), "deleted": ("D", "warn"), "modified": ("M", "muted"), "binary": ("B", "muted")}
+            path = str(f["path"])
+            kind = str(f["kind"])
+            adds, dels = f["added"], f["deleted"]
+            meta = {
+                "added": ("A", "ok"),
+                "deleted": ("D", "warn"),
+                "modified": ("M", "muted"),
+                "binary": ("B", "muted"),
+            }
             badge, cls = meta.get(str(kind), meta["modified"])
-            link = safe_html(html_t(t'<a href="{base}/pulls/{pr_id}?file={q(path)}#diff">{path}</a>'))
+            link = safe_html(
+                html_t(t'<a href="{base}/pulls/{pr_id}?file={q(path)}#diff">{path}</a>')
+            )
             selected = safe_html(" pr-file-selected") if path == selected_file else safe_html("")
-            file_rows.append(html_t(
-                t'<tr{selected}><td style="width:26px"><span class="pull-file-badge pull-file-{kind}" title="{kind}">{badge}</span></td><td>{link}</td><td class="muted" style="width:110px"><span class="add">+{adds}</span> <span class="del">−{dels}</span></td></tr>'
-            ))
-        files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No changed files.</td></tr>')
-        files_panel = safe_html(html_t(
-            t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Changed files ({len(changed_files)})</h2><table>{files_html}</table></div>'
-        )) if changed_files else safe_html("")
-        total_adds = sum(int(f["added"]) for f in changed_files)
-        total_dels = sum(int(f["deleted"]) for f in changed_files)
-        summary = safe_html(html_t(
-            t'<div class="muted" style="margin-bottom:10px">{len(commits)} commit(s), {len(changed_files)} file(s) changed: <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></div>'
-        )) if changed_files else safe_html("")
+            file_rows.append(
+                html_t(
+                    t'<tr{selected}><td style="width:26px"><span class="pull-file-badge pull-file-{kind}" title="{kind}">{badge}</span></td><td>{link}</td><td class="muted" style="width:110px"><span class="add">+{adds}</span> <span class="del">−{dels}</span></td></tr>'
+                )
+            )
+        files_html = (
+            join_html(file_rows)
+            if file_rows
+            else safe_html('<tr><td class="muted">No changed files.</td></tr>')
+        )
+        files_panel = (
+            safe_html(
+                html_t(
+                    t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Changed files ({len(changed_files)})</h2><table>{files_html}</table></div>'
+                )
+            )
+            if changed_files
+            else safe_html("")
+        )
+        total_adds = sum(f["added"] for f in changed_files)
+        total_dels = sum(f["deleted"] for f in changed_files)
+        summary = (
+            safe_html(
+                html_t(
+                    t'<div class="muted" style="margin-bottom:10px">{len(commits)} commit(s), {len(changed_files)} file(s) changed: <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></div>'
+                )
+            )
+            if changed_files
+            else safe_html("")
+        )
         comments = await asyncio.to_thread(db_pr_comment_list, pr_id)
         viewer_id = self.remote_user_id
         viewer_admin = bool(getattr(self, "remote_is_admin", False))
         comment_rows = []
-        for c in comments:
-            cid, c_author, c_username, c_body, c_created, c_edited = c
+        for comment in comments:
+            cid, c_author, c_username, c_body, c_created, c_edited = comment
             edited = " (edited)" if c_edited else ""
             when = _relative_time(c_created) or c_created
-            can_manage = (not REQUIRE_AUTH and can_write) or (viewer_id is not None and c_author == viewer_id) or viewer_admin
+            can_manage = (
+                (not REQUIRE_AUTH and can_write)
+                or (viewer_id is not None and c_author == viewer_id)
+                or viewer_admin
+            )
             controls = safe_html("")
             if can_manage:
-                controls = safe_html(html_t(t'<form method="POST" action="{base}/pulls/{pr_id}/comments/{cid}/delete" class="pr-comment-actions"><button class="danger" type="submit">Delete</button></form>'))
-            comment_rows.append(html_t(
-                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
-            ))
-        comments_join = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
+                controls = safe_html(
+                    html_t(
+                        t'<form method="POST" action="{base}/pulls/{pr_id}/comments/{cid}/delete" class="pr-comment-actions"><button class="danger" type="submit">Delete</button></form>'
+                    )
+                )
+            comment_rows.append(
+                html_t(
+                    t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
+                )
+            )
+        comments_join = (
+            join_html(comment_rows)
+            if comment_rows
+            else safe_html('<p class="muted">No comments yet.</p>')
+        )
         comment_form = safe_html("")
         if status == "open" and can_write:
-            comment_form = safe_html(html_t(
-                t'<form method="POST" action="{base}/pulls/{pr_id}/comments" class="pr-comment-form pr-md-form"><label>Add comment</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a comment… Markdown and image uploads supported"></textarea><button type="submit">Comment</button></form>'
-            ))
+            comment_form = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/pulls/{pr_id}/comments" class="pr-comment-form pr-md-form"><label>Add comment</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a comment… Markdown and image uploads supported"></textarea><button type="submit">Comment</button></form>'
+                )
+            )
         else:
             comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
-        comments_box = safe_html(html_t(
-            t'<div class="box" id="discussion" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Discussion ({len(comments)})</h2>{comments_join}{comment_form}</div>'
-        ))
+        comments_box = safe_html(
+            html_t(
+                t'<div class="box" id="discussion" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Discussion ({len(comments)})</h2>{comments_join}{comment_form}</div>'
+            )
+        )
         title_form = safe_html("")
         if status == "open" and can_write:
-            title_form = safe_html(html_t(
-                t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form pr-md-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body}</textarea><button type="submit">Save</button></form></details>'
-            ))
+            title_form = safe_html(
+                html_t(
+                    t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form pr-md-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body}</textarea><button type="submit">Save</button></form></details>'
+                )
+            )
         body_html = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> <a href="{base}/pulls">Pull requests</a> <span>/</span> !{pr_id}</div><div class="topbar"><div><h2>{title}</h2>
 <div class="muted"><span class="pill pill-{status}">{status}</span> <code>{src_branch}</code> → <code>{tgt_branch}</code> | Created: {created_at}</div></div>
@@ -3005,9 +3923,20 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">{heading}</h2>{summary}{diff_html}</div></div>
 <aside class="review-sidebar" aria-label="Pull request details"><h3>Pull request details</h3><dl><dt>Status</dt><dd><span class="pill pill-{status}">{status}</span></dd><dt>Source branch</dt><dd><code>{src_branch}</code><br><code>{src_short}</code></dd><dt>Target branch</dt><dd><code>{tgt_branch}</code><br><code>{tgt_short}</code></dd><dt>Created</dt><dd>{created_at}</dd><dt>Changes</dt><dd>{len(changed_files)} files <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></dd></dl></aside></div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-detail">{safe_html(body_html)}{self._issue_editor_assets()}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"PR #{pr_id} · {owner}/{repo}"),
+                safe_html(
+                    html_t(
+                        t'<main class="repo-page review-page review-detail">{safe_html(body_html)}{self._issue_editor_assets()}</main>'
+                    )
+                ),
+            ),
+        )
 
-    async def _ui_pull_comment(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_comment(self, owner: str, repo: str, pr_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3022,14 +3951,16 @@ document.addEventListener("DOMContentLoaded", function() {{
         await asyncio.to_thread(db_pr_comment_add, pr_id, self.remote_user_id, _clip_markdown(body))
         return await self._ui_pull_view(owner, repo, pr_id, "Comment added.", "ok")
 
-    def _can_manage_comment(self, author_id):
+    def _can_manage_comment(self, author_id: int | None) -> bool:
         if not REQUIRE_AUTH and _has_write_scope(self):
             return True  # auth disabled: IP allowlist is the trust boundary
         if author_id is None or self.remote_user_id is None:
             return False
         return author_id == self.remote_user_id or getattr(self, "remote_is_admin", False)
 
-    async def _ui_pull_comment_delete(self, owner: str, repo: str, pr_id: int, comment_id: int):
+    async def _ui_pull_comment_delete(
+        self, owner: str, repo: str, pr_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3038,11 +3969,15 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not row:
             return await self._not_found()
         if not self._can_manage_comment(row[2]):
-            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can delete.\n")
+            return await self._forbidden(
+                b"403 Forbidden: only the comment author or an admin can delete.\n"
+            )
         await asyncio.to_thread(db_pr_comment_delete, comment_id)
         return await self._ui_pull_view(owner, repo, pr_id, "Comment deleted.", "ok")
 
-    async def _ui_pull_comment_edit(self, owner: str, repo: str, pr_id: int, comment_id: int):
+    async def _ui_pull_comment_edit(
+        self, owner: str, repo: str, pr_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3051,7 +3986,9 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not row:
             return await self._not_found()
         if not self._can_manage_comment(row[2]):
-            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can edit.\n")
+            return await self._forbidden(
+                b"403 Forbidden: only the comment author or an admin can edit.\n"
+            )
         form = await self._read_form_urlencoded()
         body = (form.get("body") or "").strip()
         if not body:
@@ -3059,7 +3996,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         await asyncio.to_thread(db_pr_comment_update, comment_id, _clip_markdown(body))
         return await self._ui_pull_view(owner, repo, pr_id, "Comment updated.", "ok")
 
-    async def _ui_pull_update(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_update(self, owner: str, repo: str, pr_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3076,10 +4013,14 @@ document.addEventListener("DOMContentLoaded", function() {{
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request updated.", "ok")
 
     # ---------- Issues ----------
-    async def _ui_issues(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_issues(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query or "")
@@ -3087,80 +4028,139 @@ document.addEventListener("DOMContentLoaded", function() {{
         if status not in ("open", "closed", "all"):
             status = "open"
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        from .database import db_issue_count, db_issue_list, db_issue_comment_counts
+        from .database import db_issue_comment_counts, db_issue_count, db_issue_list
+
         size = _page_size(qs)
-        total = await asyncio.to_thread(db_issue_count, owner, repo, None if status == "all" else status)
+        total = await asyncio.to_thread(
+            db_issue_count, owner, repo, None if status == "all" else status
+        )
         page = _clamp_page(_page_number(qs), total, size)
-        rows_db = await asyncio.to_thread(db_issue_list, owner, repo, None if status == "all" else status,
-                                          limit=size, offset=(page - 1) * size)
-        comment_counts = await asyncio.to_thread(db_issue_comment_counts, [row[0] for row in rows_db])
-        rows = []
+        rows_db = await asyncio.to_thread(
+            db_issue_list,
+            owner,
+            repo,
+            None if status == "all" else status,
+            limit=size,
+            offset=(page - 1) * size,
+        )
+        comment_counts = await asyncio.to_thread(
+            db_issue_comment_counts, [row[0] for row in rows_db]
+        )
+        rows: list[str] = []
         for issue_id, title, st, created_at, author_id, username in rows_db:
             count = comment_counts.get(issue_id, 0)
-            count_suffix = safe_html(f'<small title="{count} comment(s)">💬 {count}</small>' if count else "")
-            comment_by = safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>')) if author_id else safe_html("")
-            rows.append(html_t(
-                t"""<tr class="issue-list-row">
+            count_suffix = safe_html(
+                f'<small title="{count} comment(s)">💬 {count}</small>' if count else ""
+            )
+            comment_by = (
+                safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>'))
+                if author_id
+                else safe_html("")
+            )
+            rows.append(
+                html_t(
+                    t"""<tr class="issue-list-row">
 <td><span class="issue-status-icon issue-status-{st}" aria-hidden="true">{("🞅" if st == "open" else "✓")}</span> <a href="{base}/issues/{issue_id}">Issue #{issue_id}: {title}</a></td>
 <td>{count_suffix}{comment_by}</td>
 <td><span class="pill pill-{st}">{st}</span></td>
 <td class="muted"><small title="{created_at}">{_relative_time(created_at)}</small></td></tr>"""
-            ))
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No issues.</td><td></td><td></td><td></td></tr>')
-        pagination = _pagination(str_t(t"/r/{q(owner)}/{q(repo)}/issues"),
-                                 {key: values[0] for key, values in qs.items() if key != "page"},
-                                 page, page * size < total, total=total, per_page=size)
+                )
+            )
+        rows_html = (
+            join_html(rows)
+            if rows
+            else safe_html('<tr><td class="muted">No issues.</td><td></td><td></td><td></td></tr>')
+        )
+        pagination = _pagination(
+            str_t(t"/r/{q(owner)}/{q(repo)}/issues"),
+            {key: values[0] for key, values in qs.items() if key != "page"},
+            page,
+            page * size < total,
+            total=total,
+            per_page=size,
+        )
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
         can_write = _has_write_scope(self)
-        new_pill = safe_html('<a class="pill pull-tab-active" href="{0}/issues/new">+ New issue</a>'.format(base)) if can_write else safe_html("")
+        new_pill = (
+            safe_html(
+                '<a class="pill pull-tab-active" href="{0}/issues/new">+ New issue</a>'.format(base)
+            )
+            if can_write
+            else safe_html("")
+        )
         body = html_t(
             t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>Issues</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/pulls">Pull requests</a> <a class="pill" href="/">Home</a></div></div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>
-<a class="pill pull-tab{' pull-tab-active' if status == 'open' else ''}" href="{base}/issues?status=open" id="issues-tab-open">Open</a> <a class="pill pull-tab{' pull-tab-active' if status == 'closed' else ''}" href="{base}/issues?status=closed" id="issues-tab-closed">Closed</a> <a class="pill pull-tab{' pull-tab-active' if status == 'all' else ''}" href="{base}/issues?status=all" id="issues-tab-all">All</a>
+<a class="pill pull-tab{" pull-tab-active" if status == "open" else ""}" href="{base}/issues?status=open" id="issues-tab-open">Open</a> <a class="pill pull-tab{" pull-tab-active" if status == "closed" else ""}" href="{base}/issues?status=closed" id="issues-tab-closed">Closed</a> <a class="pill pull-tab{" pull-tab-active" if status == "all" else ""}" href="{base}/issues?status=all" id="issues-tab-all">All</a>
 </div><div>{new_pill}</div></div></div>
 <div class="box"><table>{rows_html}</table>{pagination}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Issues · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Issues · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    def _webide_assets(self):
+    def _webide_assets(self) -> SafeHTML:
         """Web IDE assets with a cache-busting stamp for the workbench glue."""
         static = Path(__file__).resolve().parent.parent / "static"
         stamp = f"{int((static / 'webide.js').stat().st_mtime)}-{int((static / 'webide.css').stat().st_mtime)}"
-        return safe_html(html_t(
-            t'<link rel="stylesheet" href="/static/webide.css?v={stamp}">'
-            t'<script src="/static/vendor/monaco/vs/loader.js"></script>'
-            t'<script src="/static/webide.js?v={stamp}" defer></script>'
-        ))
+        return safe_html(
+            html_t(
+                t'<link rel="stylesheet" href="/static/webide.css?v={stamp}">'
+                t'<script src="/static/vendor/monaco/vs/loader.js"></script>'
+                t'<script src="/static/webide.js?v={stamp}" defer></script>'
+            )
+        )
 
-    def _issue_editor_assets(self):
+    def _issue_editor_assets(self) -> SafeHTML:
         """Editor assets with a cache-busting version stamp (mtime of the glue)."""
         glue = Path(__file__).resolve().parent.parent / "static" / "markdown.js"
-        bundle = Path(__file__).resolve().parent.parent / "static" / "vendor" / "tui-editor" / "toastui-editor-all.min.js"
+        bundle = (
+            Path(__file__).resolve().parent.parent
+            / "static"
+            / "vendor"
+            / "tui-editor"
+            / "toastui-editor-all.min.js"
+        )
         stamp = f"{int(glue.stat().st_mtime)}-{int(bundle.stat().st_mtime)}"
-        return safe_html(html_t(
-            t'<link rel="stylesheet" href="/static/vendor/tui-editor/toastui-editor.css?v={stamp}">'
-            t'<link rel="stylesheet" href="/static/vendor/tui-editor/toastui-editor-viewer.css?v={stamp}">'
-            t'<link rel="stylesheet" href="/static/vendor/tui-editor/theme/toastui-editor-dark.css?v={stamp}">'
-            t'<script src="/static/vendor/tui-editor/toastui-editor-all.min.js?v={stamp}"></script>'
-            t'<script src="/static/markdown.js?v={stamp}" defer></script>'
-        ))
+        return safe_html(
+            html_t(
+                t'<link rel="stylesheet" href="/static/vendor/tui-editor/toastui-editor.css?v={stamp}">'
+                t'<link rel="stylesheet" href="/static/vendor/tui-editor/toastui-editor-viewer.css?v={stamp}">'
+                t'<link rel="stylesheet" href="/static/vendor/tui-editor/theme/toastui-editor-dark.css?v={stamp}">'
+                t'<script src="/static/vendor/tui-editor/toastui-editor-all.min.js?v={stamp}"></script>'
+                t'<script src="/static/markdown.js?v={stamp}" defer></script>'
+            )
+        )
 
-    async def _ui_issues_new(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_issues_new(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         body = html_t(
             t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>New issue</h2>
@@ -3172,9 +4172,16 @@ document.addEventListener("DOMContentLoaded", function() {{
 <textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Explain the issue. Markdown is supported."></textarea>
 <button type="submit" style="margin-top:10px">Submit new issue</button></form></div>{self._issue_editor_assets()}"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"New issue · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"New issue · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_issues_create(self, owner: str, repo: str):
+    async def _ui_issues_create(self, owner: str, repo: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -3188,62 +4195,100 @@ document.addEventListener("DOMContentLoaded", function() {{
         body_md = (form.get("body") or "").strip()
         if not title:
             return await self._ui_issues_new(owner, repo, "Title is required.", "warn")
-        issue_id = await asyncio.to_thread(db_issue_create, owner, repo, title, _clip_markdown(body_md),
-                                          getattr(self, "remote_user_id", None))
+        issue_id = await asyncio.to_thread(
+            db_issue_create,
+            owner,
+            repo,
+            title,
+            _clip_markdown(body_md),
+            getattr(self, "remote_user_id", None),
+        )
         await _send_redirect(self.request, f"/r/{owner}/{repo}/issues/{issue_id}")
 
-    async def _ui_issue_view(self, owner: str, repo: str, issue_id: int, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_issue_view(
+        self, owner: str, repo: str, issue_id: int, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         issue = await asyncio.to_thread(db_issue_get, issue_id)
         if not issue or issue[1] != owner or issue[2] != repo:
             return await self._not_found()
-        _iid, _owner, _repo_db, title, body_md, author_id, username, status, created_at, updated_at, closed_at = issue
+        (
+            _iid,
+            _owner,
+            _repo_db,
+            title,
+            body_md,
+            author_id,
+            username,
+            status,
+            created_at,
+            updated_at,
+            closed_at,
+        ) = issue
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         comments = await asyncio.to_thread(db_issue_comment_list, issue_id)
         can_write = _has_write_scope(self)
-        viewer_admin = getattr(self, "remote_is_admin", False)
-        viewer_id = getattr(self, "remote_user_id", None)
-        author_label = safe_html(html_t(t'{username or "anonymous"}')) if author_id else safe_html("anonymous")
+        author_label = (
+            safe_html(html_t(t"{username or 'anonymous'}")) if author_id else safe_html("anonymous")
+        )
         # GitHub-style: the issue first post is a bordered comment block.
-        comment_rows = []
+        comment_rows: list[str] = []
         for cid, c_author, c_username, c_body, c_created, c_edited in comments:
             when = _relative_time(c_created) or c_created
             edited = " (edited)" if c_edited else ""
             can_manage = self._can_manage_comment(c_author)
             controls = safe_html("")
             if can_manage:
-                controls = safe_html(html_t(
-                    t'<form method="POST" action="{base}/issues/{issue_id}/comments/{cid}/delete" class="issue-comment-actions"><button class="danger" type="submit">Delete</button></form>'
-                ))
-            comment_rows.append(html_t(
-                t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
-            ))
-        comments_inner = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
-        comments_box = safe_html(html_t(
-            t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Comments ({len(comments)})</h2>{comments_inner}</div>'
-        ))
+                controls = safe_html(
+                    html_t(
+                        t'<form method="POST" action="{base}/issues/{issue_id}/comments/{cid}/delete" class="issue-comment-actions"><button class="danger" type="submit">Delete</button></form>'
+                    )
+                )
+            comment_rows.append(
+                html_t(
+                    t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
+                )
+            )
+        comments_inner = (
+            join_html(comment_rows)
+            if comment_rows
+            else safe_html('<p class="muted">No comments yet.</p>')
+        )
+        comments_box = safe_html(
+            html_t(
+                t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Comments ({len(comments)})</h2>{comments_inner}</div>'
+            )
+        )
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
         controls_area = safe_html("")
         if can_write:
             action = "Close issue" if status == "open" else "Reopen issue"
             route = "close" if status == "open" else "reopen"
-            controls_area = safe_html(html_t(
-                t'<form method="POST" action="{base}/issues/{issue_id}/{route}" style="margin-top:10px"><button type="submit">{action}</button></form>'
-            ))
+            controls_area = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/issues/{issue_id}/{route}" style="margin-top:10px"><button type="submit">{action}</button></form>'
+                )
+            )
         title_form = safe_html("")
         if can_write:
-            title_form = safe_html(html_t(
-                t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/issues/{issue_id}/update"><label>Title</label><input name="title" value="{title}" required maxlength="300"><label style="margin-top:10px">Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body_md}</textarea><button type="submit" style="margin-top:10px">Save</button></form></details>'
-            ))
+            title_form = safe_html(
+                html_t(
+                    t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/issues/{issue_id}/update"><label>Title</label><input name="title" value="{title}" required maxlength="300"><label style="margin-top:10px">Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body_md}</textarea><button type="submit" style="margin-top:10px">Save</button></form></details>'
+                )
+            )
         comment_form = safe_html("")
         if can_write:
-            comment_form = safe_html(html_t(
-                t'<form method="POST" action="{base}/issues/{issue_id}/comments" class="pr-md-form"><label>Add comment</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a comment… Markdown and image uploads supported"></textarea><button type="submit" style="margin-top:10px">Comment</button></form>'
-            ))
+            comment_form = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/issues/{issue_id}/comments" class="pr-md-form"><label>Add comment</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a comment… Markdown and image uploads supported"></textarea><button type="submit" style="margin-top:10px">Comment</button></form>'
+                )
+            )
         else:
             comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
         body = html_t(
@@ -3254,9 +4299,16 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="box" style="margin-bottom:14px"><div class="pr-comment issue-first-post"><div class="pr-comment-head"><b>Opened by {author_label}</b> <span class="muted"><time title="{created_at}">{_relative_time(created_at)}</time></span></div><div class="pr-comment-body md-body">{body_md}</div></div>{title_form}</div>
 {controls_area}{comments_box}{comment_form}{self._issue_editor_assets()}"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Issue #{issue_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Issue #{issue_id} · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_issue_comment(self, owner: str, repo: str, issue_id: int):
+    async def _ui_issue_comment(self, owner: str, repo: str, issue_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3267,18 +4319,29 @@ document.addEventListener("DOMContentLoaded", function() {{
         form = await self._read_form_urlencoded()
         body_md = (form.get("body") or "").strip()
         if not body_md:
-            return await self._ui_issue_view(owner, repo, issue_id, "Comment text is required.", "warn")
-        await asyncio.to_thread(db_issue_comment_add, issue_id, getattr(self, "remote_user_id", None), _clip_markdown(body_md))
+            return await self._ui_issue_view(
+                owner, repo, issue_id, "Comment text is required.", "warn"
+            )
+        await asyncio.to_thread(
+            db_issue_comment_add,
+            issue_id,
+            getattr(self, "remote_user_id", None),
+            _clip_markdown(body_md),
+        )
         return await self._ui_issue_view(owner, repo, issue_id, "Comment added.", "ok")
 
-    async def _issue_and_comment(self, owner, repo, issue_id, comment_id):
+    async def _issue_and_comment(
+        self, owner: str, repo: str, issue_id: int, comment_id: int
+    ) -> tuple[IssueRow | None, CommentIdentityRow | None]:
         issue = await asyncio.to_thread(db_issue_get, issue_id)
         if not issue or issue[1] != unquote(owner) or issue[2] != unquote(repo):
             return None, None
         comment = await asyncio.to_thread(db_issue_comment_get, issue_id, comment_id)
         return issue, comment
 
-    async def _ui_issue_comment_delete(self, owner: str, repo: str, issue_id: int, comment_id: int):
+    async def _ui_issue_comment_delete(
+        self, owner: str, repo: str, issue_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3287,11 +4350,15 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not comment:
             return await self._not_found()
         if not self._can_manage_comment(comment[2]):
-            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can delete.\n")
+            return await self._forbidden(
+                b"403 Forbidden: only the comment author or an admin can delete.\n"
+            )
         await asyncio.to_thread(db_issue_comment_delete, comment_id)
         return await self._ui_issue_view(owner, repo, issue_id, "Comment deleted.", "ok")
 
-    async def _ui_issue_comment_edit(self, owner: str, repo: str, issue_id: int, comment_id: int):
+    async def _ui_issue_comment_edit(
+        self, owner: str, repo: str, issue_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3300,15 +4367,19 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not comment:
             return await self._not_found()
         if not self._can_manage_comment(comment[2]):
-            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can edit.\n")
+            return await self._forbidden(
+                b"403 Forbidden: only the comment author or an admin can edit.\n"
+            )
         form = await self._read_form_urlencoded()
         body_md = (form.get("body") or "").strip()
         if not body_md:
-            return await self._ui_issue_view(owner, repo, issue_id, "Comment text is required.", "warn")
+            return await self._ui_issue_view(
+                owner, repo, issue_id, "Comment text is required.", "warn"
+            )
         await asyncio.to_thread(db_issue_comment_update, comment_id, _clip_markdown(body_md))
         return await self._ui_issue_view(owner, repo, issue_id, "Comment updated.", "ok")
 
-    async def _ui_issue_close(self, owner: str, repo: str, issue_id: int):
+    async def _ui_issue_close(self, owner: str, repo: str, issue_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3317,11 +4388,13 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not issue or issue[1] != owner or issue[2] != repo:
             return await self._not_found()
         if issue[7] == "closed":
-            return await self._ui_issue_view(owner, repo, issue_id, "Issue is already closed.", "warn")
+            return await self._ui_issue_view(
+                owner, repo, issue_id, "Issue is already closed.", "warn"
+            )
         await asyncio.to_thread(db_issue_close, issue_id)
         return await self._ui_issue_view(owner, repo, issue_id, "Issue closed.", "ok")
 
-    async def _ui_issue_reopen(self, owner: str, repo: str, issue_id: int):
+    async def _ui_issue_reopen(self, owner: str, repo: str, issue_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3330,11 +4403,13 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not issue or issue[1] != owner or issue[2] != repo:
             return await self._not_found()
         if issue[7] == "open":
-            return await self._ui_issue_view(owner, repo, issue_id, "Issue is already open.", "warn")
+            return await self._ui_issue_view(
+                owner, repo, issue_id, "Issue is already open.", "warn"
+            )
         await asyncio.to_thread(db_issue_reopen, issue_id)
         return await self._ui_issue_view(owner, repo, issue_id, "Issue reopened.", "ok")
 
-    async def _ui_issue_update(self, owner: str, repo: str, issue_id: int):
+    async def _ui_issue_update(self, owner: str, repo: str, issue_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3351,14 +4426,19 @@ document.addEventListener("DOMContentLoaded", function() {{
         return await self._ui_issue_view(owner, repo, issue_id, "Issue updated.", "ok")
 
     # ---------- Discussions ----------
-    def _discussion_categories(self):
+    def _discussion_categories(self) -> tuple[str, ...]:
         from .discussion_rules import CATEGORIES
+
         return CATEGORIES
 
-    async def _ui_discussions(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_discussions(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         qs = parse_qs(urlparse(self.path).query or "")
         category = (qs.get("category") or [""])[0]
@@ -3368,43 +4448,85 @@ document.addEventListener("DOMContentLoaded", function() {{
         size = _page_size(qs)
         total = await asyncio.to_thread(db_discussion_count, owner, repo, category or None)
         page = _clamp_page(_page_number(qs), total, size)
-        rows_db = await asyncio.to_thread(db_discussion_list, owner, repo, category or None,
-                                          limit=size, offset=(page - 1) * size)
-        comment_counts = await asyncio.to_thread(db_discussion_comment_counts, [row[0] for row in rows_db])
-        rows = []
+        rows_db = await asyncio.to_thread(
+            db_discussion_list, owner, repo, category or None, limit=size, offset=(page - 1) * size
+        )
+        comment_counts = await asyncio.to_thread(
+            db_discussion_comment_counts, [row[0] for row in rows_db]
+        )
+        rows: list[str] = []
         for discussion_id, title, cat, created_at, author_id, username, answered_id in rows_db:
             count = comment_counts.get(discussion_id, 0)
-            suffixes = safe_html(f'<small title="{count} comment(s)">💬 {count}</small>' if count else "")
+            suffixes: str = safe_html(
+                f'<small title="{count} comment(s)">💬 {count}</small>' if count else ""
+            )
             if answered_id:
-                suffixes = safe_html(' <small class="ok" title="Answered">✓ Answered</small>') + suffixes
-            by = safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>')) if author_id else safe_html("")
-            rows.append(html_t(
-                t"""<tr class="discussion-list-row">
+                suffixes = (
+                    safe_html(' <small class="ok" title="Answered">✓ Answered</small>') + suffixes
+                )
+            by = (
+                safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>'))
+                if author_id
+                else safe_html("")
+            )
+            rows.append(
+                html_t(
+                    t"""<tr class="discussion-list-row">
 <td><span class="issue-status-icon discussion-cat" aria-hidden="true">💬</span> <a href="{base}/discussions/{discussion_id}">{title}</a></td>
 <td><span class="pill">{cat}</span></td>
 <td>{suffixes}{by}</td>
 <td class="muted"><small title="{created_at}">{_relative_time(created_at)}</small></td></tr>"""
-            ))
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No discussions.</td><td></td><td></td><td></td></tr>')
-        pagination = _pagination(str_t(t"/r/{q(owner)}/{q(repo)}/discussions"),
-                                 {key: values[0] for key, values in qs.items() if key != "page"},
-                                 page, page * size < total, total=total, per_page=size)
+                )
+            )
+        rows_html = (
+            join_html(rows)
+            if rows
+            else safe_html(
+                '<tr><td class="muted">No discussions.</td><td></td><td></td><td></td></tr>'
+            )
+        )
+        pagination = _pagination(
+            str_t(t"/r/{q(owner)}/{q(repo)}/discussions"),
+            {key: values[0] for key, values in qs.items() if key != "page"},
+            page,
+            page * size < total,
+            total=total,
+            per_page=size,
+        )
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
-        new_pill = safe_html(html_t(t'<a class="pill pull-tab-active" href="{base}/discussions/new">+ New discussion</a>')) if _has_write_scope(self) else safe_html("")
-        counts = {}
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
+        new_pill = (
+            safe_html(
+                html_t(
+                    t'<a class="pill pull-tab-active" href="{base}/discussions/new">+ New discussion</a>'
+                )
+            )
+            if _has_write_scope(self)
+            else safe_html("")
+        )
+        counts: dict[str, int] = {}
         for cat in self._discussion_categories():
             counts[cat] = await asyncio.to_thread(db_discussion_count, owner, repo, cat)
         counts["all"] = total
-        tab_links = [safe_html(html_t(
-            t'<a class="pill pull-tab{" pull-tab-active" if category == "" else ""}" href="{base}/discussions?category=" id="discussions-tab-all">All {counts["all"]}</a>'
-        ))]
+        tab_links = [
+            safe_html(
+                html_t(
+                    t'<a class="pill pull-tab{" pull-tab-active" if category == "" else ""}" href="{base}/discussions?category=" id="discussions-tab-all">All {counts["all"]}</a>'
+                )
+            )
+        ]
         for cat in self._discussion_categories():
-            tab_links.append(safe_html(html_t(
-                t'<a class="pill pull-tab{" pull-tab-active" if category == cat else ""}" href="{base}/discussions?category={q(cat)}" id="discussions-tab-{q(cat)}">{cat} {counts[cat]}</a>'
-            )))
+            tab_links.append(
+                safe_html(
+                    html_t(
+                        t'<a class="pill pull-tab{" pull-tab-active" if category == cat else ""}" href="{base}/discussions?category={q(cat)}" id="discussions-tab-{q(cat)}">{cat} {counts[cat]}</a>'
+                    )
+                )
+            )
         body = html_t(
             t"""{_repo_tabs(base, "discussions")}<div class="topbar"><h2>Discussions</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/issues">Issues</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
@@ -3412,21 +4534,41 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>{join_html(tab_links)}</div><div>{new_pill}</div></div></div>
 <div class="box"><table>{rows_html}</table>{pagination}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Discussions · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Discussions · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_discussions_new(self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_discussions_new(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        category_options = join_html([html_t(t'<option value="{cat}"{safe_html(" selected" if cat == "General" else "")}>{cat}</option>') for cat in self._discussion_categories()])
+        category_options = join_html(
+            [
+                html_t(
+                    t'<option value="{cat}"{safe_html(" selected" if cat == "General" else "")}>{cat}</option>'
+                )
+                for cat in self._discussion_categories()
+            ]
+        )
         body = html_t(
             t"""{_repo_tabs(base, "discussions")}<div class="topbar"><h2>New discussion</h2>
 <div><a class="pill" href="{base}/discussions">All discussions</a> <a class="pill" href="{base}">Repo</a></div></div>
@@ -3438,9 +4580,16 @@ document.addEventListener("DOMContentLoaded", function() {{
 <textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Explain your idea or question. Markdown is supported."></textarea>
 <button type="submit" style="margin-top:10px">Start discussion</button></form></div>{self._issue_editor_assets()}"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"New discussion · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"New discussion · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_discussions_create(self, owner: str, repo: str):
+    async def _ui_discussions_create(self, owner: str, repo: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -3457,77 +4606,147 @@ document.addEventListener("DOMContentLoaded", function() {{
             category = "General"
         if not title:
             return await self._ui_discussions_new(owner, repo, "Title is required.", "warn")
-        discussion_id = await asyncio.to_thread(db_discussion_create, owner, repo, category, title,
-                                                _clip_markdown(body_md), getattr(self, "remote_user_id", None))
+        discussion_id = await asyncio.to_thread(
+            db_discussion_create,
+            owner,
+            repo,
+            category,
+            title,
+            _clip_markdown(body_md),
+            getattr(self, "remote_user_id", None),
+        )
         await _send_redirect(self.request, f"/r/{owner}/{repo}/discussions/{discussion_id}")
 
-    async def _ui_discussion_view(self, owner: str, repo: str, discussion_id: int, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_discussion_view(
+        self, owner: str, repo: str, discussion_id: int, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
         if not discussion or discussion[1] != owner or discussion[2] != repo:
             return await self._not_found()
-        _id, _own, _rep, category, title, body_md, author_id, username, locked, _locked_by, answered_id, created_at, updated_at = discussion
+        (
+            _id,
+            _own,
+            _rep,
+            category,
+            title,
+            body_md,
+            author_id,
+            username,
+            locked,
+            _locked_by,
+            answered_id,
+            created_at,
+            updated_at,
+        ) = discussion
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         comments = await asyncio.to_thread(db_discussion_comment_list, discussion_id)
         can_write = _has_write_scope(self)
         answered = bool(answered_id)
-        comment_rows = []
+        comment_rows: list[str] = []
         for cid, c_author, c_username, c_body, c_created, c_edited in comments:
             when = _relative_time(c_created) or c_created
             edited = " (edited)" if c_edited else ""
-            answer_badge = safe_html(' <span class="pill pill-open">✓ Answer</span>') if cid == answered_id else safe_html("")
+            answer_badge = (
+                safe_html(' <span class="pill pill-open">✓ Answer</span>')
+                if cid == answered_id
+                else safe_html("")
+            )
             controls = safe_html("")
             if self._can_manage_comment(c_author):
-                controls = safe_html(html_t(
-                    t'<form method="POST" action="{base}/discussions/{discussion_id}/comments/{cid}/delete" class="issue-comment-actions"><button class="danger" type="submit">Delete</button></form>'
-                ))
+                controls = safe_html(
+                    html_t(
+                        t'<form method="POST" action="{base}/discussions/{discussion_id}/comments/{cid}/delete" class="issue-comment-actions"><button class="danger" type="submit">Delete</button></form>'
+                    )
+                )
             answer_toggle = safe_html("")
             if can_write and category == "Q&A":
                 if cid == answered_id:
-                    answer_toggle = safe_html(html_t(
-                        t'<form method="POST" action="{base}/discussions/{discussion_id}/unanswer/{cid}" class="issue-comment-actions"><button type="submit">Unmark answer</button></form>'
-                    ))
+                    answer_toggle = safe_html(
+                        html_t(
+                            t'<form method="POST" action="{base}/discussions/{discussion_id}/unanswer/{cid}" class="issue-comment-actions"><button type="submit">Unmark answer</button></form>'
+                        )
+                    )
                 else:
-                    answer_toggle = safe_html(html_t(
-                        t'<form method="POST" action="{base}/discussions/{discussion_id}/answer/{cid}" class="issue-comment-actions"><button type="submit">Mark as answer</button></form>'
-                    ))
+                    answer_toggle = safe_html(
+                        html_t(
+                            t'<form method="POST" action="{base}/discussions/{discussion_id}/answer/{cid}" class="issue-comment-actions"><button type="submit">Mark as answer</button></form>'
+                        )
+                    )
             highlight = safe_html(" discussion-answered") if cid == answered_id else safe_html("")
-            comment_rows.append(html_t(
-                t'<div class="pr-comment{highlight}"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b>{answer_badge} <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}{answer_toggle}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
-            ))
-        comments_inner = join_html(comment_rows) if comment_rows else safe_html('<p class="muted">No comments yet.</p>')
-        comments_box = safe_html(html_t(
-            t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Replies ({len(comments)})</h2>{comments_inner}</div>'
-        ))
+            comment_rows.append(
+                html_t(
+                    t'<div class="pr-comment{highlight}"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b>{answer_badge} <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}{answer_toggle}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
+                )
+            )
+        comments_inner = (
+            join_html(comment_rows)
+            if comment_rows
+            else safe_html('<p class="muted">No comments yet.</p>')
+        )
+        comments_box = safe_html(
+            html_t(
+                t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Replies ({len(comments)})</h2>{comments_inner}</div>'
+            )
+        )
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(html_t(t"<div class=\"{cls}\" style=\"margin-bottom:12px\">{notice}</div>"))
-        answered_pill = safe_html(' <span class="pill pill-open">✓ Answered</span>') if answered else safe_html("")
-        locked_pill = safe_html(' <span class="muted">· 🔒 Locked</span>') if locked else safe_html("")
-        state_bits = safe_html(html_t(
-            t'<span class="pill">{category}</span>{answered_pill} <span class="muted">· asked by {username or "anonymous"} <time title="{created_at}">{_relative_time(created_at)}</time></span>'
-        ))
-        lock_note = safe_html('<div class="warn" style="margin-top:10px">This discussion is locked; new replies are disabled.</div>') if locked else safe_html("")
+            notice_html = safe_html(
+                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
+            )
+        answered_pill = (
+            safe_html(' <span class="pill pill-open">✓ Answered</span>')
+            if answered
+            else safe_html("")
+        )
+        locked_pill = (
+            safe_html(' <span class="muted">· 🔒 Locked</span>') if locked else safe_html("")
+        )
+        state_bits = safe_html(
+            html_t(
+                t'<span class="pill">{category}</span>{answered_pill} <span class="muted">· asked by {username or "anonymous"} <time title="{created_at}">{_relative_time(created_at)}</time></span>'
+            )
+        )
+        lock_note = (
+            safe_html(
+                '<div class="warn" style="margin-top:10px">This discussion is locked; new replies are disabled.</div>'
+            )
+            if locked
+            else safe_html("")
+        )
         controls_area = safe_html("")
         if can_write:
             lock_action = "Lock" if not locked else "Unlock"
             lock_route = "lock" if not locked else "unlock"
-            controls_area = safe_html(html_t(
-                t'<form method="POST" action="{base}/discussions/{discussion_id}/{lock_route}" style="margin-top:10px"><button type="submit">{lock_action}</button></form>'
-            ))
+            controls_area = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/discussions/{discussion_id}/{lock_route}" style="margin-top:10px"><button type="submit">{lock_action}</button></form>'
+                )
+            )
         title_form = safe_html("")
         if can_write:
-            category_options = join_html([html_t(t'<option value="{cat}"{safe_html(" selected" if cat == category else "")}>{cat}</option>') for cat in self._discussion_categories()])
-            title_form = safe_html(html_t(
-                t'<details style="margin-top:10px"><summary>Edit discussion</summary><form method="POST" action="{base}/discussions/{discussion_id}/update"><label>Category</label><select name="category">{category_options}</select><label style="margin-top:10px">Title</label><input name="title" value="{title}" required maxlength="300"><label style="margin-top:10px">Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body_md}</textarea><button type="submit" style="margin-top:10px">Save</button></form></details>'
-            ))
+            category_options = join_html(
+                [
+                    html_t(
+                        t'<option value="{cat}"{safe_html(" selected" if cat == category else "")}>{cat}</option>'
+                    )
+                    for cat in self._discussion_categories()
+                ]
+            )
+            title_form = safe_html(
+                html_t(
+                    t'<details style="margin-top:10px"><summary>Edit discussion</summary><form method="POST" action="{base}/discussions/{discussion_id}/update"><label>Category</label><select name="category">{category_options}</select><label style="margin-top:10px">Title</label><input name="title" value="{title}" required maxlength="300"><label style="margin-top:10px">Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body_md}</textarea><button type="submit" style="margin-top:10px">Save</button></form></details>'
+                )
+            )
         comment_form = safe_html("")
         if can_write and not locked:
-            comment_form = safe_html(html_t(
-                t'<form method="POST" action="{base}/discussions/{discussion_id}/comments" class="pr-md-form"><label>Reply</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a reply… (Markdown supported)"></textarea><button type="submit" style="margin-top:10px">Reply</button></form>'
-            ))
+            comment_form = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/discussions/{discussion_id}/comments" class="pr-md-form"><label>Reply</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a reply… (Markdown supported)"></textarea><button type="submit" style="margin-top:10px">Reply</button></form>'
+                )
+            )
         elif not locked:
             comment_form = safe_html('<p class="muted">Write scope is required to reply.</p>')
         body = html_t(
@@ -3538,16 +4757,25 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="box" style="margin-bottom:14px"><div class="pr-comment issue-first-post"><div class="pr-comment-head"><b>Opened by {username or "anonymous"}</b> <span class="muted"><time title="{created_at}">{_relative_time(created_at)}</time></span></div><div class="pr-comment-body md-body">{body_md}</div></div>{title_form}</div>
 {controls_area}{comments_box}{comment_form}{self._issue_editor_assets()}"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Discussion #{discussion_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Discussion #{discussion_id} · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _discussion_and_comment(self, owner, repo, discussion_id, comment_id):
+    async def _discussion_and_comment(
+        self, owner: str, repo: str, discussion_id: int, comment_id: int
+    ) -> tuple[DiscussionRow | None, CommentIdentityRow | None]:
         discussion = await asyncio.to_thread(db_discussion_get, discussion_id)
         if not discussion or discussion[1] != unquote(owner) or discussion[2] != unquote(repo):
             return None, None
         comment = await asyncio.to_thread(db_discussion_comment_get, discussion_id, comment_id)
         return discussion, comment
 
-    async def _ui_discussion_comment(self, owner: str, repo: str, discussion_id: int):
+    async def _ui_discussion_comment(self, owner: str, repo: str, discussion_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3556,47 +4784,74 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not discussion or discussion[1] != owner or discussion[2] != repo:
             return await self._not_found()
         if discussion[8]:
-            return await self._ui_discussion_view(owner, repo, discussion_id, "This discussion is locked; replies are disabled.", "warn")
+            return await self._ui_discussion_view(
+                owner,
+                repo,
+                discussion_id,
+                "This discussion is locked; replies are disabled.",
+                "warn",
+            )
         form = await self._read_form_urlencoded()
         body_md = (form.get("body") or "").strip()
         if not body_md:
-            return await self._ui_discussion_view(owner, repo, discussion_id, "Reply text is required.", "warn")
-        await asyncio.to_thread(db_discussion_comment_add, discussion_id, getattr(self, "remote_user_id", None), _clip_markdown(body_md))
+            return await self._ui_discussion_view(
+                owner, repo, discussion_id, "Reply text is required.", "warn"
+            )
+        await asyncio.to_thread(
+            db_discussion_comment_add,
+            discussion_id,
+            getattr(self, "remote_user_id", None),
+            _clip_markdown(body_md),
+        )
         return await self._ui_discussion_view(owner, repo, discussion_id, "Reply added.", "ok")
 
-    async def _ui_discussion_comment_delete(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+    async def _ui_discussion_comment_delete(
+        self, owner: str, repo: str, discussion_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
-        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
-        if not comment:
+        discussion, comment = await self._discussion_and_comment(
+            owner, repo, discussion_id, comment_id
+        )
+        if not discussion or not comment:
             return await self._not_found()
         if not self._can_manage_comment(comment[2]):
-            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can delete.\n")
+            return await self._forbidden(
+                b"403 Forbidden: only the comment author or an admin can delete.\n"
+            )
         await asyncio.to_thread(db_discussion_comment_delete, comment_id)
         if discussion[10] == comment_id:
             await asyncio.to_thread(db_discussion_set_answer, discussion_id, None)
         return await self._ui_discussion_view(owner, repo, discussion_id, "Reply deleted.", "ok")
 
-    async def _ui_discussion_comment_edit(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+    async def _ui_discussion_comment_edit(
+        self, owner: str, repo: str, discussion_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
-        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
-        if not comment:
+        discussion, comment = await self._discussion_and_comment(
+            owner, repo, discussion_id, comment_id
+        )
+        if not discussion or not comment:
             return await self._not_found()
         if not self._can_manage_comment(comment[2]):
-            return await self._forbidden(b"403 Forbidden: only the comment author or an admin can edit.\n")
+            return await self._forbidden(
+                b"403 Forbidden: only the comment author or an admin can edit.\n"
+            )
         form = await self._read_form_urlencoded()
         body_md = (form.get("body") or "").strip()
         if not body_md:
-            return await self._ui_discussion_view(owner, repo, discussion_id, "Reply text is required.", "warn")
+            return await self._ui_discussion_view(
+                owner, repo, discussion_id, "Reply text is required.", "warn"
+            )
         await asyncio.to_thread(db_discussion_comment_update, comment_id, _clip_markdown(body_md))
         return await self._ui_discussion_view(owner, repo, discussion_id, "Reply updated.", "ok")
 
-    async def _ui_discussion_lock(self, owner: str, repo: str, discussion_id: int):
+    async def _ui_discussion_lock(self, owner: str, repo: str, discussion_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3605,10 +4860,14 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not discussion or discussion[1] != owner or discussion[2] != repo:
             return await self._not_found()
         if not discussion[8]:
-            await asyncio.to_thread(db_discussion_set_locked, discussion_id, True, getattr(self, "remote_user_id", None))
-        return await self._ui_discussion_view(owner, repo, discussion_id, "Discussion locked.", "ok")
+            await asyncio.to_thread(
+                db_discussion_set_locked, discussion_id, True, getattr(self, "remote_user_id", None)
+            )
+        return await self._ui_discussion_view(
+            owner, repo, discussion_id, "Discussion locked.", "ok"
+        )
 
-    async def _ui_discussion_unlock(self, owner: str, repo: str, discussion_id: int):
+    async def _ui_discussion_unlock(self, owner: str, repo: str, discussion_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3618,33 +4877,45 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._not_found()
         if discussion[8]:
             await asyncio.to_thread(db_discussion_set_locked, discussion_id, False, None)
-        return await self._ui_discussion_view(owner, repo, discussion_id, "Discussion unlocked.", "ok")
+        return await self._ui_discussion_view(
+            owner, repo, discussion_id, "Discussion unlocked.", "ok"
+        )
 
-    async def _ui_discussion_answer(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+    async def _ui_discussion_answer(
+        self, owner: str, repo: str, discussion_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
-        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
-        if not comment:
+        discussion, comment = await self._discussion_and_comment(
+            owner, repo, discussion_id, comment_id
+        )
+        if not discussion or not comment:
             return await self._not_found()
         if discussion[3] != "Q&A":
-            return await self._ui_discussion_view(owner, repo, discussion_id, "Only Q&A discussions can have a marked answer.", "warn")
+            return await self._ui_discussion_view(
+                owner, repo, discussion_id, "Only Q&A discussions can have a marked answer.", "warn"
+            )
         await asyncio.to_thread(db_discussion_set_answer, discussion_id, comment_id)
         return await self._ui_discussion_view(owner, repo, discussion_id, "Answer marked.", "ok")
 
-    async def _ui_discussion_unanswer(self, owner: str, repo: str, discussion_id: int, comment_id: int):
+    async def _ui_discussion_unanswer(
+        self, owner: str, repo: str, discussion_id: int, comment_id: int
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
-        discussion, comment = await self._discussion_and_comment(owner, repo, discussion_id, comment_id)
+        discussion, comment = await self._discussion_and_comment(
+            owner, repo, discussion_id, comment_id
+        )
         if not comment:
             return await self._not_found()
         await asyncio.to_thread(db_discussion_set_answer, discussion_id, None)
         return await self._ui_discussion_view(owner, repo, discussion_id, "Answer unmarked.", "ok")
 
-    async def _ui_discussion_update(self, owner: str, repo: str, discussion_id: int):
+    async def _ui_discussion_update(self, owner: str, repo: str, discussion_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3659,14 +4930,22 @@ document.addEventListener("DOMContentLoaded", function() {{
         if category not in self._discussion_categories():
             category = discussion[3]
         if not title:
-            return await self._ui_discussion_view(owner, repo, discussion_id, "Title is required.", "warn")
-        await asyncio.to_thread(db_discussion_update_text, discussion_id, category, title, _clip_markdown(body_md))
-        return await self._ui_discussion_view(owner, repo, discussion_id, "Discussion updated.", "ok")
+            return await self._ui_discussion_view(
+                owner, repo, discussion_id, "Title is required.", "warn"
+            )
+        await asyncio.to_thread(
+            db_discussion_update_text, discussion_id, category, title, _clip_markdown(body_md)
+        )
+        return await self._ui_discussion_view(
+            owner, repo, discussion_id, "Discussion updated.", "ok"
+        )
 
-    def _repo_git_async(self, owner, repo):
+    def _repo_git_async(self, owner: str, repo: str) -> Awaitable[str]:
         return asyncio.to_thread(_repo_bare_path, owner, repo)
 
-    async def _ui_pull_resolve(self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"):
+    async def _ui_pull_resolve(
+        self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"
+    ) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3674,49 +4953,93 @@ document.addEventListener("DOMContentLoaded", function() {{
         pr = await asyncio.to_thread(db_pr_get, pr_id)
         if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
             return await self._not_found()
-        _id, _owner, _repo, title, _body, src_branch, tgt_branch, _author, status, created_at, _closed_at, _merged_at, _method, _mcommit = pr
+        (
+            _id,
+            _owner,
+            _repo,
+            title,
+            _body,
+            src_branch,
+            tgt_branch,
+            _author,
+            status,
+            created_at,
+            _closed_at,
+            _merged_at,
+            _method,
+            _mcommit,
+        ) = pr
         repo_git = _repo_bare_path(owner, repo)
         src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
         tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
         merge_base = await _git_merge_base(repo_git, tgt, src) if (src and tgt) else None
         if not (src and tgt and merge_base):
-            return await self._ui_pull_view(owner, repo, pr_id, "Unable to run conflict resolution in this state.", "warn")
-        conflicts = await asyncio.to_thread(pr_resolver.list_conflicts, repo_git, merge_base, src, tgt)
+            return await self._ui_pull_view(
+                owner, repo, pr_id, "Unable to run conflict resolution in this state.", "warn"
+            )
+        conflicts = await asyncio.to_thread(
+            pr_resolver.list_conflicts, repo_git, merge_base, src, tgt
+        )
         too_many = len(conflicts) > pr_resolver.MAX_CONFLICT_FILES
-        display = conflicts if too_many else conflicts[:pr_resolver.MAX_CONFLICT_FILES]
-        rows = []
+        display = conflicts if too_many else conflicts[: pr_resolver.MAX_CONFLICT_FILES]
+        rows: list[str] = []
         if not too_many:
             previews = await asyncio.to_thread(
-                lambda: [pr_resolver.preview(repo_git, item, src_branch, tgt_branch) for item in display])
+                lambda: [
+                    pr_resolver.preview(repo_git, item, src_branch, tgt_branch) for item in display
+                ]
+            )
             for index, (item, (text, kind)) in enumerate(zip(display, previews)):
-                kind_note = {"deleted-here": "The file was deleted on this branch; the target content is shown.",
-                             "deleted-there": "The target deleted this file; keep the source content or delete it.",
-                             "nonmergeable": "Binary, too large or unmergeable; the source content is shown."}.get(kind, "")
+                kind_note = {
+                    "deleted-here": "The file was deleted on this branch; the target content is shown.",
+                    "deleted-there": "The target deleted this file; keep the source content or delete it.",
+                    "nonmergeable": "Binary, too large or unmergeable; the source content is shown.",
+                }.get(kind, "")
                 delete_checked = safe_html(" checked") if kind == "deleted-here" else safe_html("")
                 escaped_text = text.decode("utf-8", "replace") if text else ""
-                rows.append(html_t(
-                    t'<fieldset class="pr-conflict-file"><legend><code>{item["path"]}</code></legend>'
-                    t'<input type="hidden" name="path_{index}" value="{item["path"]}">'
-                    t'<textarea name="content_{index}" spellcheck="false">{escaped_text}</textarea>'
-                    t'<label><input type="checkbox" name="delete_{index}" value="yes"{delete_checked}> Delete this file</label>'
-                    t'<p class="muted">{kind_note}</p></fieldset>'
-                ))
+                rows.append(
+                    html_t(
+                        t'<fieldset class="pr-conflict-file"><legend><code>{item["path"]}</code></legend>'
+                        t'<input type="hidden" name="path_{index}" value="{item["path"]}">'
+                        t'<textarea name="content_{index}" spellcheck="false">{escaped_text}</textarea>'
+                        t'<label><input type="checkbox" name="delete_{index}" value="yes"{delete_checked}> Delete this file</label>'
+                        t'<p class="muted">{kind_note}</p></fieldset>'
+                    )
+                )
         notice_html = safe_html("")
         if notice:
-            notice_html = safe_html(html_t(t"<div class=\"{'warn' if notice_kind != 'ok' else 'ok'}\" style=\"margin-bottom:12px\">{notice}</div>"))
+            notice_html = safe_html(
+                html_t(
+                    t'<div class="{"warn" if notice_kind != "ok" else "ok"}" style="margin-bottom:12px">{notice}</div>'
+                )
+            )
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        overflow = safe_html('<p class="warn">More than 40 conflicted files. The web resolver cannot show this many; resolve with Git and push.</p>') if too_many else safe_html("")
-        empty = safe_html('<p class="ok">No conflicts remain between these branches. Reload the pull request; the merge button may be available.</p>') if not conflicts else safe_html("")
+        overflow = (
+            safe_html(
+                '<p class="warn">More than 40 conflicted files. The web resolver cannot show this many; resolve with Git and push.</p>'
+            )
+            if too_many
+            else safe_html("")
+        )
+        empty = (
+            safe_html(
+                '<p class="ok">No conflicts remain between these branches. Reload the pull request; the merge button may be available.</p>'
+            )
+            if not conflicts
+            else safe_html("")
+        )
         default_message = str_t(t"Merge branch '{tgt_branch}' into {src_branch}")
         form_html = safe_html("")
         if rows and not too_many and conflicts:
-            form_html = safe_html(html_t(
-                t'<form method="POST" action="{base}/pulls/{pr_id}/resolve" class="pr-resolve-form">'
-                t'<label>Merge commit message</label>'
-                t'<textarea name="message" required maxlength="4000">{default_message}</textarea>'
-                t'<p class="muted">Applying the resolution creates a merge commit on <code>{src_branch}</code>. Edit the marked sections (<<<<<<<, =======, >>>>>>>), then apply.</p>'
-                t'<button type="submit">Apply resolution</button></form>'
-            ))
+            form_html = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/pulls/{pr_id}/resolve" class="pr-resolve-form">'
+                    t"<label>Merge commit message</label>"
+                    t'<textarea name="message" required maxlength="4000">{default_message}</textarea>'
+                    t'<p class="muted">Applying the resolution creates a merge commit on <code>{src_branch}</code>. Edit the marked sections (<<<<<<<, =======, >>>>>>>), then apply.</p>'
+                    t'<button type="submit">Apply resolution</button></form>'
+                )
+            )
         rows_html = join_html(rows) if rows else safe_html("")
         body_html = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>Resolve conflicts — PR #{pr_id}</h2>
@@ -3725,9 +5048,16 @@ document.addEventListener("DOMContentLoaded", function() {{
 {notice_html}{empty}{overflow}
 <div class="box pr-resolve-files">{rows_html}{form_html}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Resolve conflicts · PR #{pr_id} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Resolve conflicts · PR #{pr_id} · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body_html)}</main>')),
+            ),
+        )
 
-    async def _ui_pull_resolve_apply(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_resolve_apply(self, owner: str, repo: str, pr_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3735,16 +5065,35 @@ document.addEventListener("DOMContentLoaded", function() {{
         pr = await asyncio.to_thread(db_pr_get, pr_id)
         if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
             return await self._not_found()
-        _id, _owner, _repo, _title, _body, src_branch, tgt_branch, _author, _status, _created, _closed, _merged, _method, _mcommit = pr
+        (
+            _id,
+            _owner,
+            _repo,
+            _title,
+            _body,
+            src_branch,
+            tgt_branch,
+            _author,
+            _status,
+            _created,
+            _closed,
+            _merged,
+            _method,
+            _mcommit,
+        ) = pr
         repo_git = _repo_bare_path(owner, repo)
         src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
         tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
         merge_base = await _git_merge_base(repo_git, tgt, src) if (src and tgt) else None
         if not (src and tgt and merge_base):
-            return await self._ui_pull_resolve(owner, repo, pr_id, "Unable to apply a resolution now.", "warn")
+            return await self._ui_pull_resolve(
+                owner, repo, pr_id, "Unable to apply a resolution now.", "warn"
+            )
         form = await self._read_form_urlencoded()
         try:
-            count = min(pr_resolver.MAX_CONFLICT_FILES, max(0, int(form.get("conflict_count") or 0)))
+            count = min(
+                pr_resolver.MAX_CONFLICT_FILES, max(0, int(form.get("conflict_count") or 0))
+            )
         except ValueError:
             count = 0
         resolutions = []
@@ -3757,25 +5106,75 @@ document.addEventListener("DOMContentLoaded", function() {{
         message = form.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
         user = getattr(self, "remote_user", None) or "Browser user"
         try:
-            commit = await asyncio.to_thread(pr_resolver.apply_resolution, repo_git, merge_base, src, tgt, src_branch, resolutions, message, user)
+            commit = await asyncio.to_thread(
+                pr_resolver.apply_resolution,
+                repo_git,
+                merge_base,
+                src,
+                tgt,
+                src_branch,
+                resolutions,
+                message,
+                user,
+            )
         except pr_resolver.ResolverError as exc:
             return await self._ui_pull_resolve(owner, repo, pr_id, str(exc), "warn")
-        await asyncio.to_thread(db_pr_comment_add, pr_id, self.remote_user_id,
-                                f"Resolved merge conflicts with the target branch via the web UI ({len(resolutions)} file(s) changed).")
-        run = await self.server.ci_manager.enqueue(owner, repo, "pull_request", tgt_branch, tgt,
-            {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch,
-             "base_commit": tgt, "head_commit": commit})
-        return await self._ui_pull_view(owner, repo, pr_id,
-            "Merge conflicts resolved. The source branch now contains the target." +
-            (" A CI run was queued." if run else " No CI run was queued (no pipeline is configured or PR runs are disabled)."),
-            "ok")
+        await asyncio.to_thread(
+            db_pr_comment_add,
+            pr_id,
+            self.remote_user_id,
+            f"Resolved merge conflicts with the target branch via the web UI ({len(resolutions)} file(s) changed).",
+        )
+        run = await self.server.ci_manager.enqueue(
+            owner,
+            repo,
+            "pull_request",
+            tgt_branch,
+            tgt,
+            {
+                "pr_number": pr_id,
+                "base_branch": tgt_branch,
+                "head_branch": src_branch,
+                "base_commit": tgt,
+                "head_commit": commit,
+            },
+        )
+        return await self._ui_pull_view(
+            owner,
+            repo,
+            pr_id,
+            "Merge conflicts resolved. The source branch now contains the target."
+            + (
+                " A CI run was queued."
+                if run
+                else " No CI run was queued (no pipeline is configured or PR runs are disabled)."
+            ),
+            "ok",
+        )
 
-    async def _ui_pull_resolve_poststate(self, owner, repo, pr_id):
+    async def _ui_pull_resolve_poststate(
+        self, owner: str, repo: str, pr_id: int
+    ) -> tuple[str, str, str, str, str, str] | None:
         """Shared validation for the resolve flows: (pr row, branches, commits) or error page."""
         pr = await asyncio.to_thread(db_pr_get, pr_id)
         if not pr or pr[1] != unquote(owner) or pr[2] != unquote(repo) or pr[8] != "open":
             return None
-        _id, _owner, _repo, _title, _body, src_branch, tgt_branch, _author, _status, _created, _closed, _merged, _method, _mcommit = pr
+        (
+            _id,
+            _owner,
+            _repo,
+            _title,
+            _body,
+            src_branch,
+            tgt_branch,
+            _author,
+            _status,
+            _created,
+            _closed,
+            _merged,
+            _method,
+            _mcommit,
+        ) = pr
         repo_git = _repo_bare_path(unquote(owner), unquote(repo))
         src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
         tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
@@ -3784,61 +5183,119 @@ document.addEventListener("DOMContentLoaded", function() {{
             return None
         return src_branch, tgt_branch, src, tgt, merge_base, repo_git
 
-    async def _ui_pull_resolve_commit(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_resolve_commit(self, owner: str, repo: str, pr_id: int) -> None:
         """JSON endpoint used by the Web IDE resolve mode (form-encoded csrf+payload)."""
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
 
-        async def respond_json(status, value):
-            return await _send_response(self.request, status, json.dumps(value).encode(),
-                [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")])
+        async def respond_json(status: int, value: object) -> None:
+            return await _send_response(
+                self.request,
+                status,
+                json.dumps(value).encode(),
+                [
+                    ("Content-Type", "application/json; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                ],
+            )
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
             if not 0 < length <= 5 * 1024 * 1024:
-                return await respond_json(413, {"error": "Resolution request exceeds the size limit."})
+                return await respond_json(
+                    413, {"error": "Resolution request exceeds the size limit."}
+                )
             form = await self._read_form_urlencoded()
-            if not secrets.compare_digest(form.get("csrf", "").encode(), self._email_csrf_token().encode()):
-                return await respond_json(403, {"error": "Invalid security token. Reload the editor."})
+            if not secrets.compare_digest(
+                form.get("csrf", "").encode(), self._email_csrf_token().encode()
+            ):
+                return await respond_json(
+                    403, {"error": "Invalid security token. Reload the editor."}
+                )
             payload = json.loads(form.get("payload", "{}"))
             if not isinstance(payload, dict):
                 raise ValueError("Invalid resolution request.")
             state = await self._ui_pull_resolve_poststate(owner, repo, pr_id)
             if not state:
-                return await respond_json(409, {"error": "The pull request state changed. Reload the editor."})
+                return await respond_json(
+                    409, {"error": "The pull request state changed. Reload the editor."}
+                )
             src_branch, tgt_branch, src, tgt, merge_base, repo_git = state
             if payload.get("branch") != src_branch:
-                return await respond_json(403, {"error": "Conflict resolution applies to the source branch only."})
+                return await respond_json(
+                    403, {"error": "Conflict resolution applies to the source branch only."}
+                )
             changes = payload.get("changes")
-            if not isinstance(changes, dict) or not changes or len(changes) > pr_resolver.MAX_CONFLICT_FILES:
-                return await respond_json(400, {"error": f"Edit the conflicted files (up to {pr_resolver.MAX_CONFLICT_FILES})."})
-            resolutions = [(path, value if value is None else str(value), value is None)
-                           for path, value in changes.items()]
+            if (
+                not isinstance(changes, dict)
+                or not changes
+                or len(changes) > pr_resolver.MAX_CONFLICT_FILES
+            ):
+                return await respond_json(
+                    400,
+                    {
+                        "error": f"Edit the conflicted files (up to {pr_resolver.MAX_CONFLICT_FILES})."
+                    },
+                )
+            resolutions = [
+                (path, value if value is None else str(value), value is None)
+                for path, value in changes.items()
+            ]
             message = payload.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
             # Serialize with pushes; the resolver CAS-protects the source branch itself.
             lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
             async with lock:
-                commit = await asyncio.to_thread(pr_resolver.apply_resolution, repo_git, merge_base,
-                    src, tgt, src_branch, resolutions, message, getattr(self, "remote_user", "Browser user"))
+                commit = await asyncio.to_thread(
+                    pr_resolver.apply_resolution,
+                    repo_git,
+                    merge_base,
+                    src,
+                    tgt,
+                    src_branch,
+                    resolutions,
+                    message,
+                    getattr(self, "remote_user", "Browser user"),
+                )
         except pr_resolver.ResolverError as exc:
             return await respond_json(409, {"error": str(exc)})
         except (ValueError, TypeError) as exc:
             return await respond_json(400, {"error": str(exc)})
-        await asyncio.to_thread(db_pr_comment_add, pr_id, getattr(self, "remote_user_id", None),
-                                f"Resolved merge conflicts with the target branch via the web IDE ({len(resolutions)} file(s) changed).")
-        run = await self.server.ci_manager.enqueue(owner, repo, "pull_request", tgt_branch, tgt,
-            {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch,
-             "base_commit": tgt, "head_commit": commit})
+        await asyncio.to_thread(
+            db_pr_comment_add,
+            pr_id,
+            getattr(self, "remote_user_id", None),
+            f"Resolved merge conflicts with the target branch via the web IDE ({len(resolutions)} file(s) changed).",
+        )
+        run = await self.server.ci_manager.enqueue(
+            owner,
+            repo,
+            "pull_request",
+            tgt_branch,
+            tgt,
+            {
+                "pr_number": pr_id,
+                "base_branch": tgt_branch,
+                "head_branch": src_branch,
+                "base_commit": tgt,
+                "head_commit": commit,
+            },
+        )
         if run:
             return await respond_json(200, {"commit": commit})
-        return await respond_json(200, {"commit": commit,
-            "warning": "No CI run was queued (no pipeline is configured or PR runs are disabled)."})
+        return await respond_json(
+            200,
+            {
+                "commit": commit,
+                "warning": "No CI run was queued (no pipeline is configured or PR runs are disabled).",
+            },
+        )
 
-    async def _ui_pull_resolve_ide(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_resolve_ide(self, owner: str, repo: str, pr_id: int) -> None:
         """Web IDE in resolve mode: the conflicted PR files with conflict markers."""
         from . import webide
+
         owner = unquote(owner)
         repo = unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -3849,11 +5306,18 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not state:
             return await self._not_found()
         src_branch, tgt_branch, src, tgt, merge_base, repo_git = state
-        conflicts = await asyncio.to_thread(pr_resolver.list_conflicts, repo_git, merge_base, src, tgt)
+        conflicts = await asyncio.to_thread(
+            pr_resolver.list_conflicts, repo_git, merge_base, src, tgt
+        )
         too_many = len(conflicts) > pr_resolver.MAX_CONFLICT_FILES
         if too_many or not conflicts:
-            return await self._ui_pull_resolve(owner, repo, pr_id,
-                "Conflict resolution in the web IDE is unavailable for this state.", "warn")
+            return await self._ui_pull_resolve(
+                owner,
+                repo,
+                pr_id,
+                "Conflict resolution in the web IDE is unavailable for this state.",
+                "warn",
+            )
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         return_url = str_t(t"{base}/pulls/{pr_id}")
         conflict_paths_json = json.dumps([item["path"] for item in conflicts])
@@ -3880,10 +5344,14 @@ document.addEventListener("DOMContentLoaded", function() {{
 <footer class="ide-statusbar"><button id="ide-branch" type="button" disabled title="Branch locked while resolving this conflict" aria-label="Branch {src_branch} (locked while resolving this conflict)" data-branch="{src_branch}" data-branches="[]"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span id="ide-branch-name">{src_branch}</span><svg class="ide-chevron" viewBox="0 0 12 12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button><button id="ide-language" type="button" title="Select language" aria-haspopup="listbox">Plain Text</button><button id="ide-wrap" type="button" title="Toggle word wrap (Alt+Z)" aria-pressed="true">Word wrap</button><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
 <dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close picker">×</button></div><input id="ide-picker-input" placeholder="Search conflicted files…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
 </section></main>{self._webide_assets()}''')
-        return await _send_response(self.request, 200, _html_page(f"Resolve conflicts · PR #{pr_id} · {owner}/{repo}", safe_html(body)),
-            [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+        return await _send_response(
+            self.request,
+            200,
+            _html_page(f"Resolve conflicts · PR #{pr_id} · {owner}/{repo}", safe_html(body)),
+            [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+        )
 
-    async def _ui_pull_close(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_close(self, owner: str, repo: str, pr_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3894,7 +5362,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         await asyncio.to_thread(db_pr_close, pr_id)
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request closed.", "ok")
 
-    async def _ui_pull_reopen(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_reopen(self, owner: str, repo: str, pr_id: int) -> None:
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
             return await self._forbidden(b"403 Forbidden\\n")
@@ -3904,17 +5372,31 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not pr or pr[1] != owner or pr[2] != repo:
             return await self._not_found()
         if pr[8] == "merged":
-            return await self._ui_pull_view(owner, repo, pr_id, "Merged pull requests cannot be reopened.", "warn")
+            return await self._ui_pull_view(
+                owner, repo, pr_id, "Merged pull requests cannot be reopened.", "warn"
+            )
         if pr[8] == "closed":
             await asyncio.to_thread(db_pr_reopen, pr_id)
             repo_git = _repo_bare_path(owner, repo)
             base_commit = await _git_resolve_commit(repo_git, "refs/heads/" + pr[6]) or ""
             head_commit = await _git_resolve_commit(repo_git, "refs/heads/" + pr[5]) or ""
-            await self.server.ci_manager.enqueue(owner, repo, "pull_request_reopened", pr[6], base_commit,
-                {"pr_number": pr_id, "base_branch": pr[6], "head_branch": pr[5], "base_commit": base_commit, "head_commit": head_commit})
+            await self.server.ci_manager.enqueue(
+                owner,
+                repo,
+                "pull_request_reopened",
+                pr[6],
+                base_commit,
+                {
+                    "pr_number": pr_id,
+                    "base_branch": pr[6],
+                    "head_branch": pr[5],
+                    "base_commit": base_commit,
+                    "head_commit": head_commit,
+                },
+            )
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request reopened.", "ok")
 
-    async def _ui_pull_merge(self, owner: str, repo: str, pr_id: int):
+    async def _ui_pull_merge(self, owner: str, repo: str, pr_id: int) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         if not _has_write_scope(self):
@@ -3922,7 +5404,22 @@ document.addEventListener("DOMContentLoaded", function() {{
         pr = await asyncio.to_thread(db_pr_get, pr_id)
         if not pr:
             return await self._not_found()
-        (_id, db_owner, db_repo, _title, _body, src_branch, tgt_branch, _author_user_id, status, _created_at, _closed_at, _merged_at, _merge_method, _merge_commit) = pr
+        (
+            _id,
+            db_owner,
+            db_repo,
+            _title,
+            _body,
+            src_branch,
+            tgt_branch,
+            _author_user_id,
+            status,
+            _created_at,
+            _closed_at,
+            _merged_at,
+            _merge_method,
+            _merge_commit,
+        ) = pr
         if db_owner != owner or db_repo != repo:
             return await self._not_found()
         if status != "open":
@@ -3937,11 +5434,21 @@ document.addEventListener("DOMContentLoaded", function() {{
             tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
             src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
             policy = await self.server.ci_manager.config(owner, repo)
-            check = await self.server.ci_manager.merge_check(owner, repo, pr_id, tgt or "", src or "", tgt_branch)
+            check = await self.server.ci_manager.merge_check(
+                owner, repo, pr_id, tgt or "", src or "", tgt_branch
+            )
             if policy["require_ci"] and (not tgt or not src or not check or check[1] != "success"):
-                return await self._ui_pull_view(owner, repo, pr_id, "Merge blocked: successful CI is required for the current source and target commits.", "warn")
+                return await self._ui_pull_view(
+                    owner,
+                    repo,
+                    pr_id,
+                    "Merge blocked: successful CI is required for the current source and target commits.",
+                    "warn",
+                )
             before_refs = await self.server._branch_refs(owner, repo)
-            ok, msg, new_commit = await _git_ff_merge(repo_git, tgt_branch, src_branch, expected=(tgt, src))
+            ok, msg, new_commit = await _git_ff_merge(
+                repo_git, tgt_branch, src_branch, expected=(tgt, src)
+            )
             if ok and new_commit:
                 await _call_in_thread(db_pr_mark_merged, pr_id, "ff-only", new_commit)
                 # A merge changes the target for other open PRs, invalidating
@@ -3950,25 +5457,61 @@ document.addEventListener("DOMContentLoaded", function() {{
         if not ok:
             return await self._ui_pull_view(owner, repo, pr_id, msg, "warn")
         if new_commit:
-            await self.server.ci_manager.enqueue(owner, repo, "pull_request_merged", tgt_branch, new_commit,
-                {"pr_number": pr_id, "base_branch": tgt_branch, "head_branch": src_branch, "base_commit": new_commit})
+            await self.server.ci_manager.enqueue(
+                owner,
+                repo,
+                "pull_request_merged",
+                tgt_branch,
+                new_commit,
+                {
+                    "pr_number": pr_id,
+                    "base_branch": tgt_branch,
+                    "head_branch": src_branch,
+                    "base_commit": new_commit,
+                },
+            )
         return await self._ui_pull_view(owner, repo, pr_id, msg, "ok")
 
-    def _email_csrf_token(self):
-        if not getattr(self.server, "email_csrf_token", None):
-            self.server.email_csrf_token = secrets.token_urlsafe(32)
-        return self.server.email_csrf_token
+    def _email_csrf_token(self) -> str:
+        token = getattr(self.server, "email_csrf_token", None)
+        if not token:
+            token = secrets.token_urlsafe(32)
+            self.server.email_csrf_token = token
+        return token
 
-    async def _ui_admin_email(self, notice="", error=False, submitted=None):
+    async def _ui_admin_email(
+        self, notice: str = "", error: bool = False, submitted: dict[str, object] | None = None
+    ) -> None:
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
         settings = await _call_in_thread(load_email_settings)
         display = submitted if submitted is not None else settings
         token = self._email_csrf_token()
-        password_status = "A password is configured." if settings.get("password") else "No password is configured."
-        notice_html = safe_html(html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')) if notice else safe_html("")
-        tls_options = join_html([html_t(t'<option value="{value}"{safe_html(" selected" if display.get("tls") == value else "")}>{label}</option>') for value, label in (("starttls", "STARTTLS (usually port 587)"), ("ssl", "Implicit TLS (usually port 465)"))])
-        body = safe_html(html_t(t'''<div class="topbar"><h1>Email settings</h1><a class="pill" href="/">Repositories</a></div>{notice_html}
+        password_status = (
+            "A password is configured."
+            if settings.get("password")
+            else "No password is configured."
+        )
+        notice_html = (
+            safe_html(
+                html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')
+            )
+            if notice
+            else safe_html("")
+        )
+        tls_options = join_html(
+            [
+                html_t(
+                    t'<option value="{value}"{safe_html(" selected" if display.get("tls") == value else "")}>{label}</option>'
+                )
+                for value, label in (
+                    ("starttls", "STARTTLS (usually port 587)"),
+                    ("ssl", "Implicit TLS (usually port 465)"),
+                )
+            ]
+        )
+        body = safe_html(
+            html_t(t'''<div class="topbar"><h1>Email settings</h1><a class="pill" href="/">Repositories</a></div>{notice_html}
 <div class="box"><p>Server-wide SMTP settings for CI notifications. Saved web settings override SMTP environment settings immediately, without restarting.</p>
 <p class="warn">Use HTTPS. The SMTP password is stored in the server database, not encrypted. Protect database files and backups. It is never displayed or passed to job environments. Host CI still requires trusted code.</p>
 <form method="POST" action="/admin/email"><input type="hidden" name="csrf" value="{token}">
@@ -3989,15 +5532,22 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="box"><h2>Send test email</h2><p>Uses saved settings, including the certificate verification choice, not unsaved edits.</p>
 <form method="POST" action="/admin/email/test"><input type="hidden" name="csrf" value="{token}">
 <label>Recipient</label><input type="email" name="recipient" required><button type="submit">Send test email</button></form>
-<p>Choose recipients and notification preferences separately in each repository's CI settings.</p></div>'''))
-        return await _send_response(self.request, 200, _html_page("Email settings", body),
-            [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+<p>Choose recipients and notification preferences separately in each repository's CI settings.</p></div>''')
+        )
+        return await _send_response(
+            self.request,
+            200,
+            _html_page("Email settings", body),
+            [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+        )
 
-    async def _ui_admin_email_save(self, test=False):
+    async def _ui_admin_email_save(self, test: bool = False) -> None:
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
         form = await self._read_form_urlencoded()
-        if not secrets.compare_digest(str(form.get("csrf", "")).encode("utf-8"), self._email_csrf_token().encode("utf-8")):
+        if not secrets.compare_digest(
+            str(form.get("csrf", "")).encode("utf-8"), self._email_csrf_token().encode("utf-8")
+        ):
             return await self._forbidden(b"403 Forbidden: invalid form token.\n")
         current = await _call_in_thread(load_email_settings)
         if test:
@@ -4009,27 +5559,56 @@ document.addEventListener("DOMContentLoaded", function() {{
             except ValueError as exc:
                 return await self._ui_admin_email(notice=str(exc), error=True)
             try:
-                await _call_in_thread(send_notification, "server", "email-test", (0, "test", "", "", "test", "", 0, None), recipients, current)
+                await _call_in_thread(
+                    send_notification,
+                    "server",
+                    "email-test",
+                    (0, "test", "", "", "test", "", 0, None),
+                    recipients,
+                    current,
+                )
             except Exception as exc:
-                return await self._ui_admin_email(notice=f"Test email failed ({type(exc).__name__}). Check SMTP settings and connectivity.", error=True)
-            return await self._ui_admin_email(notice="Test email accepted by SMTP server. Check the recipient's inbox.")
-        settings = {key: form.get(key, "") for key in ("host", "port", "tls", "sender", "username", "password", "public_url", "ca_cert")}
+                return await self._ui_admin_email(
+                    notice=f"Test email failed ({type(exc).__name__}). Check SMTP settings and connectivity.",
+                    error=True,
+                )
+            return await self._ui_admin_email(
+                notice="Test email accepted by SMTP server. Check the recipient's inbox."
+            )
+        settings: dict[str, object] = {
+            key: form.get(key, "")
+            for key in (
+                "host",
+                "port",
+                "tls",
+                "sender",
+                "username",
+                "password",
+                "public_url",
+                "ca_cert",
+            )
+        }
         settings["trust_server_cert"] = "trust_server_cert" in form
         if "clear_password" in form:
             settings["password"] = ""
         elif not settings["password"]:
             settings["password"] = current.get("password", "")
         try:
-            settings = validate_email_settings(settings)
+            settings = dict(validate_email_settings(settings))
         except ValueError as exc:
             return await self._ui_admin_email(notice=str(exc), error=True, submitted=settings)
         await _call_in_thread(db_email_settings_set, json.dumps(settings))
         return await self._ui_admin_email(notice="Email settings saved.")
 
-    async def _ui_deployments(self, owner, repo, deployment_id=None):
-        from .database import db_deployments_list, db_deployment_detail, db_deployments_count
+    async def _ui_deployments(
+        self, owner: str, repo: str, deployment_id: int | None = None
+    ) -> None:
+        from .database import db_deployment_detail, db_deployments_count, db_deployments_list
+
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         if deployment_id is not None:
@@ -4044,38 +5623,103 @@ document.addEventListener("DOMContentLoaded", function() {{
             size = _page_size(params)
             total = await _call_in_thread(db_deployments_count, owner, repo, before)
             page = _clamp_page(_page_number(params), total, size)
-            rows = await _call_in_thread(db_deployments_list, owner, repo, before, size, (page - 1) * size)
-        entries = []
+            rows = await _call_in_thread(
+                db_deployments_list, owner, repo, before, size, (page - 1) * size
+            )
+        entries: list[str] = []
         for row in rows:
-            identity, run_id, commit, status, started, finished, notification, raw, retained = row[:9]
+            identity, run_id, commit, status, started, finished, notification, raw, retained = row[
+                :9
+            ]
             config = json.loads(raw or "{}")
             branch = config.get("deploy_branch", "—")
             if deployment_id is None:
-                entries.append(html_t(t'''<section class="box deployment-summary"><div class="topbar"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2><a class="pill" href="{base}/ci/deployments/{identity}">View details</a></div>
+                entries.append(
+                    html_t(t'''<section class="box deployment-summary"><div class="topbar"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2><a class="pill" href="{base}/ci/deployments/{identity}">View details</a></div>
 <p><strong>{config.get("deployment_name") or config.get("pipeline_id", "default")}</strong> · <code>{branch}</code> · <a href="{base}/commit/{q(commit)}"><code>{commit[:8]}</code></a></p>
-<p class="muted">Started: {started} · Duration: {_ci_elapsed(started, finished)}</p></section>'''))
+<p class="muted">Started: {started} · Duration: {_ci_elapsed(started, finished)}</p></section>''')
+                )
                 continue
-            run_link = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}">CI run #{run_id}</a>')) if retained else safe_html(html_t(t'<span class="muted">CI run #{run_id} no longer retained</span>'))
+            run_link = (
+                safe_html(
+                    html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}">CI run #{run_id}</a>')
+                )
+                if retained
+                else safe_html(
+                    html_t(t'<span class="muted">CI run #{run_id} no longer retained</span>')
+                )
+            )
             steps = json.loads(row[10] or "[]")
-            step_html = join_html([html_t(t'<details class="ci-step" open><summary><span class="ci-status" data-status="{step["status"]}">{step["status"]}</span> <strong>{step["name"]}</strong></summary><pre tabindex="0">{step["output"] or "No output yet."}</pre></details>') for step in steps])
-            logs = safe_html(html_t(t'{step_html}<details><summary>Combined output</summary><div class="ci-log-toolbar"><button type="button" data-copy-deployment="deployment-output-{identity}">Copy output</button><span class="muted" role="status" data-copy-feedback></span></div><pre id="deployment-output-{identity}" tabindex="0" aria-label="Deployment output">{row[9] or "No output yet."}</pre></details>'))
-            entries.append(html_t(t'''<section class="box"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2>
+            step_html = join_html(
+                [
+                    html_t(
+                        t'<details class="ci-step" open><summary><span class="ci-status" data-status="{step["status"]}">{step["status"]}</span> <strong>{step["name"]}</strong></summary><pre tabindex="0">{step["output"] or "No output yet."}</pre></details>'
+                    )
+                    for step in steps
+                ]
+            )
+            logs = safe_html(
+                html_t(
+                    t'{step_html}<details><summary>Combined output</summary><div class="ci-log-toolbar"><button type="button" data-copy-deployment="deployment-output-{identity}">Copy output</button><span class="muted" role="status" data-copy-feedback></span></div><pre id="deployment-output-{identity}" tabindex="0" aria-label="Deployment output">{row[9] or "No output yet."}</pre></details>'
+                )
+            )
+            entries.append(
+                html_t(t'''<section class="box"><h2><a href="{base}/ci/deployments/{identity}">Deployment #{identity}</a> · <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span></h2>
 <p>Deployment: <code>{config.get("deployment_name") or config.get("pipeline_id", "default")}</code> · Pipeline: <code>{config.get("pipeline_id", "default")}</code> · Branch: <code>{branch}</code> · Commit: <a href="{base}/commit/{q(commit)}"><code>{commit}</code></a></p>
-<p class="muted">Started: {started} · Finished: {finished or "—"} · Duration: {_ci_elapsed(started, finished)} · Email: {notification or "not queued"}</p>{run_link}{logs}</section>'''))
-        listing = join_html(entries) if entries else safe_html('<section class="box"><h2>No deployments yet</h2><p>Deployment attempts appear here after matching CI succeeds. Skipped deployments are not recorded.</p></section>')
-        older = _pagination(base + "/ci/deployments", {"before": before} if before else {}, page, page * size < total, total=total, per_page=size) if deployment_id is None else safe_html("")
+<p class="muted">Started: {started} · Finished: {finished or "—"} · Duration: {_ci_elapsed(started, finished)} · Email: {notification or "not queued"}</p>{run_link}{logs}</section>''')
+            )
+        listing = (
+            join_html(entries)
+            if entries
+            else safe_html(
+                '<section class="box"><h2>No deployments yet</h2><p>Deployment attempts appear here after matching CI succeeds. Skipped deployments are not recorded.</p></section>'
+            )
+        )
+        older = (
+            _pagination(
+                base + "/ci/deployments",
+                {"before": str(before)} if before else {},
+                page,
+                page * size < total,
+                total=total,
+                per_page=size,
+            )
+            if deployment_id is None
+            else safe_html("")
+        )
         results = safe_html(html_t(t'<div id="deployment-results">{listing}{older}</div>'))
         if (parse_qs(urlparse(self.path).query or "").get("partial") or [""])[0] == "1":
-            return await _send_response(self.request, 200, str(results).encode("utf-8"), [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+            return await _send_response(
+                self.request,
+                200,
+                str(results).encode("utf-8"),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+            )
         body = html_t(t'''{_ci_tabs(base, "deployments")}<div class="topbar"><h2>Deployment history</h2><a class="pill" href="{base}/ci/deployments">Latest deployments</a></div>
 <script>document.addEventListener("click", async function(event) {{ const button = event.target.closest("[data-copy-deployment]"); if (!button) return; const log = document.getElementById(button.dataset.copyDeployment); const feedback = button.parentElement.querySelector("[data-copy-feedback]"); if (!log) return; try {{ await navigator.clipboard.writeText(log.textContent); feedback.textContent = "Copied."; }} catch (_) {{ feedback.textContent = "Could not copy. Select the output and copy it manually."; }} }});</script>
 {results}
 <script>(function() {{ let busy = false; const timer = setInterval(async function() {{ if (busy) return; busy = true; try {{ const url = new URL(location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (!response.ok || response.redirected) {{ clearInterval(timer); return; }} const text = await response.text(); const current = document.getElementById("deployment-results"); const states = Array.from(current.querySelectorAll("details")).map(el => el.open); const scrolls = Array.from(current.querySelectorAll("pre")).map(el => [el.scrollTop, el.scrollHeight - el.clientHeight - el.scrollTop < 24]); current.outerHTML = text; const updated = document.getElementById("deployment-results"); updated.querySelectorAll("details").forEach((el, i) => {{ if (i < states.length) el.open = states[i]; }}); updated.querySelectorAll("pre").forEach((el, i) => {{ if (scrolls[i]) el.scrollTop = scrolls[i][1] ? el.scrollHeight : scrolls[i][0]; }}); }} catch (_) {{ }} finally {{ busy = false; }} }}, 2000); }})();</script>''')
-        return await _send_html(self.request, 200, _html_page(str_t(t"Deployments · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
+        return await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Deployments · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_ci(self, owner: str, repo: str, run_id: int | None = None, notice: str = "", partial: bool = False):
+    async def _ui_ci(
+        self,
+        owner: str,
+        repo: str,
+        run_id: int | None = None,
+        notice: str = "",
+        partial: bool = False,
+    ) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if run_id is not None:
             return await self._ui_ci_run_detail(owner, repo, run_id, partial=partial)
@@ -4084,8 +5728,23 @@ document.addEventListener("DOMContentLoaded", function() {{
             key: (query_params.get(key) or [""])[0].strip()
             for key in ("status", "event", "branch", "q", "warnings")
         }
-        allowed_statuses = {"queued", "running", "success", "failed", "timed_out", "interrupted", "cancelled"}
-        allowed_events = {"push", "pull_request", "pull_request_updated", "pull_request_reopened", "pull_request_merged", "manual"}
+        allowed_statuses = {
+            "queued",
+            "running",
+            "success",
+            "failed",
+            "timed_out",
+            "interrupted",
+            "cancelled",
+        }
+        allowed_events = {
+            "push",
+            "pull_request",
+            "pull_request_updated",
+            "pull_request_reopened",
+            "pull_request_merged",
+            "manual",
+        }
         if filters["status"] not in allowed_statuses:
             filters["status"] = ""
         if filters["event"] not in allowed_events:
@@ -4094,17 +5753,36 @@ document.addEventListener("DOMContentLoaded", function() {{
             filters["warnings"] = ""
         filters["q"] = filters["q"][:128]
         cursor = (query_params.get("before") or [""])[0]
-        before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
+        before = (
+            int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
+        )
         from .database import db_ci_runs_count
+
         size = _page_size(query_params)
-        total = await _call_in_thread(db_ci_runs_count, owner, repo, status=filters["status"], event=filters["event"], branch=filters["branch"], query=filters["q"], before=before, warnings=filters["warnings"])
+        total = await _call_in_thread(
+            db_ci_runs_count,
+            owner,
+            repo,
+            status=filters["status"],
+            event=filters["event"],
+            branch=filters["branch"],
+            query=filters["q"],
+            before=before,
+            warnings=filters["warnings"],
+        )
         page = _clamp_page(_page_number(query_params), total, size)
         runs = await _call_in_thread(
-            db_ci_runs_list, owner, repo, size,
-            status=filters["status"], event=filters["event"],
-            branch=filters["branch"], query=filters["q"],
+            db_ci_runs_list,
+            owner,
+            repo,
+            size,
+            status=filters["status"],
+            event=filters["event"],
+            branch=filters["branch"],
+            query=filters["q"],
             summary=True,
-            warnings=filters["warnings"], include_warnings=True,
+            warnings=filters["warnings"],
+            include_warnings=True,
             include_pipeline=True,
             before=before,
             offset=(page - 1) * size,
@@ -4112,60 +5790,153 @@ document.addEventListener("DOMContentLoaded", function() {{
         has_next = page * size < total
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        rows = []
+        rows: list[str] = []
         for run in runs:
-            warning = safe_html(html_t(t'<a class="ci-warning-badge" href="{base}/ci/runs/{run[0]}#ci-run-warnings" title="{run[11]}"><span aria-hidden="true">⚠</span> Warning</a>')) if run[11] else safe_html('<span class="muted">—</span>')
-            rows.append(html_t(t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a><br><small>{run[12]}</small></td><td>{run[1].replace("_", " ")}</td><td>{run[2]}</td><td><code>{run[3][:8]}</code></td><td><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></td><td>{warning}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'))
+            run_event = str(run[1])
+            run_branch = str(run[2])
+            run_commit = str(run[3])
+            run_status = str(run[4])
+            warning = (
+                safe_html(
+                    html_t(
+                        t'<a class="ci-warning-badge" href="{base}/ci/runs/{run[0]}#ci-run-warnings" title="{run[11]}"><span aria-hidden="true">⚠</span> Warning</a>'
+                    )
+                )
+                if run[11]
+                else safe_html('<span class="muted">—</span>')
+            )
+            rows.append(
+                html_t(
+                    t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a><br><small>{run[12]}</small></td><td>{run_event.replace("_", " ")}</td><td>{run_branch}</td><td><code>{run_commit[:8]}</code></td><td><span class="ci-status" data-status="{run_status}">{run_status.replace("_", " ")}</span></td><td>{warning}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'
+                )
+            )
         empty = "No runs match these filters." if any(filters.values()) else "No CI runs yet."
-        runs_html = join_html(rows) if rows else safe_html(html_t(t'<tr><td colspan="9" class="muted">{empty}</td></tr>'))
+        runs_html = (
+            join_html(rows)
+            if rows
+            else safe_html(html_t(t'<tr><td colspan="9" class="muted">{empty}</td></tr>'))
+        )
         filter_options = {
-            "warnings": [("", "All warnings"), ("yes", "With warnings"), ("no", "Without warnings")],
-            "status": [("", "All statuses"), ("queued", "Queued"), ("running", "Running"),
-                ("success", "Success"), ("failed", "Failed"), ("timed_out", "Timed out"), ("interrupted", "Interrupted"), ("cancelled", "Cancelled")],
-            "event": [("", "All events"), ("push", "Push"), ("pull_request", "PR opened"),
-                ("pull_request_updated", "PR updated"), ("pull_request_reopened", "PR reopened"),
-                ("pull_request_merged", "PR merged"), ("manual", "Manual")],
+            "warnings": [
+                ("", "All warnings"),
+                ("yes", "With warnings"),
+                ("no", "Without warnings"),
+            ],
+            "status": [
+                ("", "All statuses"),
+                ("queued", "Queued"),
+                ("running", "Running"),
+                ("success", "Success"),
+                ("failed", "Failed"),
+                ("timed_out", "Timed out"),
+                ("interrupted", "Interrupted"),
+                ("cancelled", "Cancelled"),
+            ],
+            "event": [
+                ("", "All events"),
+                ("push", "Push"),
+                ("pull_request", "PR opened"),
+                ("pull_request_updated", "PR updated"),
+                ("pull_request_reopened", "PR reopened"),
+                ("pull_request_merged", "PR merged"),
+                ("manual", "Manual"),
+            ],
         }
-        options_html = {}
+        options_html: dict[str, str] = {}
         for name, options in filter_options.items():
-            options_html[name] = join_html([
-                html_t(t'<option value="{value}"{safe_html(" selected" if value == filters[name] else "")}>{label}</option>')
-                for value, label in options
-            ])
+            options_html[name] = join_html(
+                [
+                    html_t(
+                        t'<option value="{value}"{safe_html(" selected" if value == filters[name] else "")}>{label}</option>'
+                    )
+                    for value, label in options
+                ]
+            )
         branch_values = [("", "All branches")] + [(branch, branch) for branch in branches]
         if filters["branch"] and filters["branch"] not in branches:
             branch_values.append((filters["branch"], filters["branch"]))
-        branch_options = join_html([
-            html_t(t'<option value="{value}"{safe_html(" selected" if value == filters["branch"] else "")}>{label}</option>')
-            for value, label in branch_values
-        ])
-        filter_form = safe_html(html_t(t'''<div class="box ci-compact"><form method="GET" action="{base}/ci" class="ci-toolbar">
+        branch_options = join_html(
+            [
+                html_t(
+                    t'<option value="{value}"{safe_html(" selected" if value == filters["branch"] else "")}>{label}</option>'
+                )
+                for value, label in branch_values
+            ]
+        )
+        filter_form = safe_html(
+            html_t(t'''<div class="box ci-compact"><form method="GET" action="{base}/ci" class="ci-toolbar">
 <input type="hidden" name="per_page" value="{size}">
 <input aria-label="Search runs" name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
 <select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
 <select aria-label="Warnings" name="warnings">{options_html["warnings"]}</select>
 <select aria-label="Branch" name="branch">{branch_options}</select><button type="submit">Filter runs</button>
-<a class="pill" href="{base}/ci">Clear filters</a></form></div>'''))
-        pagination = _pagination(base + "/ci", {**{key: value for key, value in filters.items() if value}, **({"before": before} if before is not None else {})}, page, has_next, total=total, per_page=size)
-        results_html = safe_html(html_t(t'''<div id="ci-results">
-<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Warnings</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>'''))
+<a class="pill" href="{base}/ci">Clear filters</a></form></div>''')
+        )
+        pagination = _pagination(
+            base + "/ci",
+            {
+                **{key: value for key, value in filters.items() if value},
+                **({"before": str(before)} if before is not None else {}),
+            },
+            page,
+            has_next,
+            total=total,
+            per_page=size,
+        )
+        results_html = safe_html(
+            html_t(t"""<div id="ci-results">
+<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Warnings</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>""")
+        )
         if partial:
-            return await _send_response(self.request, 200, str(results_html).encode("utf-8"),
-                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+            return await _send_response(
+                self.request,
+                200,
+                str(results_html).encode("utf-8"),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+            )
         manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
         config = await self.server.ci_manager.config(owner, repo)
         pipelines = CIManager.pipelines(config)
-        pipeline_options = join_html([html_t(t'<option value="{item.get("pipeline_id", "default")}">{item.get("pipeline_id", "default")}</option>') for item in pipelines])
-        manual_enabled = bool(any(item.get("command") or item.get("steps") or item.get("repository_config") for item in pipelines) and branches and _has_write_scope(self))
+        pipeline_options = join_html(
+            [
+                html_t(
+                    t'<option value="{item.get("pipeline_id", "default")}">{item.get("pipeline_id", "default")}</option>'
+                )
+                for item in pipelines
+            ]
+        )
+        manual_enabled = bool(
+            any(
+                item.get("command") or item.get("steps") or item.get("repository_config")
+                for item in pipelines
+            )
+            and branches
+            and _has_write_scope(self)
+        )
         disabled = safe_html("" if manual_enabled else " disabled")
-        manual_notice = "" if manual_enabled else "Manual runs require write access, a runnable pipeline, and an existing branch."
-        notice_html = safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
+        manual_notice = (
+            ""
+            if manual_enabled
+            else "Manual runs require write access, a runnable pipeline, and an existing branch."
+        )
+        notice_html = (
+            safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
+        )
         body = html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><h2>CI runs</h2></div>{notice_html}
 <div class="box ci-compact"><form class="ci-toolbar" method="POST" action="{base}/ci/run"><strong>Run manually</strong><select aria-label="Pipeline" name="pipeline">{pipeline_options}</select><select aria-label="Branch to run" name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button><small class="muted">{manual_notice}</small></form></div>{filter_form}{results_html}
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
-        await _send_html(self.request, 200, _html_page(str_t(t"CI · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"CI · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="ci-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_ci_run_detail(self, owner: str, repo: str, run_id: int, *, partial: bool = False):
+    async def _ui_ci_run_detail(
+        self, owner: str, repo: str, run_id: int, *, partial: bool = False
+    ) -> None:
         run = await _call_in_thread(db_ci_run_get, owner, repo, run_id)
         if not run:
             if partial:
@@ -4175,54 +5946,148 @@ document.addEventListener("DOMContentLoaded", function() {{
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         active = run[4] in ("queued", "running")
         meta = await _call_in_thread(db_ci_run_metadata, owner, repo, run_id)
+        if meta is None:
+            if partial:
+                return await _send_text(self.request, 404, "CI run not found.\n")
+            return await self._not_found()
         snapshot = json.loads(meta["config"] or "{}")
         payload = json.loads(meta["payload"] or "{}")
         command_details = safe_html("")
         if not REQUIRE_AUTH or _require_admin(self):
-            saved_command = json.dumps(snapshot["steps"], indent=2) if snapshot.get("steps") else snapshot.get("command", "Legacy run: no snapshot available.")
-            command_details = safe_html(html_t(t'<details id="ci-run-config" class="ci-run-disclosure"><summary>Configuration snapshot</summary><p class="muted">Image: {snapshot.get("image", "—")}</p><pre>{saved_command}</pre></details>'))
+            saved_command = (
+                json.dumps(snapshot["steps"], indent=2)
+                if snapshot.get("steps")
+                else snapshot.get("command", "Legacy run: no snapshot available.")
+            )
+            command_details = safe_html(
+                html_t(
+                    t'<details id="ci-run-config" class="ci-run-disclosure"><summary>Configuration snapshot</summary><p class="muted">Image: {snapshot.get("image", "—")}</p><pre>{saved_command}</pre></details>'
+                )
+            )
         can_write = _has_write_scope(self)
         actions = safe_html("")
         if can_write:
             action = "cancel" if active else "rerun"
-            unavailable = safe_html(' disabled title="Legacy run has no configuration snapshot"' if not active and not snapshot else "")
-            actions = safe_html(html_t(t'<form method="POST" action="{base}/ci/runs/{run_id}/{action}"><button{unavailable}>{action.capitalize()}</button></form>'))
+            unavailable = safe_html(
+                ' disabled title="Legacy run has no configuration snapshot"'
+                if not active and not snapshot
+                else ""
+            )
+            actions = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/ci/runs/{run_id}/{action}"><button{unavailable}>{action.capitalize()}</button></form>'
+                )
+            )
         email_action = safe_html("")
-        if (not REQUIRE_AUTH or _require_admin(self)) and meta["notification"].startswith(("failed", "delivery unknown")):
-            email_action = safe_html(html_t(t'<form method="POST" action="{base}/ci/runs/{run_id}/notify"><button>Retry email (may duplicate an uncertain delivery)</button></form>'))
-        waiting = "Waiting for a runner slot or an earlier run in this repository." if run[4] == "queued" else ""
+        if (not REQUIRE_AUTH or _require_admin(self)) and meta["notification"].startswith(
+            ("failed", "delivery unknown")
+        ):
+            email_action = safe_html(
+                html_t(
+                    t'<form method="POST" action="{base}/ci/runs/{run_id}/notify"><button>Retry email (may duplicate an uncertain delivery)</button></form>'
+                )
+            )
+        waiting = (
+            "Waiting for a runner slot or an earlier run in this repository."
+            if run[4] == "queued"
+            else ""
+        )
         output = run[5] or "No output yet."
         exit_code = "pending" if run[7] is None else run[7]
         started_at = run[9] or "—"
         finished_at = run[10] or "—"
-        truncated_notice = safe_html('<p class="muted">Output truncated at 1 MiB.</p>') if run[6] else safe_html("")
+        truncated_notice = (
+            safe_html('<p class="muted">Output truncated at 1 MiB.</p>')
+            if run[6]
+            else safe_html("")
+        )
         steps = json.loads(await _call_in_thread(db_ci_steps_get, run_id))
-        steps_html = join_html([html_t(t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><strong>{step["name"]}</strong><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>''') for index, step in enumerate(steps)])
-        steps_section = safe_html(html_t(t'<section class="box ci-run-steps"><div class="ci-section-heading"><h2>Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>')) if steps else safe_html("")
+        steps_html = join_html(
+            [
+                html_t(
+                    t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><strong>{step["name"]}</strong><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>'''
+                )
+                for index, step in enumerate(steps)
+            ]
+        )
+        steps_section = (
+            safe_html(
+                html_t(
+                    t'<section class="box ci-run-steps"><div class="ci-section-heading"><h2>Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>'
+                )
+            )
+            if steps
+            else safe_html("")
+        )
         artifact_size = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id)
         from .database import db_deployments_for_run
+
         deployments = await _call_in_thread(db_deployments_for_run, run_id)
-        deployment_html = join_html([html_t(t'<section class="box"><h2>Deployment: {entry[2]} · {json.loads(entry[5] or "{}").get("deployment_name") or entry[1]}</h2><p class="muted">Deployment email: {entry[4] or "not queued"}</p><pre>{entry[3] or "No output yet. Logs are available when deployment finishes."}</pre></section>') for entry in deployments])
-        active = active or any(entry[2] == "running" or entry[4] in ("queued", "sending") for entry in deployments)
+        deployment_html = join_html(
+            [
+                html_t(
+                    t'<section class="box"><h2>Deployment: {entry[2]} · {json.loads(entry[5] or "{}").get("deployment_name") or entry[1]}</h2><p class="muted">Deployment email: {entry[4] or "not queued"}</p><pre>{entry[3] or "No output yet. Logs are available when deployment finishes."}</pre></section>'
+                )
+                for entry in deployments
+            ]
+        )
+        active = active or any(
+            entry[2] == "running" or entry[4] in ("queued", "sending") for entry in deployments
+        )
         active = active or bool(run[4] == "success" and run_id in self.server.ci_manager.active)
-        artifact_html = safe_html(html_t(t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>')) if artifact_size else safe_html("")
+        artifact_html = (
+            safe_html(
+                html_t(
+                    t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>'
+                )
+            )
+            if isinstance(artifact_size, int) and artifact_size
+            else safe_html("")
+        )
         reason = waiting or meta["reason"]
-        reason_html = safe_html(html_t(t'<p class="warn" role="status">{reason}</p>')) if reason and reason != meta["warnings"] else safe_html("")
-        warning_html = safe_html(html_t(t'<div id="ci-run-warnings" class="warn" role="status"><strong>Run warnings</strong><p class="ci-warning-details">{meta["warnings"]}</p></div>')) if meta["warnings"] else safe_html("")
-        result_html = safe_html(html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
+        reason_html = (
+            safe_html(html_t(t'<p class="warn" role="status">{reason}</p>'))
+            if reason and reason != meta["warnings"]
+            else safe_html("")
+        )
+        warning_html = (
+            safe_html(
+                html_t(
+                    t'<div id="ci-run-warnings" class="warn" role="status"><strong>Run warnings</strong><p class="ci-warning-details">{meta["warnings"]}</p></div>'
+                )
+            )
+            if meta["warnings"]
+            else safe_html("")
+        )
+        result_html = safe_html(
+            html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
 <section class="box ci-run-overview" aria-label="Run summary"><div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
 {warning_html}{reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
 <details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Pipeline</dt><dd>{payload.get("pipeline_id", "default")}</dd><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
-<pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details>{deployment_html}</div>'''))
+<pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details>{deployment_html}</div>''')
+        )
         if partial:
-            return await _send_response(self.request, 200, str(result_html).encode("utf-8"),
-                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+            return await _send_response(
+                self.request,
+                200,
+                str(result_html).encode("utf-8"),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+            )
 
         title_commit = payload.get("head_commit") or run[3]
-        commit_meta = await _git_commit_meta(_repo_bare_path(owner, repo), title_commit) if title_commit else None
-        run_title = commit_meta["subject"] if commit_meta and commit_meta.get("subject") else str_t(t'{run[1].replace("_", " ").capitalize()} run on {run[2] or "repository"}')
-        body = safe_html(html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2 id="ci-run-title">{run_title}</h2><p class="muted">Run #{run_id} · {run[1].replace("_", " ")} · <code>{run[2]}</code> · <a href="{base}/commit/{q(title_commit)}"><code>{title_commit[:8]}</code></a></p></div>
+        commit_meta = (
+            await _git_commit_meta(_repo_bare_path(owner, repo), title_commit)
+            if title_commit
+            else None
+        )
+        run_title = (
+            commit_meta["subject"]
+            if commit_meta and commit_meta.get("subject")
+            else str_t(t"{run[1].replace('_', ' ').capitalize()} run on {run[2] or 'repository'}")
+        )
+        body = safe_html(
+            html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2 id="ci-run-title">{run_title}</h2><p class="muted">Run #{run_id} · {run[1].replace("_", " ")} · <code>{run[2]}</code> · <a href="{base}/commit/{q(title_commit)}"><code>{title_commit[:8]}</code></a></p></div>
 <div><a class="pill" href="{base}/ci">← All runs</a></div></div>
 {result_html}
 <script>(function() {{
@@ -4247,35 +6112,52 @@ document.getElementById("ci-follow").checked = follow;
 replacement.querySelectorAll("[data-ci-scroll]").forEach(item => item.scrollTop = follow ? item.scrollHeight : (positions.get(item.id) || 0));
 if (focus) {{ const focused = document.getElementById(focus); if (focused) focused.focus({{preventScroll:true}}); }}
 if (document.getElementById("ci-run-result").dataset.active !== "true") clearInterval(timer);
-}} catch (_error) {{ /* Retry on the next interval. */ }} finally {{ polling = false; }} }}, 3000); }})();</script>'''))
-        return await _send_html(self.request, 200,
-            _html_page(str_t(t"CI run #{run[0]} · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page">{body}</main>'))))
+}} catch (_error) {{ /* Retry on the next interval. */ }} finally {{ polling = false; }} }}, 3000); }})();</script>''')
+        )
+        return await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"CI run #{run[0]} · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="ci-page">{body}</main>')),
+            ),
+        )
 
-    async def _ui_api_docs(self):
+    async def _ui_api_docs(self) -> None:
         if not _ip_allowed(self._client_ip(), self._allowlist()):
             return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
         if not await self._require_session_auth():
             return
         from .ci_docs import render_manual
+
         path = Path(__file__).resolve().parent.parent / "docs" / "api.md"
         try:
             text = await asyncio.to_thread(path.read_text, encoding="utf-8")
             content = render_manual(text, "docs/api.md", "/api/docs")
         except OSError:
-            content = safe_html("<p>The full API manual is unavailable in this installation. "
-                                "Use GET /api/v1/openapi.json with a read-scoped bearer token "
-                                "for the implemented API contract. Writes require write scope "
-                                "and an Idempotency-Key header. Tokens are "
-                                "required even when web authentication is disabled.</p>")
-        body = safe_html(html_t(t'<main class="ci-page"><div class="topbar"><h1>API documentation</h1><a href="/">Home</a></div><nav class="row" aria-label="API documentation sections"><a href="#repository-browsing-and-comparisons">Repository browsing</a><a href="#discussions">Discussions</a><a href="#ci-automation">CI automation</a><a href="#ci-api-safety-and-test-coverage">CI safety and tests</a><a href="#responses-pagination-and-errors">Responses and errors</a><a href="#remaining-api-coverage-gaps">Remaining API gaps</a></nav><article class="box ci-guide">{content}</article></main>'))
+            content = safe_html(
+                "<p>The full API manual is unavailable in this installation. "
+                "Use GET /api/v1/openapi.json with a read-scoped bearer token "
+                "for the implemented API contract. Writes require write scope "
+                "and an Idempotency-Key header. Tokens are "
+                "required even when web authentication is disabled.</p>"
+            )
+        body = safe_html(
+            html_t(
+                t'<main class="ci-page"><div class="topbar"><h1>API documentation</h1><a href="/">Home</a></div><nav class="row" aria-label="API documentation sections"><a href="#repository-browsing-and-comparisons">Repository browsing</a><a href="#discussions">Discussions</a><a href="#ci-automation">CI automation</a><a href="#ci-api-safety-and-test-coverage">CI safety and tests</a><a href="#responses-pagination-and-errors">Responses and errors</a><a href="#remaining-api-coverage-gaps">Remaining API gaps</a></nav><article class="box ci-guide">{content}</article></main>'
+            )
+        )
         return await _send_html(self.request, 200, _html_page("API documentation", body))
 
-    async def _ui_ci_docs(self, owner: str, repo: str):
+    async def _ui_ci_docs(self, owner: str, repo: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        from .ci_docs import GUIDES, EXAMPLES, manual_content
+        from .ci_docs import EXAMPLES, GUIDES, manual_content
+
         query = parse_qs(urlparse(self.path).query)
         guide = (query.get("guide") or ["reference"])[0]
         example = (query.get("example") or [""])[0]
@@ -4285,39 +6167,92 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             content = ci_configuration_guide()
         if content is None:
             return await self._not_found()
-        guide_links = join_html([html_t(t'<a class="pill" href="{base}/ci/docs?guide={key}"{safe_html(" aria-current=\"page\"" if key == guide and not example else "")}>{title}</a>') for key, (title, _path) in GUIDES.items()])
-        example_links = join_html([html_t(t'<a class="pill" href="{base}/ci/docs?example={key}">{title}</a>') for key, (title, _path) in EXAMPLES.items()])
-        body = safe_html(html_t(t'''<main class="ci-page">{_ci_tabs(base, "docs")}<div class="topbar"><h2>CI documentation</h2></div>
+        guide_links = join_html(
+            [
+                html_t(
+                    t'<a class="pill" href="{base}/ci/docs?guide={key}"{safe_html(' aria-current="page"' if key == guide and not example else "")}>{title}</a>'
+                )
+                for key, (title, _path) in GUIDES.items()
+            ]
+        )
+        example_links = join_html(
+            [
+                html_t(t'<a class="pill" href="{base}/ci/docs?example={key}">{title}</a>')
+                for key, (title, _path) in EXAMPLES.items()
+            ]
+        )
+        body = safe_html(
+            html_t(t'''<main class="ci-page">{_ci_tabs(base, "docs")}<div class="topbar"><h2>CI documentation</h2></div>
 <section class="box"><h2>Repository CI files</h2><p>Keep repository-owned pipeline JSON and helper scripts under <code>ci/</code>. Repositories without saved settings automatically discover <code>ci/config.json</code>; other files require explicit Settings references. Commands and file references remain relative to the checkout root.</p><p>Commit a pipeline containing named steps, not the Settings reference document. Variables, secrets and retention remain in the settings controls. Existing saved root-file references still work; automatically discovered root files must move to <code>ci/config.json</code>.</p><nav class="row" aria-label="Repository CI setup"><a href="{base}/ci/docs?guide=start#repository-ci-directory">Directory layout</a><a href="{base}/ci/docs?guide=examples#multiple-git-managed-pipelines">Multiple pipeline files</a><a href="{base}/ci/docs?guide=migration#move-root-files-into-ci">Move existing CI files</a><a href="{base}/ci/docs?example=repository-pipeline">Repository pipeline example</a></nav></section>
 <nav class="row" aria-label="Documentation sections">{guide_links}</nav><section class="box"><h2>Complete JSON examples</h2><nav class="row" aria-label="Configuration examples">{example_links}</nav></section>
-<article id="ci-configuration-guide" class="box ci-guide">{content}</article></main><script src="/static/ci-docs.js" defer></script>'''))
-        return await _send_html(self.request, 200, _html_page(str_t(t"CI documentation · {owner}/{repo}"), body))
+<article id="ci-configuration-guide" class="box ci-guide">{content}</article></main><script src="/static/ci-docs.js" defer></script>''')
+        )
+        return await _send_html(
+            self.request, 200, _html_page(str_t(t"CI documentation · {owner}/{repo}"), body)
+        )
 
-    async def _ui_ci_config(self, owner: str, repo: str, notice: str = "", submitted=None, error=False, preferences_submitted=None):
+    async def _ui_ci_config(
+        self,
+        owner: str,
+        repo: str,
+        notice: str = "",
+        submitted: str | None = None,
+        error: bool = False,
+        preferences_submitted: dict[str, str] | None = None,
+    ) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
         from .ci_config import EXAMPLE, editor_document
+
         config = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         from . import ci_preferences
         from .database import db_ci_preferences_get
         from .settings_pages import preferences_forms
+
         document = ci_preferences.editor_document(editor_document(config))
         text = submitted if isinstance(submitted, str) else json.dumps(document, indent=2)
         from .ci_schema import group_document
+
         example = json.dumps(ci_preferences.editor_document(group_document(EXAMPLE)), indent=2)
-        notice_html = safe_html(html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')) if notice else safe_html("")
+        notice_html = (
+            safe_html(
+                html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')
+            )
+            if notice
+            else safe_html("")
+        )
         global_values, repository_values = await _call_in_thread(db_ci_preferences_get, owner, repo)
         raw_config = await _call_in_thread(db_ci_config_get, owner, repo)
-        raw_config = json.loads(raw_config) if raw_config else {}
-        env = raw_config.get("env", {})
-        legacy = {**ci_preferences.legacy_retention(raw_config), "env": env,
-                  "pipeline_env": {item["pipeline_id"]: item["env"] for item in CIManager.pipelines(raw_config) if item.get("env") and item["env"] != env}} if raw_config else {}
-        preferences = preferences_forms(base + "/ci/preferences", self._settings_csrf_token(), global_values,
-            repository_values, legacy=legacy, pipelines=[item["pipeline_id"] for item in CIManager.pipelines(config)], submitted=preferences_submitted)
+        raw_document: dict[str, Any] = json.loads(raw_config) if raw_config else {}
+        env = raw_document.get("env", {})
+        legacy = (
+            {
+                **ci_preferences.legacy_retention(raw_document),
+                "env": env,
+                "pipeline_env": {
+                    item["pipeline_id"]: item["env"]
+                    for item in CIManager.pipelines(raw_document)
+                    if item.get("env") and item["env"] != env
+                },
+            }
+            if raw_document
+            else {}
+        )
+        preferences = preferences_forms(
+            base + "/ci/preferences",
+            self._settings_csrf_token(),
+            global_values,
+            repository_values,
+            legacy=legacy,
+            pipelines=[item["pipeline_id"] for item in CIManager.pipelines(config)],
+            submitted=preferences_submitted,
+        )
         body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><h2>CI configuration</h2><nav class="row"><a class="pill" href="/admin/settings">Server defaults</a><a class="pill" href="{base}/ci/docs">JSON reference and examples</a></nav></div>{notice_html}
 <form id="ci-settings-form" class="ci-settings-form" method="POST" action="{base}/ci/config">
 <section class="box">
@@ -4336,12 +6271,22 @@ form.addEventListener("submit", event => {{
  catch (error) {{ event.preventDefault(); document.getElementById("ci-json-status").textContent = "Invalid JSON: " + error.message; return; }}
 }});
 }})();</script>''')
-        return await _send_html(self.request, 200,
-            _html_page(str_t(t"CI settings · {owner}/{repo}"), safe_html(html_t(t'<main class="ci-page ci-settings-page">{safe_html(body)}</main>'))))
+        return await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"CI settings · {owner}/{repo}"),
+                safe_html(
+                    html_t(t'<main class="ci-page ci-settings-page">{safe_html(body)}</main>')
+                ),
+            ),
+        )
 
-    async def _ui_ci_config_save(self, owner: str, repo: str):
+    async def _ui_ci_config_save(self, owner: str, repo: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
@@ -4350,44 +6295,70 @@ form.addEventListener("submit", event => {{
         try:
             if len(text.encode("utf-8")) > 262144:
                 raise ValueError("Configuration JSON exceeds 256 KiB.")
-            def unique_keys(pairs):
-                result = {}
+
+            def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                result: dict[str, Any] = {}
                 for key, value in pairs:
                     if key in result:
                         raise ValueError(f"Duplicate JSON key: {key}")
                     result[key] = value
                 return result
+
             document = json.loads(text, object_pairs_hook=unique_keys)
             async with self.server.settings_lock:
-                await self.server.ci_manager.save_document(owner, repo, document, preserve_page_settings=True)
+                await self.server.ci_manager.save_document(
+                    owner, repo, document, preserve_page_settings=True
+                )
         except (ValueError, RecursionError) as exc:
-            return await self._ui_ci_config(owner, repo, notice=str(exc), submitted=text, error=True)
+            return await self._ui_ci_config(
+                owner, repo, notice=str(exc), submitted=text, error=True
+            )
         return await self._ui_ci_config(owner, repo, notice="Configuration saved.")
 
-    async def _ui_ci_run(self, owner: str, repo: str):
+    async def _ui_ci_run(self, owner: str, repo: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\\n")
         form = await self._read_form_urlencoded()
         branch = (form.get("branch") or "").strip()
-        commit = await _git_resolve_commit(_repo_bare_path(owner, repo), "refs/heads/" + branch) if _safe_branch_name(branch) else None
+        commit = (
+            await _git_resolve_commit(_repo_bare_path(owner, repo), "refs/heads/" + branch)
+            if _safe_branch_name(branch)
+            else None
+        )
         if not commit:
             return await self._ui_ci(owner, repo, notice="Select a valid branch.")
         try:
-            run_id = await self.server.ci_manager.enqueue(owner, repo, "manual", branch, commit, pipeline=form.get("pipeline", "default"))
+            run_id = await self.server.ci_manager.enqueue(
+                owner, repo, "manual", branch, commit, pipeline=form.get("pipeline", "default")
+            )
         except ValueError as exc:
             return await self._ui_ci(owner, repo, notice=str(exc))
         if run_id:
-            return await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}"))
+            return await _send_redirect(
+                self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}")
+            )
         if (await self.server.ci_manager.config(owner, repo)).get("_autodetect_repository_config"):
-            return await self._ui_ci(owner, repo, notice="No run queued. Add ci/config.json to the selected branch to use automatic repository CI.")
-        return await self._ui_ci(owner, repo, notice="No run queued. Select a runnable pipeline with steps or a repository file.")
+            return await self._ui_ci(
+                owner,
+                repo,
+                notice="No run queued. Add ci/config.json to the selected branch to use automatic repository CI.",
+            )
+        return await self._ui_ci(
+            owner,
+            repo,
+            notice="No run queued. Select a runnable pipeline with steps or a repository file.",
+        )
 
-    async def _ui_ci_action(self, owner, repo, run_id, action):
+    async def _ui_ci_action(self, owner: str, repo: str, run_id: int, action: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
@@ -4401,64 +6372,125 @@ form.addEventListener("submit", event => {{
             elif action == "notify":
                 await self.server.ci_manager.retry_email(owner, repo, run_id)
             else:
-                run_id = await self.server.ci_manager.rerun(owner, repo, run_id)
+                new_run_id = await self.server.ci_manager.rerun(owner, repo, run_id)
+                if new_run_id is not None:
+                    run_id = new_run_id
         except ValueError as exc:
             return await self._ui_ci(owner, repo, notice=str(exc))
-        return await _send_redirect(self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}"))
+        return await _send_redirect(
+            self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}")
+        )
 
-    async def _ui_ci_log(self, owner, repo, run_id):
+    async def _ui_ci_log(self, owner: str, repo: str, run_id: int) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         run = await _call_in_thread(db_ci_run_get, owner, repo, run_id)
         if not run:
             return await self._not_found()
-        return await _send_response(self.request, 200, run[5].encode("utf-8"),
-            [("Content-Type", "text/plain; charset=utf-8"), ("Content-Disposition", f'attachment; filename="ci-{run_id}.log"'), ("Cache-Control", "no-store")])
+        return await _send_response(
+            self.request,
+            200,
+            run[5].encode("utf-8"),
+            [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Disposition", f'attachment; filename="ci-{run_id}.log"'),
+                ("Cache-Control", "no-store"),
+            ],
+        )
 
-    async def _ui_artifacts(self, owner, repo):
+    async def _ui_artifacts(self, owner: str, repo: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         params = parse_qs(urlparse(self.path).query or "")
         cursor = (params.get("before") or [""])[0]
-        before = int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
+        before = (
+            int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
+        )
         from .database import db_ci_artifacts_count
+
         size = _page_size(params)
         total = await _call_in_thread(db_ci_artifacts_count, owner, repo, before)
         page = _clamp_page(_page_number(params), total, size)
-        artifacts = await _call_in_thread(db_ci_artifacts_list, owner, repo, before=before, limit=size, offset=(page - 1) * size)
-        rows = []
+        artifacts = await _call_in_thread(
+            db_ci_artifacts_list, owner, repo, before=before, limit=size, offset=(page - 1) * size
+        )
+        rows: list[str] = []
         for run_id, branch, commit, status, event, created, archive_size, expires in artifacts:
-            size_label = f"{archive_size / (1024 * 1024):.1f} MiB" if archive_size >= 1024 * 1024 else f"{archive_size / 1024:.1f} KiB"
-            rows.append(html_t(t'''<tr><td><a class="ci-artifact-name" href="{base}/ci/runs/{run_id}/artifacts">ci-{run_id}-artifacts.zip</a><div class="muted">{size_label} · Created {created} UTC</div></td>
+            size_label = (
+                f"{archive_size / (1024 * 1024):.1f} MiB"
+                if archive_size >= 1024 * 1024
+                else f"{archive_size / 1024:.1f} KiB"
+            )
+            rows.append(
+                html_t(t'''<tr><td><a class="ci-artifact-name" href="{base}/ci/runs/{run_id}/artifacts">ci-{run_id}-artifacts.zip</a><div class="muted">{size_label} · Created {created} UTC</div></td>
 <td><a href="{base}/ci/runs/{run_id}">Run #{run_id}</a> <span class="ci-status" data-status="{status}">{status.replace("_", " ")}</span><div class="muted">{branch or "—"} · <code>{commit[:8]}</code> · {event.replace("_", " ")}</div></td>
-<td><span class="muted">{("Expires " + expires + " UTC") if expires else "Never expires"}</span></td><td><a class="pill" href="{base}/ci/runs/{run_id}/artifacts" aria-label="Download artifacts from run {run_id}">Download ZIP ↓</a></td></tr>'''))
+<td><span class="muted">{("Expires " + expires + " UTC") if expires else "Never expires"}</span></td><td><a class="pill" href="{base}/ci/runs/{run_id}/artifacts" aria-label="Download artifacts from run {run_id}">Download ZIP ↓</a></td></tr>''')
+            )
         if rows:
-            listing = safe_html(html_t(t'<div class="ci-table-scroll"><table><thead><tr><th scope="col">Archive</th><th scope="col">Source run</th><th scope="col">Retention</th><th scope="col">Download</th></tr></thead><tbody>{join_html(rows)}</tbody></table></div>'))
+            listing = safe_html(
+                html_t(
+                    t'<div class="ci-table-scroll"><table><thead><tr><th scope="col">Archive</th><th scope="col">Source run</th><th scope="col">Retention</th><th scope="col">Download</th></tr></thead><tbody>{join_html(rows)}</tbody></table></div>'
+                )
+            )
         else:
-            listing = safe_html(html_t(t'''<div class="ci-artifacts-empty"><div class="ci-artifact-symbol" aria-hidden="true">↓</div><h2>{"No older artifacts" if before else "No artifacts yet"}</h2><p class="muted">Save build packages, screenshots, or reports from your CI runs.<br>Configure file patterns in CI settings to start collecting downloads.</p><a class="pill" href="{base}/ci/config">Configure artifacts</a> <a class="pill" href="{base}/ci">View CI runs</a></div>'''))
-        pagination = _pagination(base + "/artifacts", {"before": before} if before is not None else {}, page, page * size < total, total=total, per_page=size)
-        back = safe_html(html_t(t'<a class="pill" href="{base}/artifacts">Newest artifacts</a>')) if before else safe_html("")
-        body = safe_html(html_t(t'''<main class="ci-page">{_repo_tabs(base, "artifacts")}<div class="topbar"><div><h2>Artifacts</h2><p class="muted">Build outputs from your CI runs, ready to download.</p></div><a class="pill" href="{base}/ci/config">Artifact settings</a></div>
-<section class="box ci-artifacts-panel"><div class="ci-section-heading"><h2>Available downloads</h2><span class="muted">Retention configured in CI settings; count limits also apply</span></div>{listing}<div class="row">{back}{pagination}</div></section></main>'''))
-        return await _send_html(self.request, 200, _html_page(str_t(t"Artifacts · {owner}/{repo}"), body))
+            listing = safe_html(
+                html_t(
+                    t'''<div class="ci-artifacts-empty"><div class="ci-artifact-symbol" aria-hidden="true">↓</div><h2>{"No older artifacts" if before else "No artifacts yet"}</h2><p class="muted">Save build packages, screenshots, or reports from your CI runs.<br>Configure file patterns in CI settings to start collecting downloads.</p><a class="pill" href="{base}/ci/config">Configure artifacts</a> <a class="pill" href="{base}/ci">View CI runs</a></div>'''
+                )
+            )
+        pagination = _pagination(
+            base + "/artifacts",
+            {"before": str(before)} if before is not None else {},
+            page,
+            page * size < total,
+            total=total,
+            per_page=size,
+        )
+        back = (
+            safe_html(html_t(t'<a class="pill" href="{base}/artifacts">Newest artifacts</a>'))
+            if before
+            else safe_html("")
+        )
+        body = safe_html(
+            html_t(t'''<main class="ci-page">{_repo_tabs(base, "artifacts")}<div class="topbar"><div><h2>Artifacts</h2><p class="muted">Build outputs from your CI runs, ready to download.</p></div><a class="pill" href="{base}/ci/config">Artifact settings</a></div>
+<section class="box ci-artifacts-panel"><div class="ci-section-heading"><h2>Available downloads</h2><span class="muted">Retention configured in CI settings; count limits also apply</span></div>{listing}<div class="row">{back}{pagination}</div></section></main>''')
+        )
+        return await _send_html(
+            self.request, 200, _html_page(str_t(t"Artifacts · {owner}/{repo}"), body)
+        )
 
-    async def _ui_ci_artifact(self, owner, repo, run_id):
+    async def _ui_ci_artifact(self, owner: str, repo: str, run_id: int) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         archive = await _call_in_thread(db_ci_artifact_get, owner, repo, run_id, content=True)
-        if archive is None:
+        if not isinstance(archive, bytes):
             return await self._not_found()
-        return await _send_response(self.request, 200, archive,
-            [("Content-Type", "application/zip"), ("Content-Disposition", f'attachment; filename="ci-{run_id}-artifacts.zip"'), ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")])
+        return await _send_response(
+            self.request,
+            200,
+            archive,
+            [
+                ("Content-Type", "application/zip"),
+                ("Content-Disposition", f'attachment; filename="ci-{run_id}-artifacts.zip"'),
+                ("Cache-Control", "no-store"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        )
 
     # ========================================================
     # UI: Commits, Commit, Tree, Blob
     # ========================================================
-    async def _ui_commits(self, owner: str, repo: str, ref: str):
+    async def _ui_commits(self, owner: str, repo: str, ref: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         ref = unquote(ref)
@@ -4469,7 +6501,9 @@ form.addEventListener("submit", event => {{
         if not resolved_ref:
             if (parse_qs(urlparse(self.path).query or "").get("partial") or [""])[0] == "1":
                 return await _send_text(self.request, 400, "400 Bad Request: invalid commit ref.\n")
-            body = html_t(t"<h1>Commits</h1><p>Could not resolve ref: {ref}</p><p><a class=\"pill\" href=\"/\">Back</a></p>")
+            body = html_t(
+                t'<h1>Commits</h1><p>Could not resolve ref: {ref}</p><p><a class="pill" href="/">Back</a></p>'
+            )
             return await _send_html(self.request, 400, _html_page("Commits", safe_html(body)))
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query or "")
@@ -4485,44 +6519,69 @@ form.addEventListener("submit", event => {{
         total = await _git_commit_count(repo_git, resolved_ref, history_path)
         if not partial and total is not None:
             skip = (_clamp_page(skip // size + 1, total, size) - 1) * size
-        commits = await _git_list_commits(repo_git, resolved_ref, limit=size + 1, skip=skip, **({"path": history_path} if history_path else {}))
+        commits = await _git_list_commits(
+            repo_git,
+            resolved_ref,
+            limit=size + 1,
+            skip=skip,
+            **({"path": history_path} if history_path else {}),
+        )
         has_more = len(commits) > size
         commits = commits[:size]
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        groups = {}
+        groups: dict[str, list[dict[str, str]]] = {}
         for commit in commits:
             try:
                 stamp = datetime.fromisoformat(commit["date"])
                 commit["date_key"] = stamp.date().isoformat()
                 commit["date_label"] = f"{stamp:%b} {stamp.day}, {stamp.year}"
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 commit["date_key"], commit["date_label"] = "unknown", "Unknown date"
             groups.setdefault(commit["date_key"], []).append(commit)
         rows = []
         for day, items in groups.items():
-            rows.append(html_t(t'<tr class="repo-commit-date" data-date-heading="{day}"><th colspan="4">Commits on {items[0]["date_label"]}</th></tr>'))
+            rows.append(
+                html_t(
+                    t'<tr class="repo-commit-date" data-date-heading="{day}"><th colspan="4">Commits on {items[0]["date_label"]}</th></tr>'
+                )
+            )
             for commit in items:
                 hsh = commit["hash"]
-                rows.append(html_t(t'<tr data-commit-date="{day}"><td><a href="{base}/commit/{q(hsh)}"><code>{hsh[:8]}</code></a></td><td>{commit["subject"]}</td><td>{commit["author_name"]}</td><td><time class="muted" datetime="{commit["date"]}" title="{commit["date"]}">{commit["date"]}</time></td></tr>'))
+                rows.append(
+                    html_t(
+                        t'<tr data-commit-date="{day}"><td><a href="{base}/commit/{q(hsh)}"><code>{hsh[:8]}</code></a></td><td>{commit["subject"]}</td><td>{commit["author_name"]}</td><td><time class="muted" datetime="{commit["date"]}" title="{commit["date"]}">{commit["date"]}</time></td></tr>'
+                    )
+                )
         if partial:
-            payload = json.dumps({"commits": commits, "has_more": has_more, "next_skip": skip + len(commits)})
+            payload = json.dumps(
+                {"commits": commits, "has_more": has_more, "next_skip": skip + len(commits)}
+            )
             return await _send_response(
                 self.request,
                 200,
                 payload.encode("utf-8"),
                 [("Content-Type", "application/json; charset=utf-8")],
             )
-        rows_html = join_html(rows) if rows else safe_html('<tr><td class="muted">No commits.</td></tr>')
+        rows_html = (
+            join_html(rows) if rows else safe_html('<tr><td class="muted">No commits.</td></tr>')
+        )
         load_more = (
             safe_html(
                 html_t(
-                    t"<button id=\"loadMoreCommits\" type=\"button\" data-ref=\"{resolved_ref}\" data-path=\"{history_path}\" data-next-skip=\"{skip + len(commits)}\">Load more commits</button>"
+                    t'<button id="loadMoreCommits" type="button" data-ref="{resolved_ref}" data-path="{history_path}" data-next-skip="{skip + len(commits)}">Load more commits</button>'
                 )
             )
             if has_more
             else safe_html("")
         )
-        pagination = _pagination(base + "/commits", {"ref": resolved_ref, **({"path": history_path} if history_path else {})}, skip // size + 1, has_more, total=total, per_page=size)
+        pagination = _pagination(
+            base + "/commits",
+            {"ref": resolved_ref, **({"path": history_path} if history_path else {})},
+            skip // size + 1,
+            has_more,
+            total=total,
+            per_page=size,
+        )
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> Commits</div><div class="topbar"><h2>Commits</h2>
 <div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
@@ -4598,9 +6657,20 @@ form.addEventListener("submit", event => {{
 }})();
 </script>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Commits · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-list review-commits">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Commits · {owner}/{repo}"),
+                safe_html(
+                    html_t(
+                        t'<main class="repo-page review-page review-list review-commits">{safe_html(body)}</main>'
+                    )
+                ),
+            ),
+        )
 
-    async def _ui_commit(self, owner: str, repo: str, commitish: str):
+    async def _ui_commit(self, owner: str, repo: str, commitish: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         commitish = unquote(commitish)
@@ -4619,39 +6689,75 @@ form.addEventListener("submit", event => {{
         files, pagination, _page = _paginate_items(files, self.path)
         patch_text, truncated = await _git_commit_patch(repo_git, commit)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        parent_links = []
+        parent_links: list[str] = []
         for p in [p for p in (meta["parents"] or "").split() if p.strip()]:
-            parent_links.append(html_t(t"<a class=\"pill\" href=\"{base}/commit/{q(p)}\"><code>{p[:8]}</code></a>"))
+            parent_links.append(
+                html_t(t'<a class="pill" href="{base}/commit/{q(p)}"><code>{p[:8]}</code></a>')
+            )
         parents_html = safe_html("")
         if parent_links:
-            parents_html = safe_html(html_t(t"<div class=\"muted\" style=\"margin-top:6px\">Parents: {join_html(parent_links)}</div>"))
-        file_rows = []
+            parents_html = safe_html(
+                html_t(
+                    t'<div class="muted" style="margin-top:6px">Parents: {join_html(parent_links)}</div>'
+                )
+            )
+        file_rows: list[str] = []
         for status, path in files:
             if status.startswith("D"):
-                file_rows.append(html_t(t"<tr><td style=\"width:70px\"><span class=\"pill\">{status}</span></td><td><code>{path}</code></td></tr>"))
+                file_rows.append(
+                    html_t(
+                        t'<tr><td style="width:70px"><span class="pill">{status}</span></td><td><code>{path}</code></td></tr>'
+                    )
+                )
             else:
                 href = str_t(t"{base}/blob/{q(commit)}/{q(path, safe='/')}")
-                file_rows.append(html_t(t"<tr><td style=\"width:70px\"><span class=\"pill\">{status}</span></td><td><a href=\"{href}\"><code>{path}</code></a></td></tr>"))
-        files_html = join_html(file_rows) if file_rows else safe_html('<tr><td class="muted">No file list.</td></tr>')
+                file_rows.append(
+                    html_t(
+                        t'<tr><td style="width:70px"><span class="pill">{status}</span></td><td><a href="{href}"><code>{path}</code></a></td></tr>'
+                    )
+                )
+        files_html = (
+            join_html(file_rows)
+            if file_rows
+            else safe_html('<tr><td class="muted">No file list.</td></tr>')
+        )
         patch_html = _prism_diff_patch_html(patch_text, truncated, "Patch")
         body = html_t(
-            t"""{_repo_tabs(base, "code")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> <a href="{base}/commits?ref={q(commit)}">Commits</a> <span>/</span> <code>{commit[:8]}</code></div><div class="topbar"><div><h2>{meta['subject']}</h2>
-<div class="muted">{meta['author_name']} &lt;{meta['author_email']}&gt; · {meta['date']}</div>{parents_html}</div>
+            t"""{_repo_tabs(base, "code")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> <a href="{base}/commits?ref={q(commit)}">Commits</a> <span>/</span> <code>{commit[:8]}</code></div><div class="topbar"><div><h2>{meta["subject"]}</h2>
+<div class="muted">{meta["author_name"]} &lt;{meta["author_email"]}&gt; · {meta["date"]}</div>{parents_html}</div>
 <div>{_repo_code_menu(owner, repo, commit)}</div></div>
 <nav class="review-section-nav" aria-label="Commit sections"><a href="#commit-files">Files</a><a href="#commit-patch">Changes</a></nav>
 <div class="review-layout"><div class="review-main"><div class="box" id="commit-files" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2><table>{files_html}</table>{pagination}</div>
 <div class="box" id="commit-patch"><h2 style="margin:0 0 10px 0;font-size:16px">Patch</h2>{patch_html}</div></div>
-<aside class="review-sidebar" aria-label="Commit details"><h3>Commit details</h3><dl><dt>Commit SHA</dt><dd><code>{commit}</code></dd><dt>Author</dt><dd>{meta['author_name']}</dd><dt>Committed</dt><dd>{meta['date']}</dd><dt>Parents</dt><dd>{parents_html if parent_links else "Initial commit"}</dd></dl></aside></div>"""
+<aside class="review-sidebar" aria-label="Commit details"><h3>Commit details</h3><dl><dt>Commit SHA</dt><dd><code>{commit}</code></dd><dt>Author</dt><dd>{meta["author_name"]}</dd><dt>Committed</dt><dd>{meta["date"]}</dd><dt>Parents</dt><dd>{parents_html if parent_links else "Initial commit"}</dd></dl></aside></div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Commit {commit[:8]} · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page review-page review-detail">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Commit {commit[:8]} · {owner}/{repo}"),
+                safe_html(
+                    html_t(
+                        t'<main class="repo-page review-page review-detail">{safe_html(body)}</main>'
+                    )
+                ),
+            ),
+        )
 
-    async def _ui_archive(self, owner, repo):
+    async def _ui_archive(self, owner: str, repo: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(_repo_bare_path(owner, repo)):
+        if not (_safe_seg(owner) and _safe_seg(repo)) or not os.path.isdir(
+            _repo_bare_path(owner, repo)
+        ):
             return await self._not_found()
         params = parse_qs(urlparse(self.path).query or "")
         ref = (params.get("ref") or [""])[0]
-        if not ref or len(ref) > 256 or ref.startswith("-") or any(char in ref for char in "\0\r\n"):
+        if (
+            not ref
+            or len(ref) > 256
+            or ref.startswith("-")
+            or any(char in ref for char in "\0\r\n")
+        ):
             return await _send_text(self.request, 400, "Select a valid branch, tag, or commit.\n")
         bare = _repo_bare_path(owner, repo)
         commit = await _git_resolve_commit(bare, ref)
@@ -4663,38 +6769,62 @@ form.addEventListener("submit", event => {{
         # and archive size is bounded without loading the ZIP into memory.
         with tempfile.TemporaryFile() as archive:
             try:
-                process = await asyncio.create_subprocess_exec("git", "--git-dir=" + bare,
-                    "archive", "--format=zip", "--prefix=" + name + "/", commit,
-                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL)
+                process = await asyncio.create_subprocess_exec(
+                    "git",
+                    "--git-dir=" + bare,
+                    "archive",
+                    "--format=zip",
+                    "--prefix=" + name + "/",
+                    commit,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
                 size = 0
+                assert process.stdout is not None
                 async with asyncio.timeout(60):
                     while chunk := await process.stdout.read(65536):
                         size += len(chunk)
                         if size > 256 * 1024 * 1024:
-                            return await _send_text(self.request, 413, "Source ZIP exceeds the 256 MiB limit.\n")
+                            return await _send_text(
+                                self.request, 413, "Source ZIP exceeds the 256 MiB limit.\n"
+                            )
                         archive.write(chunk)
                     await process.wait()
                 if process.returncode:
-                    return await _send_text(self.request, 500, "Could not create the source archive.\n")
+                    return await _send_text(
+                        self.request, 500, "Could not create the source archive.\n"
+                    )
                 archive.seek(0)
-                await _send_response(self.request, 200, headers=[("Content-Type", "application/zip"),
-                    ("Content-Length", str(size)), ("Content-Disposition", f'attachment; filename="{name}.zip"'),
-                    ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")], include_body=False)
+                await _send_response(
+                    self.request,
+                    200,
+                    headers=[
+                        ("Content-Type", "application/zip"),
+                        ("Content-Length", str(size)),
+                        ("Content-Disposition", f'attachment; filename="{name}.zip"'),
+                        ("Cache-Control", "no-store"),
+                        ("X-Content-Type-Options", "nosniff"),
+                    ],
+                    include_body=False,
+                )
                 while chunk := archive.read(65536):
                     self.request.writer.write(chunk)
                     await self.request.writer.drain()
             except asyncio.TimeoutError:
-                return await _send_text(self.request, 503, "Source archive generation timed out. Try again later.\n")
-            except (ConnectionResetError, BrokenPipeError):
+                return await _send_text(
+                    self.request, 503, "Source archive generation timed out. Try again later.\n"
+                )
+            except ConnectionResetError, BrokenPipeError:
                 raise ClientDisconnected()
             finally:
                 if process is not None and process.returncode is None:
                     process.kill()
                     await process.communicate()
 
-    async def _ui_ide(self, owner, repo, action=""):
+    async def _ui_ide(self, owner: str, repo: str, action: str = "") -> None:
         from . import webide
+
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
             return await self._not_found()
@@ -4704,12 +6834,18 @@ form.addEventListener("submit", event => {{
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
 
-        async def respond(status, value):
+        async def respond(status: int, value: object) -> None:
             body = json.dumps(value).encode()
-            headers = [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")]
+            headers = [
+                ("Content-Type", "application/json; charset=utf-8"),
+                ("Cache-Control", "no-store"),
+            ]
             # Branch snapshots and search results are large and downloaded on
             # every IDE load; gzip cuts the file list by roughly 8-10x.
-            if len(body) > 16 * 1024 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+            if (
+                len(body) > 16 * 1024
+                and "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+            ):
                 body = gzip.compress(body, 6)
                 headers += [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
             return await _send_response(self.request, status, body, headers)
@@ -4722,30 +6858,54 @@ form.addEventListener("submit", event => {{
                 if not 0 < length <= webide.MAX_REQUEST * 2:
                     return await respond(413, {"error": "Commit request exceeds the size limit."})
                 form = await self._read_form_urlencoded()
-                if not secrets.compare_digest(form.get("csrf", "").encode(), self._email_csrf_token().encode()):
-                    return await respond(403, {"error": "Invalid security token. Reload the editor."})
+                if not secrets.compare_digest(
+                    form.get("csrf", "").encode(), self._email_csrf_token().encode()
+                ):
+                    return await respond(
+                        403, {"error": "Invalid security token. Reload the editor."}
+                    )
                 payload = json.loads(form.get("payload", "{}"))
                 if not isinstance(payload, dict):
                     raise webide.IDEError("Invalid commit request.")
                 branch = payload.get("branch", "")
                 # Validate the branch before policy matching.
                 await asyncio.to_thread(webide.head, repo_git, branch)
-                async def commit_transaction():
+
+                async def commit_transaction() -> tuple[int, dict[str, str]]:
                     lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
                     async with lock:
                         policy = await self.server.ci_manager.config(owner, repo)
                         if policy["block_direct_pushes"] and protected_branch(policy, branch):
-                            return 403, {"error": "Direct commits to this protected branch are blocked. Create a branch and open a pull request."}
+                            return 403, {
+                                "error": "Direct commits to this protected branch are blocked. Create a branch and open a pull request."
+                            }
                         before = await self.server._branch_refs(owner, repo)
-                        commit = await asyncio.to_thread(webide.commit_changes, repo_git, branch,
-                            payload.get("base"), payload.get("changes"), payload.get("message"),
-                            getattr(self, "remote_user", "Browser user"))
+                        base = payload.get("base")
+                        changes = payload.get("changes")
+                        message = payload.get("message")
+                        if (
+                            not isinstance(base, str)
+                            or not isinstance(changes, dict)
+                            or not isinstance(message, str)
+                        ):
+                            raise webide.IDEError("Invalid commit request.")
+                        commit = await asyncio.to_thread(
+                            webide.commit_changes,
+                            repo_git,
+                            branch,
+                            base,
+                            changes,
+                            message,
+                            getattr(self, "remote_user", "Browser user"),
+                        )
                         result = {"commit": commit}
                         try:
                             await self.server._queue_push_changes(owner, repo, before)
                         except Exception:
                             # The ref was already committed. Never report it as a failed commit.
-                            result["warning"] = "Commit saved, but CI scheduling failed. Check CI runs."
+                            result["warning"] = (
+                                "Commit saved, but CI scheduling failed. Check CI runs."
+                            )
                         return 200, result
 
                 task = asyncio.create_task(commit_transaction())
@@ -4759,20 +6919,47 @@ form.addEventListener("submit", event => {{
                     raise
                 return await respond(status, result)
             if action == "snapshot":
-                return await respond(200, await asyncio.to_thread(webide.snapshot, repo_git, branch))
+                return await respond(
+                    200, await asyncio.to_thread(webide.snapshot, repo_git, branch)
+                )
             if action == "tree":
-                return await respond(200, await asyncio.to_thread(webide.children, repo_git, branch,
-                    (params.get("commit") or [""])[0], (params.get("path") or [""])[0]))
+                return await respond(
+                    200,
+                    await asyncio.to_thread(
+                        webide.children,
+                        repo_git,
+                        branch,
+                        (params.get("commit") or [""])[0],
+                        (params.get("path") or [""])[0],
+                    ),
+                )
             if action == "index":
-                return await respond(200, await asyncio.to_thread(webide.index, repo_git, branch,
-                    (params.get("commit") or [""])[0]))
+                return await respond(
+                    200,
+                    await asyncio.to_thread(
+                        webide.index, repo_git, branch, (params.get("commit") or [""])[0]
+                    ),
+                )
             if action == "file":
-                content = await asyncio.to_thread(webide.read_file, repo_git, branch,
-                    (params.get("commit") or [""])[0], (params.get("path") or [""])[0])
+                content = await asyncio.to_thread(
+                    webide.read_file,
+                    repo_git,
+                    branch,
+                    (params.get("commit") or [""])[0],
+                    (params.get("path") or [""])[0],
+                )
                 return await respond(200, {"content": content})
             if action == "search":
-                return await respond(200, await asyncio.to_thread(webide.search, repo_git, branch,
-                    (params.get("commit") or [""])[0], (params.get("q") or [""])[0]))
+                return await respond(
+                    200,
+                    await asyncio.to_thread(
+                        webide.search,
+                        repo_git,
+                        branch,
+                        (params.get("commit") or [""])[0],
+                        (params.get("q") or [""])[0],
+                    ),
+                )
             if action == "conflict":
                 pr_id = int((params.get("pr") or ["0"])[0])
                 pr = await asyncio.to_thread(db_pr_get, pr_id)
@@ -4785,24 +6972,44 @@ form.addEventListener("submit", event => {{
                     raise webide.IDEError("The pull request state changed. Reload the editor.")
                 _src_branch, tgt_branch, src, tgt, merge_base, repo_git_state = state
                 webide.path((params.get("path") or [""])[0])
-                conflicts = await asyncio.to_thread(pr_resolver.list_conflicts, repo_git_state, merge_base, src, tgt)
-                item = next((entry for entry in conflicts if entry["path"] == (params.get("path") or [""])[0]), None)
+                conflicts = await asyncio.to_thread(
+                    pr_resolver.list_conflicts, repo_git_state, merge_base, src, tgt
+                )
+                item = next(
+                    (
+                        entry
+                        for entry in conflicts
+                        if entry["path"] == (params.get("path") or [""])[0]
+                    ),
+                    None,
+                )
                 if item is None:
-                    raise webide.IDEError("No conflict information for this path. Reload the editor.")
-                text, kind = await asyncio.to_thread(pr_resolver.preview, repo_git_state, item,
-                    pr[5], pr[6])
-                content = None
+                    raise webide.IDEError(
+                        "No conflict information for this path. Reload the editor."
+                    )
+                text, kind = await asyncio.to_thread(
+                    pr_resolver.preview, repo_git_state, item, pr[5], pr[6]
+                )
+                decoded_content: str | None = None
                 if text and kind != "nonmergeable":
                     try:
-                        content = text.decode("utf-8")
+                        decoded_content = text.decode("utf-8")
                     except UnicodeDecodeError:
-                        content, kind = None, "nonmergeable"
-                return await respond(200, {"content": content, "kind": kind})
+                        decoded_content, kind = None, "nonmergeable"
+                return await respond(200, {"content": decoded_content, "kind": kind})
             branches = await _git_list_branches(repo_git)
             if not branches:
-                return await _send_text(self.request, 400, "Create a branch with an initial commit before opening the Web IDE.\n")
+                return await _send_text(
+                    self.request,
+                    400,
+                    "Create a branch with an initial commit before opening the Web IDE.\n",
+                )
             if branch and branch not in branches:
-                return await _send_text(self.request, 400, "Choose an existing branch to edit. Tags and historical commits are read-only.\n")
+                return await _send_text(
+                    self.request,
+                    400,
+                    "Choose an existing branch to edit. Tags and historical commits are read-only.\n",
+                )
             if not branch:
                 default_branch = await _git_default_branch(repo_git)
                 branch = default_branch if default_branch in branches else branches[0]
@@ -4817,20 +7024,29 @@ form.addEventListener("submit", event => {{
             if single and not filename:
                 raise webide.IDEError("Choose a file to edit from the repository browser.")
             if single:
-                await asyncio.to_thread(webide.read_file, repo_git, branch,
-                    await asyncio.to_thread(webide.head, repo_git, branch), filename)
+                await asyncio.to_thread(
+                    webide.read_file,
+                    repo_git,
+                    branch,
+                    await asyncio.to_thread(webide.head, repo_git, branch),
+                    filename,
+                )
             mode = "single" if single else "workspace"
             # The status-bar branch control is a searchable quick pick like the
             # language selector, so every branch is embedded as raw JSON and the
             # client filters it locally.
             branches_json = json.dumps(branches)
             token = self._email_csrf_token()
-            return_url = str_t(t"{base}/blob/{q(branch)}/{q(filename, safe='/')}") if filename else str_t(t"{base}/tree/{q(branch)}/")
+            return_url = (
+                str_t(t"{base}/blob/{q(branch)}/{q(filename, safe='/')}")
+                if filename
+                else str_t(t"{base}/tree/{q(branch)}/")
+            )
             body = html_t(t'''<main class="repo-page webide-page">{_repo_tabs(base, "code")}
 <section id="webide" data-base="{base}/ide" data-csrf="{token}" data-mode="{mode}" data-path="{filename}" data-folder="{folder}">
-<header class="ide-titlebar"><a id="ide-exit" href="{return_url}" class="ide-back">← Back to repository</a><strong>{owner} / {repo}</strong><span class="ide-mode-label">{'Edit single file' if single else 'Web IDE'}</span>
+<header class="ide-titlebar"><a id="ide-exit" href="{return_url}" class="ide-back">← Back to repository</a><strong>{owner} / {repo}</strong><span class="ide-mode-label">{"Edit single file" if single else "Web IDE"}</span>
 <button id="ide-quick-open" class="ide-workspace-only" type="button" title="Go to file (Ctrl+P / ⌘P)">Go to file… <kbd>Ctrl/⌘ P</kbd></button>
-<a id="ide-expand" class="ide-single-only pill" href="{base}/ide?{urlencode({'branch': branch, 'path': filename})}">Open in Web IDE</a></header>
+<a id="ide-expand" class="ide-single-only pill" href="{base}/ide?{urlencode({"branch": branch, "path": filename})}">Open in Web IDE</a></header>
 <div class="ide-toolbar"><div class="ide-write-tabs"><button id="ide-write" type="button" aria-pressed="true">Write</button><button id="ide-review" type="button" aria-pressed="false">Preview changes</button></div>
 <div class="ide-file-tools"><button id="ide-new" class="ide-workspace-only" type="button">+ New file</button><button id="ide-delete" type="button">Delete file</button><button id="ide-discard-file" type="button">Discard file changes</button><button id="ide-show-changes" class="ide-workspace-only" type="button">Review &amp; commit <span id="ide-count">0</span></button></div></div>
 <div class="ide-workspace"><nav class="ide-activity ide-workspace-only" aria-label="Workspace views">
@@ -4846,19 +7062,32 @@ form.addEventListener("submit", event => {{
 <footer class="ide-statusbar"><button id="ide-branch" type="button" title="Switch branch" aria-haspopup="listbox" aria-label="Switch branch (currently {branch})" data-branch="{branch}" data-branches="{branches_json}"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="4" r="2"/><circle cx="6" cy="20" r="2"/><circle cx="18" cy="6" r="2"/><path d="M6 6v12m0-6h6a6 6 0 0 0 6-6"/></svg><span id="ide-branch-name">{branch}</span><svg class="ide-chevron" viewBox="0 0 12 12" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m2.5 4.5 3.5 3.5 3.5-3.5"/></svg></button><button id="ide-language" type="button" title="Select language" aria-haspopup="listbox">Plain Text</button><button id="ide-wrap" type="button" title="Toggle word wrap (Alt+Z)" aria-pressed="true">Word wrap</button><p id="ide-status" role="status" aria-live="polite">Loading editor…</p><span id="ide-cursor">UTF-8</span></footer>
 <dialog id="ide-picker"><form method="dialog"><div class="ide-pane-heading"><label for="ide-picker-input">Go to file</label><button value="cancel" aria-label="Close picker">×</button></div><input id="ide-picker-input" placeholder="Search files by name…" autocomplete="off"><div id="ide-picker-results"></div></form></dialog>
 </section></main>{self._webide_assets()}''')
-            return await _send_response(self.request, 200, _html_page("Web IDE", safe_html(body)),
-                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")])
+            return await _send_response(
+                self.request,
+                200,
+                _html_page("Web IDE", safe_html(body)),
+                [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
+            )
         except (webide.IDEError, ValueError, TypeError) as exc:
             if action in ("", "edit"):
-                body = html_t(t'<main class="repo-page"><h1>Editor unavailable</h1><p class="warn">{str(exc)}</p><a href="/r/{q(owner)}/{q(repo)}">Back to repository</a></main>')
-                return await _send_html(self.request, 400, _html_page("Editor unavailable", safe_html(body)))
+                body = html_t(
+                    t'<main class="repo-page"><h1>Editor unavailable</h1><p class="warn">{str(exc)}</p><a href="/r/{q(owner)}/{q(repo)}">Back to repository</a></main>'
+                )
+                return await _send_html(
+                    self.request, 400, _html_page("Editor unavailable", safe_html(body))
+                )
             return await respond(409 if action == "commit" else 400, {"error": str(exc)})
 
-    async def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str):
+    async def _ui_tree(self, owner: str, repo: str, ref: str, subpath: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         ref = unquote(ref)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not ref or ref.startswith("-") or "\0" in ref:
+        if (
+            not (_safe_seg(owner) and _safe_seg(repo))
+            or not ref
+            or ref.startswith("-")
+            or "\0" in ref
+        ):
             return await self._not_found()
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
@@ -4871,7 +7100,7 @@ form.addEventListener("submit", event => {{
         code, out, err = await _run_git(repo_git, ["ls-tree", "-z", spec])
         if code != 0:
             msg = err.decode("utf-8", "replace")
-            body = html_t(t"<h1>Tree</h1><pre>{msg}</pre><p><a class=\"pill\" href=\"/\">Back</a></p>")
+            body = html_t(t'<h1>Tree</h1><pre>{msg}</pre><p><a class="pill" href="/">Back</a></p>')
             return await _send_html(self.request, 400, _html_page("Tree", safe_html(body)))
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         entries: list[tuple[str, str]] = []
@@ -4896,12 +7125,20 @@ form.addEventListener("submit", event => {{
         if total > REPO_FILES_PAGE_SIZE:
             size = _page_size(query, default=REPO_FILES_PAGE_SIZE)
             page = _clamp_page(_page_number(query), total, size)
-            page_entries = entries[(page - 1) * size:page * size]
+            page_entries = entries[(page - 1) * size : page * size]
 
-        overview = await repository_overview(owner, repo, repo_git, commit, page_entries, subpath=subpath,
-                                             page=page if total > REPO_FILES_PAGE_SIZE else None,
-                                             page_size=size, include_summary=False)
-        rows = []
+        overview = await repository_overview(
+            owner,
+            repo,
+            repo_git,
+            commit,
+            page_entries,
+            subpath=subpath,
+            page=page if total > REPO_FILES_PAGE_SIZE else None,
+            page_size=size,
+            include_summary=False,
+        )
+        rows: list[str] = []
         for kind, name in page_entries:
             if kind == "tree":
                 newpath = _join_repo_path(subpath, name)
@@ -4912,30 +7149,79 @@ form.addEventListener("submit", event => {{
                 href = str_t(t"{base}/blob/{q(ref)}/{q(newpath, safe='/')}")
                 icon = TREE_FILE_ICON
             change = overview["entries"].get(name)
-            message = safe_html(html_t(t'<a href="{base}/commit/{change["hash"]}" title="{change["subject"]}">{change["subject"]}</a>')) if change else safe_html('<span class="muted">—</span>')
-            changed_at = safe_html(html_t(t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>')) if change else safe_html("—")
-            rows.append(html_t(t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'))
+            message = (
+                safe_html(
+                    html_t(
+                        t'<a href="{base}/commit/{change["hash"]}" title="{change["subject"]}">{change["subject"]}</a>'
+                    )
+                )
+                if change
+                else safe_html('<span class="muted">—</span>')
+            )
+            changed_at = (
+                safe_html(
+                    html_t(
+                        t'<time datetime="{change["date"]}" title="{change["date"]}">{_relative_time(change["date"])}</time>'
+                    )
+                )
+                if change
+                else safe_html("—")
+            )
+            rows.append(
+                html_t(
+                    t'<tr><td class="repo-entry-name">{icon}<a class="tree-name" href="{href}">{name}</a></td><td class="repo-entry-message">{message}</td><td class="repo-entry-date muted">{changed_at}</td></tr>'
+                )
+            )
         up = safe_html("")
         if subpath:
             parent = "/".join(subpath.split("/")[:-1])
-            parent_href = str_t(t"{base}/tree/{q(ref)}/{q(parent, safe='/')}/") if parent else str_t(t"{base}/tree/{q(ref)}/")
-            up = safe_html(html_t(t"<p><a class=\"pill\" href=\"{parent_href}\">Up one level</a></p>"))
-        rows_html = join_html(rows) if rows else safe_html('<tr><td colspan="3" class="muted">Empty.</td></tr>')
-        list_url = str_t(t"{base}/tree/{q(ref)}/{q(subpath, safe='/')}/") if subpath else str_t(t"{base}/tree/{q(ref)}/")
-        pagination = _pagination(list_url, query_params, page, page * size < total,
-                                total=total, per_page=size) if total > REPO_FILES_PAGE_SIZE else safe_html("")
+            parent_href = (
+                str_t(t"{base}/tree/{q(ref)}/{q(parent, safe='/')}/")
+                if parent
+                else str_t(t"{base}/tree/{q(ref)}/")
+            )
+            up = safe_html(html_t(t'<p><a class="pill" href="{parent_href}">Up one level</a></p>'))
+        rows_html = (
+            join_html(rows)
+            if rows
+            else safe_html('<tr><td colspan="3" class="muted">Empty.</td></tr>')
+        )
+        list_url = (
+            str_t(t"{base}/tree/{q(ref)}/{q(subpath, safe='/')}/")
+            if subpath
+            else str_t(t"{base}/tree/{q(ref)}/")
+        )
+        pagination = (
+            _pagination(
+                list_url, query_params, page, page * size < total, total=total, per_page=size
+            )
+            if total > REPO_FILES_PAGE_SIZE
+            else safe_html("")
+        )
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{_repo_breadcrumbs(owner, repo, ref, subpath)}<p class="muted">ref: <code>{ref}</code></p></div>
 <div>{_repo_code_menu(owner, repo, ref, can_edit=_has_write_scope(self) and ref in await _git_list_branches(repo_git), path=subpath)}</div></div>
 {up}<div class="box repo-files-panel"><div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{rows_html}</tbody></table></div>{pagination}</div>"""
         )
-        await _send_html(self.request, 200, _html_page(str_t(t"Browse · {owner}/{repo}"), safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>'))))
+        await _send_html(
+            self.request,
+            200,
+            _html_page(
+                str_t(t"Browse · {owner}/{repo}"),
+                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+            ),
+        )
 
-    async def _ui_blob(self, owner: str, repo: str, ref: str, filepath: str):
+    async def _ui_blob(self, owner: str, repo: str, ref: str, filepath: str) -> None:
         owner = unquote(owner)
         repo = unquote(repo)
         ref = unquote(ref)
-        if not (_safe_seg(owner) and _safe_seg(repo)) or not ref or ref.startswith("-") or "\0" in ref:
+        if (
+            not (_safe_seg(owner) and _safe_seg(repo))
+            or not ref
+            or ref.startswith("-")
+            or "\0" in ref
+        ):
             return await self._not_found()
         repo_git = _repo_bare_path(owner, repo)
         if not os.path.isdir(repo_git):
@@ -4950,7 +7236,7 @@ form.addEventListener("submit", event => {{
         code, out, err = await _run_git(repo_git, ["show", spec])
         if code != 0:
             msg = err.decode("utf-8", "replace")
-            body = html_t(t"<h1>File</h1><pre>{msg}</pre><p><a class=\"pill\" href=\"/\">Back</a></p>")
+            body = html_t(t'<h1>File</h1><pre>{msg}</pre><p><a class="pill" href="/">Back</a></p>')
             return await _send_html(self.request, 400, _html_page("File", safe_html(body)))
         params = parse_qs(urlparse(self.path).query or "")
         download = (params.get("download") or [""])[0] == "1"
@@ -4959,10 +7245,23 @@ form.addEventListener("submit", event => {{
         if download or raw:
             filename = filepath.rsplit("/", 1)[-1]
             disposition = "attachment; filename*=UTF-8''" + q(filename) if download else "inline"
-            return await _send_response(self.request, 200, out,
-                [("Content-Type", "application/octet-stream" if download or binary else "text/plain; charset=utf-8"),
-                 ("Content-Disposition", disposition), ("X-Content-Type-Options", "nosniff"),
-                 ("Content-Security-Policy", "sandbox; default-src 'none'"), ("Cache-Control", "no-store")])
+            return await _send_response(
+                self.request,
+                200,
+                out,
+                [
+                    (
+                        "Content-Type",
+                        "application/octet-stream"
+                        if download or binary
+                        else "text/plain; charset=utf-8",
+                    ),
+                    ("Content-Disposition", disposition),
+                    ("X-Content-Type-Options", "nosniff"),
+                    ("Content-Security-Policy", "sandbox; default-src 'none'"),
+                    ("Cache-Control", "no-store"),
+                ],
+            )
         text = out.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
         line_count = max(1, text.count("\n") + (0 if text.endswith("\n") else 1))
         highlight_file = not binary and len(out) <= 100 * 1024 and line_count <= 2000
@@ -4975,21 +7274,64 @@ form.addEventListener("submit", event => {{
         lang = file_language if highlight_file else "none"
         file_url = str_t(t"{base}/blob/{q(commit)}/{q(filepath, safe='/')}")
         breadcrumbs = _repo_breadcrumbs(owner, repo, ref, filepath, is_file=True)
-        numbers = join_html([html_t(t'<a id="L{index}" href="#L{index}" aria-label="Line {index}">{index}</a>') for index in range(1, line_count + 1)]) if not binary else safe_html("")
+        numbers = (
+            join_html(
+                [
+                    html_t(
+                        t'<a id="L{index}" href="#L{index}" aria-label="Line {index}">{index}</a>'
+                    )
+                    for index in range(1, line_count + 1)
+                ]
+            )
+            if not binary
+            else safe_html("")
+        )
         notice = safe_html("")
-        file_view = safe_html(html_t(t'<div id="repo-file-horizontal" class="repo-file-horizontal" tabindex="0" role="region" aria-label="Scroll file horizontally" hidden><div></div></div><div id="repo-file-viewport" class="repo-file-code" tabindex="0" role="region" aria-label="Scrollable file contents"><div class="repo-line-numbers" aria-label="Line numbers">{numbers}</div><pre><code id="repo-file-source" class="language-{lang}">{text}</code></pre></div>')) if not binary else safe_html('<div class="repo-empty"><h2>Binary file</h2><p class="muted">This file cannot be displayed as text. Use Download to save the original file.</p></div>')
-        copy_button = safe_html('<button id="repo-copy-file" type="button">Copy contents</button>') if not binary else safe_html("")
-        highlight_button = safe_html('<button id="repo-highlight-file" type="button" aria-pressed="false">Highlight syntax</button>') if not binary and file_language != "none" else safe_html("")
+        file_view = (
+            safe_html(
+                html_t(
+                    t'<div id="repo-file-horizontal" class="repo-file-horizontal" tabindex="0" role="region" aria-label="Scroll file horizontally" hidden><div></div></div><div id="repo-file-viewport" class="repo-file-code" tabindex="0" role="region" aria-label="Scrollable file contents"><div class="repo-line-numbers" aria-label="Line numbers">{numbers}</div><pre><code id="repo-file-source" class="language-{lang}">{text}</code></pre></div>'
+                )
+            )
+            if not binary
+            else safe_html(
+                '<div class="repo-empty"><h2>Binary file</h2><p class="muted">This file cannot be displayed as text. Use Download to save the original file.</p></div>'
+            )
+        )
+        copy_button = (
+            safe_html('<button id="repo-copy-file" type="button">Copy contents</button>')
+            if not binary
+            else safe_html("")
+        )
+        highlight_button = (
+            safe_html(
+                '<button id="repo-highlight-file" type="button" aria-pressed="false">Highlight syntax</button>'
+            )
+            if not binary and file_language != "none"
+            else safe_html("")
+        )
         can_edit_branch = _has_write_scope(self) and ref in await _git_list_branches(repo_git)
         edit_query = urlencode({"branch": ref, "path": filepath})
         edit_single = safe_html("")
         if can_edit_branch and not binary and len(out) <= 1024 * 1024:
             try:
                 out.decode("utf-8")
-                edit_single = safe_html(html_t(t'<a href="{base}/edit?{edit_query}"><strong>Edit single file</strong><small>Make a quick change to this file.</small></a>'))
+                edit_single = safe_html(
+                    html_t(
+                        t'<a href="{base}/edit?{edit_query}"><strong>Edit single file</strong><small>Make a quick change to this file.</small></a>'
+                    )
+                )
             except UnicodeDecodeError:
                 pass
-        edit_menu = safe_html(html_t(t'<details class="repo-edit-menu"><summary>Edit <span aria-hidden="true">▾</span></summary><div>{edit_single}<a href="{base}/ide?{edit_query}"><strong>Open in Web IDE</strong><small>Edit multiple files in a full workspace.</small></a></div></details>')) if can_edit_branch else safe_html("")
+        edit_menu = (
+            safe_html(
+                html_t(
+                    t'<details class="repo-edit-menu"><summary>Edit <span aria-hidden="true">▾</span></summary><div>{edit_single}<a href="{base}/ide?{edit_query}"><strong>Open in Web IDE</strong><small>Edit multiple files in a full workspace.</small></a></div></details>'
+                )
+            )
+            if can_edit_branch
+            else safe_html("")
+        )
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="topbar"><div>{breadcrumbs}<p class="muted">{ref} · {len(out):,} bytes</p></div>{_repo_code_menu(owner, repo, ref, can_edit=can_edit_branch, path=filepath, is_file=True)}</div>
 <section class="box repo-file-panel"><div class="repo-file-toolbar"><a class="pill" href="{back}">Back to folder</a><div class="repo-file-actions"><a class="pill" href="{file_url}?raw=1">Raw</a><a class="pill" href="{file_url}?download=1">Download</a>{copy_button}{highlight_button}<a class="pill" href="{file_url}">Permalink</a><a class="pill" href="{base}/commits?{urlencode({"ref": commit, "path": filepath})}">History</a>{edit_menu}</div></div><span id="repo-file-feedback" class="muted" role="status" aria-live="polite"></span>{notice}{file_view}
@@ -5134,7 +7476,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             if ch == b"\n":
                 return bytes(buf)
 
-    async def _pipe_content_length_body_to_stdin(self, stdin: asyncio.StreamWriter, content_len: int) -> None:
+    async def _pipe_content_length_body_to_stdin(
+        self, stdin: asyncio.StreamWriter, content_len: int
+    ) -> None:
         remaining = content_len
         while remaining > 0:
             data = await self.request.reader.read(min(READ_CHUNK, remaining))
@@ -5181,7 +7525,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             if crlf != b"\r\n":
                 raise BadRequest("Invalid chunk terminator")
 
-    async def _pipe_request_body_to_stdin(self, proc: asyncio.subprocess.Process, content_len: int) -> None:
+    async def _pipe_request_body_to_stdin(
+        self, proc: asyncio.subprocess.Process, content_len: int
+    ) -> None:
         if proc.stdin is None:
             return
 
@@ -5191,7 +7537,13 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                 await self._pipe_chunked_body_to_stdin(proc.stdin)
             else:
                 await self._pipe_content_length_body_to_stdin(proc.stdin, content_len)
-        except (asyncio.IncompleteReadError, ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError):
+        except (
+            asyncio.IncompleteReadError,
+            ClientDisconnected,
+            ConnectionResetError,
+            BrokenPipeError,
+            OSError,
+        ):
             # Client disconnected or git-http-backend closed stdin early.
             pass
         finally:
@@ -5200,7 +7552,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             with contextlib.suppress(Exception):
                 await proc.stdin.wait_closed()
 
-    async def _handle_git(self):
+    async def _handle_git(self) -> None:
         if not self.path.startswith(URL_PREFIX + "/"):
             return await self._not_found()
 
@@ -5263,15 +7615,15 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         else:
             env.pop("CONTENT_LENGTH", None)
 
-        stderr_target = None
-        trace_file = None
-        body_task = None
-        proc = None
-        push_identity = None
-        push_lock = None
+        stderr_target: IO[Any] | int | None = None
+        trace_file: BinaryIO | None = None
+        body_task: asyncio.Task[None] | None = None
+        proc: asyncio.subprocess.Process | None = None
+        push_identity: tuple[str, str] | None = None
+        push_lock: asyncio.Lock | None = None
         push_lock_acquired = False
-        before_refs = {}
-        protection_hooks = None
+        before_refs: dict[str, str] | None = {}
+        protection_hooks: tempfile.TemporaryDirectory[str] | None = None
         connected = True
         is_receive_pack_post = self.command == "POST" and path_info.endswith("/git-receive-pack")
         if is_receive_pack_post:
@@ -5280,7 +7632,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                     push_identity = (candidate_owner, candidate_repo)
                     break
         if push_identity:
-            self.server.push_requests.add(asyncio.current_task())
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self.server.push_requests.add(current_task)
         try:
             if push_identity:
                 push_lock = self.server.push_locks.setdefault(push_identity, asyncio.Lock())
@@ -5290,12 +7644,22 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                 policy = await self.server.ci_manager.config(*push_identity)
                 if policy["block_direct_pushes"]:
                     bare = _repo_bare_path(*push_identity)
-                    _code, hooks_output, _err = await _run_git(bare, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+                    _code, hooks_output, _err = await _run_git(
+                        bare, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"]
+                    )
                     if _code:
-                        return await _send_text(self.request, 500, "Cannot resolve receive hooks; push rejected.\n")
+                        return await _send_text(
+                            self.request, 500, "Cannot resolve receive hooks; push rejected.\n"
+                        )
                     original = hooks_output.decode("utf-8").strip()
-                    patterns = [line.strip() for line in policy["protected_branches"].splitlines() if line.strip()]
-                    protection_hooks, hooks_path = await _call_in_thread(prepare_hooks, original, patterns)
+                    patterns = [
+                        line.strip()
+                        for line in policy["protected_branches"].splitlines()
+                        if line.strip()
+                    ]
+                    protection_hooks, hooks_path = await _call_in_thread(
+                        prepare_hooks, original, patterns
+                    )
                     count = int(env.get("GIT_CONFIG_COUNT", "0"))
                     env[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
                     env[f"GIT_CONFIG_VALUE_{count}"] = hooks_path
@@ -5361,7 +7725,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             response_lines.append("\r\n")
             self.request.status = status_code
             self.request.response_size = 0
-            connected = await self._write_git_response("".join(response_lines).encode("iso-8859-1", "replace"))
+            connected = await self._write_git_response(
+                "".join(response_lines).encode("iso-8859-1", "replace")
+            )
 
             while True:
                 if connected:
@@ -5392,7 +7758,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                 if push_identity and push_lock_acquired:
                     if proc is not None and proc.returncode is None:
                         try:
-                            if asyncio.current_task().cancelling():
+                            active_task = asyncio.current_task()
+                            if active_task is not None and active_task.cancelling():
                                 if os.name == "nt":
                                     proc.kill()
                                 else:
@@ -5400,7 +7767,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                                         os.killpg(proc.pid, signal.SIGKILL)
                                 await proc.wait()
                             else:
-                                await asyncio.wait_for(proc.wait(), timeout=30 if not connected else 5)
+                                await asyncio.wait_for(
+                                    proc.wait(), timeout=30 if not connected else 5
+                                )
                         except asyncio.TimeoutError:
                             if os.name == "nt":
                                 proc.kill()
@@ -5408,7 +7777,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                                 with contextlib.suppress(ProcessLookupError):
                                     os.killpg(proc.pid, signal.SIGKILL)
                             await proc.wait()
-                    finalizer = asyncio.create_task(self.server._queue_push_changes(*push_identity, before_refs))
+                    finalizer = asyncio.create_task(
+                        self.server._queue_push_changes(*push_identity, before_refs)
+                    )
                     self.server.push_finalizers.add(finalizer)
                     finalizer.add_done_callback(self.server.push_finalizers.discard)
                     try:
@@ -5448,13 +7819,13 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             self.request.writer.write(data)
             await self.request.writer.drain()
             return True
-        except (ConnectionResetError, BrokenPipeError, OSError):
+        except ConnectionResetError, BrokenPipeError, OSError:
             return False
 
     # ========================================================
     # ROUTING
     # ========================================================
-    async def do_GET(self):
+    async def do_GET(self) -> None:
         ip = self._client_ip()
         if not _ip_allowed(ip, self._allowlist()):
             return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
@@ -5508,7 +7879,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_ci_config(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/ci/deployments(?:/(\d+))?$", p)
         if m:
-            return await self._ui_deployments(m.group(1), m.group(2), int(m.group(3)) if m.group(3) else None)
+            return await self._ui_deployments(
+                m.group(1), m.group(2), int(m.group(3)) if m.group(3) else None
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/artifacts$", p)
         if m:
             return await self._ui_artifacts(m.group(1), m.group(2))
@@ -5591,7 +7964,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_blob(m.group(1), m.group(2), m.group(3), filepath)
         return await self._not_found()
 
-    async def do_POST(self):
+    async def do_POST(self) -> None:
         ip = self._client_ip()
         if not _ip_allowed(ip, self._allowlist()):
             return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
@@ -5646,10 +8019,14 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_issue_comment(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/comments/(\d+)/delete$", parsed.path)
         if m:
-            return await self._ui_issue_comment_delete(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_issue_comment_delete(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/comments/(\d+)/edit$", parsed.path)
         if m:
-            return await self._ui_issue_comment_edit(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_issue_comment_edit(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/issues/(\d+)/close$", parsed.path)
         if m:
             return await self._ui_issue_close(m.group(1), m.group(2), int(m.group(3)))
@@ -5667,10 +8044,14 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_discussion_comment(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/comments/(\d+)/delete$", parsed.path)
         if m:
-            return await self._ui_discussion_comment_delete(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_discussion_comment_delete(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/comments/(\d+)/edit$", parsed.path)
         if m:
-            return await self._ui_discussion_comment_edit(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_discussion_comment_edit(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/lock$", parsed.path)
         if m:
             return await self._ui_discussion_lock(m.group(1), m.group(2), int(m.group(3)))
@@ -5679,10 +8060,14 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_discussion_unlock(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/answer/(\d+)$", parsed.path)
         if m:
-            return await self._ui_discussion_answer(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_discussion_answer(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/unanswer/(\d+)$", parsed.path)
         if m:
-            return await self._ui_discussion_unanswer(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_discussion_unanswer(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/discussions/(\d+)/update$", parsed.path)
         if m:
             return await self._ui_discussion_update(m.group(1), m.group(2), int(m.group(3)))
@@ -5706,10 +8091,14 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_pull_comment(m.group(1), m.group(2), int(m.group(3)))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/comments/(\d+)/delete$", parsed.path)
         if m:
-            return await self._ui_pull_comment_delete(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_pull_comment_delete(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/comments/(\d+)/edit$", parsed.path)
         if m:
-            return await self._ui_pull_comment_edit(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+            return await self._ui_pull_comment_edit(
+                m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            )
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/update$", parsed.path)
         if m:
             return await self._ui_pull_update(m.group(1), m.group(2), int(m.group(3)))
@@ -5733,7 +8122,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._ui_branch_delete(m.group(1), m.group(2))
         return await self._not_found()
 
-    async def do_HEAD(self):
+    async def do_HEAD(self) -> None:
         ip = self._client_ip()
         if not _ip_allowed(ip, self._allowlist()):
             return await self._forbidden(b"403 Forbidden: IP not allowed.\n")
@@ -5749,16 +8138,20 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
 
         return await _send_text(self.request, 400, "HEAD is only implemented for static files.\n")
 
-    async def dispatch(self):
+    async def dispatch(self) -> None:
         path = urlparse(self.path).path
         if path == "/api" or path.startswith("/api/"):
             if path == "/api/runner/v1" or path.startswith("/api/runner/v1/"):
                 from .remote_ci import RunnerAPI
-                return await RunnerAPI(self).dispatch()
+
+                await RunnerAPI(self).dispatch()
+                return
             if path == "/api/docs" and self.command == "GET":
                 return await self._ui_api_docs()
             from .api.router import API
-            return await API(self).dispatch()
+
+            await API(self).dispatch()
+            return
         if not _is_static_request_path(path) and not path.startswith(URL_PREFIX + "/"):
             _display_name.set(await self.server.display_name())
         if self.command == "GET":
@@ -5771,15 +8164,20 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
 
 
 class AsyncGitServer:
-    def __init__(self, context: AppContext | None = None, allowlist: set[str] | None = None, config_path=None):
+    def __init__(
+        self,
+        context: AppContext | None = None,
+        allowlist: set[str] | None = None,
+        config_path: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.context = context or AppContext(AppConfig.from_mapping(default_config_for_platform()))
         apply_config(self.context.config)
         self.allowlist = allowlist if allowlist is not None else ALLOWED_CLIENT_IPS
         self.ci_manager = CIManager(_repo_bare_path)
         self.push_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        self.push_requests: set[asyncio.Task] = set()
-        self.push_finalizers: set[asyncio.Task] = set()
-        self._display_name = None
+        self.push_requests: set[asyncio.Task[Any]] = set()
+        self.push_finalizers: set[asyncio.Task[Any]] = set()
+        self._display_name: str | None = None
         self._display_name_lock = asyncio.Lock()
         self.config_path = Path(config_path).resolve() if config_path is not None else None
         server_config = self.context.config
@@ -5794,31 +8192,39 @@ class AsyncGitServer:
         self.audit_log = bool(server_config.audit_log)
         self.settings_lock = asyncio.Lock()
         self.settings_csrf_secret = secrets.token_bytes(32)
+        self.email_csrf_token: str | None = None
         from .api.policy import RateLimiter
+
         self.api_limiter = RateLimiter()
         self.api_slots = asyncio.Semaphore(8)
         self.api_download_slots = asyncio.Semaphore(2)
 
-    async def display_name(self):
+    async def display_name(self) -> str:
         from .database import db_display_name_get
+
         if self._display_name is None:
             async with self._display_name_lock:
                 if self._display_name is None:
                     self._display_name = await _call_in_thread(db_display_name_get)
-        return self._display_name
+        return self._display_name or "pygithost"
 
     async def _branch_refs(self, owner: str, repo: str) -> dict[str, str] | None:
-        code, out, _ = await _run_git(_repo_bare_path(owner, repo), ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"])
+        code, out, _ = await _run_git(
+            _repo_bare_path(owner, repo),
+            ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"],
+        )
         if code:
             return None
-        refs = {}
+        refs: dict[str, str] = {}
         for line in out.decode("ascii", "replace").splitlines():
             ref, _, oid = line.partition(" ")
             if ref.startswith("refs/heads/") and oid:
-                refs[ref[len("refs/heads/"):]] = oid
+                refs[ref[len("refs/heads/") :]] = oid
         return refs
 
-    async def _queue_push_changes(self, owner: str, repo: str, before_refs: dict[str, str] | None) -> None:
+    async def _queue_push_changes(
+        self, owner: str, repo: str, before_refs: dict[str, str] | None
+    ) -> None:
         after_refs = await self._branch_refs(owner, repo)
         if after_refs is None or before_refs is None:
             return
@@ -5827,38 +8233,72 @@ class AsyncGitServer:
             old_commit = before_refs.get(branch)
             if old_commit == commit:
                 continue
-            await self.ci_manager.enqueue(owner, repo, "push", branch, commit, {"old_commit": old_commit or ""})
-            for pr_id, target_branch in await asyncio.to_thread(db_prs_for_source, owner, repo, branch):
-                base_commit = await _git_resolve_commit(repo_git, "refs/heads/" + target_branch) or ""
-                await self.ci_manager.enqueue(owner, repo, "pull_request_updated", target_branch, base_commit,
-                    {"pr_number": pr_id, "base_branch": target_branch, "head_branch": branch,
-                      "base_commit": base_commit, "head_commit": commit})
-            for pr_id, source_branch in await asyncio.to_thread(db_prs_for_target, owner, repo, branch):
+            await self.ci_manager.enqueue(
+                owner, repo, "push", branch, commit, {"old_commit": old_commit or ""}
+            )
+            for pr_id, target_branch in await asyncio.to_thread(
+                db_prs_for_source, owner, repo, branch
+            ):
+                base_commit = (
+                    await _git_resolve_commit(repo_git, "refs/heads/" + target_branch) or ""
+                )
+                await self.ci_manager.enqueue(
+                    owner,
+                    repo,
+                    "pull_request_updated",
+                    target_branch,
+                    base_commit,
+                    {
+                        "pr_number": pr_id,
+                        "base_branch": target_branch,
+                        "head_branch": branch,
+                        "base_commit": base_commit,
+                        "head_commit": commit,
+                    },
+                )
+            for pr_id, source_branch in await asyncio.to_thread(
+                db_prs_for_target, owner, repo, branch
+            ):
                 # A source+target update in one push must yield one check per PR.
                 if before_refs.get(source_branch) != after_refs.get(source_branch):
                     continue
-                head_commit = await _git_resolve_commit(repo_git, "refs/heads/" + source_branch) or ""
+                head_commit = (
+                    await _git_resolve_commit(repo_git, "refs/heads/" + source_branch) or ""
+                )
                 if head_commit:
-                    await self.ci_manager.enqueue(owner, repo, "pull_request_updated", branch, commit,
-                        {"pr_number": pr_id, "base_branch": branch, "head_branch": source_branch,
-                         "base_commit": commit, "head_commit": head_commit})
+                    await self.ci_manager.enqueue(
+                        owner,
+                        repo,
+                        "pull_request_updated",
+                        branch,
+                        commit,
+                        {
+                            "pr_number": pr_id,
+                            "base_branch": branch,
+                            "head_branch": source_branch,
+                            "base_commit": commit,
+                            "head_commit": head_commit,
+                        },
+                    )
 
     async def shutdown(self) -> None:
         pending = tuple(self.push_requests)
         if pending:
-            _done, pending = await asyncio.wait(pending, timeout=30)
-            for task in pending:
+            _done, still_pending = await asyncio.wait(pending, timeout=30)
+            for task in still_pending:
                 task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            if still_pending:
+                await asyncio.gather(*still_pending, return_exceptions=True)
         finalizers = tuple(self.push_finalizers)
         if finalizers:
             await asyncio.gather(*finalizers, return_exceptions=True)
         await self.ci_manager.stop()
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         started = time.monotonic()
-        req = None
+        req: Request | None = None
         peer = writer.get_extra_info("peername")
         ip = peer[0] if peer else ""
         try:
@@ -5872,13 +8312,17 @@ class AsyncGitServer:
         except BadRequest as e:
             dummy_req = Request("GET", "/", "HTTP/1.1", Headers([]), BodyReader(reader), writer, ip)
             req = req or dummy_req
-            with contextlib.suppress(ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError):
+            with contextlib.suppress(
+                ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError
+            ):
                 await _send_text(dummy_req, 400, str_t(t"400 Bad Request: {e}\n"))
             req.status = dummy_req.status
         except Exception as e:
             dummy_req = Request("GET", "/", "HTTP/1.1", Headers([]), BodyReader(reader), writer, ip)
             req = req or dummy_req
-            with contextlib.suppress(ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError):
+            with contextlib.suppress(
+                ClientDisconnected, ConnectionResetError, BrokenPipeError, OSError
+            ):
                 await _send_text(dummy_req, 500, str_t(t"500 Internal Server Error: {e}\n"))
             req.status = dummy_req.status
             # Never log exception text here: it can include request data.  The
@@ -5942,13 +8386,14 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
         print(f"ERROR: could not configure logging: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    server = None
+    server: asyncio.Server | None = None
     try:
         await app.ci_manager.start()
         server = await asyncio.start_server(app.handle_client, HOST, PORT)
     except BaseException:
         await app.shutdown()
         raise
+    assert server is not None
 
     print("=" * 60)
     print(str_t(t"Async Git Smart HTTP + Web UI running on port {PORT}"))
@@ -5999,18 +8444,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser("run", help="Run the Git HTTP server using a JSON config file.")
+    run_parser = subparsers.add_parser(
+        "run", help="Run the Git HTTP server using a JSON config file."
+    )
     run_parser.add_argument(
         "--config",
         default=str(_default_config_path()),
         help=str_t(t"Path to the JSON config file. Default: {_default_config_path()}"),
     )
 
-    generate_parser = subparsers.add_parser("generate-config", help="Generate a platform-dependent JSON config file.")
+    generate_parser = subparsers.add_parser(
+        "generate-config", help="Generate a platform-dependent JSON config file."
+    )
     generate_parser.add_argument(
         "--config",
         default=str(_default_config_path()),
-        help=str_t(t"Path where the JSON config file will be written. Default: {_default_config_path()}"),
+        help=str_t(
+            t"Path where the JSON config file will be written. Default: {_default_config_path()}"
+        ),
     )
     generate_parser.add_argument(
         "--platform",
@@ -6041,7 +8492,9 @@ def main(argv: list[str] | None = None) -> None:
             if args.print_only:
                 print(json.dumps(default_config_for_platform(args.platform), indent=4))
             else:
-                config_path = write_config_file(args.config, target_platform=args.platform, overwrite=args.overwrite)
+                config_path = write_config_file(
+                    args.config, target_platform=args.platform, overwrite=args.overwrite
+                )
                 print(str_t(t"Config file generated: {config_path}"))
         except Exception as exc:
             print(str_t(t"ERROR: {exc}"), file=sys.stderr)
@@ -6052,7 +8505,12 @@ def main(argv: list[str] | None = None) -> None:
         config_path = Path(args.config).expanduser()
         if not config_path.is_file():
             print(str_t(t"ERROR: Config file not found: {config_path}"), file=sys.stderr)
-            print(str_t(t"Create one first with: {Path(sys.argv[0]).name} generate-config --config {config_path}"), file=sys.stderr)
+            print(
+                str_t(
+                    t"Create one first with: {Path(sys.argv[0]).name} generate-config --config {config_path}"
+                ),
+                file=sys.stderr,
+            )
             sys.exit(1)
         try:
             asyncio.run(main_async(config_path))

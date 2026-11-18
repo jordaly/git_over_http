@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -17,18 +16,30 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Coroutine, Mapping
 from datetime import datetime, timezone
+from email.message import Message
+from pathlib import Path
+from typing import IO, Any, TypeVar
 
 from . import database
 from .ci import CIManager, _db_call, remove_checkout, runner_environment, validate_config
+from .ci_limits import (
+    DEFAULT_SOURCE_LIMIT_MB,
+    MIB,
+    execution_limits,
+    source_limit_bytes,
+    source_response_bytes,
+)
 from .remote_ci import create_token
-from .ci_limits import (DEFAULT_SOURCE_LIMIT_MB, source_limit_bytes, source_response_bytes,
-                        execution_limits, MIB)
+from .runner_types import ProgressSnapshot, RunnerJob, RunRow
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
 
-def cleanup_attempt(fingerprint):
+def cleanup_attempt(fingerprint: str) -> None:
     if not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
         raise ValueError("Invalid attempt fingerprint.")
     # A killed worker must also disconnect its daemon build request. Match only
@@ -36,24 +47,36 @@ def cleanup_attempt(fingerprint):
     for entry in Path("/proc").glob("[0-9]*/cmdline"):
         try:
             args = entry.read_bytes().split(b"\0")
-            if (len(args) > 2 and Path(os.fsdecode(args[0])).name == "docker"
-                    and args[1] == b"build"
-                    and ("pygithost.http-attempt=" + fingerprint).encode() in args):
+            if (
+                len(args) > 2
+                and Path(os.fsdecode(args[0])).name == "docker"
+                and args[1] == b"build"
+                and ("pygithost.http-attempt=" + fingerprint).encode() in args
+            ):
                 os.kill(int(entry.parent.name), signal.SIGTERM)
-        except (OSError, ValueError):
+        except OSError, ValueError:
             pass
-    result = subprocess.run(["docker", "ps", "-aq", "--filter",
-                             "label=pygithost.http-attempt=" + fingerprint],
-                            capture_output=True, text=True, check=True, timeout=15)
+    result = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", "label=pygithost.http-attempt=" + fingerprint],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
     containers = result.stdout.split()
     if any(not re.fullmatch(r"[a-f0-9]{12,64}", item) for item in containers):
         raise ValueError("Invalid Docker container identity.")
     if containers:
-        subprocess.run(["docker", "rm", "--force", *containers], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        subprocess.run(
+            ["docker", "rm", "--force", *containers],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
 
 
-def watchdog(fingerprint, parent, seconds):
+def watchdog(fingerprint: str, parent: int, seconds: float) -> None:
     """A detached monitor also cleans containers if the worker process is killed."""
     deadline = time.monotonic() + seconds
     while os.getppid() == parent and time.monotonic() < deadline:
@@ -62,28 +85,53 @@ def watchdog(fingerprint, parent, seconds):
 
 
 class Client:
-    def __init__(self, url, token):
+    def __init__(self, url: str, token: str) -> None:
         parsed = urllib.parse.urlsplit(url)
-        if (parsed.scheme not in ("http", "https") or not parsed.netloc
-                or parsed.username or parsed.password or parsed.query or parsed.fragment
-                or parsed.path not in ("", "/")):
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
             raise ValueError("Use an HTTP(S) server origin without credentials or a path.")
         self.url, self.token = url.rstrip("/"), token
+
         # Never follow redirects with a runner credential.
         class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
+            def redirect_request(
+                self,
+                req: urllib.request.Request,
+                fp: IO[bytes],
+                code: int,
+                msg: str,
+                headers: Message,
+                newurl: str,
+            ) -> urllib.request.Request | None:
                 return None
+
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def request(self, action, document, *, source_limit_mb=DEFAULT_SOURCE_LIMIT_MB, timeout=30):
+    def request(
+        self,
+        action: str,
+        document: Mapping[str, Any],
+        *,
+        source_limit_mb: int = DEFAULT_SOURCE_LIMIT_MB,
+        timeout: float = 30,
+    ) -> dict[str, Any]:
         maximum = source_response_bytes(source_limit_mb) if action == "source" else 46 * 1024 * 1024
         headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
         if type(document.get("run_id")) is int:
             headers["X-Runner-Run-ID"] = str(document["run_id"])
-        req = urllib.request.Request(self.url + "/api/runner/v1/" + action,
-            data=json.dumps(document).encode(), headers={
-                **headers},
-            method="POST")
+        req = urllib.request.Request(
+            self.url + "/api/runner/v1/" + action,
+            data=json.dumps(document).encode(),
+            headers={**headers},
+            method="POST",
+        )
         with self.opener.open(req, timeout=timeout) as response:
             raw = bytearray()
             while True:
@@ -93,14 +141,17 @@ class Client:
                 raw.extend(chunk)
                 if len(raw) > maximum:
                     raise ValueError("Runner response exceeds this operation's configured limit.")
-        return json.loads(raw)
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise ValueError("Runner response must be a JSON object.")
+        return result
 
 
 class JobStopped(Exception):
     pass
 
 
-async def execute_with_image(manager, row, config):
+async def execute_with_image(manager: CIManager, row: RunRow, config: Mapping[str, Any]) -> None:
     """Provision on the worker host, never grant network/Docker access to jobs."""
     if config.get("image_build"):
         return await manager._execute(row)
@@ -111,52 +162,91 @@ async def execute_with_image(manager, row, config):
     started = datetime.now(timezone.utc).isoformat()
     deadline = asyncio.get_running_loop().time() + limits["image_pull_timeout_seconds"]
 
-    async def publish():
-        await _db_call(database.db_ci_run_update, run_id, output=output.decode("utf-8", "replace"),
-                       truncated=int(truncated[0]), phase="image")
+    async def publish() -> None:
+        await _db_call(
+            database.db_ci_run_update,
+            run_id,
+            output=output.decode("utf-8", "replace"),
+            truncated=int(truncated[0]),
+            phase="image",
+        )
 
-    await _db_call(database.db_ci_run_update, run_id, status="running", started_at=started, phase="image")
+    await _db_call(
+        database.db_ci_run_update, run_id, status="running", started_at=started, phase="image"
+    )
     try:
         mode = manager.docker_policy["image_pull"]
         inspect_output = bytearray()
         if mode != "always":
             cached = await manager._capture_process(
                 ["docker", "image", "inspect", "--format={{.Id}}", config["image"]],
-                shell=False, cwd=None, env=os.environ.copy(), output=inspect_output,
-                truncated=[False], timeout=deadline - asyncio.get_running_loop().time(), max_output=maximum)
+                shell=False,
+                cwd=None,
+                env=os.environ.copy(),
+                output=inspect_output,
+                truncated=[False],
+                timeout=deadline - asyncio.get_running_loop().time(),
+                max_output=maximum,
+            )
             if cached == 0:
                 output.extend(b"Using cached Docker image.\n")
             elif mode == "never":
-                raise ValueError("Docker image is not available locally; worker policy forbids image downloads.")
+                raise ValueError(
+                    "Docker image is not available locally; worker policy forbids image downloads."
+                )
         if mode == "always" or not output:
             output.extend(b"Downloading Docker image on the worker host.\n"[:maximum])
             await publish()
             result = await manager._capture_process(
-                ["docker", "pull", "--quiet", config["image"]], shell=False, cwd=None,
-                env=os.environ.copy(), output=output, truncated=truncated, on_output=publish,
-                timeout=deadline - asyncio.get_running_loop().time(), max_output=maximum)
+                ["docker", "pull", "--quiet", config["image"]],
+                shell=False,
+                cwd=None,
+                env=os.environ.copy(),
+                output=output,
+                truncated=truncated,
+                on_output=publish,
+                timeout=deadline - asyncio.get_running_loop().time(),
+                max_output=maximum,
+            )
             if result:
-                raise ValueError("Docker image download failed; check registry access and worker credentials.")
+                raise ValueError(
+                    "Docker image download failed; check registry access and worker credentials."
+                )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        reason = ("Docker image provisioning timed out." if isinstance(exc, asyncio.TimeoutError)
-                  else str(exc) if isinstance(exc, ValueError) else
-                  "Docker image provisioning failed (" + type(exc).__name__ + ").")
+        reason = (
+            "Docker image provisioning timed out."
+            if isinstance(exc, asyncio.TimeoutError)
+            else str(exc)
+            if isinstance(exc, ValueError)
+            else "Docker image provisioning failed (" + type(exc).__name__ + ")."
+        )
         message = ("\n" + reason + "\n").encode()
-        output.extend(message[:max(0, maximum - len(output))])
-        await _db_call(database.db_ci_run_update, run_id,
-                       status="timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed",
-                       output=output.decode("utf-8", "replace"), truncated=int(truncated[0]),
-                       return_code=-1, phase="image", reason=reason,
-                       finished_at=datetime.now(timezone.utc).isoformat())
+        output.extend(message[: max(0, maximum - len(output))])
+        await _db_call(
+            database.db_ci_run_update,
+            run_id,
+            status="timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed",
+            output=output.decode("utf-8", "replace"),
+            truncated=int(truncated[0]),
+            return_code=-1,
+            phase="image",
+            reason=reason,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
         return
-    await manager._execute(row, initial_output=bytes(output), initial_truncated=truncated[0], started_at=started)
+    await manager._execute(
+        row, initial_output=bytes(output), initial_truncated=truncated[0], started_at=started
+    )
 
 
-async def transfer_with_heartbeats(client, identity, awaitable):
+async def transfer_with_heartbeats(
+    client: Client, identity: Mapping[str, Any], awaitable: Coroutine[Any, Any, _T]
+) -> _T:
     """Source preparation/uploads must not expire the job lease while busy."""
-    async def heartbeat():
+
+    async def heartbeat() -> None:
         last_contact = time.monotonic()
         while True:
             try:
@@ -164,10 +254,11 @@ async def transfer_with_heartbeats(client, identity, awaitable):
                 if response.get("cancel"):
                     return
                 last_contact = time.monotonic()
-            except (OSError, ValueError, urllib.error.URLError):
+            except OSError, ValueError, urllib.error.URLError:
                 if time.monotonic() - last_contact > 45:
                     return
             await asyncio.sleep(5)
+
     work = asyncio.create_task(awaitable)
     monitor = asyncio.create_task(heartbeat())
     try:
@@ -182,42 +273,79 @@ async def transfer_with_heartbeats(client, identity, awaitable):
         await asyncio.gather(work, monitor, return_exceptions=True)
 
 
-async def run_job(client, job, root, worker_policy=None):
+async def run_job(
+    client: Client,
+    job: RunnerJob,
+    root: str | os.PathLike[str],
+    worker_policy: Mapping[str, Any] | None = None,
+) -> None:
     """Reuse the local Docker executor; its database is private to this worker."""
     run_id, attempt = job["run_id"], job["attempt"]
     identity = {"run_id": run_id, "attempt": attempt}
     workspace = Path(tempfile.mkdtemp(prefix="job-", dir=root))
-    task = None
-    monitor = None
+    task: asyncio.Task[None] | None = None
+    monitor: subprocess.Popen[bytes] | None = None
     fingerprint = hashlib.sha256(attempt.encode()).hexdigest()
     try:
         from .docker_profile import authorize
+
         try:
             configuration = validate_config(job["config"])
             job["config"] = configuration
             row = job["row"]
             if configuration.get("runner") != "docker":
                 raise ValueError("HTTP runners only accept Docker jobs.")
-            maximum_source = source_limit_bytes(configuration.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB))
+            maximum_source = source_limit_bytes(
+                configuration.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB)
+            )
             limits = execution_limits(configuration.get("limits"))
-            authorize(configuration.get("docker"), worker_policy,
-                       timeout=configuration["timeout_seconds"],
-                       repository=f"{row[1]}/{row[2]}", event=row[3],
-                       image_pull_timeout=limits["image_pull_timeout_seconds"])
-            from .image_build import authorize as authorize_build
+            authorize(
+                configuration.get("docker"),
+                worker_policy,
+                timeout=configuration["timeout_seconds"],
+                repository=f"{row[1]}/{row[2]}",
+                event=row[3],
+                image_pull_timeout=limits["image_pull_timeout_seconds"],
+            )
             from .docker_profile import policy
-            authorize_build(configuration.get("image_build"), policy(worker_policy),
-                            f"{row[1]}/{row[2]}", row[3])
+            from .image_build import authorize as authorize_build
+
+            authorize_build(
+                configuration.get("image_build"),
+                policy(worker_policy),
+                f"{row[1]}/{row[2]}",
+                row[3],
+            )
         except ValueError as exc:
-            await asyncio.to_thread(client.request, "complete", dict(identity, progress={
-                "status": "failed", "return_code": -1, "phase": "runner policy",
-                "reason": str(exc), "output": "Runner policy rejected this job: " + str(exc),
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "truncated": 0, "steps": []}))
+            await asyncio.to_thread(
+                client.request,
+                "complete",
+                dict(
+                    identity,
+                    progress={
+                        "status": "failed",
+                        "return_code": -1,
+                        "phase": "runner policy",
+                        "reason": str(exc),
+                        "output": "Runner policy rejected this job: " + str(exc),
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "truncated": 0,
+                        "steps": [],
+                    },
+                ),
+            )
             return
-        response = await transfer_with_heartbeats(client, identity, asyncio.to_thread(
-            client.request, "source", identity, timeout=limits["transfer_timeout_seconds"],
-            source_limit_mb=configuration.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB)))
+        response = await transfer_with_heartbeats(
+            client,
+            identity,
+            asyncio.to_thread(
+                client.request,
+                "source",
+                identity,
+                timeout=limits["transfer_timeout_seconds"],
+                source_limit_mb=configuration.get("source_limit_mb", DEFAULT_SOURCE_LIMIT_MB),
+            ),
+        )
         if response.get("cancel"):
             return
         source = base64.b64decode(response["bundle"], validate=True)
@@ -226,11 +354,17 @@ async def run_job(client, job, root, worker_policy=None):
         bundle = workspace / "source.bundle"
         bundle.write_bytes(source)
         bare = workspace / "repo.git"
-        def clone():
-            subprocess.run(["git", "clone", "--bare", "--", str(bundle), str(bare)],
-                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=limits["source_timeout_seconds"],
-                           env=runner_environment(str(workspace)))
+
+        def clone() -> None:
+            subprocess.run(
+                ["git", "clone", "--bare", "--", str(bundle), str(bare)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=limits["source_timeout_seconds"],
+                env=runner_environment(str(workspace)),
+            )
+
         await transfer_with_heartbeats(client, identity, asyncio.to_thread(clone))
         # Paths/configuration are never taken directly from repository code.
         row = job["row"]
@@ -240,34 +374,62 @@ async def run_job(client, job, root, worker_policy=None):
             raise ValueError("HTTP runners only accept Docker jobs.")
         database.DB_PATH = str(workspace / "runner.db")
         await _db_call(database._db_init)
-        local_id = await _db_call(database.db_ci_run_create, owner, repo, event, branch, commit,
-                                 payload, json.dumps(config))
+        local_id = await _db_call(
+            database.db_ci_run_create,
+            owner,
+            repo,
+            event,
+            branch,
+            commit,
+            payload,
+            json.dumps(config),
+        )
         local_row = (local_id, owner, repo, event, branch, commit, payload)
         manager = CIManager(lambda _owner, _repo: str(bare))
         manager.http_attempt = fingerprint
         from .docker_profile import policy
+
         manager.docker_policy = policy(worker_policy)
-        monitor = subprocess.Popen([
-            sys.executable, "-m", "pygithost.runner", "_watchdog",
-            "--attempt", fingerprint, "--parent", str(os.getpid()),
-            "--seconds", str(config["timeout_seconds"] + limits["image_pull_timeout_seconds"]
-                             + (config.get("image_build") or {}).get("timeout_seconds", 0) + 10)],
-            start_new_session=True, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        monitor = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "pygithost.runner",
+                "_watchdog",
+                "--attempt",
+                fingerprint,
+                "--parent",
+                str(os.getpid()),
+                "--seconds",
+                str(
+                    config["timeout_seconds"]
+                    + limits["image_pull_timeout_seconds"]
+                    + (config.get("image_build") or {}).get("timeout_seconds", 0)
+                    + 10
+                ),
+            ],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         task = asyncio.create_task(execute_with_image(manager, local_row, config))
         last_contact = time.monotonic()
         while not task.done():
             try:
                 progress = await snapshot(owner, repo, local_id)
-                response = await asyncio.to_thread(client.request, "heartbeat",
-                                                  dict(identity, progress=progress),
-                                                  timeout=limits["transfer_timeout_seconds"])
+                response = await asyncio.to_thread(
+                    client.request,
+                    "heartbeat",
+                    dict(identity, progress=progress),
+                    timeout=limits["transfer_timeout_seconds"],
+                )
                 last_contact = time.monotonic()
                 if response.get("cancel"):
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                     return
-            except (OSError, ValueError, urllib.error.URLError):
+            except OSError, ValueError, urllib.error.URLError:
                 # Fail closed before the server's lease expires.
                 if time.monotonic() - last_contact > 45:
                     task.cancel()
@@ -278,17 +440,33 @@ async def run_job(client, job, root, worker_policy=None):
         progress = await snapshot(owner, repo, local_id, final=True)
         artifact = await _db_call(database.db_ci_artifact_get, owner, repo, local_id, content=True)
         if artifact and len(artifact) > limits["artifact_mb"] * MIB:
-            progress.update(status="failed", return_code=-1, reason="Remote artifact exceeds this run's configured limit.")
+            progress = {
+                **progress,
+                "status": "failed",
+                "return_code": -1,
+                "reason": "Remote artifact exceeds this run's configured limit.",
+            }
             artifact = None
-        completion = dict(identity, progress=progress,
-                          artifact=base64.b64encode(artifact).decode() if artifact else "")
+        completion = dict(
+            identity,
+            progress=progress,
+            artifact=base64.b64encode(artifact).decode() if artifact else "",
+        )
         # Completion is safe to repeat: the server applies one terminal result.
         for _ in range(6):
             try:
-                await transfer_with_heartbeats(client, identity, asyncio.to_thread(
-                    client.request, "complete", completion, timeout=limits["transfer_timeout_seconds"]))
+                await transfer_with_heartbeats(
+                    client,
+                    identity,
+                    asyncio.to_thread(
+                        client.request,
+                        "complete",
+                        completion,
+                        timeout=limits["transfer_timeout_seconds"],
+                    ),
+                )
                 return
-            except (OSError, ValueError, urllib.error.URLError):
+            except OSError, ValueError, urllib.error.URLError:
                 await asyncio.sleep(5)
         raise RuntimeError("Unable to report completion; job will be interrupted, not replayed.")
     except JobStopped:
@@ -306,20 +484,36 @@ async def run_job(client, job, root, worker_policy=None):
         await asyncio.to_thread(remove_checkout, str(workspace))
 
 
-async def snapshot(owner, repo, run_id, final=False):
+async def snapshot(owner: str, repo: str, run_id: int, final: bool = False) -> ProgressSnapshot:
     row = await _db_call(database.db_ci_run_get, owner, repo, run_id)
     meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
-    result = dict(output=row[5], truncated=row[6], phase=meta["phase"],
-                  steps=json.loads(await _db_call(database.db_ci_steps_get, run_id)))
+    if row is None or meta is None:
+        raise RuntimeError("Local CI run metadata is unavailable for this worker job.")
+    result: ProgressSnapshot = {
+        "output": row[5],
+        "truncated": row[6],
+        "phase": meta["phase"],
+        "steps": json.loads(await _db_call(database.db_ci_steps_get, run_id)),
+    }
     if final:
-        result.update(status=row[4], return_code=row[7], started_at=row[9] or "",
-                      finished_at=row[10] or "", reason=meta["reason"], warnings=meta["warnings"])
+        result["status"] = row[4]
+        result["return_code"] = row[7]
+        result["started_at"] = row[9] or ""
+        result["finished_at"] = row[10] or ""
+        result["reason"] = meta["reason"]
+        result["warnings"] = meta["warnings"]
     return result
 
 
-async def serve(client, root, once=False, worker_policy=None):
+async def serve(
+    client: Client,
+    root: str | os.PathLike[str],
+    once: bool = False,
+    worker_policy: Mapping[str, Any] | None = None,
+) -> None:
     """One execution at a time; a private lock prevents competing worker processes."""
     import fcntl
+
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if root.stat().st_mode & 0o077 or root.stat().st_uid != os.getuid():
@@ -337,7 +531,9 @@ async def serve(client, root, once=False, worker_policy=None):
                 if job:
                     fingerprint = hashlib.sha256(job["attempt"].encode()).hexdigest()
                     if receipt.exists() and receipt.read_text() == fingerprint:
-                        logger.warning("Previous attempt is uncertain; refusing to execute it again.")
+                        logger.warning(
+                            "Previous attempt is uncertain; refusing to execute it again."
+                        )
                         if once:
                             return
                         await asyncio.sleep(10)
@@ -357,17 +553,21 @@ async def serve(client, root, once=False, worker_policy=None):
             await asyncio.sleep(5)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     monitor = commands.add_parser("_watchdog", help=argparse.SUPPRESS)
     monitor.add_argument("--attempt", required=True)
     monitor.add_argument("--parent", required=True, type=int)
     monitor.add_argument("--seconds", required=True, type=int)
-    token = commands.add_parser("create-token", help="Run locally on the GitHost host as its administrator.")
+    token = commands.add_parser(
+        "create-token", help="Run locally on the GitHost host as its administrator."
+    )
     token.add_argument("--db", required=True)
     token.add_argument("--name", required=True)
-    token.add_argument("--repository", action="append", required=True, help="Exact owner/repo; repeatable.")
+    token.add_argument(
+        "--repository", action="append", required=True, help="Exact owner/repo; repeatable."
+    )
     revoke = commands.add_parser("revoke-token", help="Revoke runner access immediately by name.")
     revoke.add_argument("--db", required=True)
     revoke.add_argument("--name", required=True)
@@ -375,10 +575,17 @@ def main():
     run.add_argument("--server", required=True)
     run.add_argument("--token-file", required=True)
     run.add_argument("--work-dir", required=True)
-    run.add_argument("--allow-http", action="store_true", help="Explicitly accept unencrypted transport.")
+    run.add_argument(
+        "--allow-http", action="store_true", help="Explicitly accept unencrypted transport."
+    )
     run.add_argument("--once", action="store_true")
-    run.add_argument("--policy-file", help="Administrator-managed JSON Docker ceilings and named secrets.")
-    prune = commands.add_parser("prune-images", help="Remove only old, unused runner-built images; refuse while build jobs are active.")
+    run.add_argument(
+        "--policy-file", help="Administrator-managed JSON Docker ceilings and named secrets."
+    )
+    prune = commands.add_parser(
+        "prune-images",
+        help="Remove only old, unused runner-built images; refuse while build jobs are active.",
+    )
     prune.add_argument("--older-than-hours", type=int, default=168)
     prune.add_argument("--cache-dir", help="Same private cache directory as the worker account.")
     args = parser.parse_args()
@@ -388,7 +595,9 @@ def main():
         return
     if args.command == "prune-images":
         import fcntl
+
         from .image_build import cache_directory
+
         if args.older_than_hours < 1:
             parser.error("--older-than-hours must be positive.")
         root = cache_directory(args.cache_dir)
@@ -397,10 +606,21 @@ def main():
                 fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 parser.error("Build jobs are active; cache pruning refused.")
-            subprocess.run(["docker", "image", "prune", "--all", "--force",
-                            "--filter", "label=pygithost.build-cache=1",
-                            "--filter", f"until={args.older_than_hours}h"],
-                           check=True, timeout=300)
+            subprocess.run(
+                [
+                    "docker",
+                    "image",
+                    "prune",
+                    "--all",
+                    "--force",
+                    "--filter",
+                    "label=pygithost.build-cache=1",
+                    "--filter",
+                    f"until={args.older_than_hours}h",
+                ],
+                check=True,
+                timeout=300,
+            )
         return
     if args.command in ("create-token", "revoke-token"):
         if not Path(args.db).is_file():
@@ -410,6 +630,7 @@ def main():
             print(create_token(args.name, args.repository))
         else:
             from .remote_ci import connect
+
             conn = connect()
             try:
                 conn.execute("DELETE FROM ci_runner_tokens WHERE name=?", (args.name,))
@@ -421,22 +642,33 @@ def main():
     if args.server.startswith("http:") and not args.allow_http:
         parser.error("Plain HTTP requires --allow-http; credentials and jobs are unencrypted.")
     token_file = Path(args.token_file)
-    if (token_file.is_symlink() or token_file.stat().st_mode & 0o077
-            or token_file.stat().st_uid != os.getuid()):
+    if (
+        token_file.is_symlink()
+        or token_file.stat().st_mode & 0o077
+        or token_file.stat().st_uid != os.getuid()
+    ):
         parser.error("Token file must be private, owned by the runner account, and not a symlink.")
     client = Client(args.server, token_file.read_text().strip())
     from .docker_profile import policy
+
     worker_policy = policy()
     if args.policy_file:
         path = Path(args.policy_file)
-        if (path.is_symlink() or path.stat().st_mode & 0o027
-                or path.stat().st_uid not in (0, os.getuid()) or path.stat().st_size > 65536):
-            parser.error("Policy file must be administrator-owned/private, not group-writable, and at most 64 KiB.")
+        if (
+            path.is_symlink()
+            or path.stat().st_mode & 0o027
+            or path.stat().st_uid not in (0, os.getuid())
+            or path.stat().st_size > 65536
+        ):
+            parser.error(
+                "Policy file must be administrator-owned/private, not group-writable, and at most 64 KiB."
+            )
         try:
             worker_policy = policy(json.loads(path.read_text()))
-        except (ValueError, UnicodeError):
+        except ValueError, UnicodeError:
             parser.error("Invalid Docker policy JSON.")
-    async def start():
+
+    async def start() -> None:
         task = asyncio.create_task(serve(client, args.work_dir, args.once, worker_policy))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -445,6 +677,7 @@ def main():
             await task
         except asyncio.CancelledError:
             pass
+
     asyncio.run(start())
 
 

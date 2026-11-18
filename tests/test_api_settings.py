@@ -28,12 +28,20 @@ class APISettingsTests(unittest.TestCase):
         return result
 
     def save(self, document, **kwargs):
-        return self.mutate(self.path, document, method="PUT", token=self.admin_write_token, **kwargs)
+        return self.mutate(
+            self.path, document, method="PUT", token=self.admin_write_token, **kwargs
+        )
 
     def document(self):
-        return {"expected_revision": self.current()["revision"],
-                "configuration": {"version": 1, "pipelines": {
-                    "tests": {"steps": [{"name": "Tests", "run": "echo SETTINGS_PRIVATE_PAYLOAD"}]}}}}
+        return {
+            "expected_revision": self.current()["revision"],
+            "configuration": {
+                "version": 1,
+                "pipelines": {
+                    "tests": {"steps": [{"name": "Tests", "run": "echo SETTINGS_PRIVATE_PAYLOAD"}]}
+                },
+            },
+        }
 
     def test_authorization_for_reads_and_writes(self):
         self.assertEqual(self.request(self.path, token=None)[0], 401)
@@ -57,8 +65,10 @@ class APISettingsTests(unittest.TestCase):
         self.assertEqual(headers["X-Idempotent-Replay"], "true")
         conn = database._db_connect()
         try:
-            row = conn.execute("SELECT method,path,state,status,response_json FROM api_mutations "
-                               "WHERE path=?", (self.path,)).fetchone()
+            row = conn.execute(
+                "SELECT method,path,state,status,response_json FROM api_mutations WHERE path=?",
+                (self.path,),
+            ).fetchone()
             self.assertEqual(row[:4], ("PUT", self.path, "completed", 200))
             self.assertNotIn("SETTINGS_PRIVATE_PAYLOAD", row[4])
         finally:
@@ -89,10 +99,18 @@ class APISettingsTests(unittest.TestCase):
         database.db_ci_config_set("alice", "project", raw or "{}")
         # Ensure a different persisted configuration, using the same UI helper.
         import asyncio
-        asyncio.run_coroutine_threadsafe(self.server.app.ci_manager.save_document(
-            "alice", "project", {"version": 1, "pipelines": {
-                "web": {"steps": [{"name": "Web", "run": "echo web"}]}}}),
-            self.server.loop).result(timeout=10)
+
+        asyncio.run_coroutine_threadsafe(
+            self.server.app.ci_manager.save_document(
+                "alice",
+                "project",
+                {
+                    "version": 1,
+                    "pipelines": {"web": {"steps": [{"name": "Web", "run": "echo web"}]}},
+                },
+            ),
+            self.server.loop,
+        ).result(timeout=10)
         self.assertEqual(self.save(doc)[0], 409)
 
     def test_schema_and_in_page_documentation(self):
@@ -107,15 +125,20 @@ class APISettingsTests(unittest.TestCase):
     def test_deployment_configuration_round_trip_without_starting_deployment(self):
         doc = self.document()
         doc["configuration"]["pipelines"]["tests"]["deployment"] = {
-            "enabled": True, "branch": "main", "script_content": "echo reviewed-deployment",
-            "run_with": "sh", "timeout_seconds": 60}
+            "enabled": True,
+            "branch": "main",
+            "script_content": "echo reviewed-deployment",
+            "run_with": "sh",
+            "timeout_seconds": 60,
+        }
         status, _, result = self.save(doc)
         self.assertEqual(status, 200, result)
         self.assertIn("reviewed-deployment", str(self.current()["configuration"]))
         # The returned editor document must be valid input to the same API.
         current = self.current()
-        status, _, result = self.save({"configuration": current["configuration"],
-                                      "expected_revision": current["revision"]})
+        status, _, result = self.save(
+            {"configuration": current["configuration"], "expected_revision": current["revision"]}
+        )
         self.assertEqual(status, 200, result)
 
     def test_replay_rechecks_administrator_role(self):

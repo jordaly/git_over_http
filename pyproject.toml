@@ -1,0 +1,21 @@
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+extend-exclude = ["static/vendor"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Compatibility module populates configuration globals at runtime and imports
+# the CLI after its facade is initialized.
+"pygithost/application.py" = ["E402", "F401", "F811", "F821"]
+
+[tool.mypy]
+python_version = "3.14"
+files = ["pygithost", "server.py", "hl_mappings.py"]
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+show_error_codes = true
+pretty = false

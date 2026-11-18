@@ -1,10 +1,9 @@
-import base64
 import asyncio
+import base64
 import hashlib
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -12,6 +11,7 @@ import threading
 import time
 import unittest
 import zipfile
+from pathlib import Path
 from unittest import mock
 
 from pygithost import database
@@ -40,14 +40,18 @@ class RemoteProtocolTests(unittest.TestCase):
         run = database.db_ci_run_create(owner, repo, "push", "main", "a" * 40, "{}", "{}")
         conn = connect()
         try:
-            conn.execute("INSERT INTO ci_remote_jobs(run_id,owner,repo,document,source) VALUES(?,?,?,?,?)",
-                         (run, owner, repo, json.dumps({"row": [run, owner, repo]}), b"bundle"))
+            conn.execute(
+                "INSERT INTO ci_remote_jobs(run_id,owner,repo,document,source) VALUES(?,?,?,?,?)",
+                (run, owner, repo, json.dumps({"row": [run, owner, repo]}), b"bundle"),
+            )
         finally:
             conn.close()
         return run
 
     def call(self, action, document=None, digest=None, repositories=None):
-        return operation(digest or self.digest, repositories or self.repositories, action, document or {})
+        return operation(
+            digest or self.digest, repositories or self.repositories, action, document or {}
+        )
 
     def claim(self):
         job = self.call("claim")["job"]
@@ -56,7 +60,9 @@ class RemoteProtocolTests(unittest.TestCase):
     def test_token_hashes_and_repository_restrictions(self):
         conn = connect()
         try:
-            self.assertNotIn(self.token, str(conn.execute("SELECT * FROM ci_runner_tokens").fetchall()))
+            self.assertNotIn(
+                self.token, str(conn.execute("SELECT * FROM ci_runner_tokens").fetchall())
+            )
         finally:
             conn.close()
         self.enqueue("bob")
@@ -64,7 +70,9 @@ class RemoteProtocolTests(unittest.TestCase):
         identity = self.claim()
         self.assertEqual(identity["run_id"], run)
         self.assertEqual(self.call("claim")["job"]["attempt"], identity["attempt"])
-        self.assertIsNone(self.call("claim", digest="other", repositories=["charlie/project"])["job"])
+        self.assertIsNone(
+            self.call("claim", digest="other", repositories=["charlie/project"])["job"]
+        )
 
     def test_claim_has_single_owner(self):
         self.enqueue()
@@ -72,13 +80,17 @@ class RemoteProtocolTests(unittest.TestCase):
         self.assertIsNone(self.call("claim", digest="other")["job"])
         with self.assertRaises(APIError):
             self.call("heartbeat", identity, digest="other")
-        self.assertEqual(self.call("source", identity)["bundle"], base64.b64encode(b"bundle").decode())
+        self.assertEqual(
+            self.call("source", identity)["bundle"], base64.b64encode(b"bundle").decode()
+        )
 
     def test_progress_validation_does_not_hold_writer_transaction(self):
         from pygithost import remote_ci
+
         self.enqueue()
         identity = self.claim()
         original = remote_ci.validate_progress
+
         def validating(*args, **kwargs):
             other = database._db_connect()
             try:
@@ -87,7 +99,10 @@ class RemoteProtocolTests(unittest.TestCase):
             finally:
                 other.close()
             return original(*args, **kwargs)
-        with mock.patch.object(remote_ci, "validate_progress", side_effect=validating) as validation:
+
+        with mock.patch.object(
+            remote_ci, "validate_progress", side_effect=validating
+        ) as validation:
             self.assertTrue(self.call("heartbeat", identity)["accepted"])
             validation.assert_called_once()
 
@@ -96,8 +111,10 @@ class RemoteProtocolTests(unittest.TestCase):
         path.write_bytes(content)
         conn = connect()
         try:
-            conn.execute("UPDATE ci_remote_jobs SET source=X'',source_path=? WHERE run_id=?",
-                         (str(path), run))
+            conn.execute(
+                "UPDATE ci_remote_jobs SET source=X'',source_path=? WHERE run_id=?",
+                (str(path), run),
+            )
         finally:
             conn.close()
         return path
@@ -110,7 +127,9 @@ class RemoteProtocolTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(self.call("source", identity)["bundle"]), content)
         conn = connect()
         try:
-            self.assertEqual(conn.execute("SELECT length(source) FROM ci_remote_jobs").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT length(source) FROM ci_remote_jobs").fetchone()[0], 0
+            )
         finally:
             conn.close()
         self.assertLess(Path(database.DB_PATH).stat().st_size, len(content))
@@ -125,6 +144,7 @@ class RemoteProtocolTests(unittest.TestCase):
 
     def test_restart_removes_file_sources(self):
         from pygithost.remote_ci import recover_jobs
+
         run = self.enqueue()
         path = self.file_source(run)
         recover_jobs()
@@ -138,12 +158,16 @@ class RemoteProtocolTests(unittest.TestCase):
             conn.close()
 
     def test_audit_failure_does_not_hide_an_issued_runner_token(self):
-        with mock.patch.object(database, "db_audit_append", side_effect=OSError("PRIVATE_AUDIT_ERROR")):
+        with mock.patch.object(
+            database, "db_audit_append", side_effect=OSError("PRIVATE_AUDIT_ERROR")
+        ):
             with self.assertLogs("pygithost.remote_ci", level="WARNING") as logs:
                 token = create_token("audit-failure", self.repositories)
         conn = connect()
         try:
-            digest = conn.execute("SELECT digest FROM ci_runner_tokens WHERE name='audit-failure'").fetchone()[0]
+            digest = conn.execute(
+                "SELECT digest FROM ci_runner_tokens WHERE name='audit-failure'"
+            ).fetchone()[0]
         finally:
             conn.close()
         self.assertEqual(digest, hashlib.sha256(token.encode()).hexdigest())
@@ -152,6 +176,7 @@ class RemoteProtocolTests(unittest.TestCase):
 
     def test_restart_preserves_blocked_source_cleanup_and_retries_it(self):
         from pygithost.remote_ci import recover_jobs
+
         run = self.enqueue()
         path = self.file_source(run)
         with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
@@ -172,10 +197,14 @@ class RemoteProtocolTests(unittest.TestCase):
                 path = self.file_source(run)
                 identity = self.claim()
                 database.db_ci_run_update(run, status="cancelled")
-                with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
+                with mock.patch.object(
+                    Path, "unlink", side_effect=PermissionError("Windows sharing lock")
+                ):
                     with self.assertLogs("pygithost.remote_ci", level="WARNING"):
                         result = self.call(action, identity if action != "claim" else {})
-                self.assertTrue(result["cancel"] if action == "heartbeat" else result["job"] is None)
+                self.assertTrue(
+                    result["cancel"] if action == "heartbeat" else result["job"] is None
+                )
                 self.assertTrue(path.exists())
                 self.assertIn(str(path), self.pending_sources())
                 self.assertIsNone(self.call("claim")["job"])
@@ -184,13 +213,16 @@ class RemoteProtocolTests(unittest.TestCase):
 
     def test_one_blocked_source_does_not_prevent_other_cleanup(self):
         from pygithost.remote_ci import recover_jobs
+
         blocked = self.file_source(self.enqueue())
         removable = self.file_source(self.enqueue())
         unlink = Path.unlink
+
         def selective_unlink(path, *args, **kwargs):
             if path == blocked:
                 raise PermissionError("Windows sharing lock")
             return unlink(path, *args, **kwargs)
+
         with mock.patch.object(Path, "unlink", selective_unlink):
             with self.assertLogs("pygithost.remote_ci", level="WARNING"):
                 recover_jobs()
@@ -202,22 +234,32 @@ class RemoteProtocolTests(unittest.TestCase):
 
     def test_successful_run_is_not_failed_by_a_source_cleanup_lock(self):
         from pygithost.remote_ci import execute_remote
+
         run = database.db_ci_run_create("alice", "project", "push", "main", "a" * 40, "{}", "{}")
         path = Path(self.temp.name) / "completion.bundle"
         path.write_bytes(b"bundle")
 
         async def check():
-            task = asyncio.create_task(execute_remote(
-                mock.Mock(), (run, "alice", "project", "push", "main", "a" * 40, "{}"), {}))
+            task = asyncio.create_task(
+                execute_remote(
+                    mock.Mock(), (run, "alice", "project", "push", "main", "a" * 40, "{}"), {}
+                )
+            )
             try:
                 deadline = asyncio.get_running_loop().time() + 5
                 job = None
                 while job is None and asyncio.get_running_loop().time() < deadline:
                     job = self.call("claim")["job"]
-                    await asyncio.sleep(.01)
+                    await asyncio.sleep(0.01)
                 self.assertIsNotNone(job)
-                self.call("complete", {"run_id": run, "attempt": job["attempt"],
-                                      "progress": {"status": "success", "return_code": 0, "output": "done"}})
+                self.call(
+                    "complete",
+                    {
+                        "run_id": run,
+                        "attempt": job["attempt"],
+                        "progress": {"status": "success", "return_code": 0, "output": "done"},
+                    },
+                )
                 await asyncio.wait_for(asyncio.shield(task), timeout=5)
             finally:
                 if not task.done():
@@ -225,7 +267,9 @@ class RemoteProtocolTests(unittest.TestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
         with mock.patch("pygithost.remote_ci.source_bundle_file", return_value=str(path)):
-            with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
+            with mock.patch.object(
+                Path, "unlink", side_effect=PermissionError("Windows sharing lock")
+            ):
                 with self.assertLogs("pygithost.remote_ci", level="WARNING"):
                     asyncio.run(check())
         self.assertEqual(database.db_ci_run_get("alice", "project", run)[4], "success")
@@ -235,16 +279,22 @@ class RemoteProtocolTests(unittest.TestCase):
 
     def test_cancelled_preparation_retains_blocked_unqueued_source(self):
         from pygithost.remote_ci import execute_remote
+
         path = Path(self.temp.name) / "cancelled-preparation.bundle"
         started, release = threading.Event(), threading.Event()
+
         def prepare(*args):
             started.set()
             release.wait(5)
             path.write_bytes(b"bundle")
             return str(path)
+
         async def check():
-            task = asyncio.create_task(execute_remote(
-                mock.Mock(), (1, "alice", "project", "push", "main", "a" * 40, "{}"), {}))
+            task = asyncio.create_task(
+                execute_remote(
+                    mock.Mock(), (1, "alice", "project", "push", "main", "a" * 40, "{}"), {}
+                )
+            )
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 5))
                 task.cancel()
@@ -256,8 +306,11 @@ class RemoteProtocolTests(unittest.TestCase):
                 if not task.done():
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
         with mock.patch("pygithost.remote_ci.source_bundle_file", side_effect=prepare):
-            with mock.patch.object(Path, "unlink", side_effect=PermissionError("Windows sharing lock")):
+            with mock.patch.object(
+                Path, "unlink", side_effect=PermissionError("Windows sharing lock")
+            ):
                 with self.assertLogs("pygithost.remote_ci", level="WARNING"):
                     asyncio.run(check())
         self.assertTrue(path.exists())
@@ -270,29 +323,40 @@ class RemoteProtocolTests(unittest.TestCase):
         self.file_source(run, b"bundle")
         conn = connect()
         try:
-            conn.execute("UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
-                         (json.dumps({"config": {"source_limit_mb": 1_000_000}}), run))
+            conn.execute(
+                "UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
+                (json.dumps({"config": {"source_limit_mb": 1_000_000}}), run),
+            )
         finally:
             conn.close()
         identity = self.claim()
         real_open = open
         reads = []
+
         class Reader:
             def __init__(self, stream):
                 self.stream = stream
+
             def __enter__(self):
                 return self
+
             def __exit__(self, *args):
                 self.stream.close()
+
             def fileno(self):
                 return self.stream.fileno()
+
             def read(self, size):
                 reads.append(size)
                 if not 0 < size <= 65536:
                     raise AssertionError("Source read allocated the configured maximum")
                 return self.stream.read(size)
-        with mock.patch("pygithost.remote_ci.open", create=True,
-                        side_effect=lambda *args, **kwargs: Reader(real_open(*args, **kwargs))):
+
+        with mock.patch(
+            "pygithost.remote_ci.open",
+            create=True,
+            side_effect=lambda *args, **kwargs: Reader(real_open(*args, **kwargs)),
+        ):
             self.assertEqual(base64.b64decode(self.call("source", identity)["bundle"]), b"bundle")
         self.assertTrue(reads)
 
@@ -301,17 +365,21 @@ class RemoteProtocolTests(unittest.TestCase):
         path = self.file_source(run, b"x" * (1024 * 1024))
         conn = connect()
         try:
-            conn.execute("UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
-                         (json.dumps({"config": {"source_limit_mb": 1}}), run))
+            conn.execute(
+                "UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
+                (json.dumps({"config": {"source_limit_mb": 1}}), run),
+            )
         finally:
             conn.close()
         identity = self.claim()
         real_fstat = os.fstat
+
         def grow_after_stat(fd):
             info = real_fstat(fd)
             with path.open("ab") as stream:
                 stream.write(b"x")
             return info
+
         with mock.patch("pygithost.remote_ci.os.fstat", side_effect=grow_after_stat):
             with self.assertRaises(APIError) as error:
                 self.call("source", identity)
@@ -347,6 +415,7 @@ class RemoteProtocolTests(unittest.TestCase):
 
     def test_cancel_during_preparation_deletes_unqueued_source(self):
         from pygithost.remote_ci import execute_remote
+
         path = Path(self.temp.name) / "preparing.bundle"
         started, release = threading.Event(), threading.Event()
 
@@ -358,8 +427,9 @@ class RemoteProtocolTests(unittest.TestCase):
 
         async def check():
             manager = mock.Mock()
-            task = asyncio.create_task(execute_remote(
-                manager, (1, "alice", "project", "push", "main", "a" * 40, "{}"), {}))
+            task = asyncio.create_task(
+                execute_remote(manager, (1, "alice", "project", "push", "main", "a" * 40, "{}"), {})
+            )
             await asyncio.to_thread(started.wait, 5)
             task.cancel()
             release.set()
@@ -373,14 +443,21 @@ class RemoteProtocolTests(unittest.TestCase):
     def test_heartbeat_completion_and_duplicate_completion(self):
         run = self.enqueue()
         identity = self.claim()
-        self.call("heartbeat", dict(identity, progress={"output": "live", "truncated": 0, "phase": "command"}))
+        self.call(
+            "heartbeat",
+            dict(identity, progress={"output": "live", "truncated": 0, "phase": "command"}),
+        )
         self.assertEqual(database.db_ci_run_get("alice", "project", run)[5], "live")
         result = {"status": "success", "return_code": 0, "output": "done"}
         self.call("complete", dict(identity, progress=result))
-        self.assertTrue(self.call("complete", dict(identity, progress={"invalid": True}))["accepted"])
+        self.assertTrue(
+            self.call("complete", dict(identity, progress={"invalid": True}))["accepted"]
+        )
         conn = connect()
         try:
-            self.assertEqual(json.loads(conn.execute("SELECT result FROM ci_remote_jobs").fetchone()[0]), result)
+            self.assertEqual(
+                json.loads(conn.execute("SELECT result FROM ci_remote_jobs").fetchone()[0]), result
+            )
         finally:
             conn.close()
 
@@ -402,6 +479,7 @@ class RemoteProtocolTests(unittest.TestCase):
 
     def test_coordinator_restart_interrupts_unclaimed_and_claimed_jobs(self):
         from pygithost.remote_ci import recover_jobs
+
         claimed = self.enqueue()
         identity = self.claim()
         queued = self.enqueue()
@@ -416,9 +494,11 @@ class RemoteProtocolTests(unittest.TestCase):
         identity = self.claim()
         with self.assertRaises(APIError):
             self.call("source", dict(identity, attempt="wrong"))
-        for result in ({"status": "success", "return_code": 1},
-                       {"status": "success", "return_code": 0, "steps": [1]},
-                       {"status": "success", "return_code": 0, "owner": "bob"}):
+        for result in (
+            {"status": "success", "return_code": 1},
+            {"status": "success", "return_code": 0, "steps": [1]},
+            {"status": "success", "return_code": 0, "owner": "bob"},
+        ):
             with self.assertRaises(APIError):
                 self.call("complete", dict(identity, progress=result))
 
@@ -431,48 +511,93 @@ class RemoteProtocolTests(unittest.TestCase):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
             archive.writestr("result.txt", "passed")
-        self.assertTrue(self.call("complete", dict(result, artifact=base64.b64encode(buffer.getvalue()).decode()))["accepted"])
+        self.assertTrue(
+            self.call(
+                "complete", dict(result, artifact=base64.b64encode(buffer.getvalue()).decode())
+            )["accepted"]
+        )
 
     def test_remote_configuration_and_client_url_validation(self):
         from pygithost.ci_config import compile_document
+
         text = (Path(__file__).resolve().parents[1] / "docs/http-runner.md").read_text()
         document = json.loads(text.split("```json\n", 1)[1].split("```", 1)[0])
         self.assertEqual(compile_document(document)["runner"], "remote-docker")
         self.assertEqual(validate_config({"runner": "remote-docker"})["runner"], "remote-docker")
-        for url in ("ftp://host", "http://user:pass@host", "http://host/path", "http://host?token=x"):
+        for url in (
+            "ftp://host",
+            "http://user:pass@host",
+            "http://host/path",
+            "http://host?token=x",
+        ):
             with self.assertRaises(ValueError):
                 Client(url, "secret")
-        self.assertEqual(Client("http://192.168.16.16:8000", "secret").url,
-                         "http://192.168.16.16:8000")
+        self.assertEqual(
+            Client("http://192.168.16.16:8000", "secret").url, "http://192.168.16.16:8000"
+        )
 
     def test_runner_usage_guide_is_rendered_and_artifact_example_is_valid(self):
         from pygithost.ci_config import compile_document
         from pygithost.ci_docs import manual_content
+
         text = (Path(__file__).resolve().parents[1] / "docs/http-runner.md").read_text()
-        examples = [json.loads(block.split("```", 1)[0])
-                    for block in text.split("```json\n")[1:]]
+        examples = [json.loads(block.split("```", 1)[0]) for block in text.split("```json\n")[1:]]
         configuration, artifact_example = examples
         configuration["pipelines"][0].update(artifact_example)
-        self.assertEqual(compile_document(configuration)["artifacts"]["paths"], ["test-results.json"])
+        self.assertEqual(
+            compile_document(configuration)["artifacts"]["paths"], ["test-results.json"]
+        )
         rendered = str(manual_content("http-runner", None, "/r/root/project"))
-        for marker in ("Already-installed test server", "Change authorized repositories",
-                       "Docker images and dependencies", "Troubleshooting",
-                       "192.168.250.1:8000", "pygithost-runner.service"):
+        for marker in (
+            "Already-installed test server",
+            "Change authorized repositories",
+            "Docker images and dependencies",
+            "Troubleshooting",
+            "192.168.250.1:8000",
+            "pygithost-runner.service",
+        ):
             self.assertIn(marker, rendered)
 
     def test_bundle_contains_exact_commit_and_pr_head(self):
         root = Path(self.temp.name)
         repo = root / "source"
+
         def git(*args):
-            return subprocess.check_output(["git", *map(str, args)], stderr=subprocess.DEVNULL).decode().strip()
+            return (
+                subprocess.check_output(["git", *map(str, args)], stderr=subprocess.DEVNULL)
+                .decode()
+                .strip()
+            )
+
         git("init", "-b", "main", repo)
-        git("-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-            "commit", "--allow-empty", "-m", "base")
+        git(
+            "-C",
+            repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        )
         commit = git("-C", repo, "rev-parse", "HEAD")
-        git("-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-            "commit", "--allow-empty", "-m", "head")
+        git(
+            "-C",
+            repo,
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "head",
+        )
         head = git("-C", repo, "rev-parse", "HEAD")
         from pygithost.remote_ci import source_bundle_file
+
         private = Path(source_bundle_file(repo, commit, head))
         self.addCleanup(private.unlink, missing_ok=True)
         if os.name != "nt":
@@ -498,8 +623,13 @@ class RunnerHTTPTests(unittest.TestCase):
     tearDown = read_tests.APITests.tearDown
 
     def post(self, action, body, token):
-        return self.request("/api/runner/v1/" + action, method="POST", token=token,
-                            body=json.dumps(body), headers={"Content-Type": "application/json"})
+        return self.request(
+            "/api/runner/v1/" + action,
+            method="POST",
+            token=token,
+            body=json.dumps(body),
+            headers={"Content-Type": "application/json"},
+        )
 
     def test_runner_tokens_are_separate_and_revocable(self):
         token = create_token("worker", ["alice/project"])
@@ -509,7 +639,9 @@ class RunnerHTTPTests(unittest.TestCase):
         self.assertEqual(self.request("/api/v1/user", token=token)[0], 401)
         status, _, specification = self.request("/api/runner/v1/openapi.json", token=token)
         self.assertEqual(status, 200)
-        self.assertEqual(set(specification["paths"]), {"/claim", "/source", "/heartbeat", "/complete"})
+        self.assertEqual(
+            set(specification["paths"]), {"/claim", "/source", "/heartbeat", "/complete"}
+        )
         conn = connect()
         try:
             conn.execute("DELETE FROM ci_runner_tokens")
@@ -520,14 +652,23 @@ class RunnerHTTPTests(unittest.TestCase):
     def test_real_http_execution_bridge_and_secret_filtering(self):
         from pygithost.ci import CIManager
         from pygithost.remote_ci import execute_remote
-        config = validate_config({"runner": "remote-docker", "command": "true",
-                                  "deploy_script_content": "#!/bin/sh\nPRIVATE_DEPLOYMENT",
-                                  "deploy_enabled": False})
-        run = database.db_ci_run_create("alice", "project", "push", "main", self.sha, "{}",
-                                       json.dumps(config))
+
+        config = validate_config(
+            {
+                "runner": "remote-docker",
+                "command": "true",
+                "deploy_script_content": "#!/bin/sh\nPRIVATE_DEPLOYMENT",
+                "deploy_enabled": False,
+            }
+        )
+        run = database.db_ci_run_create(
+            "alice", "project", "push", "main", self.sha, "{}", json.dumps(config)
+        )
         manager = CIManager(lambda owner, repo: str(self.bare))
         row = (run, "alice", "project", "push", "main", self.sha, "{}")
-        task = asyncio.run_coroutine_threadsafe(execute_remote(manager, row, config), self.server.loop)
+        task = asyncio.run_coroutine_threadsafe(
+            execute_remote(manager, row, config), self.server.loop
+        )
         token = create_token("worker", ["alice/project"])
         client = Client(f"http://127.0.0.1:{self.server.port}", token)
         deadline = time.monotonic() + 10
@@ -541,7 +682,8 @@ class RunnerHTTPTests(unittest.TestCase):
         conn = connect()
         try:
             stored, path = conn.execute(
-                "SELECT length(source),source_path FROM ci_remote_jobs WHERE run_id=?", (run,)).fetchone()
+                "SELECT length(source),source_path FROM ci_remote_jobs WHERE run_id=?", (run,)
+            ).fetchone()
         finally:
             conn.close()
         self.assertEqual(stored, 0)
@@ -553,24 +695,34 @@ class RunnerHTTPTests(unittest.TestCase):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
             archive.writestr("result.txt", "passed")
-        result = dict(identity, progress={"status": "success", "return_code": 0, "output": "passed"},
-                      artifact=base64.b64encode(buffer.getvalue()).decode())
+        result = dict(
+            identity,
+            progress={"status": "success", "return_code": 0, "output": "passed"},
+            artifact=base64.b64encode(buffer.getvalue()).decode(),
+        )
         self.assertTrue(client.request("complete", result)["accepted"])
         task.result(timeout=10)
         self.assertFalse(Path(path).exists())
         run_row = database.db_ci_run_get("alice", "project", run)
         self.assertEqual(run_row[4:6], ("success", "passed"))
-        self.assertEqual(database.db_ci_artifact_get("alice", "project", run, content=True), buffer.getvalue())
+        self.assertEqual(
+            database.db_ci_artifact_get("alice", "project", run, content=True), buffer.getvalue()
+        )
         self.assertTrue(client.request("heartbeat", identity)["cancel"])
 
     def test_bridge_cancellation_closes_remote_attempt(self):
         from pygithost.ci import CIManager
         from pygithost.remote_ci import execute_remote
+
         config = validate_config({"runner": "remote-docker", "command": "true"})
-        run = database.db_ci_run_create("alice", "project", "push", "main", self.sha, "{}", json.dumps(config))
+        run = database.db_ci_run_create(
+            "alice", "project", "push", "main", self.sha, "{}", json.dumps(config)
+        )
         row = (run, "alice", "project", "push", "main", self.sha, "{}")
         task = asyncio.run_coroutine_threadsafe(
-            execute_remote(CIManager(lambda owner, repo: str(self.bare)), row, config), self.server.loop)
+            execute_remote(CIManager(lambda owner, repo: str(self.bare)), row, config),
+            self.server.loop,
+        )
         token = create_token("worker", ["alice/project"])
         client = Client(f"http://127.0.0.1:{self.server.port}", token)
         job = None
@@ -581,7 +733,9 @@ class RunnerHTTPTests(unittest.TestCase):
         self.assertIsNotNone(job)
         conn = connect()
         try:
-            path = conn.execute("SELECT source_path FROM ci_remote_jobs WHERE run_id=?", (run,)).fetchone()[0]
+            path = conn.execute(
+                "SELECT source_path FROM ci_remote_jobs WHERE run_id=?", (run,)
+            ).fetchone()[0]
         finally:
             conn.close()
         task.cancel()
@@ -597,10 +751,13 @@ class RunnerHTTPTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertFalse(Path(path).exists())
 
-    @unittest.skipUnless(os.name == "posix" and os.getuid() != 0, "worker requires unprivileged Linux")
+    @unittest.skipUnless(
+        os.name == "posix" and os.getuid() != 0, "worker requires unprivileged Linux"
+    )
     def test_worker_process_checkout_steps_logs_and_artifacts_over_http(self):
         from pygithost.ci import CIManager
         from pygithost.remote_ci import execute_remote
+
         # A Docker CLI stand-in exercises the real runner process and protocol
         # without requiring a Docker daemon in the unit-test environment.
         tools = self.root / "tools"
@@ -621,20 +778,34 @@ if args[0] == 'run':
     raise SystemExit(subprocess.call(['/bin/sh', '-c', args[-1]]))
 """)
         docker.chmod(0o700)
-        config = validate_config({
-            "runner": "remote-docker",
-            "steps": [{"name": "Read exact source", "run": "cat README.md"},
-                      {"name": "Produce artifact", "run": "printf passed > result.txt"}],
-            "artifacts": {"paths": ["result.txt"], "when": "always"}})
-        run = database.db_ci_run_create("alice", "project", "push", "main", self.sha, "{}", json.dumps(config))
-        task = asyncio.run_coroutine_threadsafe(execute_remote(
-            CIManager(lambda owner, repo: str(self.bare)),
-            (run, "alice", "project", "push", "main", self.sha, "{}"), config), self.server.loop)
+        config = validate_config(
+            {
+                "runner": "remote-docker",
+                "steps": [
+                    {"name": "Read exact source", "run": "cat README.md"},
+                    {"name": "Produce artifact", "run": "printf passed > result.txt"},
+                ],
+                "artifacts": {"paths": ["result.txt"], "when": "always"},
+            }
+        )
+        run = database.db_ci_run_create(
+            "alice", "project", "push", "main", self.sha, "{}", json.dumps(config)
+        )
+        task = asyncio.run_coroutine_threadsafe(
+            execute_remote(
+                CIManager(lambda owner, repo: str(self.bare)),
+                (run, "alice", "project", "push", "main", self.sha, "{}"),
+                config,
+            ),
+            self.server.loop,
+        )
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             conn = connect()
             try:
-                exists = conn.execute("SELECT 1 FROM ci_remote_jobs WHERE run_id=?", (run,)).fetchone()
+                exists = conn.execute(
+                    "SELECT 1 FROM ci_remote_jobs WHERE run_id=?", (run,)
+                ).fetchone()
             finally:
                 conn.close()
             if exists:
@@ -643,12 +814,26 @@ if args[0] == 'run':
         token_path = self.root / "runner.token"
         token_path.write_text(create_token("worker", ["alice/project"]))
         token_path.chmod(0o600)
-        result = subprocess.run([
-            sys.executable, "-m", "pygithost.runner", "run",
-            "--server", f"http://127.0.0.1:{self.server.port}",
-            "--token-file", str(token_path), "--work-dir", str(self.root / "worker"),
-            "--allow-http", "--once"], env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
-            capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pygithost.runner",
+                "run",
+                "--server",
+                f"http://127.0.0.1:{self.server.port}",
+                "--token-file",
+                str(token_path),
+                "--work-dir",
+                str(self.root / "worker"),
+                "--allow-http",
+                "--once",
+            ],
+            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         task.result(timeout=10)
         row = database.db_ci_run_get("alice", "project", run)

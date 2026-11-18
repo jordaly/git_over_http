@@ -7,6 +7,5 @@ commands such as ``python server.py run`` and existing imports keep working.
 from pygithost import *  # noqa: F401,F403
 from pygithost import main
 
-
 if __name__ == "__main__":
     main()

@@ -1,12 +1,12 @@
 import gzip
 import http.client
 import json
-from html import unescape
 import os
 import re
 import subprocess
 import tempfile
 import unittest
+from html import unescape
 from unittest import mock
 from urllib.parse import urlencode
 
@@ -28,14 +28,22 @@ class WebIDETests(unittest.TestCase):
         url = self.base + "/" + action
         if params:
             url += "?" + urlencode(params)
-        fields = None if payload is None else {"csrf": self.token if token is None else token, "payload": json.dumps(payload)}
+        fields = (
+            None
+            if payload is None
+            else {"csrf": self.token if token is None else token, "payload": json.dumps(payload)}
+        )
         status, body = self.fixture.request(url, fields)
         return status, json.loads(body)
 
     def payload(self, **overrides):
-        return dict(branch="main", base=self.fixture.sha,
-                    changes={"README.md": "Browser edit\n", "folder/new.py": "print('hi')\n"},
-                    message="Edit from browser", **overrides)
+        return dict(
+            branch="main",
+            base=self.fixture.sha,
+            changes={"README.md": "Browser edit\n", "folder/new.py": "print('hi')\n"},
+            message="Edit from browser",
+            **overrides,
+        )
 
     def test_snapshot_tree_index_and_local_vendor(self):
         (self.fixture.source / "src").mkdir()
@@ -50,7 +58,9 @@ class WebIDETests(unittest.TestCase):
         # The initial snapshot only carries the root listing; directories load
         # on demand and the flat index is fetched only when needed.
         self.assertTrue(any(item["path"] == "README.md" for item in snapshot["root"]))
-        self.assertTrue(any(item["path"] == "src" and item["type"] == "tree" for item in snapshot["root"]))
+        self.assertTrue(
+            any(item["path"] == "src" and item["type"] == "tree" for item in snapshot["root"])
+        )
         self.assertEqual(set(snapshot["root"][0]), {"name", "path", "type"})
         status, tree = self.api("tree", {"branch": "main", "commit": head, "path": "src"})
         self.assertEqual(status, 200)
@@ -81,23 +91,41 @@ class WebIDETests(unittest.TestCase):
         self.assertGreater(len(index), 10000)
         children = webide.children(str(self.fixture.bare), "main", head, "many")["entries"]
         self.assertEqual(len(children), 10050)
-        self.assertEqual(webide.read_file(str(self.fixture.bare), "main", head, "many/file-10049.txt"), "value\n")
+        self.assertEqual(
+            webide.read_file(str(self.fixture.bare), "main", head, "many/file-10049.txt"), "value\n"
+        )
         status, result = self.api("search", {"branch": "main", "commit": head, "q": "value"})
         self.assertEqual(status, 200)
         self.assertTrue(any(item["path"] == "many/file-00000.txt" for item in result["results"]))
-        commit = webide.commit_changes(str(self.fixture.bare), "main", head,
-                                       {"many/file-00000.txt": "changed\n"}, "Edit one", "test")
-        self.assertEqual(webide.tree(str(self.fixture.bare), commit)["many/file-00000.txt"]["mode"], "100644")
+        commit = webide.commit_changes(
+            str(self.fixture.bare),
+            "main",
+            head,
+            {"many/file-00000.txt": "changed\n"},
+            "Edit one",
+            "test",
+        )
+        self.assertEqual(
+            webide.tree(str(self.fixture.bare), commit)["many/file-00000.txt"]["mode"], "100644"
+        )
 
     def test_large_ide_response_is_gzipped_for_browsers(self):
-        big = {"branch": "main", "commit": self.fixture.sha,
-               "root": [{"name": f"file-{index}.txt", "path": f"dir/file-{index}.txt", "type": "blob"}
-                        for index in range(2000)]}
+        big = {
+            "branch": "main",
+            "commit": self.fixture.sha,
+            "root": [
+                {"name": f"file-{index}.txt", "path": f"dir/file-{index}.txt", "type": "blob"}
+                for index in range(2000)
+            ],
+        }
         with mock.patch.object(webide, "snapshot", return_value=big):
-            connection = http.client.HTTPConnection("127.0.0.1", self.fixture.server.port, timeout=10)
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", self.fixture.server.port, timeout=10
+            )
             try:
-                connection.request("GET", self.base + "/snapshot?branch=main",
-                                   headers={"Accept-Encoding": "gzip"})
+                connection.request(
+                    "GET", self.base + "/snapshot?branch=main", headers={"Accept-Encoding": "gzip"}
+                )
                 response = connection.getresponse()
                 body = response.read()
                 self.assertEqual(response.status, 200)
@@ -108,7 +136,9 @@ class WebIDETests(unittest.TestCase):
             finally:
                 connection.close()
             # Clients that do not advertise gzip still receive plain JSON.
-            connection = http.client.HTTPConnection("127.0.0.1", self.fixture.server.port, timeout=10)
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", self.fixture.server.port, timeout=10
+            )
             try:
                 connection.request("GET", self.base + "/snapshot?branch=main")
                 response = connection.getresponse()
@@ -136,22 +166,37 @@ class WebIDETests(unittest.TestCase):
         # Branch switching is a searchable picker, not a native select.
         self.assertIn('data-branch="feature/api"', page)
         self.assertIn('id="ide-branch-name">feature/api<', page)
-        self.assertIn('data-branches=', page)
+        self.assertIn("data-branches=", page)
         self.assertNotIn('<select id="ide-branch"', page)
-        self.assertIn('feature/api', unescape(page))
+        self.assertIn("feature/api", unescape(page))
         status, page = self.fixture.request(self.base + query)
         self.assertEqual(status, 200)
         self.assertIn('data-mode="workspace"', page)
-        for label in ("Explorer", "Source Control", "Open files", "Go to file", "Back to repository", "New file", "New folder"):
+        for label in (
+            "Explorer",
+            "Source Control",
+            "Open files",
+            "Go to file",
+            "Back to repository",
+            "New file",
+            "New folder",
+        ):
             self.assertIn(label, page)
 
     def test_immutable_refs_and_read_only_users_have_no_edit_actions(self):
-        status, page = self.fixture.request(self.fixture.base + "/blob/" + self.fixture.sha + "/README.md")
+        status, page = self.fixture.request(
+            self.fixture.base + "/blob/" + self.fixture.sha + "/README.md"
+        )
         self.assertEqual(status, 200)
         self.assertNotIn("Edit single file", page)
         self.assertNotIn("Open in Web IDE", page)
         for route in ("/ide", "/edit"):
-            status, _ = self.fixture.request(self.fixture.base + route + "?" + urlencode({"branch": self.fixture.sha, "path": "README.md"}))
+            status, _ = self.fixture.request(
+                self.fixture.base
+                + route
+                + "?"
+                + urlencode({"branch": self.fixture.sha, "path": "README.md"})
+            )
             self.assertEqual(status, 400)  # Never silently edit the default branch instead.
         with mock.patch.object(application, "_has_write_scope", return_value=False):
             status, page = self.fixture.request(self.fixture.base + "/blob/main/README.md")
@@ -162,26 +207,39 @@ class WebIDETests(unittest.TestCase):
             self.assertEqual(status, 403)
 
     def test_commit_add_modify_delete_and_queue_push(self):
-        with mock.patch.object(application.AsyncGitServer, "_queue_push_changes", new_callable=mock.AsyncMock) as queue:
+        with mock.patch.object(
+            application.AsyncGitServer, "_queue_push_changes", new_callable=mock.AsyncMock
+        ) as queue:
             status, result = self.api("commit", payload=self.payload())
             self.assertEqual(status, 200, result)
             queue.assert_awaited_once()
         commit = result["commit"]
         git = self.fixture.git
-        self.assertEqual(git("--git-dir", self.fixture.bare, "show", commit + ":README.md"), "Browser edit")
-        self.assertEqual(git("--git-dir", self.fixture.bare, "show", commit + ":folder/new.py"), "print('hi')")
-        self.assertEqual(git("--git-dir", self.fixture.bare, "rev-parse", commit + "^"), self.fixture.sha)
+        self.assertEqual(
+            git("--git-dir", self.fixture.bare, "show", commit + ":README.md"), "Browser edit"
+        )
+        self.assertEqual(
+            git("--git-dir", self.fixture.bare, "show", commit + ":folder/new.py"), "print('hi')"
+        )
+        self.assertEqual(
+            git("--git-dir", self.fixture.bare, "rev-parse", commit + "^"), self.fixture.sha
+        )
         payload = self.payload()
         payload.update(base=commit, changes={"folder/new.py": None})
         status, result = self.api("commit", payload=payload)
         self.assertEqual(status, 200, result)
-        self.assertNotIn("folder/new.py", git("--git-dir", self.fixture.bare, "ls-tree", "-r", "--name-only", "main"))
+        self.assertNotIn(
+            "folder/new.py",
+            git("--git-dir", self.fixture.bare, "ls-tree", "-r", "--name-only", "main"),
+        )
 
     def test_content_search_is_literal_case_insensitive_and_validated(self):
         params = {"branch": "main", "commit": self.fixture.sha, "q": "REPOSITORY"}
         status, result = self.api("search", params)
         self.assertEqual(status, 200, result)
-        self.assertEqual(result["results"], [{"path": "README.md", "line": 1, "text": "Repository fixture"}])
+        self.assertEqual(
+            result["results"], [{"path": "README.md", "line": 1, "text": "Repository fixture"}]
+        )
         self.assertFalse(result["truncated"])
         for query in (".*", "--help", "no such text"):
             status, result = self.api("search", dict(params, q=query))
@@ -193,8 +251,14 @@ class WebIDETests(unittest.TestCase):
         self.assertEqual(status, 400)
 
     def test_content_search_bounds_results_and_long_lines(self):
-        commit = webide.commit_changes(str(self.fixture.bare), "main", self.fixture.sha,
-            {"many.txt": "needle\n" * 250, "long.txt": "long-match" + "x" * (300 * 1024) + "\n"}, "Search fixtures", "test")
+        commit = webide.commit_changes(
+            str(self.fixture.bare),
+            "main",
+            self.fixture.sha,
+            {"many.txt": "needle\n" * 250, "long.txt": "long-match" + "x" * (300 * 1024) + "\n"},
+            "Search fixtures",
+            "test",
+        )
         status, result = self.api("search", {"branch": "main", "commit": commit, "q": "needle"})
         self.assertEqual(status, 200)
         self.assertEqual(len(result["results"]), 200)
@@ -214,14 +278,24 @@ class WebIDETests(unittest.TestCase):
         with mock.patch.object(application, "_has_write_scope", return_value=False):
             status, _ = self.fixture.request(self.base)
             self.assertEqual(status, 403)
-            status, _ = self.fixture.request(self.base + "/commit", {"csrf": self.token, "payload": json.dumps(self.payload())})
+            status, _ = self.fixture.request(
+                self.base + "/commit", {"csrf": self.token, "payload": json.dumps(self.payload())}
+            )
             self.assertEqual(status, 403)
-        self.assertEqual(self.fixture.git("--git-dir", self.fixture.bare, "rev-parse", "main"), self.fixture.sha)
+        self.assertEqual(
+            self.fixture.git("--git-dir", self.fixture.bare, "rev-parse", "main"), self.fixture.sha
+        )
 
     def test_conflict_invalid_paths_and_noop_leave_branch_unchanged(self):
-        for changes in ({"../escape": "bad"}, {".git/config": "bad"}, {"a\\b": "bad"},
-                        {"README.md": "Repository fixture\n"}, {"binary": "\0"}, {"missing": None},
-                        {"big": "x" * (webide.MAX_FILE + 1)}):
+        for changes in (
+            {"../escape": "bad"},
+            {".git/config": "bad"},
+            {"a\\b": "bad"},
+            {"README.md": "Repository fixture\n"},
+            {"binary": "\0"},
+            {"missing": None},
+            {"big": "x" * (webide.MAX_FILE + 1)},
+        ):
             payload = self.payload()
             payload["changes"] = changes
             with self.subTest(changes=list(changes)):
@@ -231,7 +305,9 @@ class WebIDETests(unittest.TestCase):
         payload["base"] = "0" * 40
         status, _ = self.api("commit", payload=payload)
         self.assertEqual(status, 409)
-        self.assertEqual(self.fixture.git("--git-dir", self.fixture.bare, "rev-parse", "main"), self.fixture.sha)
+        self.assertEqual(
+            self.fixture.git("--git-dir", self.fixture.bare, "rev-parse", "main"), self.fixture.sha
+        )
 
     def test_executable_mode_and_symlink_safety(self):
         source = self.fixture.source
@@ -247,18 +323,26 @@ class WebIDETests(unittest.TestCase):
             with self.assertRaises(webide.IDEError):
                 webide.read_file(str(self.fixture.bare), "main", base, filename)
             with self.assertRaises(webide.IDEError):
-                webide.commit_changes(str(self.fixture.bare), "main", base, {filename: "bad"}, "bad", "user")
+                webide.commit_changes(
+                    str(self.fixture.bare), "main", base, {filename: "bad"}, "bad", "user"
+                )
         # Search still excludes the symlink (120000) and binary entries.
-        status, result = self.api("search", {"branch": "main", "commit": base, "q": "Repository fixture"})
+        status, result = self.api(
+            "search", {"branch": "main", "commit": base, "q": "Repository fixture"}
+        )
         self.assertEqual(status, 200)
         self.assertTrue(all(item["path"] != "link" for item in result["results"]))
-        commit = webide.commit_changes(str(self.fixture.bare), "main", base, {"run.sh": "echo new\n"}, "Executable", "user")
+        commit = webide.commit_changes(
+            str(self.fixture.bare), "main", base, {"run.sh": "echo new\n"}, "Executable", "user"
+        )
         self.assertEqual(webide.tree(str(self.fixture.bare), commit)["run.sh"]["mode"], "100755")
 
     def test_server_checkout_is_not_overwritten(self):
         repo = str(self.fixture.source / ".git")
         with self.assertRaisesRegex(webide.IDEError, "checked out"):
-            webide.commit_changes(repo, "main", webide.head(repo, "main"), {"README.md": "bad"}, "bad", "user")
+            webide.commit_changes(
+                repo, "main", webide.head(repo, "main"), {"README.md": "bad"}, "bad", "user"
+            )
         self.assertEqual((self.fixture.source / "README.md").read_text(), "Repository fixture\n")
 
     @unittest.skipUnless(os.name == "posix", "requires executable shell hooks")
@@ -272,44 +356,79 @@ class WebIDETests(unittest.TestCase):
         self.assertEqual(webide.head(str(self.fixture.bare), "main"), self.fixture.sha)
 
     def test_ci_scheduling_failure_still_confirms_successful_commit(self):
-        with mock.patch.object(application.AsyncGitServer, "_queue_push_changes", new_callable=mock.AsyncMock,
-                               side_effect=RuntimeError("CI unavailable")):
+        with mock.patch.object(
+            application.AsyncGitServer,
+            "_queue_push_changes",
+            new_callable=mock.AsyncMock,
+            side_effect=RuntimeError("CI unavailable"),
+        ):
             status, result = self.api("commit", payload=self.payload())
         self.assertEqual(status, 200, result)
         self.assertIn("warning", result)
         self.assertEqual(webide.head(str(self.fixture.bare), "main"), result["commit"])
 
 
-@unittest.skipUnless(os.environ.get("PYGITHOST_TEST_BROWSER"), "set PYGITHOST_TEST_BROWSER to Chromium")
+@unittest.skipUnless(
+    os.environ.get("PYGITHOST_TEST_BROWSER"), "set PYGITHOST_TEST_BROWSER to Chromium"
+)
 class WebIDEBrowserTests(unittest.TestCase):
     def run_browser(self, fixture, script, path):
         original = application._html_page
 
         def page(title, body):
             result = original(title, body)
-            return result.replace(b"</body>", script.encode() + b"</body>") if title == "Web IDE" else result
+            return (
+                result.replace(b"</body>", script.encode() + b"</body>")
+                if title == "Web IDE"
+                else result
+            )
 
         with tempfile.TemporaryDirectory(prefix="webide-browser-", dir="/tmp/opencode") as profile:
             with mock.patch.object(application, "_html_page", side_effect=page):
-                result = subprocess.run([os.environ["PYGITHOST_TEST_BROWSER"], "--headless", "--no-sandbox", "--disable-gpu",
-                    "--no-first-run", "--no-default-browser-check", "--disable-dev-shm-usage", "--window-size=1440,1000",
-                    "--user-data-dir=" + profile, "--dump-dom", "--virtual-time-budget=15000",
-                    f"http://127.0.0.1:{fixture.server.port}{fixture.base}{path}"],
-                    capture_output=True, text=True, timeout=60)
+                result = subprocess.run(
+                    [
+                        os.environ["PYGITHOST_TEST_BROWSER"],
+                        "--headless",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-dev-shm-usage",
+                        "--window-size=1440,1000",
+                        "--user-data-dir=" + profile,
+                        "--dump-dom",
+                        "--virtual-time-budget=15000",
+                        f"http://127.0.0.1:{fixture.server.port}{fixture.base}{path}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
         error = re.search(r'data-webide-error="([^"]*)"', result.stdout)
-        self.assertTrue('data-webide-test="passed"' in result.stdout,
-                        unescape(error[1]) if error else result.stderr[-2000:])
+        self.assertTrue(
+            'data-webide-test="passed"' in result.stdout,
+            unescape(error[1]) if error else result.stderr[-2000:],
+        )
 
     def test_edit_diff_discard_and_commit_in_real_browser(self):
         fixture = ui.RepositoryUITests()
         fixture.setUp()
         self.addCleanup(fixture.tearDown)
-        webide.commit_changes(str(fixture.bare), "main", fixture.sha, {
-            "a-root.txt": "root\n", "z-folder/a.txt": "nested\n",
-            "z-folder/z-nested/code.py": "print('fixture')\n", "z-root.txt": "root\n"
-        }, "Explorer ordering fixture", "test")
-        script = r'''<script>
+        webide.commit_changes(
+            str(fixture.bare),
+            "main",
+            fixture.sha,
+            {
+                "a-root.txt": "root\n",
+                "z-folder/a.txt": "nested\n",
+                "z-folder/z-nested/code.py": "print('fixture')\n",
+                "z-root.txt": "root\n",
+            },
+            "Explorer ordering fixture",
+            "test",
+        )
+        script = r"""<script>
 (async function () {
  const sleep = () => new Promise(resolve => setTimeout(resolve, 50));
  async function wait(test) { for (let i = 0; i < 180; i++) { if (test()) return; await sleep(); } throw Error("Timed out: " + document.getElementById("ide-status").textContent); }
@@ -469,15 +588,18 @@ class WebIDEBrowserTests(unittest.TestCase):
   document.documentElement.dataset.webideTest = "failed";
   document.documentElement.dataset.webideError = error.message;
  }
-})();</script>'''
+})();</script>"""
         self.run_browser(fixture, script, "/ide?branch=main")
-        self.assertEqual(fixture.git("--git-dir", fixture.bare, "show", "main:README.md"), "Committed in real Chromium")
+        self.assertEqual(
+            fixture.git("--git-dir", fixture.bare, "show", "main:README.md"),
+            "Committed in real Chromium",
+        )
 
     def test_single_file_commit_then_expand_preserves_edits_tabs_and_quick_open(self):
         fixture = ui.RepositoryUITests()
         fixture.setUp()
         self.addCleanup(fixture.tearDown)
-        script = r'''<script>
+        script = r"""<script>
 (async function () {
  const sleep = () => new Promise(resolve => setTimeout(resolve, 50));
  const el = id => document.getElementById("ide-" + id);
@@ -531,10 +653,23 @@ class WebIDEBrowserTests(unittest.TestCase):
   if (el("changes").textContent || el("tabs").querySelectorAll('[role="tab"]').length !== 3) throw Error("Commit failed to keep clean tabs");
   document.documentElement.dataset.webideTest = "passed";
  } catch (error) { document.documentElement.dataset.webideTest = "failed"; document.documentElement.dataset.webideError = error.message; }
-})();</script>'''
-        self.run_browser(fixture, script, "/edit?" + urlencode({"branch": "feature/api", "path": "README.md"}))
-        self.assertEqual(fixture.git("--git-dir", fixture.bare, "show", "feature/api:README.md"), "Preserved when opening full IDE")
-        self.assertEqual(fixture.git("--git-dir", fixture.bare, "show", "feature/api:nested/second.py"), "print('two files')")
-        self.assertEqual(fixture.git("--git-dir", fixture.bare, "show", "feature/api:empty-folder/.gitkeep"), "")
+})();</script>"""
+        self.run_browser(
+            fixture, script, "/edit?" + urlencode({"branch": "feature/api", "path": "README.md"})
+        )
+        self.assertEqual(
+            fixture.git("--git-dir", fixture.bare, "show", "feature/api:README.md"),
+            "Preserved when opening full IDE",
+        )
+        self.assertEqual(
+            fixture.git("--git-dir", fixture.bare, "show", "feature/api:nested/second.py"),
+            "print('two files')",
+        )
+        self.assertEqual(
+            fixture.git("--git-dir", fixture.bare, "show", "feature/api:empty-folder/.gitkeep"), ""
+        )
         self.assertEqual(fixture.git("--git-dir", fixture.bare, "rev-parse", "main"), fixture.sha)
-        self.assertEqual(fixture.git("--git-dir", fixture.bare, "log", "-1", "--format=%s", "feature/api^"), "Quick single-file change")
+        self.assertEqual(
+            fixture.git("--git-dir", fixture.bare, "log", "-1", "--format=%s", "feature/api^"),
+            "Quick single-file change",
+        )

@@ -3752,6 +3752,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         tgt_commit = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
         commits: list[dict[str, str]] = []
         params = parse_qs(urlparse(self.path).query or "")
+        pr_url = f"{base}/pulls/{pr_id}"
+        view = (params.get("tab") or [""])[0]
+        if view not in ("conversation", "commits", "checks", "files"):
+            view = (
+                "files" if "file" in params else "commits" if "page" in params else "conversation"
+            )
         page = _page_number(params)
         size = _page_size(params)
         total: int | None = 0
@@ -3764,11 +3770,12 @@ document.addEventListener("DOMContentLoaded", function() {{
             total = await _git_commit_count(repo_git, tgt_commit + ".." + src_commit)
             if total is not None:
                 page = _clamp_page(page, total, size)
-            commits = await _git_list_commits(
-                repo_git, tgt_commit + ".." + src_commit, limit=size + 1, skip=(page - 1) * size
-            )
+            if view == "commits":
+                commits = await _git_list_commits(
+                    repo_git, tgt_commit + ".." + src_commit, limit=size + 1, skip=(page - 1) * size
+                )
         commits_pagination = _pagination(
-            base + f"/pulls/{pr_id}", {}, page, len(commits) > size, total=total, per_page=size
+            pr_url, {"tab": "commits"}, page, len(commits) > size, total=total, per_page=size
         )
         commits = commits[:size]
         changed_files: list[ChangedFile] = (
@@ -3779,25 +3786,21 @@ document.addEventListener("DOMContentLoaded", function() {{
         selected_file = (params.get("file") or [""])[0]
         if selected_file and not any(f["path"] == selected_file for f in changed_files):
             selected_file = ""
-        if src_commit and tgt_commit and src_commit != tgt_commit:
+        diff_text, diff_trunc = "", False
+        if view == "files" and src_commit and tgt_commit and src_commit != tgt_commit:
             # Three-dot diff: show what this PR adds relative to the merge base,
             # not unrelated target-branch changes.
             diff_text, diff_trunc = await _git_diff_between(
-                repo_git, merge_base or tgt_commit, src_commit, max_bytes=PR_PATCH_MAX_BYTES
+                repo_git,
+                merge_base or tgt_commit,
+                src_commit,
+                max_bytes=PR_PATCH_MAX_BYTES,
+                path=selected_file,
             )
         elif src_commit and tgt_commit and src_commit == tgt_commit:
             diff_text, diff_trunc = "(No changes; branches point to the same commit.)", False
         else:
             diff_text, diff_trunc = "(Could not resolve one or both branches.)", False
-        if selected_file and (merge_base or tgt_commit) and src_commit:
-            diff_text, diff_trunc = await _git_diff_between(
-                repo_git,
-                merge_base or tgt_commit or "",
-                src_commit,
-                max_bytes=PR_PATCH_MAX_BYTES,
-                path=selected_file,
-            )
-
         notice_html = safe_html("")
         if notice:
             cls = "ok" if notice_kind == "ok" else "warn"
@@ -3806,9 +3809,18 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         can_write = _has_write_scope(self)
         merge_box = safe_html("")
-        ci_policy = await self.server.ci_manager.config(owner, repo)
-        check = await self.server.ci_manager.merge_check(
-            owner, repo, pr_id, tgt_commit or "", src_commit or "", tgt_branch
+        needs_checks = view in ("conversation", "checks")
+        ci_policy = (
+            await self.server.ci_manager.config(owner, repo, include_secrets=False)
+            if needs_checks
+            else {"require_ci": False}
+        )
+        check = (
+            await self.server.ci_manager.merge_check(
+                owner, repo, pr_id, tgt_commit or "", src_commit or "", tgt_branch
+            )
+            if needs_checks
+            else None
         )
         ci_passed = bool(check and check[1] == "success" and src_commit and tgt_commit)
         ci_label = (
@@ -3817,9 +3829,10 @@ document.addEventListener("DOMContentLoaded", function() {{
             else "not run for current commits (missing or outdated)"
         )
         ci_requirement = "required" if ci_policy["require_ci"] else "informational"
+        check_href = f"{base}/ci/runs/{check[0]}" if check else f"{base}/ci"
         ci_panel = safe_html(
             html_t(
-                t'<div class="box" style="margin-bottom:14px"><h2>CI checks</h2><p>CI is {ci_requirement}: {ci_label}.</p><a href="{base}/ci">View CI runs</a></div>'
+                t'<section class="box pr-check-panel"><h2>CI checks</h2><p>CI is {ci_requirement}: {ci_label}.</p><a href="{check_href}">{"View check run" if check else "View CI runs"}</a></section>'
             )
         )
         merge_note = safe_html("")
@@ -3834,7 +3847,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             merge_note = safe_html('<div class="warn" style="margin-top:10px">Closed.</div>')
 
         conflicts = None
-        if status == "open" and src_commit and tgt_commit:
+        if view == "conversation" and status == "open" and src_commit and tgt_commit:
             if merge_base is None:
                 conflicts = None  # incompatible histories; simulate unavailable
             elif merge_base != tgt_commit:
@@ -3906,11 +3919,11 @@ document.addEventListener("DOMContentLoaded", function() {{
                 '<tr><td class="muted">No commits (or branches not resolvable).</td></tr>'
             )
         )
-        diff_html = _prism_diff_patch_html(diff_text, diff_trunc, "Diff")
+        diff_html = _prism_diff_patch_html(diff_text, diff_trunc, "Diff") if view == "files" else ""
         if selected_file:
             heading = safe_html(
                 html_t(
-                    t'Diff — <code>{selected_file}</code> <a class="pill" href="{base}/pulls/{pr_id}#diff">All files</a>'
+                    t'Diff — <code>{selected_file}</code> <a class="pill" href="{pr_url}?tab=files#diff">All files</a>'
                 )
             )
         else:
@@ -3935,9 +3948,11 @@ document.addEventListener("DOMContentLoaded", function() {{
             }
             badge, cls = meta.get(str(kind), meta["modified"])
             link = safe_html(
-                html_t(t'<a href="{base}/pulls/{pr_id}?file={q(path)}#diff">{path}</a>')
+                html_t(t'<a href="{pr_url}?tab=files&amp;file={q(path)}#diff">{path}</a>')
             )
-            selected = safe_html(" pr-file-selected") if path == selected_file else safe_html("")
+            selected = (
+                safe_html(' class="pr-file-selected"') if path == selected_file else safe_html("")
+            )
             file_rows.append(
                 html_t(
                     t'<tr{selected}><td style="width:26px"><span class="pull-file-badge pull-file-{kind}" title="{kind}">{badge}</span></td><td>{link}</td><td class="muted" style="width:110px"><span class="add">+{adds}</span> <span class="del">−{dels}</span></td></tr>'
@@ -3954,7 +3969,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                     t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Changed files ({len(changed_files)})</h2><table>{files_html}</table></div>'
                 )
             )
-            if changed_files
+            if changed_files and view == "files"
             else safe_html("")
         )
         total_adds = sum(f["added"] for f in changed_files)
@@ -3962,13 +3977,26 @@ document.addEventListener("DOMContentLoaded", function() {{
         summary = (
             safe_html(
                 html_t(
-                    t'<div class="muted" style="margin-bottom:10px">{len(commits)} commit(s), {len(changed_files)} file(s) changed: <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></div>'
+                    t'<div class="muted" style="margin-bottom:10px">{total if total is not None else "—"} commit(s), {len(changed_files)} file(s) changed: <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></div>'
                 )
             )
             if changed_files
             else safe_html("")
         )
-        comments = await asyncio.to_thread(db_pr_comment_list, pr_id)
+        comments = (
+            await asyncio.to_thread(db_pr_comment_list, pr_id) if view == "conversation" else []
+        )
+        comment_count = (
+            len(comments)
+            if view == "conversation"
+            else await _call_in_thread(db_pr_comment_count, pr_id)
+        )
+        author = (
+            await _call_in_thread(db_get_user_by_id, author_user_id)
+            if author_user_id is not None
+            else None
+        )
+        author_name = author[1] if author else "Anonymous"
         viewer_id = self.remote_user_id
         viewer_admin = bool(getattr(self, "remote_is_admin", False))
         comment_rows = []
@@ -4009,7 +4037,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
         comments_box = safe_html(
             html_t(
-                t'<div class="box" id="discussion" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Discussion ({len(comments)})</h2>{comments_join}{comment_form}</div>'
+                t'<section id="discussion" class="pr-conversation"><h2>Conversation</h2>{comments_join}</section>'
             )
         )
         title_form = safe_html("")
@@ -4019,22 +4047,44 @@ document.addEventListener("DOMContentLoaded", function() {{
                     t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form pr-md-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body}</textarea><button type="submit">Save</button></form></details>'
                 )
             )
-        body_html = html_t(
-            t"""{_repo_tabs(base, "pulls")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> <a href="{base}/pulls">Pull requests</a> <span>/</span> !{pr_id}</div><div class="topbar"><div><h2>{title}</h2>
-<div class="muted"><span class="pill pill-{status}">{status}</span> <code>{src_branch}</code> → <code>{tgt_branch}</code> | Created: {created_at}</div></div>
-<div><a class="pill" href="{base}/pulls">All PRs</a> <a class="pill" href="{base}">Repo</a> {_repo_code_menu(owner, repo, src_branch, can_edit=can_write and bool(src_commit))}</div></div>
-{notice_html}
-<nav class="review-section-nav" aria-label="Pull request sections"><a href="#overview">Overview</a><a href="#discussion">Discussion <span>{len(comments)}</span></a><a href="#pr-commits">Commits <span>{len(commits)}</span></a><a href="#diff">Changes <span>{len(changed_files)}</span></a></nav>
-<div class="review-layout"><div class="review-main" id="overview">
-<div class="box" style="margin-bottom:14px"><span class="pill pill-{status}">{status}</span>{merge_note}
-<div style="margin-top:10px">{description}</div>{title_form}
-<div class="muted" style="margin-top:10px">Source: <code>{src_branch}</code> @ <code>{src_short}</code><br>Target: <code>{tgt_branch}</code> @ <code>{tgt_short}</code></div></div>
-{ci_panel}{merge_box}{comments_box}
-<div class="box" id="pr-commits" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Commits</h2><table>{commits_html}</table>{commits_pagination}</div>
-{files_panel}
-<div class="box" id="diff" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">{heading}</h2>{summary}{diff_html}</div></div>
-<aside class="review-sidebar" aria-label="Pull request details"><h3>Pull request details</h3><dl><dt>Status</dt><dd><span class="pill pill-{status}">{status}</span></dd><dt>Source branch</dt><dd><code>{src_branch}</code><br><code>{src_short}</code></dd><dt>Target branch</dt><dd><code>{tgt_branch}</code><br><code>{tgt_short}</code></dd><dt>Created</dt><dd>{created_at}</dd><dt>Changes</dt><dd>{len(changed_files)} files <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></dd></dl></aside></div>"""
+        tabs = join_html(
+            html_t(
+                t'''<a href="{pr_url + ("?tab=" + key if key != "conversation" else "")}"{safe_html(' aria-current="page"' if view == key else "")}>{label}{safe_html(html_t(t"<span>{count}</span>")) if count is not None else safe_html("")}</a>'''
+            )
+            for key, label, count in (
+                ("conversation", "Conversation", comment_count),
+                ("commits", "Commits", total),
+                ("checks", "Checks", None),
+                ("files", "Files changed", len(changed_files)),
+            )
         )
+        sidebar = html_t(t"""<aside class="review-sidebar" aria-label="Pull request details">
+<h3>Pull request details</h3><dl><dt>Source branch</dt><dd><code>{src_branch}</code><br><code>{src_short}</code></dd><dt>Target branch</dt><dd><code>{tgt_branch}</code><br><code>{tgt_short}</code></dd>
+<dt>Changes</dt><dd>{len(changed_files)} files <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></dd></dl></aside>""")
+        if view == "conversation":
+            panel = html_t(t"""<div class="review-layout pr-conversation-layout"><div class="review-main">
+<article class="pr-comment pr-description"><div class="pr-comment-head"><b>{author_name}</b> <span class="muted">opened this pull request <time title="{created_at}">{_relative_time(created_at)}</time></span></div>
+<div class="pr-comment-body">{description}{title_form}</div></article>
+{comments_box}<div class="pr-merge-stack">{merge_note}{ci_panel}{merge_box}</div>{comment_form}</div>{safe_html(sidebar)}</div>""")
+        elif view == "commits":
+            panel = html_t(
+                t'<section class="box pr-tab-panel" id="pr-commits"><h2>Commits</h2><div class="pr-commit-scroll"><table>{commits_html}</table></div>{commits_pagination}</section>'
+            )
+        elif view == "checks":
+            panel = str(ci_panel)
+        else:
+            panel = html_t(
+                t'<div class="pr-files-layout"><section class="box pr-tab-panel" id="diff"><h2>{heading}</h2>{summary}{diff_html}</section><aside class="pr-files-sidebar" aria-label="Changed files">{files_panel}</aside></div>'
+            )
+        body_html = html_t(
+            t"""{_repo_tabs(base, "pulls")}<div class="review-breadcrumb"><a href="{base}/pulls">Pull requests</a> <span>/</span> #{pr_id}</div>
+<header class="pr-detail-header"><div><h2>{title} <span>#{pr_id}</span></h2>
+<div class="pr-detail-meta"><span class="pill pill-{status}">{status.capitalize()}</span> <strong>{author_name}</strong><span>·</span>
+<code>{src_branch}</code> <span>→</span> <code>{tgt_branch}</code></div></div>
+<div class="pr-header-actions">{_repo_code_menu(owner, repo, src_branch, can_edit=can_write and bool(src_commit))}</div></header>
+{notice_html}<nav class="review-section-nav pr-detail-tabs" aria-label="Pull request views">{tabs}</nav>{safe_html(panel)}"""
+        )
+        editor_assets = self._issue_editor_assets() if view == "conversation" else safe_html("")
         await _send_html(
             self.request,
             200,
@@ -4042,7 +4092,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 str_t(t"PR #{pr_id} · {owner}/{repo}"),
                 safe_html(
                     html_t(
-                        t'<main class="repo-page review-page review-detail">{safe_html(body_html)}{self._issue_editor_assets()}</main>'
+                        t'<main class="repo-page review-page review-detail">{safe_html(body_html)}{editor_assets}</main>'
                     )
                 ),
             ),

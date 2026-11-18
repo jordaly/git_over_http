@@ -133,7 +133,7 @@ class RepositoryUITests(unittest.TestCase):
             self.assertIn("PRIVATE_STEP_OUTPUT", page)
             self.assertIn("Detailed release step", page)
 
-    def test_review_pages_have_gitlab_style_layout_and_working_navigation(self):
+    def test_review_pages_have_working_navigation(self):
         identity = database.db_pr_create(
             FLAT_OWNER_UI, "project", "Review layout", "Description", "feature/api", "main", None
         )
@@ -147,11 +147,21 @@ class RepositoryUITests(unittest.TestCase):
             self.assertEqual(status, 200, page)
             self.assertIn("review-page", page)
             self.assertIn(marker, page)
-        status, page = self.request(self.base + f"/pulls/{identity}")
-        for anchor in ("overview", "discussion", "pr-commits", "diff"):
-            self.assertIn(f'href="#{anchor}"', page)
-            self.assertIn(f'id="{anchor}"', page)
-        self.assertIn(f'action="{self.base}/pulls/{identity}/comments"', page)
+        pr_url = f"{self.base}/pulls/{identity}"
+        status, page = self.request(pr_url)
+        self.assertEqual(status, 200)
+        self.assertIn('id="discussion"', page)
+        self.assertIn(f'action="{pr_url}/comments"', page)
+        for tab, marker in (
+            ("commits", 'id="pr-commits"'),
+            ("files", 'id="diff"'),
+            ("checks", "CI checks"),
+        ):
+            self.assertIn(f'href="{pr_url}?tab={tab}"', page)
+            status, tab_page = self.request(f"{pr_url}?tab={tab}")
+            self.assertEqual(status, 200)
+            self.assertIn(f'href="{pr_url}?tab={tab}" aria-current="page"', tab_page)
+            self.assertIn(marker, tab_page)
 
     def test_review_titles_and_branch_names_remain_escaped(self):
         identity = database.db_pr_create(
@@ -777,7 +787,7 @@ class RepositoryUITests(unittest.TestCase):
                 "pygithost.application._git_commit_count", new=mock.AsyncMock(return_value=60)
             ),
         ):
-            _, first = self.request(self.base + f"/pulls/{pr_id}")
+            _, first = self.request(self.base + f"/pulls/{pr_id}?tab=commits")
             _, second = self.request(self.base + f"/pulls/{pr_id}?page=2")
             self.assertIn("Paged commit 00", first)
             self.assertNotIn("Paged commit 25", first)

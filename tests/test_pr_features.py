@@ -98,14 +98,13 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertIn(
             'Diff — <code>app.py</code> <a class="pill" href="/r/root/project/pulls/'
             + str(self.pr)
-            + '#diff">All files</a>',
+            + '?tab=files#diff">All files</a>',
             page,
         )
         self.assertNotIn("&lt;a", page)
 
     def test_pr_shows_merge_base_diff_excluding_target_changes(self):
-        page = self.page()
-        self.assertIn("Feature edits", page)
+        page = self.page("?tab=files")
         self.assertIn("three-edited", page)
         self.assertIn("+six", page)
         self.assertNotIn("unrelated main change", page)
@@ -120,6 +119,23 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertIn("Changed files (2)", page)
         self.assertIn("three-edited", page)
         self.assertNotIn("brand new file", page)
+
+    def test_pull_request_separates_conversation_commits_checks_and_files(self):
+        conversation = self.page()
+        self.assertIn('aria-current="page">Conversation', conversation)
+        self.assertIn('id="discussion"', conversation)
+        self.assertNotIn('id="pr-commits"', conversation)
+        self.assertNotIn('id="diff"', conversation)
+        commits = self.page("?tab=commits")
+        self.assertIn('aria-current="page">Commits', commits)
+        self.assertIn("Feature edits", commits)
+        checks = self.page("?tab=checks")
+        self.assertIn('aria-current="page">Checks', checks)
+        self.assertIn("CI checks", checks)
+        self.assertNotIn("Merge (ff-only)", checks)
+        files = self.page("?tab=files")
+        self.assertIn('aria-current="page">Files changed', files)
+        self.assertIn('id="diff"', files)
 
     def test_discussion_add_edit_delete_and_permissions(self):
         page = self.page()

@@ -36,17 +36,30 @@ class RemoteProtocolTests(unittest.TestCase):
         database.DB_PATH = self.old_db
         self.temp.cleanup()
 
-    def enqueue(self, owner="alice", repo="project"):
+    def enqueue(self, owner="alice", repo="project", config=None):
         run = database.db_ci_run_create(owner, repo, "push", "main", "a" * 40, "{}", "{}")
+        document = {"row": [run, owner, repo]}
+        if config is not None:
+            document["config"] = config
         conn = connect()
         try:
             conn.execute(
                 "INSERT INTO ci_remote_jobs(run_id,owner,repo,document,source) VALUES(?,?,?,?,?)",
-                (run, owner, repo, json.dumps({"row": [run, owner, repo]}), b"bundle"),
+                (run, owner, repo, json.dumps(document), b"bundle"),
             )
         finally:
             conn.close()
         return run
+
+    def job(self, run):
+        conn = connect()
+        try:
+            return conn.execute(
+                "SELECT state,runner,attempt,result,document FROM ci_remote_jobs WHERE run_id=?",
+                (run,),
+            ).fetchone()
+        finally:
+            conn.close()
 
     def call(self, action, document=None, digest=None, repositories=None):
         return operation(
@@ -235,6 +248,7 @@ class RemoteProtocolTests(unittest.TestCase):
     def test_successful_run_is_not_failed_by_a_source_cleanup_lock(self):
         from pygithost.remote_ci import execute_remote
 
+        secret = "page-managed-value"
         run = database.db_ci_run_create("alice", "project", "push", "main", "a" * 40, "{}", "{}")
         path = Path(self.temp.name) / "completion.bundle"
         path.write_bytes(b"bundle")
@@ -242,7 +256,9 @@ class RemoteProtocolTests(unittest.TestCase):
         async def check():
             task = asyncio.create_task(
                 execute_remote(
-                    mock.Mock(), (run, "alice", "project", "push", "main", "a" * 40, "{}"), {}
+                    mock.Mock(),
+                    (run, "alice", "project", "push", "main", "a" * 40, "{}"),
+                    {"env": {"TOKEN": secret}, "runner": "docker"},
                 )
             )
             try:
@@ -276,6 +292,13 @@ class RemoteProtocolTests(unittest.TestCase):
         self.assertIn(str(path), self.pending_sources())
         self.call("claim")
         self.assertFalse(path.exists())
+        state, _runner, _attempt, result, document = self.job(run)
+        self.assertEqual(state, "closed")
+        self.assertEqual(
+            json.loads(result), {"status": "success", "return_code": 0, "output": "done"}
+        )
+        self.assertEqual(json.loads(document)["config"], {"runner": "docker", "email_mode": "off"})
+        self.assertNotIn(secret, document)
 
     def test_cancelled_preparation_retains_blocked_unqueued_source(self):
         from pygithost.remote_ci import execute_remote
@@ -488,6 +511,123 @@ class RemoteProtocolTests(unittest.TestCase):
             self.assertEqual(database.db_ci_run_get("alice", "project", run)[4], "interrupted")
         self.assertIsNone(self.call("claim")["job"])
         self.assertTrue(self.call("heartbeat", identity)["cancel"])
+
+    def test_completion_scrubs_environment_but_keeps_attempt_and_result(self):
+        secret = "page-managed-value"
+        config = {"env": {"TOKEN": secret}, "runner": "docker", "limits": {"log_mb": 2}}
+        run = self.enqueue(config=config)
+        identity = self.claim()
+        self.assertEqual(self.call("claim")["job"]["config"]["env"], {"TOKEN": secret})
+        expected = {"status": "success", "return_code": 0, "output": "done"}
+        self.call("complete", dict(identity, progress=expected))
+        state, runner, attempt, result, document = self.job(run)
+        self.assertEqual((state, runner, attempt), ("finished", self.digest, identity["attempt"]))
+        self.assertEqual(json.loads(result), expected)
+        decoded = json.loads(document)
+        self.assertEqual(decoded["row"][0], run)
+        self.assertEqual(decoded["config"], {"runner": "docker", "limits": {"log_mb": 2}})
+        self.assertNotIn(secret, document)
+        self.assertTrue(self.call("complete", dict(identity, progress={}))["accepted"])
+
+    def test_cancelled_assignment_closes_without_environment(self):
+        secret = "page-managed-value"
+        run = self.enqueue(config={"env": {"TOKEN": secret}, "runner": "docker"})
+        identity = self.claim()
+        database.db_ci_run_update(run, status="cancelled")
+        self.assertTrue(self.call("heartbeat", identity)["cancel"])
+        state, runner, attempt, result, document = self.job(run)
+        self.assertEqual(
+            (state, runner, attempt, result), ("closed", self.digest, identity["attempt"], None)
+        )
+        decoded = json.loads(document)
+        self.assertEqual(decoded["row"][0], run)
+        self.assertEqual(decoded["config"], {"runner": "docker"})
+        self.assertNotIn(secret, document)
+        self.assertIsNone(self.call("claim")["job"])
+
+    def test_claim_closes_abandoned_assignments_without_environment(self):
+        secret = "page-managed-value"
+        config = {"env": {"TOKEN": secret}, "runner": "docker"}
+        abandoned = self.enqueue(config=config)
+        database.db_ci_run_update(abandoned, status="interrupted")
+        claimed = self.enqueue(config=config)
+        identity = self.claim()
+        self.assertEqual(identity["run_id"], claimed)
+        database.db_ci_run_update(claimed, status="cancelled")
+        self.assertIsNone(self.call("claim")["job"])
+        for run, attempt in ((abandoned, None), (claimed, identity["attempt"])):
+            with self.subTest(run=run):
+                state, runner, stored_attempt, result, document = self.job(run)
+                expected_runner = None if attempt is None else self.digest
+                self.assertEqual(
+                    (state, runner, stored_attempt, result),
+                    ("closed", expected_runner, attempt, None),
+                )
+                self.assertEqual(json.loads(document)["config"], {"runner": "docker"})
+                self.assertNotIn(secret, document)
+
+    def test_recovery_scrubs_environment_in_active_and_legacy_rows(self):
+        from pygithost.remote_ci import recover_jobs
+
+        secret = "page-managed-value"
+        config = {"env": {"TOKEN": secret}, "runner": "docker", "limits": {"log_mb": 2}}
+        rows = {}
+        for state in ("queued", "claimed", "finished", "closed"):
+            run = self.enqueue(config=config)
+            attempt = None if state == "queued" else hashlib.sha256(state.encode()).hexdigest()
+            result = (
+                json.dumps({"status": "failed", "return_code": 1, "output": state})
+                if state in ("finished", "closed")
+                else None
+            )
+            conn = connect()
+            try:
+                conn.execute(
+                    """UPDATE ci_remote_jobs SET state=?,runner=?,attempt=?,heartbeat=?,result=?
+                    WHERE run_id=?""",
+                    (state, self.digest if attempt else None, attempt, time.time(), result, run),
+                )
+            finally:
+                conn.close()
+            rows[state] = (run, attempt, result)
+        recover_jobs()
+        for state, (run, attempt, result) in rows.items():
+            with self.subTest(state=state):
+                stored_state, runner, stored_attempt, stored_result, document = self.job(run)
+                self.assertEqual(stored_state, "closed")
+                self.assertEqual(runner, self.digest if attempt else None)
+                self.assertEqual(stored_attempt, attempt)
+                self.assertEqual(stored_result, result)
+                decoded = json.loads(document)
+                self.assertEqual(decoded["row"][0], run)
+                self.assertEqual(decoded["config"], {"runner": "docker", "limits": {"log_mb": 2}})
+                self.assertNotIn(secret, document)
+        self.assertIsNone(self.call("claim")["job"])
+
+    def test_schema_initialization_scrubs_legacy_terminal_documents(self):
+        secret = "page-managed-value"
+        run = self.enqueue(config={"env": {"TOKEN": secret}, "runner": "docker"})
+        attempt = hashlib.sha256(b"legacy").hexdigest()
+        conn = connect()
+        try:
+            conn.execute(
+                "UPDATE ci_remote_jobs SET state='closed',attempt=? WHERE run_id=?",
+                (attempt, run),
+            )
+        finally:
+            conn.close()
+        database._db_init()
+        state, runner, stored_attempt, result, document = self.job(run)
+        self.assertEqual((state, runner, stored_attempt, result), ("closed", None, attempt, None))
+        self.assertEqual(json.loads(document)["config"], {"runner": "docker"})
+        self.assertNotIn(secret, document)
+
+    def test_schema_initialization_keeps_active_environment(self):
+        secret = "page-managed-value"
+        run = self.enqueue(config={"env": {"TOKEN": secret}, "runner": "docker"})
+        database._db_init()
+        document = self.job(run)[4]
+        self.assertEqual(json.loads(document)["config"]["env"], {"TOKEN": secret})
 
     def test_wrong_attempt_and_invalid_results_rejected(self):
         self.enqueue()

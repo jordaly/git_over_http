@@ -22,6 +22,12 @@ from pygithost.ci import (
     validate_config,
 )
 from pygithost.ci_email import send_notification, validate_recipients
+from tests.ci_fixtures import (
+    commit_ci_config,
+    commit_legacy_config,
+    trusted_ci_repositories,
+    verified_retention,
+)
 
 
 class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
@@ -38,6 +44,9 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = str(Path(self.temp.name) / "ci.db")
         database._db_init()
         self.managers = []
+        trust = trusted_ci_repositories("owner/repo")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
 
     async def asyncTearDown(self):
         for manager in self.managers:
@@ -62,7 +71,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         database.db_ci_run_update(run_id, status=status)
         return (run_id, "owner", "repo", event, branch, "a" * 40, json.dumps(payload or {}))
 
-    def repository(self):
+    def repository(self, config=None, *, simple=False):
         source = Path(self.temp.name) / "source"
         bare = Path(self.temp.name) / "repo.git"
         subprocess.run(["git", "init", "-b", "main", str(source)], check=True, capture_output=True)
@@ -90,6 +99,11 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         commit = subprocess.check_output(
             ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
         ).strip()
+        if config is not None:
+            if simple:
+                commit = commit_ci_config(bare, config)
+            else:
+                commit = commit_legacy_config(bare, config)
         return bare, commit
 
     async def test_only_one_scheduler_can_own_database_and_lock_is_released(self):
@@ -176,28 +190,27 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
             await manager.retry_email("owner", "repo", row[0])
 
     async def test_queued_run_snapshots_configuration_and_reruns_exact_payload(self):
-        manager = self.manager()
+        bare, commit = self.repository({"command": "echo original", "events": {"manual": True}})
+        manager = self.manager(bare)
         manager.started = True  # Hold dispatch while examining queued records.
-        config = {"command": "echo original", "events": {"manual": True}}
-        await manager.save_config("owner", "repo", config)
         run_id = await manager.enqueue(
-            "owner", "repo", "manual", "main", "b" * 40, {"test": "payload"}
+            "owner", "repo", "manual", "main", commit, {"test": "payload"}
         )
-        await manager.save_config("owner", "repo", {"command": "echo changed"})
+        commit_legacy_config(bare, {"command": "echo changed"})
         rerun_id = await manager.rerun("owner", "repo", run_id)
         meta = database.db_ci_run_metadata("owner", "repo", rerun_id)
-        self.assertEqual(json.loads(meta["config"])["command"], "echo original")
-        self.assertEqual(json.loads(meta["payload"]), {"test": "payload"})
-        self.assertEqual(database.db_ci_run_get("owner", "repo", rerun_id)[3], "b" * 40)
+        self.assertEqual(json.loads(meta["config"])["steps"][0]["run"], "echo original")
+        self.assertEqual(
+            json.loads(meta["payload"]), {"test": "payload", "configuration_commit": commit}
+        )
+        self.assertEqual(database.db_ci_run_get("owner", "repo", rerun_id)[3], commit)
 
     async def test_queue_limit_records_rejection_without_losing_existing_jobs(self):
-        manager = self.manager()
+        bare, commit = self.repository({"command": "echo hi", "events": {"manual": True}})
+        manager = self.manager(bare)
         manager.started, manager.queue_limit = True, 1
-        await manager.save_config(
-            "owner", "repo", {"command": "echo hi", "events": {"manual": True}}
-        )
-        first = await manager.enqueue("owner", "repo", "manual", "main", "a" * 40)
-        second = await manager.enqueue("owner", "repo", "manual", "main", "b" * 40)
+        first = await manager.enqueue("owner", "repo", "manual", "main", commit)
+        second = await manager.enqueue("owner", "repo", "manual", "main", commit)
         self.assertEqual(list(manager.pending), [first])
         self.assertEqual(database.db_ci_run_get("owner", "repo", second)[4], "failed")
         self.assertIn(
@@ -205,22 +218,20 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_cancel_pending_checks_repository_and_supersedes_only_same_pr(self):
-        manager = self.manager()
-        manager.started = True
-        await manager.save_config(
-            "owner",
-            "repo",
-            {"command": "echo hi", "events": {"pr_updated": True}, "cancel_superseded": True},
+        bare, commit = self.repository(
+            {"command": "echo hi", "events": {"pr_updated": True}, "cancel_superseded": True}
         )
+        manager = self.manager(bare)
+        manager.started = True
         first = await manager.enqueue(
-            "owner", "repo", "pull_request_updated", "main", "a" * 40, {"pr_number": 1}
+            "owner", "repo", "pull_request_updated", "main", commit, {"pr_number": 1}
         )
         other = await manager.enqueue(
-            "owner", "repo", "pull_request_updated", "main", "a" * 40, {"pr_number": 2}
+            "owner", "repo", "pull_request_updated", "main", commit, {"pr_number": 2}
         )
         self.assertFalse(await manager.cancel("owner", "wrong", first))
         latest = await manager.enqueue(
-            "owner", "repo", "pull_request_updated", "main", "b" * 40, {"pr_number": 1}
+            "owner", "repo", "pull_request_updated", "main", commit, {"pr_number": 1}
         )
         self.assertEqual(database.db_ci_run_get("owner", "repo", first)[4], "cancelled")
         self.assertEqual(set(manager.pending), {other, latest})
@@ -234,7 +245,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         }
         row = list(self.configured_run(config))
         row[5] = commit
-        await manager.save_config("owner", "repo", {"command": "echo WRONG"})
+        changed = commit_legacy_config(bare, {"command": "echo WRONG"})
         with mock.patch.dict(os.environ, {"PYGITHOST_SMTP_PASSWORD": "server-secret"}):
             task = asyncio.create_task(manager._execute(tuple(row)))
             try:
@@ -260,7 +271,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
             subprocess.check_output(
                 ["git", "--git-dir", str(bare), "rev-parse", "main"], text=True
             ).strip(),
-            commit,
+            changed,
         )
 
     @unittest.skipUnless(shutil.which("git"), "requires Git")
@@ -355,13 +366,10 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
     async def test_cancel_active_job_keeps_partial_output_and_removes_checkout(self):
-        bare, commit = self.repository()
-        manager = self.manager(bare)
-        await manager.save_config(
-            "owner",
-            "repo",
-            {"command": "printf 'started\\n'; sleep 20", "events": {"manual": True}},
+        bare, commit = self.repository(
+            {"command": "printf 'started\\n'; sleep 20", "events": {"manual": True}}
         )
+        manager = self.manager(bare)
         run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
         for _ in range(150):
             run = database.db_ci_run_get("owner", "repo", run_id)
@@ -460,7 +468,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_target_branch_update_triggers_pr_check(self):
         server = object.__new__(AsyncGitServer)
-        server.ci_manager = SimpleNamespace(enqueue=AsyncMock())
+        server.ci_manager = SimpleNamespace(enqueue=AsyncMock(), refresh_retention=AsyncMock())
         server._branch_refs = AsyncMock(return_value={"main": "b" * 40, "feature": "c" * 40})
         with (
             mock.patch("pygithost.application.db_prs_for_source", return_value=[]),
@@ -479,7 +487,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_simultaneous_source_and_target_update_does_not_duplicate_pr_check(self):
         server = object.__new__(AsyncGitServer)
-        server.ci_manager = SimpleNamespace(enqueue=AsyncMock())
+        server.ci_manager = SimpleNamespace(enqueue=AsyncMock(), refresh_retention=AsyncMock())
         server._branch_refs = AsyncMock(return_value={"main": "b" * 40, "feature": "d" * 40})
         with (
             mock.patch(
@@ -505,7 +513,7 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(checks), 1)
         self.assertEqual(checks[0].args[5]["head_commit"], "d" * 40)
 
-    async def test_invalid_settings_preserve_all_submitted_values(self):
+    async def test_editor_save_is_rejected_without_touching_legacy_storage(self):
         handler = object.__new__(GitHTTPHandler)
         handler.server = SimpleNamespace(
             ci_manager=self.manager(),
@@ -515,37 +523,19 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         handler.request = SimpleNamespace(peer_ip="127.0.0.1")
         handler.headers = {}
         handler.remote_is_admin = True
-        handler._read_form_urlencoded = AsyncMock(
-            return_value={
-                "configuration_json": json.dumps(
-                    {
-                        "defaults": {
-                            "runner": "docker",
-                            "image": "custom:tag",
-                            "env": "invalid entry",
-                        },
-                        "pipelines": {
-                            "unsaved": {"steps": [{"name": "Test", "run": "echo unsaved"}]}
-                        },
-                    }
-                )
-            }
-        )
+        database.db_ci_config_set("owner", "repo", json.dumps({"command": "echo legacy"}))
         with (
             mock.patch("pygithost.application._repo_bare_path", return_value=self.temp.name),
-            mock.patch("pygithost.application._send_html", new_callable=AsyncMock) as send,
+            mock.patch("pygithost.application._send_text", new_callable=AsyncMock) as send,
         ):
             await handler._ui_ci_config_save("owner", "repo")
-        page = send.await_args.args[2].decode()
-        for value in (
-            "echo unsaved",
-            "invalid entry",
-            "custom:tag",
-            'class="warn"',
-            'role="alert"',
-        ):
-            self.assertIn(value, page)
-        self.assertIsNone(database.db_ci_config_get("owner", "repo"))
+        status, message = send.await_args.args[1:3]
+        self.assertEqual(status, 410)
+        self.assertIn("ci/config.json", message)
+        self.assertEqual(
+            json.loads(database.db_ci_config_get("owner", "repo")),
+            {"command": "echo legacy"},
+        )
 
     async def test_actions_require_write_scope_and_logs_are_repository_scoped(self):
         handler = object.__new__(GitHTTPHandler)
@@ -575,12 +565,13 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0][5], "")
 
     async def test_configurable_retention_preserves_pending(self):
-        pending = self.configured_run()[0]
-        with mock.patch.dict(os.environ, {"PYGITHOST_CI_RETENTION": "2"}):
-            for _ in range(3):
-                self.configured_run(status="success")
-        self.assertEqual(len(database.db_ci_runs_list("owner", "repo")), 3)
-        self.assertEqual(database.db_ci_run_get("owner", "repo", pending)[4], "queued")
+        with verified_retention("a" * 40, ("owner", "repo")):
+            pending = self.configured_run()[0]
+            with mock.patch.dict(os.environ, {"PYGITHOST_CI_RETENTION": "2"}):
+                for _ in range(3):
+                    self.configured_run(status="success")
+            self.assertEqual(len(database.db_ci_runs_list("owner", "repo")), 3)
+            self.assertEqual(database.db_ci_run_get("owner", "repo", pending)[4], "queued")
 
 
 class CIConfigurationAndSMTPTests(unittest.TestCase):

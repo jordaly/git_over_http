@@ -1,27 +1,47 @@
 # CI retention and pagination
 
-## Configure retention in the website
+## Configure retention
 
-Set server defaults under **Admin → Settings → Runs and artifacts**. For one
-repository, open **CI → Settings → Runs and artifacts**. Each repository field has
-**Use server default**; clear it to override only that limit. Zero is an explicit
-unlimited value, not inheritance. Check the deletion acknowledgement and save.
+Set administrator defaults under **Admin → Settings → Runs and artifacts**. These
+defaults apply to repositories without project retention, and to any
+retention field omitted from a project's configuration. The repository
+**CI → Settings** page has no retention form.
 
-Retention is stored separately from pipeline JSON. Saving pipeline changes does
-not reset these settings. Older JSON retention values remain readable and appear
-as repository overrides; selecting **Use server default** replaces that legacy
-override. Saving a server default applies to repositories without an override.
+A project may add this `retention` block alongside `pipelines` in the full
+grouped **`ci/config.json`** document:
+
+```json
+{
+  "retention": {
+    "artifacts": {"days": 30, "max_count": 50},
+    "runs": {"max_count": 100}
+  }
+}
+```
+
+The simple single-pipeline form cannot set retention. Cleanup uses the policy in
+**`ci/config.json` on the default branch**. Feature branches and reruns cannot
+change it. GitHost refreshes the policy at scheduler startup and after branch
+updates it handles. The cached policy is tied to the commit it was verified at;
+if `HEAD` later differs, including after a default-branch switch or an
+out-of-band Git update, deletion pauses until the next successful refresh. If
+the default branch configuration cannot be validated or the cache cannot be
+updated, cleanup is paused rather than deleting data under a fallback policy.
+
+An explicit nonzero administrator setting also acts as a cap: a repository may
+choose a lower limit, but cannot exceed or disable that cap. A zero administrator
+setting does not impose a cap.
 
 | Setting | Default | Zero means | Maximum |
 | --- | --- | --- | --- |
 | Artifact expiration, in days | 7 | Never expire by age | 36500 |
 | Maximum artifact bundles | 0 | No count limit | 1000000 |
-| Completed CI runs to retain | 100, or server default | Keep unlimited completed runs | 1000000 |
+| Completed CI runs to retain | 100, or administrator default | Keep unlimited completed runs | 1000000 |
 
 A **bundle** is the ZIP archive collected from one CI run, not an individual file
 inside the ZIP. Per-run artifact limits (default 20 MiB uncompressed and 1000
-files, configurable through `execution.limits`) still
-apply; unlimited retention does not remove those limits.
+files, configurable through `execution.limits`) still apply; unlimited retention
+does not remove those limits.
 
 ### Examples
 
@@ -45,10 +65,10 @@ and is not pruned by the CI run limit.
 
 ### When cleanup happens
 
-These are **current repository storage policies**, not per-run configuration
-snapshots. Saving settings applies them to existing data immediately. Artifact
-expiration is also enforced at startup, artifact reads/uploads, and run/configuration
-pruning. There is no exact-time deletion timer.
+These limits apply across the repository, including older runs. Lower limits can
+permanently delete data at the next cleanup, not necessarily when the run is
+queued. Cleanup happens during normal operations such as run completion, artifact
+reads/uploads, and server startup. There is no exact-time deletion timer.
 
 The Artifacts page displays the current age-based expiration, or **Never expires**
 when age expiration is zero. A nonzero count limit can still delete that archive.
@@ -60,8 +80,8 @@ disk space, so monitor database growth. Artifacts live in SQLite; deleting rows
 may free reusable database pages without reducing the database file's physical size.
 
 The server environment variable `PYGITHOST_CI_RETENTION` supplies the default run
-limit for repositories without an explicit override. It accepts 0–10000, with 0
-meaning unlimited. Repository settings allow values up to 1000000.
+limit. It accepts 0–10000, with 0 meaning unlimited. Project configuration allows
+values up to 1000000, subject to administrator defaults where a field is omitted.
 
 ## Browse multiple pages
 

@@ -2,11 +2,17 @@
   "version": 1,
   "pipelines": [
     {
-      "name": "checks",
+      "name": "tests",
       "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 600},
       "cancellation": {"superseded": true},
       "triggers": {"push": {"enabled": true}, "pull_request": {"enabled": true}},
-      "file": "ci/config.json"
+      "file": "ci/tests.json"
+    },
+    {
+      "name": "build",
+      "execution": {"runner": "docker", "image": "python:3.14-slim", "timeout_seconds": 900},
+      "triggers": {"push": {"enabled": true, "branches": ["main"]}},
+      "file": "ci/build.json"
     }
   ],
   "deployments": []

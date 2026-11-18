@@ -5,6 +5,7 @@ import unittest
 
 from pygithost.ci import CIManager
 from pygithost.ci_config import compile_document
+from pygithost.repository_ci import compile_repository_document
 
 
 class ConfigurationOptionTests(unittest.TestCase):
@@ -184,10 +185,46 @@ class ConfigurationOptionTests(unittest.TestCase):
         ]
         self.assertEqual(compile_document(document)["steps"], document["pipelines"][0]["steps"])
         document["pipelines"][0].pop("steps")
-        document["pipelines"][0]["file"] = ".pygithost-ci.json"
+        document["pipelines"][0]["file"] = "ci/pipeline.json"
         config = compile_document(document)
         self.assertTrue(config["repository_config"])
-        self.assertEqual(config["repository_file"], ".pygithost-ci.json")
+        self.assertEqual(config["repository_file"], "ci/pipeline.json")
+
+    def test_repository_documents_accept_simple_steps_and_full_documents(self):
+        simple = {
+            "version": 1,
+            "steps": [{"name": "Test", "run": "echo simple"}],
+        }
+        config = compile_repository_document(simple)
+        self.assertEqual(config["steps"], simple["steps"])
+        self.assertFalse(config["repository_config"])
+
+        document = self.document()
+        document["pipelines"][0]["file"] = "ci/pipeline.json"
+        document["pipelines"][0].pop("steps")
+        config = compile_repository_document(document)
+        self.assertTrue(config["repository_config"])
+        self.assertEqual(config["repository_file"], "ci/pipeline.json")
+
+    def test_repository_file_references_must_stay_inside_ci(self):
+        for filename in (
+            "pipeline.json",
+            "../ci/x.json",
+            "ci/../x.json",
+            "ci//x.json",
+            "/ci/x.json",
+            "ci\\x.json",
+            "ci/config.json",
+        ):
+            with self.subTest(filename=filename):
+                document = self.document()
+                document["pipelines"][0].pop("steps")
+                document["pipelines"][0]["file"] = filename
+                with self.assertRaises(ValueError):
+                    compile_repository_document(document)
+        with self.assertRaises(ValueError):
+            # The old Settings-only shorthand cannot point ci/config.json at itself.
+            compile_repository_document({"version": 1, "file": "ci/config.json"})
 
     def test_changing_one_pipeline_does_not_change_another(self):
         document = self.document()

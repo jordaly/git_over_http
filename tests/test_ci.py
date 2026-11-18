@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import shutil
 import subprocess
@@ -17,6 +16,7 @@ from pygithost.ci import CIManager, remove_checkout
 from pygithost.ci_windows_launcher import _exec_command, _shell_command
 from pygithost.config import AppConfig
 from pygithost.context import AppContext
+from tests.ci_fixtures import commit_legacy_config, trusted_ci_repositories, verified_retention
 
 
 class WindowsExecutableLookupTests(unittest.TestCase):
@@ -84,6 +84,9 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         self.old_db_path = database.DB_PATH
         database.DB_PATH = str(Path(self.temp.name) / "ci.db")
         database._db_init()
+        trust = trusted_ci_repositories("root/repo", "owner/repo", "owner/timeout", "owner/windows")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
 
     def tearDown(self):
         database.DB_PATH = self.old_db_path
@@ -96,20 +99,32 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         return database.db_ci_run_get("owner", repo, run_id)[4]
 
     async def test_retention_keeps_pending_jobs_and_caps_completed_history(self):
-        pending_id = self._queued_run("retention")
-        finished_ids = []
-        for _ in range(105):
-            run_id = self._queued_run("retention")
-            finished_ids.append(run_id)
-            database.db_ci_run_update(run_id, status="success", return_code=0)
+        with verified_retention("a" * 40, ("owner", "retention")):
+            pending_id = self._queued_run("retention")
+            finished_ids = []
+            for _ in range(105):
+                run_id = self._queued_run("retention")
+                finished_ids.append(run_id)
+                database.db_ci_run_update(run_id, status="success", return_code=0)
 
-        self.assertIsNotNone(database.db_ci_run_get("owner", "retention", pending_id))
-        completed = [
-            row
-            for row in database.db_ci_runs_list("owner", "retention", 200)
-            if row[4] == "success"
-        ]
-        self.assertEqual(len(completed), 100)
+            self.assertIsNotNone(database.db_ci_run_get("owner", "retention", pending_id))
+            completed = [
+                row
+                for row in database.db_ci_runs_list("owner", "retention", 200)
+                if row[4] == "success"
+            ]
+            self.assertEqual(len(completed), 100)
+
+    async def test_startup_retention_failure_does_not_block_scheduler(self):
+        run_id = self._queued_run("retention")
+        database.db_ci_run_update(run_id, status="success", return_code=0)
+        manager = CIManager(lambda *_: "")
+        with mock.patch.object(
+            manager, "refresh_retention", side_effect=RuntimeError("database unavailable")
+        ):
+            await manager.start()
+        self.assertTrue(manager.started)
+        await manager.stop()
 
     async def test_scheduler_skips_busy_repo_and_preserves_waiting_jobs_on_stop(self):
         first_a = self._queued_run("repo_a")
@@ -191,6 +206,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
 
         class Manager:
             enqueue = staticmethod(record_enqueue)
+            refresh_retention = AsyncMock()
 
         server.ci_manager = Manager()
 
@@ -203,6 +219,29 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(call[2], call[3], call[4]) for call in calls],
             [("push", "main", "b" * 40), ("push", "new", "c" * 40)],
+        )
+
+    async def test_push_finalizer_queues_after_retention_refresh_failure(self):
+        server = object.__new__(AsyncGitServer)
+        calls = []
+
+        class Manager:
+            async def refresh_retention(self, _owner, _repo):
+                raise RuntimeError("database unavailable")
+
+            async def enqueue(self, *args):
+                calls.append(args)
+
+        server.ci_manager = Manager()
+        server._branch_refs = AsyncMock(return_value={"main": "b" * 40})
+        with (
+            mock.patch("pygithost.application.db_prs_for_source", return_value=[]),
+            mock.patch("pygithost.application.db_prs_for_target", return_value=[]),
+        ):
+            await server._queue_push_changes("owner", "repo", {"main": "a" * 40})
+        self.assertEqual(
+            [(call[2], call[3], call[4]) for call in calls],
+            [("push", "main", "b" * 40)],
         )
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
@@ -317,6 +356,25 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             check=True,
             capture_output=True,
         )
+        previous_main = subprocess.check_output(
+            ["git", "--git-dir", str(bare), "rev-parse", "main"], text=True
+        ).strip()
+        next_commit = commit_legacy_config(
+            bare,
+            {"command": "true", "events": {"push": True}},
+        )
+        subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(bare),
+                "update-ref",
+                "refs/heads/main",
+                previous_main,
+                next_commit,
+            ],
+            check=True,
+        )
         backend = root / "fake-git-backend"
         backend.write_text(
             "#!/bin/sh\n"
@@ -334,19 +392,6 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         app = AsyncGitServer(AppContext(config), allowlist={"127.0.0.1"})
-        database.db_ci_config_set(
-            FLAT_OWNER_UI,
-            "repo",
-            json.dumps(
-                {
-                    "command": "true",
-                    "env": {},
-                    "events": {"push": True},
-                    "push_branches": "",
-                    "pr_branches": "",
-                }
-            ),
-        )
 
         class DisconnectedWriter:
             def write(self, _data):
@@ -463,10 +508,12 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(handler._ui_ci_config("owner", "repo"), timeout=3)
         page = send_html.await_args.args[2].decode("utf-8")
-        self.assertIn('name="configuration_json"', page)
+        self.assertIn("ci/config.json", page)
+        self.assertIn("Project pipelines", page)
+        self.assertNotIn('name="configuration_json"', page)
         self.assertNotIn('name="command"', page)
         self.assertNotIn('name="pipeline_mode"', page)
-        self.assertIn('action="/r/owner/repo/ci/config"', page)
+        self.assertIn('action="/r/owner/repo/ci/preferences"', page)
         self.assertIn('href="/r/owner/repo/ci"', page)
         self.assertNotIn("Recent runs", page)
 
@@ -522,21 +569,16 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
             check=True,
             capture_output=True,
         )
-        commit = subprocess.check_output(
-            ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/main"], text=True
-        ).strip()
         config = {
             "command": "printf 'started'; sleep 10",
-            "env": {},
             "events": {},
-            "push_branches": "",
-            "pr_branches": "",
+            "timeout_seconds": 3,
         }
-        config["timeout_seconds"] = 1
-        database.db_ci_config_set("owner", "timeout", json.dumps(config))
-        run_id = self._queued_run("timeout")
-        row = (run_id, "owner", "timeout", "manual", "main", commit, "{}")
+        commit = commit_legacy_config(bare, config)
         manager = CIManager(lambda *_: str(bare))
+        manager.started = True
+        run_id = await manager.enqueue("owner", "timeout", "manual", "main", commit)
+        row = manager.pending[run_id]
         await manager._execute(row)
 
         result = database.db_ci_run_get("owner", "timeout", run_id)
@@ -680,10 +722,7 @@ class CICoreTests(unittest.IsolatedAsyncioTestCase):
         subprocess.run(
             ["git", "clone", "--bare", str(source), str(bare)], check=True, capture_output=True
         )
-        commit = subprocess.check_output(
-            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
-        ).strip()
-        database.db_ci_config_set("owner", "windows", json.dumps({"command": "dir"}))
+        commit = commit_legacy_config(bare, {"command": "dir"})
         run_id = self._queued_run("windows")
         manager = CIManager(lambda *_: str(bare))
         await asyncio.wait_for(

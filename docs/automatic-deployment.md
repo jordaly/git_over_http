@@ -2,9 +2,20 @@
 
 [JSON reference](ci-options.md#every-deployment-option) · [Multiple-target example](pipeline-examples.md#one-pipeline-separate-named-targets)
 
-Each target is a named object in top-level `deployments` in **CI → Settings →
-Configuration JSON**. `pipeline` references an independently configured pipeline.
-There are no shared defaults or inherited deployment notification settings.
+Each target is a named object in the top-level `deployments` array of the full
+grouped **`ci/config.json`** committed in the repository. `pipeline` references an
+independently configured pipeline. There are no shared defaults or inherited
+deployment notification settings.
+
+Deployments are trusted host execution. Every enabled deployment requires the
+exact `owner/repo` to appear in the server environment variable
+**`PYGITHOST_CI_TRUSTED_REPOSITORIES`** (comma- or newline-separated, default
+empty). Use exact names only; wildcards, patterns and malformed entries are
+rejected. Adding a deployment or setting a host runner in Git does not authorize
+it. The check is repeated at execution time, including for reruns and historical
+snapshots. Removing authorization stops future host execution. A parseable
+configuration denied by the guard keeps its declared branch policies, but the
+queued run fails during configuration before commands execute.
 
 ## Safe first run
 
@@ -16,8 +27,9 @@ set -eu
 printf 'Would deploy commit %s from pipeline %s\n' "$1" "$PYGITHOST_PIPELINE"
 ```
 
-Make it executable and readable by the server's unprivileged OS account. Then save
-this complete example, adapting the test command for your project:
+Make it executable and readable by the server's unprivileged OS account. Commit
+this complete example as `ci/config.json`, adapting the test command for your
+project (do not paste it into a page):
 
 ```json
 {
@@ -36,11 +48,18 @@ this complete example, adapting the test command for your project:
 ```
 
 Omitted CI execution uses built-in defaults, initially Docker; prepare
-the image and dependencies first. Queue `release` manually to verify tests first;
-no manual-trigger flag is necessary. **Manual runs never deploy.** Push
-an actual update to `main` after saving to exercise deployment; inspect the run's
-deployment section and **CI → Deployments**. Only replace the harmless script with
-a real deployment tool after verifying the tested commit and target.
+the image and dependencies first. Add the repository to the trust allowlist only
+after reviewing the script and target. Queue `release` manually to verify tests
+first; no manual-trigger flag is necessary. **Manual runs never deploy.** Push
+an actual update to `main` after trust is configured to exercise deployment;
+inspect the run's deployment section and **CI → Deployments**. Only replace the
+harmless script with a real deployment tool after verifying the tested commit and
+target.
+
+The configuration is read from the recorded commit. Committing a change does not
+run a deployment; a qualifying successful branch update is still required. There
+is no automatic migration of older deployment definitions and no replay of
+historical attempts.
 
 ## Conditions and execution
 
@@ -72,7 +91,8 @@ a real deployment tool after verifying the tested commit and target.
 ## Named deployment steps
 
 Instead of a single script, insert a target like this into the top-level
-`deployments` array in Settings (the referenced `release` pipeline must exist):
+`deployments` array in committed `ci/config.json` (the referenced `release`
+pipeline must exist):
 
 ```json
 {
@@ -88,22 +108,24 @@ Instead of a single script, insert a target like this into the top-level
 }
 ```
 
-Review commands and target addresses before enabling. `steps` uses the same
-checkout, timeout and credentials as a script target. A target accepts up to 64
-steps, each containing a nonempty `name` and `run` string. Commands execute
-sequentially in fresh host shells in the tested commit's checkout, sharing that
-working directory and its files, but not shell state, exported variables or `cd`
-changes. `run_with` applies to script execution, not step commands. The example
-uses POSIX shell syntax; adapt commands and environment-variable syntax for
-Windows hosts.
+Review commands and target addresses, commit the document, and configure the trust
+allowlist before enabling. `steps` uses the same checkout, timeout and credentials
+as a script target. A target accepts up to 64 steps, each containing a nonempty
+`name` and `run` string. Commands execute sequentially in fresh host shells in the
+tested commit's checkout, sharing that working directory and its files, but not
+shell state, exported variables or `cd` changes. `run_with` applies to script
+execution, not step commands. The example uses POSIX shell syntax; adapt commands
+and environment-variable syntax for Windows hosts.
 
 All steps share one deployment timeout, independent of CI's timeout. A failed step
 stops the target and skips its remaining steps. Each step receives the deployment
 environment described above, including `PYGITHOST_WORKTREE`; use
 `PYGITHOST_COMMIT` explicitly, since step commands do not receive the script's
-automatic SHA argument. Page-managed CI variables and CI artifacts are not
-automatically supplied to deployment steps; commit required files to the
-repository or fetch artifacts with an authenticated API call.
+automatic SHA argument. Repository page variables scoped to **Deployments only**
+are resolved live for deployment scripts and steps. Ordinary non-PR CI values and
+protected-branch values are not sent to deployments, and deployment-only values
+are not sent to CI test jobs. CI artifacts are not automatically supplied; commit
+required files to the repository or fetch artifacts with an authenticated API call.
 
 ## Live output and status
 
@@ -151,8 +173,9 @@ pipes or command chaining is performed for `run_with`. Quote paths containing
 spaces; use forward slashes for Windows executable paths.
 
 Direct execution on POSIX requires a shebang. Inline content is limited to 64 KiB,
-stored in SQLite, written to a private temporary file only during deployment, and
-removed afterward. Timeout defaults to 600 seconds, maximum 86400.
+committed in `ci/config.json`, captured in the run snapshot, written to a private
+temporary file only during deployment, and removed afterward. Timeout defaults to
+600 seconds, maximum 86400.
 
 ## SSH to Ubuntu
 
@@ -180,8 +203,18 @@ does not inherit arbitrary server environment variables.
 
 Host scripts are trusted code with the server user's filesystem/network access.
 Protect scripts and credentials from CI job writes. Owner-only permissions do not
-isolate processes running as that same user. JSON, script snapshots and logs are
-not secret-redacted. Use a dedicated unprivileged account and restrict backups.
+isolate processes running as that same user. Committed JSON/script snapshots, live
+deployment-only page values, remote assignments and logs are not secret-redacted.
+Page values are not stored in new run snapshots, but they can appear in execution
+assignments and logs. Use a dedicated unprivileged account and restrict backups.
+
+Repository writers cannot grant themselves host execution by editing
+`ci/config.json`. An administrator must explicitly authorize the exact
+`owner/repo` in `PYGITHOST_CI_TRUSTED_REPOSITORIES`; wildcards and malformed names
+are rejected. Ordinary Docker and remote-Docker jobs do not require that entry.
+The trust check also applies when a historical snapshot is rerun after authorization
+changes. A malformed committed configuration separately fails closed, requiring CI
+and protecting all direct branches until an operator repairs the file.
 
 Deployment status and bounded logs are separate from test results; a deployment
 failure does not turn successful tests into failing tests. History survives CI
@@ -198,7 +231,7 @@ manager, remote runner protocol or built-in rollback.
 
 ## Shared helpers and named steps
 
-Administrator-managed deployment `script_content` or `script` may be combined
+A project-defined deployment `script_content` or `script` may be combined
 with named `steps`. The helper is staged once; commands can invoke its absolute
 path through `PYGITHOST_DEPLOY_SCRIPT`, for example
 `sh "$PYGITHOST_DEPLOY_SCRIPT" release`. With named steps the helper is not
@@ -209,6 +242,6 @@ ordered execution and stop-on-failure semantics.
 Repository-scoped deployment history, step results and bounded logs are available
 through the [REST API](api.md#deployment-diagnostics-and-preflight).
 Administrators can also request advisory preflight checks without executing
-deployment code. This does not grant trust to repository scripts or bypass CI and
-branch-tip checks. Controlled retries and restricted automation tokens remain
+deployment code. This does not grant trust to repository deployments or bypass CI
+and branch-tip checks. Controlled retries and restricted automation tokens remain
 unfinished.

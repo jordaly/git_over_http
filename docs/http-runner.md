@@ -73,12 +73,13 @@ artifact transfer back to Windows. Existing application pipelines were not chang
    pipeline; see [Docker images and dependencies](#docker-images-and-dependencies).
 3. **Authorize the repository** with a replacement token containing the complete
    desired repository list; see [Change authorized repositories](#change-authorized-repositories).
-4. Open the repository's **CI → Settings → Configuration JSON**. In the chosen
-   pipeline's `execution`, set `runner` to `remote-docker` and `image` to the
-   prepared local or registry image name. Preserve its other triggers, steps and policies;
-   do not replace a working configuration with the minimal example below.
-5. Save, then use the repository's **CI** manual-run action if enabled, or push a
-   real update if its push trigger is enabled.
+4. Edit the repository's committed **`ci/config.json`**. In the chosen pipeline's
+   `execution`, set `runner` to `remote-docker` and `image` to the prepared local or
+   registry image name. Preserve its other triggers, steps and policies; do not
+   replace a working configuration with the minimal example below. Referenced
+   pipeline files must remain under `ci/`.
+5. Commit and push the change, then use the repository's **CI** manual-run action
+   if enabled, or push a real update if its push trigger is enabled.
 6. Open the run and check its steps, logs and artifacts. Ubuntu service logs alone
    do not establish that a job succeeded.
 
@@ -220,8 +221,10 @@ To retain a generated file, add this field alongside the pipeline's `steps`:
 ```
 
 The command must actually create that file. View/download collected artifacts from
-the run in GitHost. Secrets should be configured through existing trusted CI
-variables, never baked into an image or put in artifact files.
+the run in GitHost. Configure credentials through page-managed CI values with the
+least permissive scope, never in an image or artifact file. Page values are resolved
+live and omitted from new stored run snapshots, but the remote assignment and logs
+can contain them; unmerged PR checks receive none.
 
 ## Ubuntu setup
 

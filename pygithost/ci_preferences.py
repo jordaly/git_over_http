@@ -15,20 +15,44 @@ RETENTION = {
     "run_retention_count": 1000000,
 }
 EXECUTION = {"runner", "image", "timeout_seconds", "cancel_superseded"}
+# ``env_scopes`` is metadata for repository values.  The empty identity is the
+# repository-wide environment; other identities are pipeline names.
+ENV_SCOPES = {"ordinary", "protected", "deployment"}
+DEFAULT_ENV_SCOPE = "ordinary"
 
 
 def validate(values: object) -> JsonObject:
     from .ci import validate_config
 
     if not isinstance(values, dict) or set(values) - (
-        set(RETENTION) | EXECUTION | {"env", "pipeline_env"}
+        set(RETENTION) | EXECUTION | {"env", "pipeline_env", "env_scopes"}
     ):
         raise ValueError("Invalid CI preferences.")
     result: JsonObject = copy.deepcopy(values)
     for key, value in result.items():
         if value is None:
             continue
-        if key == "pipeline_env":
+        if key == "env_scopes":
+            if not isinstance(value, dict) or len(value) > 17:
+                raise ValueError("Invalid environment scopes.")
+            for identity, entries in value.items():
+                if not isinstance(identity, str) or (
+                    identity and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", identity)
+                ):
+                    raise ValueError("Invalid pipeline name in environment scopes.")
+                if (
+                    not isinstance(entries, dict)
+                    or len(entries) > 64
+                    or any(
+                        not isinstance(name, str)
+                        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                        or not isinstance(scope, str)
+                        or scope not in ENV_SCOPES
+                        for name, scope in entries.items()
+                    )
+                ):
+                    raise ValueError("Invalid environment scope.")
+        elif key == "pipeline_env":
             if not isinstance(value, dict) or len(value) > 16:
                 raise ValueError("Invalid pipeline environment variables.")
             for name, env in value.items():
@@ -106,14 +130,63 @@ def environment(
     repository_values: Mapping[str, Any],
     legacy: Mapping[str, Any],
     pipeline: str,
+    *,
+    repository_owned: bool = False,
 ) -> dict[str, str]:
     # A saved variables form owns the repository's variables, including an empty
     # form used to remove old JSON values. Otherwise retain legacy definitions.
     result: dict[str, str] = dict(global_values.get("env") or {})
-    if "env" not in repository_values and "pipeline_env" not in repository_values:
+    if repository_owned or (
+        "env" not in repository_values and "pipeline_env" not in repository_values
+    ):
         result.update(legacy)
     result.update(repository_values.get("env") or {})
     result.update((repository_values.get("pipeline_env") or {}).get(pipeline, {}))
+    return result
+
+
+def page_environment(
+    global_values: Mapping[str, Any],
+    repository_values: Mapping[str, Any],
+    pipeline: str,
+    *,
+    event: str,
+    protected: bool = False,
+    deployment: bool = False,
+) -> dict[str, str]:
+    """Resolve page-managed values that are safe for one execution phase.
+
+    Unmerged pull-request events never receive page-managed values, including
+    server-wide defaults.  Scopes are independent: an ordinary value is not
+    reused during deployment, a protected-branch value never authorizes a
+    deployment, and a deployment value is not available to ordinary runs.
+    """
+    from .ci import UNMERGED_PR_EVENTS
+
+    if event in UNMERGED_PR_EVENTS:
+        return {}
+    result: dict[str, str] = {}
+    scopes = repository_values.get("env_scopes") or {}
+    for values, restrictions in (
+        (global_values.get("env") or {}, {}),
+        (repository_values.get("env") or {}, scopes.get("") or {}),
+        (
+            (repository_values.get("pipeline_env") or {}).get(pipeline, {}),
+            scopes.get(pipeline) or {},
+        ),
+    ):
+        for name, value in values.items():
+            # A restricted override must not silently fall back to a value
+            # supplied by a broader scope.
+            result.pop(name, None)
+            scope = restrictions.get(name, DEFAULT_ENV_SCOPE)
+            allowed = (
+                (scope == "ordinary" and not deployment)
+                or (scope == "protected" and protected and not deployment)
+                or (scope == "deployment" and deployment)
+            )
+            if allowed:
+                result[name] = value
     return result
 
 
@@ -140,6 +213,8 @@ def apply(
     config: JsonObject,
     global_values: Mapping[str, Any],
     repository_values: Mapping[str, Any],
+    *,
+    repository_owned: bool = False,
 ) -> JsonObject:
     from .ci import default_config
 
@@ -151,7 +226,13 @@ def apply(
             value = builtins[key]
             if document is not None and not explicit_execution(document, identity, key):
                 item[key] = value
-        item["env"] = environment(global_values, repository_values, item.get("env", {}), identity)
+        item["env"] = environment(
+            global_values,
+            repository_values,
+            item.get("env", {}),
+            identity,
+            repository_owned=repository_owned,
+        )
     config.update(retention(global_values, repository_values, legacy_retention(config)))
     return config
 

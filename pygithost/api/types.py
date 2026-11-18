@@ -188,6 +188,10 @@ class Deployment(TypedDict):
 class SettingsSnapshot(TypedDict):
     configuration: JSONObject
     revision: str
+    source_commit: str | None
+    source_path: str
+    status: str
+    error: str | None
 
 
 class DeploymentStep(TypedDict):
@@ -255,7 +259,9 @@ class AppContext(Protocol):
 
 
 class CIManager(Protocol):
-    async def config(self, owner: str, repo: str) -> DynamicJSONObject: ...
+    async def config(
+        self, owner: str, repo: str, revision: str = "HEAD", *, include_secrets: bool = True
+    ) -> DynamicJSONObject: ...
     def pipelines(self, config: Mapping[str, Any]) -> list[DynamicJSONObject]: ...
     async def enqueue(
         self,

@@ -13,7 +13,7 @@ class DocumentationPageTests(unittest.TestCase):
         self.assertIn('id="repository-ci-directory"', start)
         self.assertIn("ci/config.json", start)
         self.assertIn("sh ci/test.sh", start)
-        self.assertIn(base + "?guide=examples#multiple-git-managed-pipelines", start)
+        self.assertIn(base + "?guide=examples", start)
         self.assertIn(base + "?guide=migration#move-root-files-into-ci", start)
         recipes = str(manual_content("examples", "", base))
         self.assertIn('id="multiple-git-managed-pipelines"', recipes)
@@ -24,24 +24,38 @@ class DocumentationPageTests(unittest.TestCase):
 
     def test_current_settings_workflow_and_file_reference_are_linked_in_page(self):
         base = "/r/team/repo/ci/docs"
+        start = str(manual_content("start", "", base))
+        self.assertIn(base + "?guide=migration", start)
+        self.assertIn("ci/config.json", start)
+        self.assertIn("no project JSON editor", start)
         recipes = str(manual_content("examples", "", base))
-        self.assertIn(base + "?guide=settings", recipes)
         self.assertIn(base + "?example=repository-pipeline", recipes)
+        self.assertIn("Commit it as", recipes)
+        self.assertIn("do not paste it into a page", recipes)
+        self.assertNotIn("repository-reference", recipes)
         settings = str(manual_content("settings", "", base))
-        self.assertIn("Use server default", settings)
-        self.assertIn("restart required", settings)
-        self.assertIn("omitted options", settings)
-        self.assertIn("built-in defaults", settings)
+        self.assertIn("There is no project JSON editor", settings)
+        self.assertIn("only environment variables/secrets", settings)
+        self.assertIn("PUT /ci/settings", settings)
+        self.assertIn("is disabled", settings)
+        self.assertIn("project retention has no separate page form", settings)
         migration = str(manual_content("migration", "", base))
-        self.assertIn("Previously saved page execution overrides are ignored", migration)
+        self.assertIn("Database definitions are ignored for execution", migration)
+        self.assertIn("The old page retention form is removed", migration)
+        self.assertIn(
+            "Current administrator authorization and page-managed values still apply", migration
+        )
         workflow = str(manual_content("workflow", "", base))
         self.assertIn("Collapse all folders", workflow)
         self.assertIn("Ctrl/⌘+S", workflow)
         self.assertIn("FOREIGN KEY constraint failed", workflow)
         self.assertIn("Discussion", workflow)
         self.assertIn("merge base", workflow)
-        reference = str(manual_content("reference", "repository-reference", base))
-        self.assertIn("ci/config.json", reference)
+        # The obsolete Settings-only reference is not a registry entry or file.
+        self.assertIsNone(manual_content("reference", "repository-reference", base))
+        self.assertNotIn("repository-reference", EXAMPLES)
+        reference = str(manual_content("reference", "all-options", base))
+        self.assertIn("Commit this configuration as ci/config.json", reference)
         self.assertIn('class="language-json"', reference)
 
     def test_current_json_examples_use_page_controls_for_variables_and_retention(self):
@@ -51,7 +65,10 @@ class DocumentationPageTests(unittest.TestCase):
         for _title, path in EXAMPLES.values():
             document = json.loads(Path(path).read_text())
             self.assertNotIn("env", document, path)
-            self.assertNotIn("retention", document, path)
+            if "retention" in document:
+                # Project retention belongs only in a full grouped Git document.
+                self.assertIsInstance(document.get("pipelines"), list, path)
+                self.assertNotIn("retention", document.get("settings", {}), path)
             for pipeline in document.get("pipelines", []):
                 self.assertNotIn("env", pipeline.get("execution", {}), path)
                 self.assertNotIn("manual", pipeline.get("triggers", {}), path)
@@ -146,8 +163,7 @@ class DocumentationBrowserTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="ci-browser-", dir="/tmp/opencode") as profile:
                 for path in (
                     "/ci/docs?example=all-options",
-                    "/ci/docs?example=repository-reference",
-                    "/ci/config",
+                    "/ci/docs?example=git-managed",
                 ):
                     with self.subTest(path=path):
                         url = f"http://127.0.0.1:{fixture.server.port}{fixture.base}{path}"
@@ -173,5 +189,28 @@ class DocumentationBrowserTests(unittest.TestCase):
                         self.assertIn('class="token property"', result.stdout)
                         self.assertIn('class="token string"', result.stdout)
                         self.assertIn('class="language-json"', result.stdout)
+                url = f"http://127.0.0.1:{fixture.server.port}{fixture.base}/ci/config"
+                result = subprocess.run(
+                    [
+                        os.environ["PYGITHOST_TEST_BROWSER"],
+                        "--headless",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-dev-shm-usage",
+                        f"--user-data-dir={profile}",
+                        "--dump-dom",
+                        "--virtual-time-budget=5000",
+                        url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+                self.assertIn("ci/config.json", result.stdout)
+                self.assertIn("settings-env-form", result.stdout)
+                self.assertNotIn('class="language-json"', result.stdout)
         finally:
             fixture.tearDown()

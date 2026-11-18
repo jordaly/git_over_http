@@ -1,14 +1,9 @@
-"""Administrator-only CI/deployment configuration using the UI's save path."""
+"""Administrator-only, read-only CI/deployment configuration from the repository."""
 
-import asyncio
-import json
-
-from .. import database
-from ..ci_config import editor_document
+from ..repository_ci import CONFIG_FILE
 from . import data
 from .errors import APIError
 from .types import APIContext, SettingsSnapshot
-from .validation import expected_revision, fields
 
 
 def authorize(api: APIContext) -> None:
@@ -18,12 +13,16 @@ def authorize(api: APIContext) -> None:
 
 
 async def snapshot(api: APIContext, owner: str, repo: str) -> SettingsSnapshot:
-    raw = await asyncio.to_thread(database.db_ci_config_get, owner, repo)
-    preferences = await asyncio.to_thread(database.db_ci_preferences_get, owner, repo)
-    config = await api.handler.server.ci_manager.config(owner, repo)
+    config = await api.handler.server.ci_manager.config(owner, repo, include_secrets=False)
+    commit = config.get("_configuration_commit")
+    document = config.get("_configuration_document")
     return {
-        "configuration": editor_document(config),
-        "revision": data.revision({"configuration": raw, "preferences": preferences}),
+        "configuration": document if isinstance(document, dict) else {},
+        "revision": data.revision({"commit": commit, "path": CONFIG_FILE}),
+        "source_commit": commit,
+        "source_path": CONFIG_FILE,
+        "status": config.get("_configuration_status", "unavailable"),
+        "error": config.get("_configuration_error"),
     }
 
 
@@ -37,32 +36,10 @@ async def read(api: APIContext, owner: str, repo: str) -> object:
 async def update(api: APIContext, owner: str, repo: str) -> tuple[int, dict[str, str]]:
     authorize(api)
     if api.request.method != "PUT":
-        raise APIError(405, "method_not_allowed", "Use PUT to replace CI/deployment configuration.")
-    document = api.document
-    fields(document, {"configuration", "expected_revision"}, {"configuration", "expected_revision"})
-    expected_revision(document)
-    if not isinstance(document["configuration"], dict):
-        raise APIError(422, "validation_error", "configuration must be a JSON object.")
-    if len(json.dumps(document["configuration"], ensure_ascii=False).encode("utf-8")) > 262144:
-        raise APIError(413, "request_too_large", "Configuration exceeds 256 KiB.")
-    async with api.handler.server.settings_lock:
-        current = await snapshot(api, owner, repo)
-        if current["revision"] != document["expected_revision"]:
-            raise APIError(
-                409, "revision_conflict", "Settings changed. Fetch the current revision."
-            )
-        try:
-            await api.handler.server.ci_manager.save_document(
-                owner, repo, document["configuration"], preserve_page_settings=True
-            )
-        except ValueError, RecursionError:
-            # Do not echo scripts, paths or environment values in error/audit output.
-            raise APIError(
-                422,
-                "validation_error",
-                "Invalid CI/deployment configuration. See the configuration JSON reference.",
-            ) from None
-        saved = await snapshot(api, owner, repo)
-        # Durable idempotency caches responses: never copy configuration secrets
-        # or executable payloads into the mutation audit table.
-        return 200, {"revision": saved["revision"]}
+        raise APIError(405, "method_not_allowed", "Use GET to read CI/deployment settings.")
+    raise APIError(
+        410,
+        "gone",
+        "CI configuration is repository-owned. Commit project pipeline definitions to "
+        "ci/config.json; this API only reads configuration and cannot replace it.",
+    )

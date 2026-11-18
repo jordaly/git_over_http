@@ -153,23 +153,38 @@ Never embed credentials in a clone URL or commit them in scripts.
 ## Manage settings in the browser
 
 Open **Admin → Settings** to edit the display name and browser favicon, basic server configuration,
-and server-wide CI variables and retention. Unlike appearance/CI preference changes, basic server
+and server-wide CI variables and retention. Unlike appearance and CI environment/default changes, basic server
 configuration is saved to the startup file for the **next restart**. Review allowed
 IPs, credentials, cookie security and storage paths before restarting; saving paths
 does not migrate data. Instances started programmatically without a config file
 show the basic fields read-only.
 
-Repository **CI → Settings** supplies per-pipeline execution JSON, environment variable
-rows and retention controls. Leave **Use server default** selected to inherit an
-individual retention limit. Execution and cancellation are per-pipeline JSON;
-omitted options use built-in defaults. See [Server and repository settings](server-settings.md)
-for a worked example and [Browser editing and pull requests](repository-workflow.md)
-for editing/committing from the web UI.
+Repository **CI → Settings** manages only environment variables and secrets.
+Pipeline, trigger, deployment, policy and optional retention definitions are read
+from the committed **`ci/config.json`**. There is no project JSON editor and no
+retention form on that page; administrator retention defaults remain under
+**Admin → Settings → Runs and artifacts**. Page values are resolved when a job
+executes, are not stored in new run snapshots, and are withheld from unmerged PR
+checks; repository rows may be scoped to ordinary non-PR CI, an authorized protected
+branch, or deployments only. Execution and cancellation are per-pipeline JSON;
+omitted options use built-in defaults. See
+[Server and repository settings](server-settings.md) for a worked example and
+[Browser editing and pull requests](repository-workflow.md) for editing/committing
+from the web UI.
 
-An unconfigured repository automatically looks for `ci/config.json`. Commit the
-[repository pipeline example](examples/ci/repository-pipeline.json) under that name,
-prepare the Python Docker image, and adapt its steps to your project. Manual runs
-always require write access and a runnable pipeline; they never deploy.
+Commit the [repository pipeline example](examples/ci/repository-pipeline.json) as
+`ci/config.json`, prepare the Python Docker image, and adapt its steps to your
+project. Validate before committing with `python -m pygithost ci validate`
+(add `--rev HEAD` for the committed version), or choose a branch in **CI → Runs**
+and select **Check configuration** to see its exact configuration commit and status
+without queueing. A missing file creates no run; an invalid file fails
+configuration, and a malformed committed file fails closed with CI required and all
+direct branches protected until repaired through Git or the server filesystem.
+Manual runs always require write access and a runnable pipeline; they never deploy,
+and a manual request is rejected if the branch moved after the configuration check.
+Host jobs and enabled deployments additionally require administrator authorization
+in `PYGITHOST_CI_TRUSTED_REPOSITORIES` using exact `owner/repo` names; wildcards and
+malformed entries are rejected.
 
 ## Development checks
 

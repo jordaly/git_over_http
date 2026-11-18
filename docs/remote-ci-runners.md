@@ -87,7 +87,7 @@ Ubuntu; disabling TLS verification is not an acceptable deployment shortcut.
    checkout at the recorded commit. PR jobs merge the recorded head commit into
    the recorded base commit, preserving current CI semantics.
 5. **Execute:** the worker runs sequential pipeline steps in Docker using the
-   configuration snapshot and explicit job environment.
+   assigned job configuration and its explicit live job environment.
 6. **Report:** the worker sends ordered log chunks, step updates, and regular
    heartbeats. Heartbeat responses can instruct it to cancel.
 7. **Finish:** the worker uploads allowed artifacts and submits a final result.
@@ -140,8 +140,8 @@ A pool is a named group of eligible workers. For example, `ubuntu` could contain
 two general-purpose machines, while `gpu` contains one specialized machine. A
 pool can contain just one worker.
 
-Repository settings choose local execution or a remote pool. The server assigns
-work to a connected eligible worker with free capacity. Labels may later narrow
+A pipeline's committed `execution.runner` chooses local or remote execution. The
+server assigns work to a connected eligible worker with free capacity. Labels may later narrow
 selection by operating system, architecture, or specialized hardware. Pool and
 label membership must be administrator-controlled, not trusted solely because a
 worker claims a label.
@@ -195,9 +195,15 @@ for multiple web servers sharing the SQLite database.
   Repository code must not control Docker mounts, privileged mode, or the worker
   service configuration.
 
-Current CI environment settings are plaintext configuration, not a secret store,
-and output is not redacted. Remote execution does not change that. A future
-secrets feature needs its own design and trust model.
+Page-managed CI values are plaintext configuration, not an encrypted secret store,
+and output is not redacted. They are resolved when execution begins and are not
+copied into new stored run snapshots, but remote job assignments and logs can
+contain them. Unmerged pull-request checks receive no page-managed values. Repository
+rows may be limited to ordinary non-PR CI, administrator-authorized protected
+branches, or deployments only; see
+[Secrets, retention and administrator defaults](ci-options.md#secrets-retention-and-administrator-defaults).
+Remote execution does not change these boundaries. A future encrypted secrets
+feature would need its own design and trust model.
 
 Workers are trusted executors: a compromised worker can read assigned source and
 forge execution results. Repository eligibility is therefore a security boundary,
@@ -227,7 +233,8 @@ The eventual installation procedure would be:
 4. Register the worker on the server and securely provision its token.
 5. Pre-pull the approved Docker images on the worker.
 6. Install and enable a systemd service.
-7. Select the remote pool in repository CI settings and run a test pipeline.
+7. Configure the pipeline's committed `execution.runner` for the remote pool and
+   run a test pipeline.
 
 Illustrative configuration—not an implemented file format:
 

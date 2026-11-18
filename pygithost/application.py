@@ -14,6 +14,7 @@ import re
 import secrets
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -41,6 +42,7 @@ from .context import AppContext
 from .database import (
     _db_init,
     _ensure_dir,
+    configure_retention_head_resolver,
     db_audit_append,
     db_ci_artifact_get,
     db_ci_artifacts_list,
@@ -922,6 +924,19 @@ def _repo_bare_path(owner_ui: str, repo: str) -> str:
     return _repo_git_path(owner_ui, repo)
 
 
+def _retention_head_commit(owner: str, repo: str) -> str | None:
+    """Resolve the commit cleanup must have verified before deleting data."""
+    from .repository_ci import resolve_commit
+
+    try:
+        return resolve_commit(_repo_bare_path(owner, repo), "HEAD")
+    except OSError, ValueError, subprocess.SubprocessError:
+        return None
+
+
+configure_retention_head_resolver(_retention_head_commit)
+
+
 def _git_dir_path_info(owner_ui: str, repo: str, rest: list[str]) -> str | None:
     """
     Build the PATH_INFO git-http-backend needs for the resolved repository.
@@ -1522,6 +1537,8 @@ _STATUS_REASONS = {
     401: "Unauthorized",
     403: "Forbidden",
     404: "Not Found",
+    405: "Method Not Allowed",
+    410: "Gone",
     415: "Unsupported Media Type",
     500: "Internal Server Error",
 }
@@ -2692,6 +2709,13 @@ class GitHTTPHandler:
         form = await self._read_form_urlencoded()
         if not self._valid_settings_csrf(form):
             return await self._forbidden(b"403 Forbidden: invalid security token.\n")
+        if form.get("action") != "ci_environment":
+            return await _send_text(
+                self.request,
+                400,
+                "Only repository environment variables can be saved here. Configure project "
+                "retention in ci/config.json; server defaults remain on the server settings page.\n",
+            )
         try:
             async with self.server.settings_lock:
                 _global, values = await _call_in_thread(db_ci_preferences_get, owner, repo)
@@ -2701,12 +2725,11 @@ class GitHTTPHandler:
             return await self._ui_ci_config(
                 owner, repo, notice=str(exc), error=True, preferences_submitted=form
             )
-        message = (
-            "Repository settings saved. Retention limits apply to stored runs and artifacts immediately."
-            if form["action"] == "ci_retention"
-            else "Repository settings saved. New runs use the updated settings."
+        return await self._ui_ci_config(
+            owner,
+            repo,
+            notice="Repository settings saved. New runs use the updated environment variables.",
         )
-        return await self._ui_ci_config(owner, repo, notice=message)
 
     async def _ui_admin_users(self, notice: str = "", notice_kind: str = "ok") -> None:
         if not _require_admin(self):
@@ -5034,19 +5057,20 @@ document.addEventListener("DOMContentLoaded", function() {{
             form_html = safe_html(
                 html_t(
                     t'<form method="POST" action="{base}/pulls/{pr_id}/resolve" class="pr-resolve-form">'
+                    t'<input type="hidden" name="csrf" value="{self._email_csrf_token()}">'
+                    t"{join_html(rows)}"
                     t"<label>Merge commit message</label>"
                     t'<textarea name="message" required maxlength="4000">{default_message}</textarea>'
                     t'<p class="muted">Applying the resolution creates a merge commit on <code>{src_branch}</code>. Edit the marked sections (<<<<<<<, =======, >>>>>>>), then apply.</p>'
                     t'<button type="submit">Apply resolution</button></form>'
                 )
             )
-        rows_html = join_html(rows) if rows else safe_html("")
         body_html = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><div><h2>Resolve conflicts — PR #{pr_id}</h2>
 <div class="muted"><code>{src_branch}</code> ← <code>{tgt_branch}</code></div></div>
 <div><a class="pill" href="{base}/pulls/{pr_id}">Back to PR</a> <a class="pill" href="{base}/pulls/{pr_id}/resolve/ide">Open in Web IDE</a></div></div>
 {notice_html}{empty}{overflow}
-<div class="box pr-resolve-files">{rows_html}{form_html}</div>"""
+<div class="box pr-resolve-files">{form_html}</div>"""
         )
         await _send_html(
             self.request,
@@ -5062,34 +5086,11 @@ document.addEventListener("DOMContentLoaded", function() {{
         repo = unquote(repo)
         if not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
-        pr = await asyncio.to_thread(db_pr_get, pr_id)
-        if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
-            return await self._not_found()
-        (
-            _id,
-            _owner,
-            _repo,
-            _title,
-            _body,
-            src_branch,
-            tgt_branch,
-            _author,
-            _status,
-            _created,
-            _closed,
-            _merged,
-            _method,
-            _mcommit,
-        ) = pr
-        repo_git = _repo_bare_path(owner, repo)
-        src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
-        tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
-        merge_base = await _git_merge_base(repo_git, tgt, src) if (src and tgt) else None
-        if not (src and tgt and merge_base):
-            return await self._ui_pull_resolve(
-                owner, repo, pr_id, "Unable to apply a resolution now.", "warn"
-            )
         form = await self._read_form_urlencoded()
+        if not secrets.compare_digest(
+            form.get("csrf", "").encode(), self._email_csrf_token().encode()
+        ):
+            return await self._forbidden(b"403 Forbidden: invalid security token.\n")
         try:
             count = min(
                 pr_resolver.MAX_CONFLICT_FILES, max(0, int(form.get("conflict_count") or 0))
@@ -5103,20 +5104,30 @@ document.addEventListener("DOMContentLoaded", function() {{
             content = form.get(f"content_{index}") or ""
             if path:
                 resolutions.append((path, content, delete))
-        message = form.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
         user = getattr(self, "remote_user", None) or "Browser user"
         try:
-            commit = await asyncio.to_thread(
-                pr_resolver.apply_resolution,
-                repo_git,
-                merge_base,
-                src,
-                tgt,
-                src_branch,
-                resolutions,
-                message,
-                user,
-            )
+            lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
+            async with lock:
+                state = await self._ui_pull_resolve_poststate(owner, repo, pr_id)
+                if not state:
+                    return await self._not_found()
+                src_branch, tgt_branch, src, tgt, merge_base, repo_git = state
+                blocked = await self._pull_resolution_policy_error(owner, repo, src_branch)
+                if blocked:
+                    status, error = blocked
+                    return await _send_response(self.request, status, error.encode())
+                message = form.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
+                commit = await asyncio.to_thread(
+                    pr_resolver.apply_resolution,
+                    repo_git,
+                    merge_base,
+                    src,
+                    tgt,
+                    src_branch,
+                    resolutions,
+                    message,
+                    user,
+                )
         except pr_resolver.ResolverError as exc:
             return await self._ui_pull_resolve(owner, repo, pr_id, str(exc), "warn")
         await asyncio.to_thread(
@@ -5152,12 +5163,23 @@ document.addEventListener("DOMContentLoaded", function() {{
             "ok",
         )
 
+    async def _pull_resolution_policy_error(
+        self, owner: str, repo: str, source_branch: str
+    ) -> tuple[int, str] | None:
+        """Check the source-branch write under the repository push lock."""
+        policy = await self.server.ci_manager.config(owner, repo, include_secrets=False)
+        if policy.get("_configuration_git_error"):
+            return 503, "Repository CI policy cannot be verified."
+        if protected_branch(policy, source_branch):
+            return 403, "Conflict resolution cannot write to a protected source branch."
+        return None
+
     async def _ui_pull_resolve_poststate(
         self, owner: str, repo: str, pr_id: int
     ) -> tuple[str, str, str, str, str, str] | None:
         """Shared validation for the resolve flows: (pr row, branches, commits) or error page."""
         pr = await asyncio.to_thread(db_pr_get, pr_id)
-        if not pr or pr[1] != unquote(owner) or pr[2] != unquote(repo) or pr[8] != "open":
+        if not pr or pr[1] != owner or pr[2] != repo or pr[8] != "open":
             return None
         (
             _id,
@@ -5175,7 +5197,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             _method,
             _mcommit,
         ) = pr
-        repo_git = _repo_bare_path(unquote(owner), unquote(repo))
+        repo_git = _repo_bare_path(owner, repo)
         src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
         tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
         merge_base = await _git_merge_base(repo_git, tgt, src) if (src and tgt) else None
@@ -5217,16 +5239,6 @@ document.addEventListener("DOMContentLoaded", function() {{
             payload = json.loads(form.get("payload", "{}"))
             if not isinstance(payload, dict):
                 raise ValueError("Invalid resolution request.")
-            state = await self._ui_pull_resolve_poststate(owner, repo, pr_id)
-            if not state:
-                return await respond_json(
-                    409, {"error": "The pull request state changed. Reload the editor."}
-                )
-            src_branch, tgt_branch, src, tgt, merge_base, repo_git = state
-            if payload.get("branch") != src_branch:
-                return await respond_json(
-                    403, {"error": "Conflict resolution applies to the source branch only."}
-                )
             changes = payload.get("changes")
             if (
                 not isinstance(changes, dict)
@@ -5243,10 +5255,24 @@ document.addEventListener("DOMContentLoaded", function() {{
                 (path, value if value is None else str(value), value is None)
                 for path, value in changes.items()
             ]
-            message = payload.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
             # Serialize with pushes; the resolver CAS-protects the source branch itself.
             lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
             async with lock:
+                state = await self._ui_pull_resolve_poststate(owner, repo, pr_id)
+                if not state:
+                    return await respond_json(
+                        409, {"error": "The pull request state changed. Reload the editor."}
+                    )
+                src_branch, tgt_branch, src, tgt, merge_base, repo_git = state
+                if payload.get("branch") != src_branch:
+                    return await respond_json(
+                        403, {"error": "Conflict resolution applies to the source branch only."}
+                    )
+                blocked = await self._pull_resolution_policy_error(owner, repo, src_branch)
+                if blocked:
+                    status, error = blocked
+                    return await respond_json(status, {"error": error})
+                message = payload.get("message") or f"Merge branch '{tgt_branch}' into {src_branch}"
                 commit = await asyncio.to_thread(
                     pr_resolver.apply_resolution,
                     repo_git,
@@ -5433,7 +5459,17 @@ document.addEventListener("DOMContentLoaded", function() {{
             repo_git = _repo_bare_path(owner, repo)
             tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
             src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
+            # CI requirements are repository-wide and come from the default
+            # branch. The exact target commit still selects the required checks.
             policy = await self.server.ci_manager.config(owner, repo)
+            if policy.get("_configuration_git_error"):
+                return await self._ui_pull_view(
+                    owner,
+                    repo,
+                    pr_id,
+                    "Merge blocked: repository CI policy cannot be verified.",
+                    "warn",
+                )
             check = await self.server.ci_manager.merge_check(
                 owner, repo, pr_id, tgt or "", src or "", tgt_branch
             )
@@ -5894,8 +5930,27 @@ document.addEventListener("DOMContentLoaded", function() {{
                 str(results_html).encode("utf-8"),
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
             )
-        manual_options = join_html([html_t(t'<option value="{b}">{b}</option>') for b in branches])
-        config = await self.server.ci_manager.config(owner, repo)
+        selected_branch = (query_params.get("run_branch") or [""])[0]
+        if selected_branch not in branches:
+            default_branch = await _git_default_branch(_repo_bare_path(owner, repo))
+            selected_branch = (
+                default_branch if default_branch in branches else next(iter(branches), "")
+            )
+        manual_options = join_html(
+            html_t(
+                t'<option value="{b}"{safe_html(" selected" if b == selected_branch else "")}>{b}</option>'
+            )
+            for b in branches
+        )
+        config = await self.server.ci_manager.config(
+            owner,
+            repo,
+            "refs/heads/" + selected_branch if selected_branch else "HEAD",
+            include_secrets=False,
+        )
+        config_commit = config.get("_configuration_commit") or ""
+        config_status = config.get("_configuration_status", "unavailable")
+        config_error = config.get("_configuration_error") or ""
         pipelines = CIManager.pipelines(config)
         pipeline_options = join_html(
             [
@@ -5911,6 +5966,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 for item in pipelines
             )
             and branches
+            and config_status in ("valid", "blocked")
             and _has_write_scope(self)
         )
         disabled = safe_html("" if manual_enabled else " disabled")
@@ -5923,7 +5979,9 @@ document.addEventListener("DOMContentLoaded", function() {{
             safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
         )
         body = html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><h2>CI runs</h2></div>{notice_html}
-<div class="box ci-compact"><form class="ci-toolbar" method="POST" action="{base}/ci/run"><strong>Run manually</strong><select aria-label="Pipeline" name="pipeline">{pipeline_options}</select><select aria-label="Branch to run" name="branch" required>{manual_options}</select> <button type="submit"{disabled}>Queue run</button><small class="muted">{manual_notice}</small></form></div>{filter_form}{results_html}
+<div class="box ci-compact"><form class="ci-toolbar" method="GET" action="{base}/ci"><label>Branch to validate<select name="run_branch" required>{manual_options}</select></label><button type="submit">Check configuration</button></form>
+<p>Configuration: <strong>{config_status}</strong> <code>{config_commit}</code> {config_error}</p>
+<form class="ci-toolbar" method="POST" action="{base}/ci/run"><strong>Run manually</strong><input type="hidden" name="branch" value="{selected_branch}"><input type="hidden" name="sha" value="{config_commit}"><select aria-label="Pipeline" name="pipeline">{pipeline_options}</select><button type="submit"{disabled}>Queue run</button><small class="muted">{manual_notice}</small></form></div>{filter_form}{results_html}
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>''')
         await _send_html(
             self.request,
@@ -6063,7 +6121,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
 <section class="box ci-run-overview" aria-label="Run summary"><div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
 {warning_html}{reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
-<details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Pipeline</dt><dd>{payload.get("pipeline_id", "default")}</dd><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
+<details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Pipeline</dt><dd>{payload.get("pipeline_id", "default")}</dd><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Configuration commit</dt><dd><code>{payload.get("configuration_commit", "—")}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
 <pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details>{deployment_html}</div>''')
         )
@@ -6183,7 +6241,14 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         )
         body = safe_html(
             html_t(t'''<main class="ci-page">{_ci_tabs(base, "docs")}<div class="topbar"><h2>CI documentation</h2></div>
-<section class="box"><h2>Repository CI files</h2><p>Keep repository-owned pipeline JSON and helper scripts under <code>ci/</code>. Repositories without saved settings automatically discover <code>ci/config.json</code>; other files require explicit Settings references. Commands and file references remain relative to the checkout root.</p><p>Commit a pipeline containing named steps, not the Settings reference document. Variables, secrets and retention remain in the settings controls. Existing saved root-file references still work; automatically discovered root files must move to <code>ci/config.json</code>.</p><nav class="row" aria-label="Repository CI setup"><a href="{base}/ci/docs?guide=start#repository-ci-directory">Directory layout</a><a href="{base}/ci/docs?guide=examples#multiple-git-managed-pipelines">Multiple pipeline files</a><a href="{base}/ci/docs?guide=migration#move-root-files-into-ci">Move existing CI files</a><a href="{base}/ci/docs?example=repository-pipeline">Repository pipeline example</a></nav></section>
+<section class="box"><h2>Repository CI files</h2>
+<ol>
+<li>Commit <code>ci/config.json</code> with a simple steps pipeline or a full configuration with named pipelines and deployments. This is the only project configuration entry point. Any referenced pipeline files must also be under <code>ci/</code>; commands run from the checkout root.</li>
+<li>Keep credentials out of Git. Add them in <a href="{base}/ci/config">CI → Settings</a>, where repository secrets and environment variables are still managed.</li>
+<li>Push the commit, then check <a href="{base}/ci">CI → Runs</a>. You can queue a manual run to verify the configuration without deploying.</li>
+</ol>
+<p>Upgrading from the old editor? Move the saved definitions into <code>ci/config.json</code>; they are not imported automatically. Host jobs and enabled deployments still require administrator authorization.</p>
+<nav class="row" aria-label="Repository CI setup"><a href="{base}/ci/docs?guide=start#repository-ci-directory">Directory layout</a><a href="{base}/ci/docs?guide=examples#multiple-git-managed-pipelines">Multiple pipeline files</a><a href="{base}/ci/docs?guide=migration">Migration guide</a><a href="{base}/ci/docs?example=repository-pipeline">Repository pipeline example</a></nav></section>
 <nav class="row" aria-label="Documentation sections">{guide_links}</nav><section class="box"><h2>Complete JSON examples</h2><nav class="row" aria-label="Configuration examples">{example_links}</nav></section>
 <article id="ci-configuration-guide" class="box ci-guide">{content}</article></main><script src="/static/ci-docs.js" defer></script>''')
         )
@@ -6196,7 +6261,6 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         owner: str,
         repo: str,
         notice: str = "",
-        submitted: str | None = None,
         error: bool = False,
         preferences_submitted: dict[str, str] | None = None,
     ) -> None:
@@ -6207,19 +6271,11 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\\n")
-        from .ci_config import EXAMPLE, editor_document
-
         config = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        from . import ci_preferences
         from .database import db_ci_preferences_get
         from .settings_pages import preferences_forms
 
-        document = ci_preferences.editor_document(editor_document(config))
-        text = submitted if isinstance(submitted, str) else json.dumps(document, indent=2)
-        from .ci_schema import group_document
-
-        example = json.dumps(ci_preferences.editor_document(group_document(EXAMPLE)), indent=2)
         notice_html = (
             safe_html(
                 html_t(t'<div class="{"warn" if error else "ok"}" role="alert">{notice}</div>')
@@ -6227,18 +6283,41 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             if notice
             else safe_html("")
         )
+        if config.get("_repository_config_invalid"):
+            config_warning = safe_html(
+                '<p class="warn" role="alert">The repository CI configuration in '
+                "<code>ci/config.json</code> is invalid. Fix the file to run pipelines.</p>"
+            )
+        elif config.get("_repository_config_error"):
+            config_warning = safe_html(
+                '<p class="warn" role="alert">The repository CI configuration is blocked. '
+                "Host and deployment execution require administrator authorization; "
+                "check <code>ci/config.json</code> and server policy.</p>"
+            )
+        else:
+            config_warning = safe_html("")
         global_values, repository_values = await _call_in_thread(db_ci_preferences_get, owner, repo)
         raw_config = await _call_in_thread(db_ci_config_get, owner, repo)
         raw_document: dict[str, Any] = json.loads(raw_config) if raw_config else {}
         env = raw_document.get("env", {})
+        raw_pipelines = raw_document.get("pipelines", [])
+        legacy_pipelines = (
+            list(raw_pipelines.values())
+            if isinstance(raw_pipelines, dict)
+            else raw_pipelines
+            if isinstance(raw_pipelines, list)
+            else []
+        )
         legacy = (
             {
-                **ci_preferences.legacy_retention(raw_document),
                 "env": env,
                 "pipeline_env": {
-                    item["pipeline_id"]: item["env"]
-                    for item in CIManager.pipelines(raw_document)
-                    if item.get("env") and item["env"] != env
+                    str(item["pipeline_id"]): item["env"]
+                    for item in legacy_pipelines
+                    if isinstance(item, dict)
+                    and item.get("pipeline_id")
+                    and isinstance(item.get("env"), dict)
+                    and item["env"] != env
                 },
             }
             if raw_document
@@ -6253,24 +6332,9 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             pipelines=[item["pipeline_id"] for item in CIManager.pipelines(config)],
             submitted=preferences_submitted,
         )
-        body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><h2>CI configuration</h2><nav class="row"><a class="pill" href="/admin/settings">Server defaults</a><a class="pill" href="{base}/ci/docs">JSON reference and examples</a></nav></div>{notice_html}
-<form id="ci-settings-form" class="ci-settings-form" method="POST" action="{base}/ci/config">
-<section class="box">
-<label id="ci-config-label" for="ci-config-json">Configuration JSON (maximum 256 KiB)</label><div class="ci-config-editor-tools"><button id="ci-format-json" type="button" hidden>Format JSON</button><span id="ci-editor-status" role="status" class="muted">Plain-text fallback; loading Monaco…</span></div><div id="ci-config-editor" aria-labelledby="ci-config-label" hidden></div><textarea id="ci-config-json" name="configuration_json" rows="32" spellcheck="false">{text}</textarea>
-<p class="warn">Host jobs and deployment scripts run as the server user. Use trusted code only. Environment values and scripts are stored in plaintext; logs are not secret-redacted.</p>
-<p class="warn">Saving replaces pipeline configuration. Environment variables and retention are managed separately below. Removing pipelines stops new runs and pending deployments, not already queued CI commands.</p>
-<button type="submit">Save configuration</button><span id="ci-json-status" role="status" class="muted"></span></section></form>
-<details class="box ci-guide"><summary>Example: independent named pipelines</summary><pre class="language-json"><code class="language-json">{example}</code></pre></details>
-{preferences}<script src="/static/settings-pages.js" defer></script>
-<script src="/static/ci-docs.js" defer></script>
-<script src="/static/vendor/monaco/vs/loader.js" defer></script><script src="/static/ci-settings.js" defer></script>
-<script>(function() {{
-const form = document.getElementById("ci-settings-form");
-form.addEventListener("submit", event => {{
- let config; try {{ config = JSON.parse(form.elements.configuration_json.value); }}
- catch (error) {{ event.preventDefault(); document.getElementById("ci-json-status").textContent = "Invalid JSON: " + error.message; return; }}
-}});
-}})();</script>''')
+        body = html_t(t'''{_ci_tabs(base, "settings")}<div class="topbar"><h2>CI settings</h2><nav class="row"><a class="pill" href="/admin/settings">Server defaults</a><a class="pill" href="{base}/ci/docs">JSON reference and examples</a></nav></div>{notice_html}{config_warning}
+<section class="box"><h2>Project pipelines</h2><p>Project CI pipeline definitions are read from <code>ci/config.json</code> in the repository. Commit changes to that file; pipelines are not edited on this page. See the <a href="{base}/ci/docs?guide=start">CI quick start</a> or <a href="{base}/ci/docs?guide=migration">migration guide</a>.</p><p class="muted">Environment variables and secrets for this repository remain below. Retention limits come from repository configuration and the <a href="/admin/settings">server defaults</a>.</p><p class="muted">Host or deployment execution additionally requires administrator authorization; repository files cannot grant it.</p></section>
+{preferences}<script src="/static/settings-pages.js" defer></script>''')
         return await _send_html(
             self.request,
             200,
@@ -6289,31 +6353,14 @@ form.addEventListener("submit", event => {{
         ):
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
-            return await self._forbidden(b"403 Forbidden: admin required.\\n")
-        form = await self._read_form_urlencoded()
-        text = form.get("configuration_json", "")
-        try:
-            if len(text.encode("utf-8")) > 262144:
-                raise ValueError("Configuration JSON exceeds 256 KiB.")
-
-            def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-                result: dict[str, Any] = {}
-                for key, value in pairs:
-                    if key in result:
-                        raise ValueError(f"Duplicate JSON key: {key}")
-                    result[key] = value
-                return result
-
-            document = json.loads(text, object_pairs_hook=unique_keys)
-            async with self.server.settings_lock:
-                await self.server.ci_manager.save_document(
-                    owner, repo, document, preserve_page_settings=True
-                )
-        except (ValueError, RecursionError) as exc:
-            return await self._ui_ci_config(
-                owner, repo, notice=str(exc), submitted=text, error=True
-            )
-        return await self._ui_ci_config(owner, repo, notice="Configuration saved.")
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
+        return await _send_text(
+            self.request,
+            410,
+            "CI configuration is repository-owned. Commit project pipeline definitions to "
+            "ci/config.json; this settings page only manages environment variables and "
+            "secrets.\n",
+        )
 
     async def _ui_ci_run(self, owner: str, repo: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
@@ -6332,6 +6379,10 @@ form.addEventListener("submit", event => {{
         )
         if not commit:
             return await self._ui_ci(owner, repo, notice="Select a valid branch.")
+        if form.get("sha") and form["sha"] != commit:
+            return await self._ui_ci(
+                owner, repo, notice="Branch changed. Check its configuration again."
+            )
         try:
             run_id = await self.server.ci_manager.enqueue(
                 owner, repo, "manual", branch, commit, pipeline=form.get("pipeline", "default")
@@ -6342,7 +6393,9 @@ form.addEventListener("submit", event => {{
             return await _send_redirect(
                 self.request, str_t(t"/r/{q(owner)}/{q(repo)}/ci/runs/{run_id}")
             )
-        if (await self.server.ci_manager.config(owner, repo)).get("_autodetect_repository_config"):
+        if (await self.server.ci_manager.config(owner, repo, commit, include_secrets=False)).get(
+            "_autodetect_repository_config"
+        ):
             return await self._ui_ci(
                 owner,
                 repo,
@@ -6442,7 +6495,7 @@ form.addEventListener("submit", event => {{
         else:
             listing = safe_html(
                 html_t(
-                    t'''<div class="ci-artifacts-empty"><div class="ci-artifact-symbol" aria-hidden="true">↓</div><h2>{"No older artifacts" if before else "No artifacts yet"}</h2><p class="muted">Save build packages, screenshots, or reports from your CI runs.<br>Configure file patterns in CI settings to start collecting downloads.</p><a class="pill" href="{base}/ci/config">Configure artifacts</a> <a class="pill" href="{base}/ci">View CI runs</a></div>'''
+                    t'''<div class="ci-artifacts-empty"><div class="ci-artifact-symbol" aria-hidden="true">↓</div><h2>{"No older artifacts" if before else "No artifacts yet"}</h2><p class="muted">Save build packages, screenshots, or reports from your CI runs.<br>Configure artifact paths in <code>ci/config.json</code> to start collecting downloads.</p><a class="pill" href="{base}/ci/docs">CI documentation</a> <a class="pill" href="{base}/ci">View CI runs</a></div>'''
                 )
             )
         pagination = _pagination(
@@ -6459,7 +6512,7 @@ form.addEventListener("submit", event => {{
             else safe_html("")
         )
         body = safe_html(
-            html_t(t'''<main class="ci-page">{_repo_tabs(base, "artifacts")}<div class="topbar"><div><h2>Artifacts</h2><p class="muted">Build outputs from your CI runs, ready to download.</p></div><a class="pill" href="{base}/ci/config">Artifact settings</a></div>
+            html_t(t'''<main class="ci-page">{_repo_tabs(base, "artifacts")}<div class="topbar"><div><h2>Artifacts</h2><p class="muted">Build outputs from your CI runs, ready to download.</p></div><a class="pill" href="{base}/ci/docs">CI documentation</a></div>
 <section class="box ci-artifacts-panel"><div class="ci-section-heading"><h2>Available downloads</h2><span class="muted">Retention configured in CI settings; count limits also apply</span></div>{listing}<div class="row">{back}{pagination}</div></section></main>''')
         )
         return await _send_html(
@@ -7642,6 +7695,13 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                 push_lock_acquired = True
                 before_refs = await self.server._branch_refs(*push_identity)
                 policy = await self.server.ci_manager.config(*push_identity)
+                if policy.get("_configuration_git_error"):
+                    return await _send_text(
+                        self.request,
+                        503,
+                        "503 Service Unavailable: repository CI policy cannot be verified; "
+                        "push rejected.\n",
+                    )
                 if policy["block_direct_pushes"]:
                     bare = _repo_bare_path(*push_identity)
                     _code, hooks_output, _err = await _run_git(
@@ -8228,6 +8288,21 @@ class AsyncGitServer:
         after_refs = await self._branch_refs(owner, repo)
         if after_refs is None or before_refs is None:
             return
+        if after_refs != before_refs:
+            try:
+                await self.ci_manager.refresh_retention(owner, repo)
+            except Exception as exc:
+                # The ref update is already accepted. Leave the old cache in
+                # place so cleanup stays paused, but still queue its CI runs.
+                logger.warning(
+                    "CI retention refresh failed; cleanup paused",
+                    extra={
+                        "event": "ci_retention_refresh_failure",
+                        "owner": owner,
+                        "repo": repo,
+                        "error_type": type(exc).__name__,
+                    },
+                )
         repo_git = _repo_bare_path(owner, repo)
         for branch, commit in after_refs.items():
             old_commit = before_refs.get(branch)

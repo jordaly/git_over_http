@@ -1,8 +1,9 @@
 # Configurable Docker limits
 
-Remote pipelines request a Docker execution profile in `execution.docker`.
-The Ubuntu worker separately enforces an administrator-owned policy. A repository
-can request capabilities, **not authorize itself** to use them.
+Remote pipelines request a Docker execution profile in `execution.docker` inside
+the committed `ci/config.json`. The Ubuntu worker separately enforces an
+administrator-owned policy. A repository can request capabilities, **not authorize
+itself** to use them.
 
 Omitting `docker` preserves the existing hardened container defaults. Unknown
 fields, arbitrary Docker flags, host networking, host-path mounts and privileged
@@ -140,7 +141,7 @@ disconnects—do not prune shared Docker data automatically.
 For private registries, an administrator can run
 `sudo -H -u githost-runner docker login registry.example.com` interactively on the
 worker. Keep its credential configuration private in that account's home; never
-mount it in a job or supply registry passwords through pipeline JSON.
+mount it in a job or commit registry passwords to `ci/config.json`.
 Pin `image@sha256:...` for reproducibility. `missing` deliberately reuses a cached
 tag; `always` can obtain a different image when a mutable tag changes.
 

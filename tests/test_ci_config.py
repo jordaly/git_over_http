@@ -236,7 +236,33 @@ class JSONConfigurationTests(unittest.TestCase):
         ):
             for block in re.findall(r"```json\n(.*?)\n```", Path(path).read_text(), re.S):
                 with self.subTest(path=path):
-                    compile_document(json.loads(block))
+                    document = json.loads(block)
+                    if isinstance(document, dict) and not set(document) & {
+                        "file",
+                        "defaults",
+                        "pipelines",
+                        "settings",
+                        "steps",
+                        "command",
+                    }:
+                        # Documentation also shows root-field fragments such as
+                        # retention; validate them in a complete document.
+                        document = {
+                            "version": 1,
+                            "pipelines": [
+                                {
+                                    "name": "ci",
+                                    "steps": [{"name": "Check", "run": "true"}],
+                                }
+                            ],
+                            **document,
+                        }
+                    try:
+                        compile_document(document)
+                    except ValueError:
+                        from pygithost.repository_ci import compile_repository_document
+
+                        compile_repository_document(document)
 
     def test_downloadable_examples_validate_and_cover_every_option(self):
         from pathlib import Path
@@ -270,11 +296,9 @@ class JSONConfigurationTests(unittest.TestCase):
                     seen_common.update(set(pipeline) & COMMON)
                     seen_pipeline.update(pipeline)
                     seen_deployment.update(pipeline.get("deployment", {}))
-        # Variables and retention now have page controls, not JSON examples.
-        from pygithost.ci_preferences import RETENTION
-
+        # Variables remain page controls; retention and policies are Git-owned.
         self.assertEqual(seen_common, COMMON - {"env"})
-        self.assertEqual(seen_settings, SETTINGS - set(RETENTION))
+        self.assertEqual(seen_settings, SETTINGS)
         self.assertEqual(seen_deployment, set(DEPLOYMENT))
         self.assertTrue({"steps", "deployment", "file"} <= seen_pipeline)
 

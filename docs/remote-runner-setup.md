@@ -251,7 +251,7 @@ budget is 600 seconds, independent of the command execution budget.
 
 ## 9. Validate a disposable smoke pipeline
 
-In an authorized repository's **CI → Settings → Configuration JSON**, add a smoke
+In an authorized repository's committed **`ci/config.json`**, add a smoke
 pipeline while preserving unrelated pipelines, policies and deployments:
 
 ```json
@@ -277,7 +277,8 @@ pipeline while preserving unrelated pipelines, policies and deployments:
 }
 ```
 
-Trigger `remote-smoke` manually. Manual CI never deploys. Verify:
+Commit and push the document, then trigger `remote-smoke` manually. Manual CI
+never deploys. Verify:
 
 1. The run is assigned rather than left waiting for an eligible worker.
 2. Both steps pass; logs show the recorded exact commit.

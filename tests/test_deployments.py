@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,12 @@ from pygithost.ci import (
     validate_config,
 )
 from pygithost.ci_documentation import ci_configuration_guide
+from tests.ci_fixtures import (
+    commit_ci_config,
+    commit_file,
+    commit_legacy_config,
+    trusted_ci_repositories,
+)
 
 
 class DeploymentTests(unittest.IsolatedAsyncioTestCase):
@@ -25,23 +32,42 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.old_db = database.DB_PATH
         database.DB_PATH = str(Path(self.temp.name) / "test.db")
         database._db_init()
-        self.manager = CIManager(lambda *_: str(Path(self.temp.name) / "repo.git"))
+        self.bare = Path(self.temp.name) / "repo.git"
+        subprocess.run(["git", "init", "--bare", str(self.bare)], check=True, capture_output=True)
+        self.commit = commit_file(self.bare, "README.txt", "deployment fixture\n")
+        self.manager = CIManager(lambda *_: str(self.bare))
         self.script = Path(self.temp.name) / "deploy.sh"
         self.script.write_text("#!/bin/sh\necho deployed\n")
         self.script.chmod(0o700)
-        self.commit = "a" * 40
         self.config = {
             **default_config(),
             "deploy_enabled": True,
             "deploy_script": str(self.script),
         }
+        trust = trusted_ci_repositories("owner/repo")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
 
     def tearDown(self):
         database.DB_PATH = self.old_db
         self.temp.cleanup()
 
+    async def save_config(self, config):
+        if config.get("deploy_script_content"):
+            config = {**config, "deploy_script": ""}
+        validated = validate_config(config)
+        self.commit = commit_legacy_config(self.bare, validated)
+        return validated
+
+    async def save_document(self, document):
+        from pygithost.ci_config import compile_document
+
+        config = compile_document(document)
+        self.commit = commit_ci_config(self.bare, document)
+        return config
+
     async def run_record(self, event="push", branch="main", status="success"):
-        await self.manager.save_config("owner", "repo", self.config)
+        await self.save_config(self.config)
         run_id = database.db_ci_run_create(
             "owner",
             "repo",
@@ -126,7 +152,17 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.capture()
         await self.manager._deploy(row)
         self.assertEqual(database.db_deployment_get(row[0]), ("success", "deployed\n"))
-        second = await self.run_record()
+        second_id = database.db_ci_run_create(
+            "owner",
+            "repo",
+            "push",
+            "main",
+            self.commit,
+            "{}",
+            json.dumps(validate_config(self.config)),
+        )
+        database.db_ci_run_update(second_id, status="success")
+        second = (second_id, "owner", "repo", "push", "main", self.commit, "{}")
         await self.manager._deploy(second)
         self.assertIsNone(database.db_deployment_get(second[0]))
         self.assertEqual(self.manager._capture_process.await_count, 6)
@@ -144,7 +180,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         }
-        config = await self.manager.save_document("owner", "repo", document)
+        config = await self.save_document(document)
         run_id = database.db_ci_run_create(
             "owner", "repo", "push", "main", self.commit, "{}", json.dumps(config)
         )
@@ -181,7 +217,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
     async def test_independent_deployments_for_same_commit_and_removed_pipeline(self):
         child = {**self.config, "pipeline_id": "staging"}
         self.config["pipelines"] = [child]
-        await self.manager.save_config("owner", "repo", self.config)
+        await self.save_config(self.config)
         self.capture()
         rows = []
         for config in (self.config, child):
@@ -201,7 +237,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(database.db_deployment_get(run_id)[0], "success")
         self.assertEqual(self.manager._capture_process.await_count, 10)
         # A removed pipeline's pending snapshot must never use default's script.
-        await self.manager.save_config("owner", "repo", {**self.config, "pipelines": []})
+        await self.save_config({**self.config, "pipelines": []})
         self.manager._capture_process.reset_mock()
         await self.manager._deploy(rows[1])
         self.manager._capture_process.assert_not_awaited()
@@ -251,7 +287,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabling_prevents_pending_deployment(self):
         row = await self.run_record()
-        await self.manager.save_config("owner", "repo", {**self.config, "deploy_enabled": False})
+        await self.save_config({**self.config, "deploy_enabled": False})
         self.capture()
         await self.manager._deploy(row)
         self.manager._capture_process.assert_not_awaited()
@@ -262,14 +298,13 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             deploy_interpreter="python", deploy_script_content='print("old")\n', deploy_script=""
         )
         row = await self.run_record()
-        await self.manager.save_config(
-            "owner", "repo", {**self.config, "deploy_script_content": 'print("new")\n'}
-        )
+        await self.save_config({**self.config, "deploy_script_content": 'print("new")\n'})
         self.capture()
         await self.manager._deploy(row)
         self.manager._capture_process.assert_not_awaited()
         self.assertIn(
-            "settings changed", database.db_ci_run_metadata("owner", "repo", row[0])["reason"]
+            "configuration changed",
+            database.db_ci_run_metadata("owner", "repo", row[0])["reason"],
         )
 
     async def test_failure_and_timeout_do_not_change_ci_result(self):
@@ -293,7 +328,9 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
     async def test_uploaded_script_stored_and_executable(self):
         content = "#!/bin/sh\r\nprintf '%s' \"$1\"\r\n"
         saved = await self.manager.save_config(
-            "owner", "repo", {**self.config, "deploy_script": "", "deploy_script_content": content}
+            "owner",
+            "repo",
+            {**self.config, "deploy_script": "", "deploy_script_content": content},
         )
         self.assertEqual(saved["deploy_script"], "")
         self.assertEqual(saved["deploy_script_content"], content.replace("\r\n", "\n"))
@@ -327,9 +364,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_python_upload_without_shebang(self):
         content = 'import sys\nprint("deployed " + sys.argv[1])\n'
-        saved = await self.manager.save_config(
-            "owner",
-            "repo",
+        saved = await self.save_config(
             {**self.config, "deploy_interpreter": "python", "deploy_script_content": content},
         )
         self.config = saved
@@ -392,10 +427,9 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             "Initial",
         )
         self.commit = git("-C", source, "rev-parse", "HEAD")
+        shutil.rmtree(bare, ignore_errors=True)
         git("clone", "--bare", source, bare)
-        config = await self.manager.save_config(
-            "owner",
-            "repo",
+        config = await self.save_config(
             {
                 **self.config,
                 "command": "echo tests passed",
@@ -443,10 +477,9 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
             "Initial",
         )
         self.commit = git("-C", source, "rev-parse", "HEAD")
+        shutil.rmtree(bare, ignore_errors=True)
         git("clone", "--bare", source, bare)
-        await self.manager.save_config(
-            "owner",
-            "repo",
+        await self.save_config(
             {
                 **self.config,
                 "command": "true",
@@ -545,9 +578,7 @@ class DeploymentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail[9], "deployment output")
 
     async def test_explicit_runner_does_not_require_shebang(self):
-        saved = await self.manager.save_config(
-            "owner",
-            "repo",
+        saved = await self.save_config(
             {
                 **self.config,
                 "deploy_interpreter": "node",

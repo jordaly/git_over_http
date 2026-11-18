@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import platform
+import subprocess
 import sys
 from pathlib import Path
 
@@ -37,11 +38,114 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate.add_argument("--overwrite", action="store_true")
     generate.add_argument("--print", dest="print_only", action="store_true")
+
+    ci = commands.add_parser("ci", help="Inspect repository-owned CI configuration.")
+    ci_commands = ci.add_subparsers(dest="ci_command", required=True)
+    validate = ci_commands.add_parser(
+        "validate",
+        help="Validate ci/config.json and every pipeline file it references without running it.",
+    )
+    validate.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Repository or checkout to inspect; defaults to the current directory.",
+    )
+    validate.add_argument(
+        "--repository",
+        "--repo",
+        "--path",
+        dest="repository",
+        default=None,
+        help="Repository or checkout to inspect; defaults to the current directory.",
+    )
+    validate.add_argument(
+        "--rev",
+        "--revision",
+        dest="revision",
+        default=None,
+        help="Validate a committed revision (for example HEAD or refs/heads/main) "
+        "instead of the working tree.",
+    )
     return parser
+
+
+def _git(root: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except OSError, subprocess.SubprocessError:
+        return None
+    if result.returncode:
+        return None
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def _git_directory(root: Path) -> str | None:
+    directory = _git(root, "rev-parse", "--absolute-git-dir")
+    return directory or None
+
+
+def _is_working_tree(root: Path) -> bool:
+    return _git(root, "rev-parse", "--is-inside-work-tree") == "true"
+
+
+def _validate_ci(path: str | None, repository: str | None, revision: str | None) -> int:
+    from .repository_ci import (
+        CONFIG_FILE,
+        inspect_configuration,
+        inspect_working_configuration,
+    )
+
+    root = Path(repository or path or ".").expanduser()
+    if not root.exists():
+        print(f"ERROR: Repository path not found: {root}", file=sys.stderr)
+        return 1
+
+    label: str
+    if revision is not None:
+        git_directory = _git_directory(root)
+        if git_directory is None:
+            print(f"ERROR: Not a Git repository: {root}", file=sys.stderr)
+            return 1
+        inspection = inspect_configuration(git_directory, revision)
+        label = f"at {revision}"
+    elif _is_working_tree(root):
+        top_level = _git(root, "rev-parse", "--show-toplevel")
+        worktree = Path(top_level) if top_level else root
+        inspection = inspect_working_configuration(worktree)
+        label = "in the working tree"
+    else:
+        git_directory = _git_directory(root)
+        if git_directory is None:
+            print(f"ERROR: Not a Git repository: {root}", file=sys.stderr)
+            return 1
+        inspection = inspect_configuration(git_directory, "HEAD")
+        revision = "HEAD"
+        label = "at HEAD"
+
+    if inspection.error:
+        print(f"ERROR: {inspection.error}", file=sys.stderr)
+        return 1
+    if inspection.config is None:
+        if revision is not None and inspection.commit is None:
+            print(f"ERROR: Cannot resolve revision {revision!r}.", file=sys.stderr)
+        else:
+            print(f"ERROR: No {CONFIG_FILE} found {label}.", file=sys.stderr)
+        return 1
+    print(f"Repository CI configuration is valid {label}.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.command == "ci":
+        raise SystemExit(_validate_ci(args.path, args.repository, args.revision))
     if args.command == "generate-config":
         try:
             config = AppConfig.default_for_platform(args.platform)

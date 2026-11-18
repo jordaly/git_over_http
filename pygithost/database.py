@@ -11,7 +11,7 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast, overload
 
@@ -55,6 +55,27 @@ from .rendering import str_t
 
 DB_PATH = ""
 SESSION_TTL_SECONDS = 12 * 60 * 60
+
+RetentionHeadResolver: TypeAlias = Callable[[str, str], str | None]
+_retention_head_resolver: RetentionHeadResolver | None = None
+
+
+def configure_retention_head_resolver(resolver: RetentionHeadResolver | None) -> None:
+    """Register how cleanup resolves the current default-branch commit.
+
+    Cleanup deletes only when the cached retention policy was verified at the
+    commit this resolver reports now. ``None`` keeps cleanup paused, which is
+    the safe result when the repository cannot be read.
+    """
+    global _retention_head_resolver
+    _retention_head_resolver = resolver
+
+
+def _db_ci_retention_head(owner: str, repo: str) -> str | None:
+    resolver = _retention_head_resolver
+    if resolver is None:
+        return None
+    return resolver(owner, repo)
 
 
 class _TransactionInfo(TypedDict):
@@ -527,6 +548,18 @@ def _db_init() -> None:
             started_at TEXT, finished_at TEXT)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_repo ON ci_runs(owner, repo, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_runs_status ON ci_runs(status, id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS ci_retention_policy (
+            owner TEXT NOT NULL, repo TEXT NOT NULL, policy_json TEXT NOT NULL,
+            commit_hash TEXT NOT NULL DEFAULT '', PRIMARY KEY(owner, repo))""")
+        retention_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(ci_retention_policy)")
+        }
+        if "commit_hash" not in retention_columns:
+            # Rows from older servers have no verified commit and therefore pause
+            # cleanup until the next successful default-branch refresh.
+            conn.execute(
+                "ALTER TABLE ci_retention_policy ADD COLUMN commit_hash TEXT NOT NULL DEFAULT ''"
+            )
         conn.execute("""CREATE TABLE IF NOT EXISTS ci_deployments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -616,7 +649,6 @@ def _db_init() -> None:
             "CREATE INDEX IF NOT EXISTS idx_users_name_order ON users(username COLLATE NOCASE)",
         ):
             conn.execute(statement)
-        _db_ci_cleanup_artifacts(conn)
     finally:
         conn.close()
 
@@ -2527,20 +2559,117 @@ def db_ci_steps_get(run_id: int) -> str:
         conn.close()
 
 
-def _db_ci_retention(conn: sqlite3.Connection, owner: str, repo: str) -> RetentionConfig:
-    from .ci_preferences import legacy_retention, read, retention
+def db_ci_retention_repositories() -> list[tuple[str, str]]:
+    conn = _db_connect()
+    try:
+        return cast(
+            list[tuple[str, str]],
+            conn.execute("SELECT DISTINCT owner,repo FROM ci_runs").fetchall(),
+        )
+    finally:
+        conn.close()
+
+
+def db_ci_retention_policy_set(
+    owner: str, repo: str, policy: JSONObject, *, commit: str | None = None
+) -> None:
+    """Store a policy together with the default-branch commit it was read from."""
+    if commit is None:
+        commit = _db_ci_retention_head(owner, repo)
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """INSERT INTO ci_retention_policy VALUES (?,?,?,?)
+               ON CONFLICT(owner,repo) DO UPDATE SET
+               policy_json=excluded.policy_json, commit_hash=excluded.commit_hash""",
+            (owner, repo, json.dumps(policy), commit or ""),
+        )
+    finally:
+        conn.close()
+
+
+def db_ci_retention_policy_cached(owner: str, repo: str) -> bool:
+    """Cheap check for a cache row carrying a verified commit."""
+    conn = _db_connect()
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM ci_retention_policy WHERE owner=? AND repo=? AND commit_hash<>''",
+                (owner, repo),
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+
+
+def _db_ci_retention_state(
+    conn: sqlite3.Connection, owner: str, repo: str
+) -> tuple[RetentionConfig, str] | None:
+    """Return effective limits only when the cache row is verified at HEAD.
+
+    A missing row means cleanup has never confirmed the repository policy (or a
+    first cache write failed), so deletion pauses rather than assuming defaults.
+    """
+    from .ci_preferences import read, retention
 
     row = conn.execute(
-        "SELECT config_json FROM ci_configs WHERE owner=? AND repo=?", (owner, repo)
+        "SELECT policy_json, commit_hash FROM ci_retention_policy WHERE owner=? AND repo=?",
+        (owner, repo),
     ).fetchone()
-    config = decode_json_object(row[0]) if row else {}
-    global_values, repository_values = read(conn, owner, repo)
-    return retention(global_values, repository_values, legacy_retention(config))
+    if row is None:
+        return None
+    global_values, _repository_values = read(conn, owner, repo)
+    policy = decode_json_object(row[0])
+    commit = str(row[1] or "")
+    if not commit or policy.get("unavailable") is True:
+        return None
+    current = _db_ci_retention_head(owner, repo)
+    if current is None or current != commit:
+        # A ref update, default-branch switch, out-of-band write or unreadable
+        # repository leaves the cached limits unverified. Do not delete.
+        return None
+    bounded = {}
+    for key, value in policy.items():
+        if type(value) is not int:
+            continue
+        ceiling = global_values.get(key)
+        bounded[key] = min(value or ceiling, ceiling) if type(ceiling) is int and ceiling else value
+    return retention(global_values, {}, bounded), commit
+
+
+def _db_ci_retention_unchanged(
+    conn: sqlite3.Connection, owner: str, repo: str, commit: str
+) -> bool:
+    """True while the verified cache state used for a delete is still current."""
+    row = conn.execute(
+        "SELECT commit_hash FROM ci_retention_policy WHERE owner=? AND repo=?",
+        (owner, repo),
+    ).fetchone()
+    return (
+        row is not None
+        and str(row[0] or "") == commit
+        and _db_ci_retention_head(owner, repo) == commit
+    )
+
+
+def _db_ci_retention(conn: sqlite3.Connection, owner: str, repo: str) -> RetentionConfig:
+    state = _db_ci_retention_state(conn, owner, repo)
+    if state is not None:
+        return state[0]
+    return RetentionConfig(
+        artifact_retention_days=0, artifact_retention_count=0, run_retention_count=0
+    )
 
 
 def _db_ci_cleanup_artifacts(
     conn: sqlite3.Connection, owner: str | None = None, repo: str | None = None
-) -> None:
+) -> bool:
+    """Delete artifacts only under a cache entry verified at the current HEAD.
+
+    Returns ``False`` when any examined repository was stale or changed while
+    deleting, so a caller pruning runs can abandon the same operation.
+    """
     if owner is not None:
         conditions = " WHERE r.owner=? AND r.repo=?"
         params: tuple[SQLValue, ...] = (owner, repo)
@@ -2555,25 +2684,72 @@ def _db_ci_cleanup_artifacts(
             params,
         ).fetchall(),
     )
+    consistent = True
     for artifact_owner, artifact_repo in repositories:
-        config = _db_ci_retention(conn, artifact_owner, artifact_repo)
+        state = _db_ci_retention_state(conn, artifact_owner, artifact_repo)
+        if state is None:
+            consistent = False
+            continue
+        config, commit = state
         days = config.get("artifact_retention_days", 7)
         count = config.get("artifact_retention_count", 0)
-        if days:
-            conn.execute(
-                """DELETE FROM ci_artifacts WHERE run_id IN
-                (SELECT id FROM ci_runs WHERE owner=? AND repo=?)
-                AND created_at <= datetime('now', ?)""",
-                (artifact_owner, artifact_repo, f"-{days} days"),
-            )
-        if count:
-            conn.execute(
-                """DELETE FROM ci_artifacts WHERE run_id IN
-                (SELECT id FROM ci_runs WHERE owner=? AND repo=?) AND run_id NOT IN
-                (SELECT a.run_id FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id
-                 WHERE r.owner=? AND r.repo=? ORDER BY a.run_id DESC LIMIT ?)""",
-                (artifact_owner, artifact_repo, artifact_owner, artifact_repo, count),
-            )
+        if not days and not count:
+            continue
+        conn.execute("SAVEPOINT ci_retention_cleanup")
+        deleted = False
+        try:
+            if days:
+                cursor = conn.execute(
+                    """DELETE FROM ci_artifacts WHERE run_id IN
+                    (SELECT id FROM ci_runs WHERE owner=? AND repo=?)
+                    AND created_at <= datetime('now', ?)
+                    AND EXISTS (SELECT 1 FROM ci_retention_policy p
+                     WHERE p.owner=? AND p.repo=? AND p.commit_hash=?)""",
+                    (
+                        artifact_owner,
+                        artifact_repo,
+                        f"-{days} days",
+                        artifact_owner,
+                        artifact_repo,
+                        commit,
+                    ),
+                )
+                deleted = cursor.rowcount > 0
+            if count:
+                cursor = conn.execute(
+                    """DELETE FROM ci_artifacts WHERE run_id IN
+                    (SELECT id FROM ci_runs WHERE owner=? AND repo=?) AND run_id NOT IN
+                    (SELECT a.run_id FROM ci_artifacts a JOIN ci_runs r ON r.id=a.run_id
+                     WHERE r.owner=? AND r.repo=? ORDER BY a.run_id DESC LIMIT ?)
+                    AND EXISTS (SELECT 1 FROM ci_retention_policy p
+                     WHERE p.owner=? AND p.repo=? AND p.commit_hash=?)""",
+                    (
+                        artifact_owner,
+                        artifact_repo,
+                        artifact_owner,
+                        artifact_repo,
+                        count,
+                        artifact_owner,
+                        artifact_repo,
+                        commit,
+                    ),
+                )
+                deleted = deleted or cursor.rowcount > 0
+            if deleted and not _db_ci_retention_unchanged(
+                conn, artifact_owner, artifact_repo, commit
+            ):
+                # HEAD or the cache changed while deleting. Keep the old limits
+                # from applying to the new state; the next refresh verifies it.
+                conn.execute("ROLLBACK TO SAVEPOINT ci_retention_cleanup")
+                conn.execute("RELEASE SAVEPOINT ci_retention_cleanup")
+                consistent = False
+                continue
+            conn.execute("RELEASE SAVEPOINT ci_retention_cleanup")
+        except BaseException:
+            conn.execute("ROLLBACK TO SAVEPOINT ci_retention_cleanup")
+            conn.execute("RELEASE SAVEPOINT ci_retention_cleanup")
+            raise
+    return consistent
 
 
 def db_ci_artifact_set(run_id: int, archive: bytes | memoryview) -> None:
@@ -2582,7 +2758,12 @@ def db_ci_artifact_set(run_id: int, archive: bytes | memoryview) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO ci_artifacts(run_id,archive) VALUES(?,?)", (run_id, archive)
         )
-        _db_ci_cleanup_artifacts(conn)
+        row = cast(
+            tuple[str, str] | None,
+            conn.execute("SELECT owner,repo FROM ci_runs WHERE id=?", (int(run_id),)).fetchone(),
+        )
+        if row:
+            _db_ci_cleanup_artifacts(conn, row[0], row[1])
     finally:
         conn.close()
 
@@ -2821,24 +3002,41 @@ def db_ci_recover_runs() -> None:
 
 
 def _db_ci_prune_completed(conn: sqlite3.Connection, owner: str, repo: str) -> None:
-    config = _db_ci_retention(conn, owner, repo)
+    state = _db_ci_retention_state(conn, owner, repo)
+    if state is None:
+        return
+    config, commit = state
     retention = config.get(
         "run_retention_count",
         max(0, min(10000, int(os.environ.get("PYGITHOST_CI_RETENTION", "100")))),
     )
-    _db_ci_cleanup_artifacts(conn, owner, repo)
+    if not _db_ci_cleanup_artifacts(conn, owner, repo):
+        return
     if not retention:
         return
-    conn.execute(
-        """DELETE FROM ci_runs AS old
-        WHERE old.owner=? AND old.repo=? AND old.status NOT IN ('queued','running')
-          AND old.notification NOT IN ('queued','sending')
-          AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.run_id=old.id)
-          AND old.id NOT IN (SELECT newer.id FROM ci_runs AS newer
-            WHERE newer.owner=? AND newer.repo=? AND newer.status NOT IN ('queued','running')
-            ORDER BY newer.id DESC LIMIT ?)""",
-        (owner, repo, owner, repo, retention),
-    )
+    conn.execute("SAVEPOINT ci_retention_prune")
+    try:
+        cursor = conn.execute(
+            """DELETE FROM ci_runs AS old
+            WHERE old.owner=? AND old.repo=? AND old.status NOT IN ('queued','running')
+              AND old.notification NOT IN ('queued','sending')
+              AND NOT EXISTS (SELECT 1 FROM ci_artifacts a WHERE a.run_id=old.id)
+              AND old.id NOT IN (SELECT newer.id FROM ci_runs AS newer
+                WHERE newer.owner=? AND newer.repo=? AND newer.status NOT IN ('queued','running')
+                ORDER BY newer.id DESC LIMIT ?)
+              AND EXISTS (SELECT 1 FROM ci_retention_policy p
+                WHERE p.owner=? AND p.repo=? AND p.commit_hash=?)""",
+            (owner, repo, owner, repo, retention, owner, repo, commit),
+        )
+        if cursor.rowcount and not _db_ci_retention_unchanged(conn, owner, repo, commit):
+            conn.execute("ROLLBACK TO SAVEPOINT ci_retention_prune")
+            conn.execute("RELEASE SAVEPOINT ci_retention_prune")
+            return
+        conn.execute("RELEASE SAVEPOINT ci_retention_prune")
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT ci_retention_prune")
+        conn.execute("RELEASE SAVEPOINT ci_retention_prune")
+        raise
 
 
 def db_prs_for_source(owner: str, repo: str, branch: str) -> list[PullRequestBranchRow]:

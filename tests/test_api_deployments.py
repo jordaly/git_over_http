@@ -4,6 +4,7 @@ import unittest
 
 from pygithost import database
 from tests import test_api as read_tests
+from tests.ci_fixtures import commit_legacy_config, trusted_ci_repositories
 from tests.test_server import _which_git_backend
 
 
@@ -17,6 +18,9 @@ class APIDeploymentTests(unittest.TestCase):
     def setUp(self):
         read_tests.APITests.setUp(self)
         self.path = self.base + "/deployments"
+        trust = trusted_ci_repositories("alice/project")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
         database.db_deployment_claim(
             99999,
             "alice",
@@ -133,7 +137,7 @@ class APIDeploymentTests(unittest.TestCase):
             "deploy_script_content": "#!/bin/sh\ntouch " + str(marker),
             "deploy_interpreter": "missing-pygithost-runtime",
         }
-        database.db_ci_config_set("alice", "project", json.dumps(config))
+        commit_legacy_config(self.bare, config)
         self.assertEqual(self.request(self.path + "/preflight")[0], 403)
         status, _, result = self.request(self.path + "/preflight", token=self.admin_token)
         self.assertEqual(status, 200, result)

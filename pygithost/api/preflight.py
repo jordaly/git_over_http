@@ -19,6 +19,7 @@ def inspect(config: Mapping[str, Any], repository: str) -> dict[str, object]:
     def check(name: str, ok: object) -> None:
         checks.append({"name": name, "ok": bool(ok)})
 
+    check("execution_authorized", not config.get("_repository_config_error"))
     prefix = deployment_prefix(config.get("deploy_interpreter", "direct"))
     if prefix:
         check("interpreter_available", shutil.which(prefix[0]) is not None)
@@ -72,7 +73,7 @@ async def read(api: APIContext, owner: str, repo: str, path: str) -> object:
     api.parameters()
     async with api.handler.server.settings_lock:
         state = await settings.snapshot(api, owner, repo)
-        config = await api.handler.server.ci_manager.config(owner, repo)
+        config = await api.handler.server.ci_manager.config(owner, repo, include_secrets=False)
         targets = []
         for pipeline in api.handler.server.ci_manager.pipelines(config):
             entries = pipeline.get("deployment_targets") or [pipeline]

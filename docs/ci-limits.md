@@ -3,7 +3,7 @@
 Each run has explicit positive limits. Omission uses the defaults below; `0`,
 negative values, booleans, strings and fractions are rejected. There is **no
 hard-coded upper size ceiling** on configured values. Limits are recorded in the
-queued configuration snapshot, so changing settings does not change an existing
+queued configuration snapshot, so committing a change does not change an existing
 run.
 
 MB-suffixed settings use **MiB** (`1024 × 1024` bytes).
@@ -42,9 +42,10 @@ Fields belong inside a pipeline's `execution`, alongside `runner`, `image` and
 ```
 
 Prepare the image first; adapt the command and generate the report files.
-Keep existing unrelated pipeline/deployment settings rather than blindly replacing
-the whole document. Container resource/security permissions are separate:
-see [Docker profiles](docker-profiles.md).
+Commit the full document as `ci/config.json`, preserving unrelated
+pipeline/deployment settings rather than blindly replacing the file. Referenced
+pipeline files must also be under `ci/`. Container resource/security permissions
+are separate: see [Docker profiles](docker-profiles.md).
 
 ## Defaults and enforcement
 

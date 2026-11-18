@@ -1,4 +1,5 @@
 import http.client
+import json
 import re
 import subprocess
 import tempfile
@@ -9,6 +10,7 @@ from urllib.parse import quote, urlencode
 
 from pygithost import application, database
 from pygithost.application import FLAT_OWNER_UI
+from tests.ci_fixtures import commit_ci_config
 from tests.test_server import ServerRunner, _which_git_backend
 
 
@@ -314,9 +316,14 @@ class PullRequestFeaturesTests(unittest.TestCase):
     def test_resolve_apply_creates_merge_commit_then_ff_merge(self):
         self._make_conflict()
         name = self.git("--git-dir", self.bare, "rev-parse", "refs/heads/feature/pr")
+        path = self.base + f"/pulls/{self.pr}/resolve"
+        status, page = self.request(path)
+        self.assertEqual(status, 200)
+        token = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
         status, page = self.request(
-            self.base + f"/pulls/{self.pr}/resolve",
+            path,
             {
+                "csrf": token,
                 "conflict_count": "1",
                 "path_0": "app.py",
                 "delete_0": "",
@@ -344,18 +351,60 @@ class PullRequestFeaturesTests(unittest.TestCase):
 
     def test_resolve_apply_validates_paths_and_unknown_pr(self):
         self._make_conflict()
-        status, page = self.request(
-            self.base + f"/pulls/{self.pr}/resolve",
-            {"conflict_count": "1", "path_0": "app.py", "content_0": "resolved\n", "message": "x"},
-        )
-        # The stale one-row resolution misses nothing else, but an unknown PR or
-        # bad path must not commit anything.
+        path = self.base + f"/pulls/{self.pr}/resolve"
         name = self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr")
+        status, _ = self.request(
+            path, {"conflict_count": "1", "path_0": "app.py", "content_0": "resolved\n"}
+        )
+        self.assertEqual(status, 403)
+        _, page = self.request(path)
+        token = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+        status, page = self.request(
+            path, {"csrf": token, "conflict_count": "1", "path_0": "other", "content_0": "x"}
+        )
+        self.assertNotIn("Merge conflicts resolved", page)
         self.assertEqual(
             name, self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr")
         )
         status, _ = self.request(self.base + "/pulls/999/resolve")
         self.assertEqual(status, 404)
+
+    def test_resolution_endpoints_respect_source_branch_protection(self):
+        self._make_conflict()
+        commit_ci_config(
+            self.bare,
+            {
+                "version": 1,
+                "pipelines": [{"name": "check", "steps": [{"name": "Check", "run": "true"}]}],
+                "policies": {"block_direct_pushes": True, "protected_branches": ["feature/*"]},
+            },
+            branch="main",
+        )
+        path = self.base + f"/pulls/{self.pr}/resolve"
+        before = self.git("--git-dir", self.bare, "rev-parse", "refs/heads/feature/pr")
+        for endpoint, token_pattern, form in (
+            (
+                path,
+                r'name="csrf" value="([^"]+)"',
+                {"conflict_count": "1", "path_0": "app.py", "content_0": "resolved\n"},
+            ),
+            (
+                path + "/ide/commit",
+                r'data-csrf="([^"]+)"',
+                {"payload": json.dumps({"branch": "feature/pr", "changes": {"app.py": "x"}})},
+            ),
+        ):
+            with self.subTest(endpoint=endpoint):
+                status, page = self.request(path + "/ide" if endpoint.endswith("commit") else path)
+                self.assertEqual(status, 200, page)
+                token = re.search(token_pattern, page).group(1)
+                status, body = self.request(endpoint, {"csrf": token, **form})
+                self.assertEqual(status, 403, body)
+                self.assertIn("protected source branch", body)
+        self.assertEqual(
+            self.git("--git-dir", self.bare, "rev-parse", "refs/heads/feature/pr"), before
+        )
+        self.assertEqual(database.db_pr_comment_count(self.pr), 0)
 
     def test_resolver_unit_conflict_flow_and_race(self):
         import shutil

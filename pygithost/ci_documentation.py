@@ -18,10 +18,9 @@ def ci_configuration_guide() -> SafeHTML:
             raise OSError("CI reference guide is unavailable.")
     except OSError:
         example = json.dumps(group_document(EXAMPLE), indent=2)
-        reference = json.dumps({"version": 1, "file": "ci/config.json"}, indent=2)
         content = safe_html(
             html_t(
-                t"""<h2>CI configuration</h2><p>The full manual is unavailable in this installation. The default Settings reference is:</p><pre>{reference}</pre><p>Commit ci/config.json with named steps inside the repository's ci directory. Expanded Settings documents use separate pipelines and deployments arrays; each object requires a name. Each deployment references its pipeline. Environment variables and retention use page controls, with server defaults under Admin → Settings and repository overrides under CI → Settings. Configure execution and cancellation inside each pipeline; omitted options use built-in defaults. There is no execution-defaults settings form. Basic server configuration changes require a restart.</p><pre>{example}</pre><p>Host jobs and deployment scripts are trusted server-user code. Manual CI is always available to write-authorized users with a runnable pipeline and never deploys. Unsupported retries and approvals are rejected.</p>"""
+                t"""<h2>CI configuration</h2><p>The full manual is unavailable in this installation. Commit configuration to ci/config.json; referenced pipeline files must also be under ci/. Use separate pipelines and deployments arrays; each object requires a name. Each deployment references its pipeline.</p><p>Validate your checkout with <code>python -m pygithost ci validate</code>. In CI → Runs, select a branch to inspect its committed configuration and available pipelines. Manual runs never deploy.</p><p>Manage credentials in CI → Settings, not in Git. Unmerged pull-request runs do not receive page-managed values. There is no project configuration editor or API replacement endpoint.</p><pre>{example}</pre><p>Host jobs and deployment scripts require separate administrator authorization.</p>"""
             )
         )
     return safe_html(

@@ -1,4 +1,4 @@
-"""The single administrator-facing JSON format for repository CI settings."""
+"""Compile repository CI documents into validated execution snapshots."""
 
 import json
 from collections.abc import Mapping
@@ -263,7 +263,7 @@ def export_document(config: Mapping[str, Any]) -> JsonObject:
             if key in item and item[key] != baseline.get(key)
         }
         if item.get("repository_config"):
-            pipeline["file"] = item.get("repository_file", ".pygithost-ci.json")
+            pipeline["file"] = item.get("repository_file", "ci/config.json")
         else:
             pipeline["steps"] = item.get("steps") or [
                 {"name": "Run", "run": item.get("command", "")}

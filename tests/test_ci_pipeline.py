@@ -25,6 +25,13 @@ from pygithost.ci import (
 )
 from pygithost.ci_documentation import EXAMPLE_PIPELINE, ci_configuration_guide
 from pygithost.ci_protection import check_updates, prepare_hooks
+from tests.ci_fixtures import (
+    commit_ci_config,
+    commit_file,
+    commit_legacy_config,
+    trusted_ci_repositories,
+    verified_retention,
+)
 from tests.test_server import ServerRunner, _which_git_backend
 
 
@@ -36,6 +43,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = str(self.root / "ci.db")
         database._db_init()
         self.managers = []
+        trust = trusted_ci_repositories("owner/repo", "root/repo")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
 
     async def asyncTearDown(self):
         for manager in self.managers:
@@ -52,7 +62,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             ["git", *map(str, args)], stderr=subprocess.PIPE, text=True
         ).strip()
 
-    def repository(self, pipeline=None, filename=".pygithost-ci.json"):
+    def repository(self, pipeline=None, filename="ci/config.json"):
         source, bare = self.root / "source", self.root / "repo.git"
         self.git("init", "-b", "main", source)
         self.git("-C", source, "config", "user.name", "CI")
@@ -66,6 +76,21 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.git("clone", "--bare", source, bare)
         return source, bare, self.git("-C", source, "rev-parse", "HEAD")
 
+    def commit_config(
+        self, document, *, branch="main", filename="ci/config.json", raw=None, message="CI fixture"
+    ):
+        return commit_ci_config(
+            self.root / "repo.git",
+            document,
+            filename=filename,
+            branch=branch,
+            raw=raw,
+            message=message,
+        )
+
+    def commit_legacy(self, config, *, branch="main"):
+        return commit_legacy_config(self.root / "repo.git", config, branch=branch)
+
     def manager(self, bare):
         manager = CIManager(lambda *_: str(bare))
         self.managers.append(manager)
@@ -73,6 +98,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def execute(self, manager, commit, config):
         config = validate_config(config)
+        config["_page_environment_live"] = True
         run_id = database.db_ci_run_create(
             "owner", "repo", "manual", "main", commit, "{}", json.dumps(config)
         )
@@ -186,7 +212,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["artifacts"], pipeline["artifacts"])
         self.assertIsNone(database.db_ci_config_get("owner", "repo"))
 
-    async def test_saved_disabled_configuration_does_not_auto_discover(self):
+    async def test_saved_legacy_configuration_does_not_hide_repository_config(self):
         _source, bare, commit = self.repository(
             {"steps": [{"name": "Test", "run": "echo auto"}]}, "ci/config.json"
         )
@@ -194,18 +220,17 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await manager.save_document(
             "owner", "repo", {"version": 1, "pipelines": [], "deployments": []}
         )
-        config = await manager.config("owner", "repo")
+        config = await manager.config("owner", "repo", commit)
         self.assertNotIn("_autodetect_repository_config", config)
-        self.assertEqual(manager.pipelines(config), [])
-        self.assertIsNone(await manager.enqueue("owner", "repo", "push", "main", commit))
+        self.assertEqual(config["steps"], [{"name": "Test", "run": "echo auto"}])
 
     async def test_manual_runs_ignore_disabled_legacy_manual_trigger(self):
-        _source, bare, commit = self.repository()
+        _source, bare, _commit = self.repository()
         manager = self.manager(bare)
         raw = default_config()
         raw.update(command="echo manual-only")
         raw["events"] = {key: False for key in raw["events"]}
-        database.db_ci_config_set("owner", "repo", json.dumps(raw))
+        commit = self.commit_legacy(raw)
         with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
             self.assertIsNone(await manager.enqueue("owner", "repo", "push", "main", commit))
             run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
@@ -222,10 +247,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             run_id = await manager.enqueue("owner", "repo", "push", "main", commit)
         run = database.db_ci_run_get("owner", "repo", run_id)
         self.assertEqual(run[4], "failed")
-        self.assertIn("only command, steps", run[5])
+        self.assertIn("does not match the supported pipeline schema", run[5])
         self.assertEqual(manager.pending, {})
 
-    async def test_saving_the_preset_makes_missing_file_an_error(self):
+    async def test_saving_legacy_preset_does_not_activate_missing_file(self):
         _source, bare, commit = self.repository()
         manager = self.manager(bare)
         from pygithost.ci_config import editor_document
@@ -233,11 +258,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await manager.save_document(
             "owner", "repo", editor_document(await manager.config("owner", "repo"))
         )
+        config = await manager.config("owner", "repo", commit)
+        self.assertTrue(config["_autodetect_repository_config"])
         with mock.patch.object(manager, "start", new_callable=mock.AsyncMock):
-            run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
-        run = database.db_ci_run_get("owner", "repo", run_id)
-        self.assertEqual(run[4], "failed")
-        self.assertIn("ci/config.json", run[5])
+            self.assertIsNone(await manager.enqueue("owner", "repo", "manual", "main", commit))
+        self.assertIsNotNone(database.db_ci_config_get("owner", "repo"))
 
     @unittest.skipUnless(
         os.name == "posix" and os.environ.get("PYGITHOST_TEST_DOCKER_IMAGE") == "python:3.14-slim",
@@ -286,11 +311,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 validate_config({"pipelines": children})
 
     async def test_multiple_pipelines_fan_out_and_manual_selection(self):
-        _source, bare, commit = self.repository()
+        _source, bare, _commit = self.repository()
         manager = self.manager(bare)
-        await manager.save_config(
-            "owner",
-            "repo",
+        commit = self.commit_legacy(
             {
                 "command": "echo default",
                 "events": {"push": True, "manual": True},
@@ -303,7 +326,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         "events": {"push": True, "manual": True},
                     }
                 ],
-            },
+            }
         )
         await manager.enqueue("owner", "repo", "push", "main", commit)
         await manager.wait_idle()
@@ -333,7 +356,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             await manager.enqueue("owner", "repo", "manual", "main", commit, pipeline="missing")
 
     async def test_json_document_executes_shared_defaults_and_keeps_rerun_snapshot(self):
-        _source, bare, commit = self.repository()
+        _source, bare, _commit = self.repository()
         manager = self.manager(bare)
         document = {
             "defaults": {
@@ -342,13 +365,13 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             },
             "pipelines": {"tests": {"steps": [{"name": "Test", "run": "echo {{ env.VALUE }}"}]}},
         }
-        await manager.save_document("owner", "repo", document)
-        self.assertEqual((await manager.config("owner", "repo"))["document"], document)
+        commit = self.commit_config(document)
+        self.assertEqual((await manager.config("owner", "repo", commit))["document"], document)
         first = await manager.enqueue("owner", "repo", "manual", "main", commit, pipeline="tests")
         await manager.wait_idle()
         self.assertIn("original", database.db_ci_run_get("owner", "repo", first)[5])
         document["defaults"]["execution"]["env"]["VALUE"] = "changed"
-        await manager.save_document("owner", "repo", document)
+        self.commit_config(document)
         rerun = await manager.rerun("owner", "repo", first)
         await manager.wait_idle()
         self.assertIn("original", database.db_ci_run_get("owner", "repo", rerun)[5])
@@ -357,38 +380,36 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_json_document_merge_check_does_not_require_phantom_default(self):
+        self.repository()
         manager = self.manager(self.root / "repo.git")
-        await manager.save_document(
-            "owner",
-            "repo",
+        base = self.commit_config(
             {
                 "policies": {"require_ci": True},
                 "defaults": {"triggers": {"pull_request": {"enabled": True}}},
                 "pipelines": {"tests": {"steps": [{"name": "Test", "run": "echo test"}]}},
-            },
+            }
         )
         payload = {
             "pr_number": 1,
-            "base_commit": "base",
+            "base_commit": base,
             "head_commit": "head",
             "pipeline_id": "tests",
         }
         run = database.db_ci_run_create(
-            "owner", "repo", "pull_request", "main", "base", json.dumps(payload)
+            "owner", "repo", "pull_request", "main", base, json.dumps(payload)
         )
         self.assertNotEqual(
-            (await manager.merge_check("owner", "repo", 1, "base", "head", "main"))[1], "success"
+            (await manager.merge_check("owner", "repo", 1, base, "head", "main"))[1], "success"
         )
         database.db_ci_run_update(run, status="success")
         self.assertEqual(
-            (await manager.merge_check("owner", "repo", 1, "base", "head", "main"))[1], "success"
+            (await manager.merge_check("owner", "repo", 1, base, "head", "main"))[1], "success"
         )
 
     async def test_merge_requires_each_applicable_pipeline(self):
+        self.repository()
         manager = self.manager(self.root / "repo.git")
-        await manager.save_config(
-            "owner",
-            "repo",
+        base = self.commit_legacy(
             {
                 "command": "echo test",
                 "require_ci": True,
@@ -396,29 +417,29 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 "pipelines": [
                     {"pipeline_id": "lint", "command": "echo lint", "events": {"pr_opened": True}}
                 ],
-            },
+            }
         )
-        payload = {"pr_number": 1, "base_commit": "base", "head_commit": "head"}
+        payload = {"pr_number": 1, "base_commit": base, "head_commit": "head"}
         first = database.db_ci_run_create(
-            "owner", "repo", "pull_request", "main", "base", json.dumps(payload)
+            "owner", "repo", "pull_request", "main", base, json.dumps(payload)
         )
         database.db_ci_run_update(first, status="success")
-        self.assertIsNone(await manager.merge_check("owner", "repo", 1, "base", "head", "main"))
+        self.assertIsNone(await manager.merge_check("owner", "repo", 1, base, "head", "main"))
         second = database.db_ci_run_create(
             "owner",
             "repo",
             "pull_request",
             "main",
-            "base",
+            base,
             json.dumps({**payload, "pipeline_id": "lint"}),
         )
         database.db_ci_run_update(second, status="success")
         self.assertEqual(
-            (await manager.merge_check("owner", "repo", 1, "base", "head", "main"))[1], "success"
+            (await manager.merge_check("owner", "repo", 1, base, "head", "main"))[1], "success"
         )
         database.db_ci_run_update(second, status="failed")
         self.assertEqual(
-            (await manager.merge_check("owner", "repo", 1, "base", "head", "main"))[1], "failed"
+            (await manager.merge_check("owner", "repo", 1, base, "head", "main"))[1], "failed"
         )
 
     def test_deployment_claim_is_per_pipeline_and_commit(self):
@@ -434,15 +455,16 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(validate_config(example)["steps"], EXAMPLE_PIPELINE["steps"])
         guide = str(ci_configuration_guide())
         for text in (
-            ".pygithost-ci.json",
+            "ci/config.json",
             "fresh shell",
             "target/base commit",
-            "64 KiB",
+            "256 KiB",
             "20 MiB",
             "settings",
             "No runs appear",
             "PYGITHOST_WORKTREE",
             "trailing commas",
+            "PYGITHOST_CI_TRUSTED_REPOSITORIES",
         ):
             self.assertIn(text, guide)
         self.assertIn('id="ci-configuration-guide"', guide)
@@ -527,18 +549,32 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("should-not-run", run[5])
 
     async def test_repository_config_is_snapshotted_and_server_policy_cannot_be_overridden(self):
-        _source, bare, commit = self.repository(
-            {"version": 1, "steps": [{"name": "Test", "run": "echo versioned"}]}
-        )
+        _source, bare, _commit = self.repository()
         manager = self.manager(bare)
-        server = validate_config(
-            {"repository_config": True, "events": {"manual": True}, "require_ci": True}
+        self.commit_config(
+            {"version": 1, "steps": [{"name": "Test", "run": "echo versioned"}]},
+            filename="ci/pipeline.json",
         )
-        await manager.save_config("owner", "repo", server)
+        commit = self.commit_config(
+            {
+                "version": 1,
+                "settings": {"require_ci": True},
+                "pipelines": {
+                    "tests": {
+                        "file": "ci/pipeline.json",
+                        "events": {"manual": True},
+                        "runner": "host",
+                    }
+                },
+            }
+        )
+        server = manager.pipelines(await manager.config("owner", "repo", commit))[0]
+        self.assertTrue(server["require_ci"])
+        self.assertEqual(server["pipeline_id"], "tests")
         run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
         await manager.wait_idle()
         run = database.db_ci_run_get("owner", "repo", run_id)
-        self.assertEqual(run[4], "success")
+        self.assertEqual(run[4], "success", run[5])
         self.assertIn("versioned", run[5])
         config = json.loads(database.db_ci_run_metadata("owner", "repo", run_id)["config"])
         self.assertTrue(config["require_ci"])
@@ -549,24 +585,25 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             {"command": "true", "timeout_seconds": 9999},
             {"version": 2},
         ):
-            with mock.patch.object(
-                manager, "repository_pipeline", wraps=manager.repository_pipeline
-            ):
-                # Commit each invalid file so validation exercises real Git reads.
-                source = self.root / "source"
-                (source / ".pygithost-ci.json").write_text(json.dumps(raw))
-                self.git("-C", source, "add", ".")
-                self.git("-C", source, "commit", "-m", "invalid")
-                self.git("--git-dir", bare, "fetch", source, "main")
-                sha = self.git("-C", source, "rev-parse", "HEAD")
+            with self.subTest(raw=raw):
+                sha = self.commit_config(raw, filename="ci/pipeline.json", message="invalid")
                 with self.assertRaises(ValueError):
                     await manager.repository_pipeline("owner", "repo", sha, server)
 
     async def test_missing_repository_config_fails_closed(self):
-        _source, bare, commit = self.repository()
+        _source, bare, _commit = self.repository()
         manager = self.manager(bare)
-        await manager.save_config(
-            "owner", "repo", {"repository_config": True, "events": {"manual": True}}
+        commit = self.commit_config(
+            {
+                "version": 1,
+                "pipelines": {
+                    "tests": {
+                        "file": "ci/pipeline.json",
+                        "events": {"manual": True},
+                        "runner": "host",
+                    }
+                },
+            }
         )
         run_id = await manager.enqueue("owner", "repo", "manual", "main", commit)
         run = database.db_ci_run_get("owner", "repo", run_id)
@@ -578,32 +615,54 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             await manager.rerun("owner", "repo", run_id)
 
     async def test_pr_uses_base_pipeline_and_rerun_keeps_snapshot(self):
-        source, bare, base = self.repository({"command": "echo reviewed-pipeline"})
-        (source / ".pygithost-ci.json").write_text(
-            json.dumps({"command": "echo unreviewed-pipeline; exit 9"})
+        _source, bare, _commit = self.repository()
+        base = self.commit_config(
+            {
+                "version": 1,
+                "pipelines": {
+                    "default": {
+                        "runner": "host",
+                        "steps": [{"name": "Reviewed", "run": "echo reviewed-pipeline"}],
+                        "events": {"pr_opened": True},
+                    }
+                },
+            }
         )
-        self.git("-C", source, "add", ".")
-        self.git("-C", source, "commit", "-m", "unreviewed pipeline")
-        head = self.git("-C", source, "rev-parse", "HEAD")
-        self.git("--git-dir", bare, "fetch", source, "main:refs/heads/feature")
+        head = self.commit_config(
+            {
+                "version": 1,
+                "pipelines": {
+                    "default": {
+                        "runner": "host",
+                        "steps": [
+                            {"name": "Unreviewed", "run": "echo unreviewed-pipeline; exit 9"}
+                        ],
+                        "events": {"pr_opened": True},
+                    }
+                },
+            }
+        )
         manager = self.manager(bare)
-        await manager.save_config(
-            "owner", "repo", {"repository_config": True, "events": {"pr_opened": True}}
-        )
         run_id = await manager.enqueue(
             "owner",
             "repo",
             "pull_request",
             "main",
-            base,
+            head,
             {"pr_number": 1, "base_commit": base, "head_commit": head},
         )
         await manager.wait_idle()
         run = database.db_ci_run_get("owner", "repo", run_id)
-        self.assertEqual(run[4], "success")
+        self.assertEqual(run[4], "success", run[5])
         self.assertIn("reviewed-pipeline", run[5])
         self.assertNotIn("unreviewed-pipeline", run[5])
-        await manager.save_config("owner", "repo", {"command": "exit 10"})
+        self.commit_config(
+            {
+                "version": 1,
+                "runner": "host",
+                "steps": [{"name": "Changed", "run": "exit 10"}],
+            }
+        )
         rerun_id = await manager.rerun("owner", "repo", run_id)
         await manager.wait_idle()
         self.assertEqual(database.db_ci_run_get("owner", "repo", rerun_id)[4], "success")
@@ -639,9 +698,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(zipped.read("reports/test.xml"), b"raw\n")
         self.assertIsNone(database.db_ci_artifact_get("other", "repo", run[0], content=True))
         self.assertEqual(run[4], "failed")
-        with closing(database._db_connect()) as connection:
-            connection.execute("UPDATE ci_artifacts SET created_at=datetime('now','-8 days')")
-        self.assertIsNone(database.db_ci_artifact_get("owner", "repo", run[0]))
+        with verified_retention(commit, ("owner", "repo")):
+            with closing(database._db_connect()) as connection:
+                connection.execute("UPDATE ci_artifacts SET created_at=datetime('now','-8 days')")
+            self.assertIsNone(database.db_ci_artifact_get("owner", "repo", run[0]))
 
     def test_artifacts_skip_symlinks_hardlinks_git_and_enforce_size(self):
         work = self.root / "checkout"
@@ -673,14 +733,15 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row[0] for row in rows], [ids[1]])
         rows = database.db_ci_artifacts_list("owner", "repo", before=ids[1])
         self.assertEqual([row[0] for row in rows], [ids[0]])
-        with closing(database._db_connect()) as connection:
-            connection.execute(
-                "UPDATE ci_artifacts SET created_at=datetime('now','-8 days') WHERE run_id=?",
-                (ids[1],),
+        with verified_retention("a" * 40, ("owner", "repo")):
+            with closing(database._db_connect()) as connection:
+                connection.execute(
+                    "UPDATE ci_artifacts SET created_at=datetime('now','-8 days') WHERE run_id=?",
+                    (ids[1],),
+                )
+            self.assertEqual(
+                [row[0] for row in database.db_ci_artifacts_list("owner", "repo")], [ids[0]]
             )
-        self.assertEqual(
-            [row[0] for row in database.db_ci_artifacts_list("owner", "repo")], [ids[0]]
-        )
         self.assertEqual(database.db_ci_artifacts_list("owner", "different"), [])
 
     def test_merge_check_requires_exact_pr_base_and_head_and_newest_result(self):
@@ -760,20 +821,16 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(_which_git_backend() and os.name == "posix", "real HTTP Git backend")
     async def test_http_push_protection_toggle_and_artifact_route(self):
-        source, bare, base = self.repository()
+        source, bare, _base = self.repository()
         self.git("--git-dir", bare, "config", "http.receivepack", "true")
+        protected = commit_legacy_config(
+            bare,
+            validate_config({"block_direct_pushes": True, "protected_branches": "main\nrelease/*"}),
+        )
+        self.git("-C", source, "fetch", bare, "main")
+        self.git("-C", source, "reset", "--hard", "FETCH_HEAD")
         self.git("-C", source, "commit", "--allow-empty", "-m", "next")
-        head = self.git("-C", source, "rev-parse", "HEAD")
         with ServerRunner(project_root=str(self.root)) as server:
-            database.db_ci_config_set(
-                FLAT_OWNER_UI,
-                "repo",
-                json.dumps(
-                    validate_config(
-                        {"block_direct_pushes": True, "protected_branches": "main\nrelease/*"}
-                    )
-                ),
-            )
             remote = f"http://127.0.0.1:{server.port}/git/repo.git"
 
             async def push(ref):
@@ -786,15 +843,19 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             rejected = await push("HEAD:main")
             self.assertNotEqual(rejected.returncode, 0, rejected.stderr.decode())
             self.assertIn(b"protected branch main", rejected.stderr)
-            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), base)
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), protected)
             allowed = await push("HEAD:feature")
             self.assertEqual(allowed.returncode, 0, allowed.stderr.decode())
             # Turning the independent toggle off restores direct pushing.
-            database.db_ci_config_set(FLAT_OWNER_UI, "repo", json.dumps(default_config()))
+            unprotected = commit_legacy_config(bare, default_config())
+            self.git("-C", source, "fetch", bare, "main")
+            self.git("-C", source, "reset", "--hard", "FETCH_HEAD")
             allowed = await push("HEAD:main")
             self.assertEqual(allowed.returncode, 0, allowed.stderr.decode())
-            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), head)
-            run_id = database.db_ci_run_create(FLAT_OWNER_UI, "repo", "manual", "main", head, "{}")
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), unprotected)
+            run_id = database.db_ci_run_create(
+                FLAT_OWNER_UI, "repo", "manual", "main", unprotected, "{}"
+            )
             database.db_ci_artifact_set(run_id, b"zip-fixture")
 
             def fetch(path):
@@ -818,15 +879,17 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("attachment", disposition)
             status, body, _ = await asyncio.to_thread(fetch, f"/r/{FLAT_OWNER_UI}/repo/ci/config")
             self.assertEqual(status, 200)
-            self.assertIn(b"Configuration JSON", body)
+            self.assertIn(b"Project pipelines", body)
+            self.assertIn(b"ci/config.json", body)
             self.assertIn(b">Deployments</a>", body)
+            self.assertIn(b"Environment variables", body)
             status, deployment_body, _ = await asyncio.to_thread(
                 fetch, f"/r/{FLAT_OWNER_UI}/repo/ci/deployments"
             )
             self.assertEqual(status, 200)
             self.assertIn(b"No deployments yet", deployment_body)
             self.assertIn(b'<nav class="ci-tabs"', deployment_body)
-            database.db_deployment_claim(run_id, FLAT_OWNER_UI, "repo", head)
+            database.db_deployment_claim(run_id, FLAT_OWNER_UI, "repo", unprotected)
             database.db_deployment_finish(run_id, "failed", "<script>private output</script>")
             deployment_id = database.db_deployments_list(FLAT_OWNER_UI, "repo")[0][0]
             status, deployment_body, _ = await asyncio.to_thread(
@@ -837,8 +900,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(b"<script>private output</script>", deployment_body)
             self.assertIn(f'href="/r/{FLAT_OWNER_UI}/repo/ci/docs"'.encode(), body)
             self.assertNotIn(b'id="ci-configuration-guide"', body)
-            self.assertIn(b'name="configuration_json"', body)
+            self.assertNotIn(b'name="configuration_json"', body)
             self.assertNotIn(b"Apply pipeline JSON", body)
+            self.assertIn(b'action="/r/root/repo/ci/preferences"', body)
             for old in (
                 b'name="pipeline_mode"',
                 b'for="ci-command"',
@@ -862,137 +926,34 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f'href="/r/{FLAT_OWNER_UI}/repo/artifacts"'.encode(), body)
 
     @unittest.skipUnless(_which_git_backend(), "real HTTP backend")
-    async def test_inline_json_editor_preserves_policy_and_rejects_invalid_input(self):
+    async def test_json_editor_posts_are_rejected_in_favor_of_repository_file(self):
         self.repository()
         with ServerRunner(project_root=str(self.root)) as server:
-            original = validate_config(
-                {
-                    "command": "echo old",
-                    "repository_config": True,
-                    "require_ci": True,
-                    "block_direct_pushes": True,
-                    "runner": "docker",
-                    "image": "python:3.14-slim",
-                    "events": {"manual": True},
-                    "env": {"KEEP": "yes"},
-                }
-            )
-            database.db_ci_config_set(FLAT_OWNER_UI, "repo", json.dumps(original))
 
-            async def apply(text):
-                def request():
-                    connection = http.client.HTTPConnection("127.0.0.1", server.port)
-                    try:
-                        connection.request(
-                            "POST",
-                            f"/r/{FLAT_OWNER_UI}/repo/ci/config",
-                            body=urlencode({"configuration_json": text}),
-                            headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        )
-                        response = connection.getresponse()
-                        return response.status, response.read()
-                    finally:
-                        connection.close()
+            def post(fields):
+                connection = http.client.HTTPConnection("127.0.0.1", server.port)
+                try:
+                    connection.request(
+                        "POST",
+                        f"/r/{FLAT_OWNER_UI}/repo/ci/config",
+                        body=urlencode(fields),
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    )
+                    response = connection.getresponse()
+                    return response.status, response.read()
+                finally:
+                    connection.close()
 
-                return await asyncio.to_thread(request)
-
-            from pygithost.ci_config import export_document
-
-            document = export_document(original)
-            document["pipelines"]["default"].pop("file")
-            document["pipelines"]["default"].update(
-                steps=[{"name": "Test", "run": "echo new"}], timeout_seconds=3600
-            )
-            text = json.dumps(document)
-            status, body = await apply(text)
-            self.assertEqual(status, 200)
-            self.assertIn(b"Configuration saved", body)
-            saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo"))
-            self.assertEqual(saved["steps"], [{"name": "Test", "run": "echo new"}])
-            self.assertEqual(saved["command"], "")
-            self.assertEqual(saved["timeout_seconds"], 3600)
-            self.assertFalse(saved["repository_config"])
-            for key in ("require_ci", "block_direct_pushes", "runner", "image", "events", "env"):
-                self.assertEqual(saved[key], original[key])
-            for invalid in (
-                '{"command": "</textarea><script>bad</script>"',
-                '{"command":"echo new", "require_ci":false}',
-                '{"steps":[]}',
-                "[1,2]",
-                '{"command":"' + "a" * 262144 + '"}',
+            for fields in (
+                {"configuration_json": '{"command": "echo must-not-save"}'},
+                {"pipeline_mode": "command", "command": "echo stale-command"},
             ):
-                status, body = await apply(invalid)
-                self.assertEqual(status, 200)
-                self.assertIn(b'role="alert"', body)
-                self.assertNotIn(b"<script>bad</script>", body)
-                self.assertEqual(
-                    json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo")), saved
-                )
-            status, _ = await apply('{"pipelines":{}}')
-            self.assertEqual(status, 200)
-            saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo"))
-            self.assertEqual(saved["steps"], [])
-            self.assertEqual(saved["command"], "")
-            self.assertEqual(saved["env"], {})
-
-    @unittest.skipUnless(_which_git_backend(), "real HTTP backend")
-    async def test_json_editor_ignores_old_fields_and_rejects_old_only_submissions(self):
-        self.repository()
-        with ServerRunner(project_root=str(self.root)) as server:
-
-            async def save(text=None):
-                def request():
-                    connection = http.client.HTTPConnection("127.0.0.1", server.port)
-                    try:
-                        fields = {"pipeline_mode": "command", "command": "echo stale-command"}
-                        if text is not None:
-                            fields["configuration_json"] = text
-                        connection.request(
-                            "POST",
-                            f"/r/{FLAT_OWNER_UI}/repo/ci/config",
-                            body=urlencode(fields),
-                            headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        )
-                        response = connection.getresponse()
-                        return response.status, response.read()
-                    finally:
-                        connection.close()
-
-                return await asyncio.to_thread(request)
-
-            text = '{"pipelines":{"default":{"steps":[{"name":"Test","run":"echo steps"}]}}}'
-            status, body = await save(text)
-            self.assertEqual(status, 200)
-            self.assertIn(b"Configuration saved", body)
-            config = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo"))
-            self.assertEqual(config["command"], "")
-            self.assertEqual(config["steps"][0]["run"], "echo steps")
-            self.assertNotIn(b'name="pipeline_mode"', body)
-            status, body = await save()
-            self.assertEqual(status, 200)
-            self.assertNotIn(b"Configuration saved", body)
-            self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo")), config)
-            status, body = await save("invalid JSON")
-            self.assertEqual(status, 200)
-            self.assertNotIn(b"Configuration saved", body)
-            self.assertIn(b"invalid JSON</textarea>", body)
-            self.assertNotIn(b'name="pipeline_mode"', body)
-            self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo")), config)
-            status, body = await save(
-                '{"defaults":{"env":{"FROM_JSON":"yes"}},"pipelines":{"default":{"steps":[{"name":"Test","run":"echo json"}]}}}'
-            )
-            self.assertEqual(status, 200)
-            self.assertIn(b"Configuration saved", body)
-            self.assertNotIn(b'name="pipeline_mode"', body)
-            config = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo"))
-            self.assertEqual(config["steps"][0]["run"], "echo json")
-            self.assertEqual(config["command"], "")
-            self.assertEqual(config["env"], {"FROM_JSON": "yes"})
-            self.assertTrue(config["events"]["manual"])
-            status, body = await save('{"pipelines":{},"pipelines":{}}')
-            self.assertNotIn(b"Configuration saved", body)
-            self.assertIn(b"Duplicate JSON key: pipelines", body)
-            self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "repo")), config)
+                with self.subTest(fields=fields):
+                    status, body = await asyncio.to_thread(post, fields)
+                    self.assertEqual(status, 410, body)
+                    self.assertIn(b"ci/config.json", body)
+                    self.assertNotIn(b"Configuration saved", body)
+            self.assertIsNone(database.db_ci_config_get(FLAT_OWNER_UI, "repo"))
 
     @unittest.skipUnless(_which_git_backend(), "real HTTP backend")
     async def test_http_merge_enforcement_is_optional_and_checks_current_commits(self):
@@ -1031,38 +992,152 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status, 200)
             self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), head)
             self.git("--git-dir", bare, "update-ref", "refs/heads/main", base)
+            required = commit_legacy_config(
+                bare,
+                validate_config(
+                    {
+                        "command": "true",
+                        "require_ci": True,
+                        "block_direct_pushes": True,
+                        "events": {"pr_opened": True},
+                    }
+                ),
+            )
+            self.git("--git-dir", bare, "update-ref", "refs/heads/feature", required)
+            changed = commit_file(bare, "feature.txt", "changed\n", branch="feature")
             pr_id = database.db_pr_create(
                 FLAT_OWNER_UI, "repo", "Required", "", "feature", "main", author
-            )
-            database.db_ci_config_set(
-                FLAT_OWNER_UI,
-                "repo",
-                json.dumps(validate_config({"require_ci": True, "block_direct_pushes": True})),
             )
             status, body = await merge(pr_id)
             self.assertEqual(status, 200)
             self.assertIn(b"Merge blocked", body)
-            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), base)
-            payload = {"pr_number": pr_id, "base_commit": base, "head_commit": head}
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), required)
+            payload = {"pr_number": pr_id, "base_commit": required, "head_commit": changed}
             run_id = database.db_ci_run_create(
-                FLAT_OWNER_UI, "repo", "pull_request", "main", base, json.dumps(payload)
+                FLAT_OWNER_UI, "repo", "pull_request", "main", required, json.dumps(payload)
             )
             for result in ("queued", "running", "failed", "cancelled", "timed_out"):
                 database.db_ci_run_update(run_id, status=result)
                 status, body = await merge(pr_id)
                 self.assertIn(b"Merge blocked", body)
-                self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), base)
+                self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), required)
             database.db_ci_run_update(run_id, status="success")
-            self.git("-C", source, "commit", "--allow-empty", "-m", "changed")
-            changed = self.git("-C", source, "rev-parse", "HEAD")
-            self.git("--git-dir", bare, "fetch", source, "main:refs/heads/feature")
+            newer = commit_file(bare, "feature.txt", "newer\n", branch="feature")
             status, body = await merge(pr_id)
             self.assertIn(b"Merge blocked", body)
-            payload["head_commit"] = changed
+            payload["head_commit"] = newer
             run_id = database.db_ci_run_create(
-                FLAT_OWNER_UI, "repo", "pull_request_updated", "main", base, json.dumps(payload)
+                FLAT_OWNER_UI,
+                "repo",
+                "pull_request_updated",
+                "main",
+                required,
+                json.dumps(payload),
             )
             database.db_ci_run_update(run_id, status="success")
             status, body = await merge(pr_id)
-            self.assertEqual(status, 200)
-            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), changed)
+            self.assertEqual(status, 200, body)
+            self.assertNotIn(b"Merge blocked", body)
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), newer, body)
+
+    @unittest.skipUnless(_which_git_backend(), "real HTTP backend")
+    async def test_http_merge_reads_ci_requirement_from_default_branch(self):
+        source, bare, _base = self.repository()
+        required = self.commit_legacy(
+            {"command": "true", "require_ci": True, "events": {"pr_opened": True}}
+        )
+        self.git("--git-dir", bare, "branch", "release", required)
+        release = self.commit_legacy(
+            {"command": "true", "events": {"pr_opened": True}}, branch="release"
+        )
+        self.git("-C", source, "fetch", bare, "release")
+        self.git("-C", source, "reset", "--hard", "FETCH_HEAD")
+        self.git("-C", source, "commit", "--allow-empty", "-m", "release feature")
+        head = self.git("-C", source, "rev-parse", "HEAD")
+        self.git("-C", source, "push", bare, "HEAD:refs/heads/feature")
+        with ServerRunner(project_root=str(self.root)) as server:
+            with closing(database._db_connect()) as connection:
+                connection.execute(
+                    "INSERT INTO users(username,pass_salt,pass_hash) VALUES('author',X'00',X'00')"
+                )
+            author = database.db_get_user_by_username("author")[0]
+            pr_id = database.db_pr_create(
+                FLAT_OWNER_UI, "repo", "Release policy", "", "feature", "release", author
+            )
+
+            async def merge():
+                def request():
+                    connection = http.client.HTTPConnection("127.0.0.1", server.port)
+                    try:
+                        connection.request(
+                            "POST",
+                            f"/r/{FLAT_OWNER_UI}/repo/pulls/{pr_id}/merge",
+                            body=b"",
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        )
+                        response = connection.getresponse()
+                        return response.status, response.read()
+                    finally:
+                        connection.close()
+
+                return await asyncio.to_thread(request)
+
+            status, body = await merge()
+            self.assertIn(b"Merge blocked", body)
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "release"), release)
+
+            # A success recorded for the default branch is not a check for the
+            # release target commit and must not unlock this merge.
+            main_run = database.db_ci_run_create(
+                FLAT_OWNER_UI,
+                "repo",
+                "pull_request",
+                "main",
+                required,
+                json.dumps({"pr_number": pr_id, "base_commit": required, "head_commit": head}),
+            )
+            database.db_ci_run_update(main_run, status="success")
+            status, body = await merge()
+            self.assertIn(b"Merge blocked", body)
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "release"), release)
+
+            release_run = database.db_ci_run_create(
+                FLAT_OWNER_UI,
+                "repo",
+                "pull_request",
+                "release",
+                release,
+                json.dumps({"pr_number": pr_id, "base_commit": release, "head_commit": head}),
+            )
+            database.db_ci_run_update(release_run, status="success")
+            status, body = await merge()
+            self.assertEqual(status, 200, body)
+            self.assertNotIn(b"Merge blocked", body)
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "release"), head)
+
+    @unittest.skipUnless(_which_git_backend() and os.name == "posix", "real HTTP Git backend")
+    async def test_http_push_rejects_unverifiable_ci_policy(self):
+        source, bare, base = self.repository()
+        self.git("--git-dir", bare, "config", "http.receivepack", "true")
+        self.git("-C", source, "commit", "--allow-empty", "-m", "next")
+        with ServerRunner(project_root=str(self.root)) as server:
+            remote = f"http://127.0.0.1:{server.port}/git/repo.git"
+            with mock.patch.object(
+                CIManager,
+                "config",
+                new=mock.AsyncMock(
+                    return_value={
+                        "_configuration_git_error": True,
+                        "require_ci": False,
+                        "block_direct_pushes": False,
+                    }
+                ),
+            ):
+                rejected = await asyncio.to_thread(
+                    subprocess.run,
+                    ["git", "-C", str(source), "push", remote, "HEAD:main"],
+                    capture_output=True,
+                )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stderr.decode())
+            self.assertIn(b"503", rejected.stderr)
+            self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), base)

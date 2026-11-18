@@ -11,6 +11,11 @@ from unittest import mock
 from pygithost import database
 from pygithost.api import mutations
 from tests import test_api as read_tests
+from tests.ci_fixtures import (
+    commit_file,
+    commit_legacy_config,
+    trusted_ci_repositories,
+)
 from tests.test_server import _which_git_backend
 
 
@@ -26,6 +31,14 @@ class APIWriteTests(unittest.TestCase):
         read_tests.APITests.setUp(self)
         self.write_token = database.db_create_token(self.alice, "writer", "write")
         self.admin_write_token = database.db_create_token(self.admin, "writer", "write")
+        trust = trusted_ci_repositories("alice/project")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
+
+    def save_config(self, config):
+        self.sha = commit_legacy_config(self.bare, config)
+        self.git("--git-dir", self.bare, "update-ref", "refs/heads/feature/api", self.sha)
+        return self.sha
 
     def mutate(self, path, document, *, method="POST", key=None, token=None):
         return self.request(
@@ -169,11 +182,7 @@ class APIWriteTests(unittest.TestCase):
             ],
             403,
         )
-        database.db_ci_config_set(
-            "alice",
-            "project",
-            json.dumps({"block_direct_pushes": True, "protected_branches": "release/*"}),
-        )
+        self.save_config({"block_direct_pushes": True, "protected_branches": "release/*"})
         self.assertEqual(
             self.mutate(self.base + "/branches", {"name": "release/prod", "sha": self.sha})[0], 403
         )
@@ -245,10 +254,8 @@ class APIWriteTests(unittest.TestCase):
         self.assertEqual(
             self.mutate(self.base + "/contents/new.txt", invalid, method="PUT")[0], 422
         )
-        database.db_ci_config_set(
-            "alice",
-            "project",
-            json.dumps({"block_direct_pushes": True, "protected_branches": "main"}),
+        doc["expected_head"] = self.save_config(
+            {"block_direct_pushes": True, "protected_branches": "main"}
         )
         self.assertEqual(self.mutate(self.base + "/contents/new.txt", doc, method="PUT")[0], 403)
 
@@ -308,13 +315,62 @@ class APIWriteTests(unittest.TestCase):
 
     def test_merge_ci_gate_and_closed_pull_rejection(self):
         path = self.base + f"/pulls/{self.pull}/merge"
-        database.db_ci_config_set("alice", "project", json.dumps({"require_ci": True}))
+        self.save_config({"command": "true", "require_ci": True})
         doc = {"sha": self.sha, "expected_base_sha": self.sha}
         status, _headers, result = self.mutate(path, doc, method="PUT")
         self.assertEqual(status, 409, result)
         self.assertEqual(result["code"], "ci_required")
         database.db_pr_close(self.pull)
         self.assertEqual(self.mutate(path, doc, method="PUT")[0], 409)
+
+    def test_merge_uses_default_branch_ci_requirement_and_exact_target_checks(self):
+        required = commit_legacy_config(
+            self.bare,
+            {"command": "true", "require_ci": True, "events": {"pr_opened": True}},
+        )
+        self.git("--git-dir", self.bare, "branch", "release", required)
+        release = commit_legacy_config(
+            self.bare,
+            {"command": "true", "events": {"pr_opened": True}},
+            branch="release",
+        )
+        self.git("--git-dir", self.bare, "update-ref", "refs/heads/feature/api", release)
+        feature = commit_file(self.bare, "feature.txt", "feature\n", branch="feature/api")
+        pull = database.db_pr_create(
+            "alice", "project", "Release PR", "", "feature/api", "release", self.alice
+        )
+        path = self.base + f"/pulls/{pull}/merge"
+        doc = {"sha": feature, "expected_base_sha": release}
+
+        status, _headers, result = self.mutate(path, doc, method="PUT")
+        self.assertEqual(status, 409, result)
+        self.assertEqual(result["code"], "ci_required")
+
+        # A success for the default branch has the wrong target commit.
+        main_run = database.db_ci_run_create(
+            "alice",
+            "project",
+            "pull_request",
+            "main",
+            required,
+            json.dumps({"pr_number": pull, "base_commit": required, "head_commit": feature}),
+        )
+        database.db_ci_run_update(main_run, status="success")
+        self.assertEqual(self.mutate(path, doc, method="PUT")[0], 409)
+
+        release_run = database.db_ci_run_create(
+            "alice",
+            "project",
+            "pull_request",
+            "release",
+            release,
+            json.dumps({"pr_number": pull, "base_commit": release, "head_commit": feature}),
+        )
+        database.db_ci_run_update(release_run, status="success")
+        status, _headers, result = self.mutate(path, doc, method="PUT")
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["merged"])
+        self.assertEqual(self.git("--git-dir", self.bare, "rev-parse", "release"), feature)
 
     def test_json_validation_and_idempotency_key_requirement(self):
         path = self.base + "/issues"

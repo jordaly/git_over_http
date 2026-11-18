@@ -28,10 +28,6 @@ GUIDES = {
     "getting-started": ("Server setup", "docs/getting-started.md"),
 }
 EXAMPLES = {
-    "repository-reference": (
-        "Default file reference (Settings)",
-        "docs/examples/ci/repository-reference.json",
-    ),
     "all-options": ("All options", "docs/examples/ci/all-options.json"),
     "inline-deployment": ("Inline deployment", "docs/examples/ci/inline-deployment.json"),
     "git-managed": ("Git-managed configuration", "docs/examples/ci/git-managed.json"),
@@ -208,9 +204,9 @@ def manual_content(guide: str, example: str | None, base: str) -> SafeHTML | Non
         title, path = EXAMPLES[example]
         text = (ROOT / path).read_text(encoding="utf-8")
         warning = (
-            "Commit this as ci/config.json; it is not an administrator document."
-            if example == "repository-pipeline"
-            else "Copy this complete document into CI → Settings → Configuration JSON and adapt it before saving."
+            "Commit this configuration as ci/config.json and adapt it before running. "
+            "Referenced pipeline files must also be under ci/. "
+            "Keep secrets in the project page, never in Git."
         )
         return safe_html(
             "<h2>"

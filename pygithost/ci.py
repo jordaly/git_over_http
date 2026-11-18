@@ -34,6 +34,7 @@ _T = TypeVar("_T")
 
 MAX_OUTPUT = 1024 * 1024
 JOB_TIMEOUT = 30 * 60
+UNMERGED_PR_EVENTS = frozenset({"pull_request", "pull_request_updated", "pull_request_reopened"})
 BUILTINS = {
     "CI",
     "PYGITHOST_OWNER",
@@ -50,6 +51,8 @@ BUILTINS = {
     "PYGITHOST_BASE_COMMIT",
     "PYGITHOST_WORKTREE",
     "PYGITHOST_PIPELINE",
+    "PYGITHOST_DEPLOYMENT",
+    "PYGITHOST_DEPLOY_SCRIPT",
 }
 
 
@@ -120,7 +123,7 @@ def default_config() -> JsonObject:
         "email_mode": "off",
         "cancel_superseded": False,
         "repository_config": False,
-        "repository_file": ".pygithost-ci.json",
+        "repository_file": "ci/config.json",
         "require_ci": False,
         "block_direct_pushes": False,
         "protected_branches": "main",
@@ -135,14 +138,42 @@ def default_config() -> JsonObject:
 
 
 def unconfigured_repository_config() -> JsonObject:
-    """Safe discovery preset; never overrides a saved repository configuration."""
+    """Safe discovery preset for repositories without ci/config.json."""
     from .ci_config import compile_document
 
     config: JsonObject = compile_document({"version": 1, "file": "ci/config.json"})
-    # Ephemeral server-only marker. Saving settings makes the reference explicit,
-    # so missing files then produce configuration failures rather than idle CI.
+    # Missing files leave CI idle, while malformed files produce a failed run.
     config["_autodetect_repository_config"] = True
     return config
+
+
+def authorize_repository_execution(owner: str, repo: str, config: Mapping[str, Any]) -> None:
+    """Repository writers cannot grant themselves server-user execution."""
+    trusted = {
+        name.strip()
+        for name in os.environ.get("PYGITHOST_CI_TRUSTED_REPOSITORIES", "")
+        .replace(",", "\n")
+        .splitlines()
+        if name.strip()
+    }
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", name) or ".." in name
+        for name in trusted
+    ):
+        raise ValueError(
+            "PYGITHOST_CI_TRUSTED_REPOSITORIES requires exact owner/repo names, not patterns."
+        )
+    if f"{owner}/{repo}" in trusted:
+        return
+    if (
+        config.get("runner") == "host"
+        or config.get("deploy_enabled")
+        or any(target.get("deploy_enabled") for target in config.get("deployment_targets", []))
+    ):
+        raise ValueError(
+            "Host jobs and deployments require administrator authorization in "
+            "PYGITHOST_CI_TRUSTED_REPOSITORIES."
+        )
 
 
 def validate_config(raw: object, *, nested: bool = False) -> JsonObject:
@@ -369,7 +400,7 @@ def validate_config(raw: object, *, nested: bool = False) -> JsonObject:
     ):
         raise ValueError("Invalid deployment name.")
     defaults["deployment_name"] = deployment_name
-    filename = raw.get("repository_file", ".pygithost-ci.json")
+    filename = raw.get("repository_file", "ci/config.json")
     if (
         not isinstance(filename, str)
         or len(filename) > 256
@@ -456,7 +487,7 @@ def pipeline_config(
     }
     merged = validate_config(merged)
     if enforce_timeout and merged["timeout_seconds"] > config["timeout_seconds"]:
-        raise ValueError("Repository timeout exceeds the server-configured limit.")
+        raise ValueError("Pipeline timeout exceeds the limit in ci/config.json.")
     if not merged["command"] and not merged["steps"]:
         raise ValueError("Pipeline requires command or steps.")
     return merged
@@ -739,6 +770,9 @@ class CIManager:
         self.runner_lock: IO[bytes] | None = None
         self.max_concurrency = max(1, int(os.environ.get("PYGITHOST_CI_CONCURRENCY", "2")))
         self.queue_limit = max(1, int(os.environ.get("PYGITHOST_CI_QUEUE_LIMIT", "100")))
+        self.retention_failed: set[tuple[str, str]] = set()
+        self.retention_retry_at: dict[tuple[str, str], float] = {}
+        self.retention_retry_seconds = 30.0
 
     async def start(self) -> None:
         async with self.lifecycle_lock:
@@ -749,6 +783,21 @@ class CIManager:
                 from .remote_ci import recover_jobs
 
                 await _db_call(recover_jobs)
+                for owner, repo in await _db_call(database.db_ci_retention_repositories):
+                    try:
+                        await self.refresh_retention(owner, repo)
+                    except Exception as exc:
+                        # Cleanup stays paused until a retry succeeds, but a
+                        # retention cache failure must not stop the scheduler.
+                        logging.getLogger(__name__).warning(
+                            "CI retention refresh failed during startup; cleanup paused",
+                            extra={
+                                "event": "ci_retention_startup_failure",
+                                "owner": owner,
+                                "repo": repo,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
                 await _db_call(database.db_ci_recover_runs)
                 await _db_call(database.db_deployment_recover)
                 rows = await _db_call(database.db_ci_queued_runs)
@@ -830,24 +879,190 @@ class CIManager:
                 return_exceptions=True,
             )
 
-    async def config(self, owner: str, repo: str) -> JsonObject:
-        raw = await _db_call(database.db_ci_config_get, owner, repo)
-        if not raw:
-            config = unconfigured_repository_config()
-        else:
-            parsed = json.loads(raw)
-            config = validate_config(parsed)
-            if "document" in parsed:
-                config["document"] = parsed["document"]
-        from .ci_preferences import apply
+    async def refresh_retention(self, owner: str, repo: str) -> None:
+        """Resolve default-branch retention before touching the SQLite cache."""
+        from .ci_preferences import legacy_retention
+        from .repository_ci import inspect_configuration
 
-        preferences = await _db_call(database.db_ci_preferences_get, owner, repo)
-        merged: JsonObject = apply(config, *preferences)
+        key = (owner, repo)
+        source = await asyncio.to_thread(inspect_configuration, self.repo_path(owner, repo))
+        if source.commit is None or source.error:
+            policy: JsonObject = {"unavailable": True}
+        elif source.config is None or "document" not in source.config:
+            policy = {}
+        else:
+            policy = legacy_retention(source.config)
+        try:
+            await _db_call(
+                database.db_ci_retention_policy_set, owner, repo, policy, commit=source.commit
+            )
+        except Exception:
+            self.retention_failed.add(key)
+            raise
+        self.retention_failed.discard(key)
+        self.retention_retry_at.pop(key, None)
+
+    async def ensure_retention(self, owner: str, repo: str) -> None:
+        """Bounded best-effort refresh when no verified cache row exists.
+
+        A cheap cache check runs for each enqueue; Git is only read when the row
+        is missing or a previous refresh failed, and at most once per cooldown.
+        """
+        key = (owner, repo)
+        if key not in self.retention_failed:
+            try:
+                if await _db_call(database.db_ci_retention_policy_cached, owner, repo):
+                    return
+            except Exception:
+                # The caller's normal CI path will surface persistent DB errors.
+                return
+        now = time.monotonic()
+        if now < self.retention_retry_at.get(key, 0.0):
+            return
+        self.retention_retry_at[key] = now + self.retention_retry_seconds
+        try:
+            await self.refresh_retention(owner, repo)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "CI retention refresh retry failed; cleanup paused",
+                extra={
+                    "event": "ci_retention_retry_failure",
+                    "owner": owner,
+                    "repo": repo,
+                    "error_type": type(exc).__name__,
+                },
+            )
+
+    async def config(
+        self, owner: str, repo: str, revision: str = "HEAD", *, include_secrets: bool = True
+    ) -> JsonObject:
+        from .ci_preferences import apply
+        from .repository_ci import inspect_configuration
+
+        source = await asyncio.to_thread(
+            inspect_configuration, self.repo_path(owner, repo), revision
+        )
+        config = source.config if source.config is not None else unconfigured_repository_config()
+        status = "valid" if source.config is not None else "missing"
+        source_error = source.error
+        error = source_error
+        if source.commit is None:
+            status = "unavailable"
+        elif error:
+            status = "invalid"
+        if source.git_error:
+            # A failed Git lookup must not turn stored protections off. Mutations
+            # are rejected instead of silently running without a policy.
+            status = "unavailable"
+            error = "Repository CI policy cannot be verified."
+            config.update(require_ci=True, block_direct_pushes=True, protected_branches="*")
+        if error:
+            config["_repository_config_invalid"] = True
+            if source.config is None:
+                config.update(require_ci=True, block_direct_pushes=True, protected_branches="*")
+        global_values, secrets_values = (
+            await self.secret_preferences(owner, repo)
+            if include_secrets
+            else await _db_call(database.db_ci_preferences_get)
+        )
+        if not include_secrets:
+            global_values = {key: value for key, value in global_values.items() if key != "env"}
+        merged: JsonObject = apply(config, global_values, secrets_values, repository_owned=True)
+        for item in [merged, *merged.get("pipelines", [])]:
+            if source_error:
+                item["_repository_config_error"] = source_error
+                continue
+            try:
+                authorize_repository_execution(owner, repo, item)
+            except ValueError as exc:
+                item["_repository_config_error"] = str(exc)
+                if status == "valid":
+                    status = "blocked"
+                    error = str(exc)
+        merged.update(
+            _configuration_commit=source.commit,
+            _configuration_status=status,
+            _configuration_error=error,
+            _configuration_document=source.document,
+            _configuration_git_error=source.git_error,
+        )
         return merged
+
+    async def secret_preferences(self, owner: str, repo: str) -> tuple[JsonObject, JsonObject]:
+        global_values, repository_values = await _db_call(
+            database.db_ci_preferences_get, owner, repo
+        )
+        # Only secrets/environment remain page-managed. Preserve legacy secrets
+        # without allowing old saved commands, triggers or execution settings to
+        # become an alternative configuration source.
+        secrets_values: JsonObject = {
+            key: repository_values[key]
+            for key in ("env", "pipeline_env", "env_scopes")
+            if key in repository_values
+        }
+        if not any(key in repository_values for key in ("env", "pipeline_env")):
+            raw = await _db_call(database.db_ci_config_get, owner, repo)
+            if raw:
+                legacy = json.loads(raw)
+                secrets_values["env"] = legacy.get("env", {})
+                secrets_values["pipeline_env"] = {
+                    item.get("pipeline_id", "default"): item["env"]
+                    for item in legacy.get("pipelines", [])
+                    if item.get("env")
+                }
+        return global_values, secrets_values
+
+    async def execution_environment(
+        self,
+        row: RunRow,
+        pipeline: str,
+        git_values: Mapping[str, str],
+        *,
+        deployment: bool = False,
+    ) -> dict[str, str]:
+        from .ci_preferences import page_environment
+        from .repository_ci import resolve_commit
+
+        _run_id, owner, repo, event, branch, commit, _payload = row
+        if event in UNMERGED_PR_EVENTS:
+            return dict(git_values)
+        global_values, secrets_values = await self.secret_preferences(owner, repo)
+        # A repository writer must not be able to unlock protected secrets by
+        # changing its Git protection rules. The server authorizes exact refs.
+        trusted_refs = {
+            value.strip()
+            for value in re.split(
+                r"[,\n]", os.environ.get("PYGITHOST_CI_PROTECTED_SECRET_BRANCHES", "")
+            )
+            if value.strip()
+        }
+        protected = False
+        if branch and f"{owner}/{repo}:{branch}" in trusted_refs:
+            default = await self.config(owner, repo, include_secrets=False)
+            protected = (
+                default.get("_configuration_status") in ("valid", "blocked")
+                and protected_branch(default, branch)
+                and await asyncio.to_thread(
+                    resolve_commit, self.repo_path(owner, repo), "refs/heads/" + branch
+                )
+                == commit
+            )
+        return {
+            **git_values,
+            **page_environment(
+                global_values,
+                secrets_values,
+                pipeline,
+                event=event,
+                protected=protected,
+                deployment=deployment,
+            ),
+        }
 
     async def save_document(
         self, owner: str, repo: str, document: object, *, preserve_page_settings: bool = False
     ) -> JsonObject:
+        """Legacy storage/export compatibility; execution reads ci/config.json."""
         from .ci_config import compile_document
 
         config: JsonObject = compile_document(document)
@@ -885,6 +1100,7 @@ class CIManager:
         return config
 
     async def save_config(self, owner: str, repo: str, config: Mapping[str, Any]) -> JsonObject:
+        """Preserve legacy data for migration; this does not activate a pipeline."""
         if config.get("deploy_script_content"):
             config = {**config, "deploy_script": ""}
         validated = validate_config(config)
@@ -908,7 +1124,9 @@ class CIManager:
     async def merge_check(
         self, owner: str, repo: str, pr_id: int, base: str, head: str, branch: str
     ) -> CIRunStatusRow | None:
-        config = await self.config(owner, repo)
+        config = await self.config(owner, repo, base, include_secrets=False)
+        if config.get("_repository_config_invalid"):
+            return None
         checks: list[CIRunStatusRow] = []
         for item in self.pipelines(config):
             if item["pipeline_id"] != "default" or "document" in config:
@@ -968,40 +1186,16 @@ class CIManager:
         missing_ok: bool = False,
     ) -> JsonObject | None:
         """Read a bounded blob at an immutable SHA, never from the working tree."""
-        if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
-            raise ValueError("Repository pipeline requires an exact commit SHA.")
+        from .repository_ci import compile_repository_document, read_document
 
-        async def git(*args: str) -> bytes:
-            process = await asyncio.create_subprocess_exec(
-                "git",
-                "--git-dir",
-                self.repo_path(owner, repo),
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=runner_environment(tempfile.gettempdir()),
-            )
-            try:
-                stdout, _stderr = await asyncio.wait_for(process.communicate(), 10)
-            except BaseException:
-                if process.returncode is None:
-                    process.kill()
-                await process.wait()
-                raise
-            if process.returncode:
-                raise ValueError("Cannot read the repository pipeline at the recorded commit.")
-            return stdout
-
-        filename = config.get("repository_file", ".pygithost-ci.json")
-        tree = (await git("ls-tree", "--full-tree", commit, "--", filename)).decode().split()
-        if not tree and missing_ok:
+        filename = config.get("repository_file", "ci/config.json")
+        raw = await asyncio.to_thread(read_document, self.repo_path(owner, repo), commit, filename)
+        if raw is None and missing_ok:
             return None
-        if len(tree) < 3 or tree[0] not in ("100644", "100755") or tree[1] != "blob":
+        if raw is None:
             raise ValueError(f"Missing regular {filename} file.")
-        blob = tree[2]
-        if int((await git("cat-file", "-s", blob)).strip()) > 65536:
-            raise ValueError("Repository pipeline exceeds 64 KiB.")
-        raw = json.loads(await git("cat-file", "blob", blob))
+        if filename == "ci/config.json":
+            return compile_repository_document(raw)
         return pipeline_config(raw, config)
 
     @staticmethod
@@ -1021,7 +1215,21 @@ class CIManager:
         pipeline: str | None = None,
     ) -> int | None:
         async with self.enqueue_lock:
-            configs = self.pipelines(await self.config(owner, repo))
+            if self.started:
+                await self.ensure_retention(owner, repo)
+            # Pull-request callers supply the trusted base SHA as commit; never
+            # load executable configuration from the unreviewed head revision.
+            config_revision = (
+                (payload or {}).get("base_commit", commit)
+                if event in UNMERGED_PR_EVENTS
+                else commit
+            )
+            if event in UNMERGED_PR_EVENTS and not config_revision:
+                return None
+            source = await self.config(
+                owner, repo, config_revision or "HEAD", include_secrets=False
+            )
+            configs = self.pipelines(source)
             if pipeline is not None:
                 configs = [item for item in configs if item["pipeline_id"] == pipeline]
                 if not configs:
@@ -1030,12 +1238,21 @@ class CIManager:
             for config in configs:
                 identity = config["pipeline_id"]
                 run_payload: JsonObject = {**(payload or {})}
+                if source.get("_configuration_commit"):
+                    run_payload["configuration_commit"] = source["_configuration_commit"]
                 if identity != "default":
                     run_payload["pipeline_id"] = identity
                 else:
                     run_payload.pop("pipeline_id", None)
                 run = await self._enqueue(
-                    owner, repo, event, branch, commit, run_payload, selected=config
+                    owner,
+                    repo,
+                    event,
+                    branch,
+                    commit,
+                    run_payload,
+                    selected=config,
+                    source_commit=config_revision or commit,
                 )
                 first = first or run
             return first
@@ -1050,6 +1267,8 @@ class CIManager:
         payload: Mapping[str, Any] | None = None,
         snapshot: Mapping[str, Any] | None = None,
         selected: Mapping[str, Any] | None = None,
+        *,
+        source_commit: str = "",
     ) -> int | None:
         config: JsonObject
         if snapshot:
@@ -1057,7 +1276,7 @@ class CIManager:
         elif selected:
             config = dict(selected)
         else:
-            config = await self.config(owner, repo)
+            config = await self.config(owner, repo, include_secrets=False)
         key = {
             "push": "push",
             "pull_request": "pr_opened",
@@ -1076,38 +1295,41 @@ class CIManager:
             config["pr_branches"], (payload or {}).get("base_branch", branch)
         ):
             return None
-        config_error = ""
-        if snapshot is None and config["repository_config"]:
+        config_error = config.get("_repository_config_error", "")
+        if snapshot is None and config["repository_config"] and not config_error:
             try:
                 # PR code cannot change its own pipeline before review/merge.
                 repository_pipeline = await self.repository_pipeline(
                     owner,
                     repo,
-                    commit,
+                    source_commit or commit,
                     config,
                     missing_ok=config.get("_autodetect_repository_config", False),
                 )
                 if repository_pipeline is None:
                     return None
                 config = repository_pipeline
-            except (ValueError, UnicodeError, OSError, RecursionError, asyncio.TimeoutError) as exc:
+            except (
+                ValueError,
+                UnicodeError,
+                OSError,
+                RecursionError,
+                asyncio.TimeoutError,
+                subprocess.TimeoutExpired,
+            ) as exc:
                 config_error = f"Repository pipeline configuration: {exc}"
         if snapshot is None and not config_error:
-            from .ci_preferences import environment
-
-            global_values, repository_values = await _db_call(
-                database.db_ci_preferences_get, owner, repo
-            )
-            config["env"] = environment(
-                global_values,
-                repository_values,
-                config.get("env", {}),
-                config.get("pipeline_id", "default"),
-            )
             try:
                 config = validate_config(config)
+                authorize_repository_execution(owner, repo, config)
+                config["_page_environment_live"] = True
             except ValueError as exc:
                 config_error = f"CI preferences: {exc}"
+        if snapshot is not None:
+            try:
+                authorize_repository_execution(owner, repo, config)
+            except ValueError as exc:
+                config_error = str(exc)
         if not self.started:
             await self.start()
         if self.stopping:
@@ -1171,6 +1393,14 @@ class CIManager:
             meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
             if not run or not meta or not meta["config"]:
                 raise ValueError("This run has no configuration snapshot; queue a new run instead.")
+            stored = json.loads(meta["config"])
+            snapshot = validate_config(stored)
+            if stored.get("_page_environment_live") is True:
+                snapshot["_page_environment_live"] = True
+            else:
+                # Historical snapshots could contain page credentials mixed
+                # into Git variables. Do not replay those credentials.
+                snapshot["env"] = {}
             return await self._enqueue(
                 owner,
                 repo,
@@ -1178,7 +1408,7 @@ class CIManager:
                 run[2],
                 run[3],
                 json.loads(meta["payload"]),
-                validate_config(json.loads(meta["config"])),
+                snapshot,
             )
 
     async def cancel(self, owner: str, repo: str, run_id: int) -> bool:
@@ -1302,7 +1532,9 @@ class CIManager:
     async def _deploy(self, row: RunRow) -> None:
         """Run each independently named target linked to this pipeline."""
         run_id, owner, repo, event, branch, commit, _payload = row
-        repository_config = await self.config(owner, repo)
+        repository_config = await self.config(
+            owner, repo, "refs/heads/" + branch, include_secrets=False
+        )
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
         snapshot: JsonObject = json.loads(meta["config"] or "{}") if meta else {}
         identity = snapshot.get("pipeline_id", "default")
@@ -1353,6 +1585,13 @@ class CIManager:
                 reason="Deployment skipped: " + deployment_key + ": " + reason,
             )
 
+        try:
+            authorize_repository_execution(owner, repo, config)
+            authorize_repository_execution(owner, repo, snapshot)
+        except ValueError as exc:
+            await skip(str(exc))
+            return
+
         if event not in ("push", "pull_request_merged"):
             await skip("only Push and PR merged runs deploy; manual runs and PR checks do not.")
             return
@@ -1378,7 +1617,7 @@ class CIManager:
             )
         ):
             await skip(
-                "deployment settings changed since this run was queued; push a new commit with the saved settings."
+                "deployment configuration changed since this run was queued; push a new commit with the updated configuration."
             )
             return
         output, truncated = bytearray(), [False]
@@ -1438,6 +1677,10 @@ class CIManager:
                     raise ValueError(
                         "Cannot check out the tested commit for deployment; Git data or the deployment timeout is insufficient."
                     )
+                deployment_env = await self.execution_environment(
+                    row, identity, {}, deployment=True
+                )
+                validate_config({"env": deployment_env})
                 claimed = await _db_call(
                     database.db_deployment_claim, run_id, owner, repo, commit, json.dumps(config)
                 )
@@ -1479,6 +1722,7 @@ class CIManager:
                     PYGITHOST_WORKTREE=worktree,
                     CI="true",
                 )
+                env.update(deployment_env)
                 if script is not None:
                     # Named commands explicitly invoke the shared helper. Do not
                     # also execute it implicitly before/after the named steps.
@@ -1799,11 +2043,14 @@ class CIManager:
         run_id, owner, repo, event, branch, commit, payload_json = row
         payload = json.loads(payload_json or "{}")
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
-        config: JsonObject = (
-            validate_config(json.loads(meta["config"]))
-            if meta and meta["config"]
-            else await self.config(owner, repo)
-        )
+        stored: JsonObject = json.loads(meta["config"]) if meta and meta["config"] else {}
+        if not stored:
+            raise ValueError("CI run has no execution snapshot; queue a new run.")
+        config = validate_config(stored)
+        authorize_repository_execution(owner, repo, config)
+        git_values = config["env"] if stored.get("_page_environment_live") is True else {}
+        config["env"] = await self.execution_environment(row, config["pipeline_id"], git_values)
+        config = validate_config(config)
         if config["runner"] == "remote-docker":
             from .remote_ci import execute_remote
 

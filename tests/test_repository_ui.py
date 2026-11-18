@@ -16,6 +16,11 @@ from urllib.parse import urlencode
 
 from pygithost import application, database
 from pygithost.application import FLAT_OWNER_UI
+from tests.ci_fixtures import (
+    commit_ci_config,
+    commit_legacy_config,
+    trusted_ci_repositories,
+)
 from tests.test_server import ServerRunner, _which_git_backend
 
 
@@ -37,14 +42,34 @@ class RepositoryUITests(unittest.TestCase):
         self.sha = self.git("--git-dir", self.bare, "rev-parse", "main")
         for branch in ("feature/api", "release/1"):
             self.git("--git-dir", self.bare, "branch", branch, "main")
+        self.sha = commit_legacy_config(
+            self.bare,
+            {"block_direct_pushes": True, "protected_branches": "release/*"},
+            message="Initial UI fixture",
+        )
+        self.sync_source()
+        for branch in ("feature/api", "release/1"):
+            self.git("--git-dir", self.bare, "update-ref", f"refs/heads/{branch}", self.sha)
         self.server = ServerRunner(project_root=str(self.root))
         self.server.__enter__()
         self.base = f"/r/{FLAT_OWNER_UI}/project"
-        database.db_ci_config_set(
-            FLAT_OWNER_UI,
-            "project",
-            json.dumps({"block_direct_pushes": True, "protected_branches": "release/*"}),
-        )
+        trust = trusted_ci_repositories(f"{FLAT_OWNER_UI}/project")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
+
+    def sync_source(self):
+        self.git("-C", self.source, "fetch", self.bare, "main")
+        self.git("-C", self.source, "reset", "--hard", "FETCH_HEAD")
+
+    def save_config(self, config):
+        self.sha = commit_legacy_config(self.bare, config)
+        self.sync_source()
+        return self.sha
+
+    def save_document(self, document):
+        self.sha = commit_ci_config(self.bare, document)
+        self.sync_source()
+        return self.sha
 
     def tearDown(self):
         self.server.__exit__(None, None, None)
@@ -270,31 +295,31 @@ class RepositoryUITests(unittest.TestCase):
         self.assertNotIn("<script>alert(1)</script>", page)
 
     def test_multiple_pipeline_settings_and_manual_selection(self):
-        document = {
-            "defaults": {"events": {"manual": True}},
-            "pipelines": {"lint": {"steps": [{"name": "Lint", "run": "echo lint"}]}},
-        }
-        status, page = self.request(
-            self.base + "/ci/config", {"configuration_json": json.dumps(document)}
+        self.save_document(
+            {
+                "defaults": {"triggers": {"manual": {"enabled": True}}},
+                "pipelines": {
+                    "lint": {"steps": [{"name": "Lint", "run": "echo lint"}]},
+                    "build": {"steps": [{"name": "Build", "run": "echo build"}]},
+                },
+            }
         )
-        self.assertEqual(status, 200)
-        self.assertIn("Configuration saved", page)
-        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
-        self.assertEqual(application.CIManager.pipelines(saved)[0]["pipeline_id"], "lint")
         _, page = self.request(self.base + "/ci")
         self.assertIn('<option value="lint">lint</option>', page)
+        self.assertIn('<option value="build">build</option>', page)
         status, _ = self.request(self.base + "/ci/run", {"branch": "main", "pipeline": "lint"})
         self.assertEqual(status, 303)
         rows = database.db_ci_runs_list(FLAT_OWNER_UI, "project")
         self.assertEqual(len(rows), 1)
         meta = database.db_ci_run_metadata(FLAT_OWNER_UI, "project", rows[0][0])
         self.assertEqual(json.loads(meta["config"])["pipeline_id"], "lint")
-        _, page = self.request(
+        status, page = self.request(
             self.base + "/ci/config",
             {"configuration_json": '{"pipelines":{"lint":{"command":"echo old"}}}'},
         )
-        self.assertIn("unknown fields: command", page)
-        self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project")), saved)
+        self.assertEqual(status, 410)
+        self.assertIn("ci/config.json", page)
+        self.assertIsNone(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
 
     def test_full_ci_documentation_and_examples_are_shown_in_page(self):
         status, page = self.request(self.base + "/ci/docs")
@@ -310,6 +335,11 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("<table>", page)
         self.assertIn('src="/static/ci-docs.js"', page)
         self.assertIn('id="every-execution-option"', page)
+        self.assertIn("This is the only project configuration entry point.", page)
+        self.assertIn(f'href="{self.base}/ci/config">CI → Settings</a>', page)
+        self.assertIn(f'href="{self.base}/ci">CI → Runs</a>', page)
+        self.assertIn("verify the configuration without deploying", page)
+        self.assertIn(f'href="{self.base}/ci/docs?guide=migration">Migration guide</a>', page)
         self.assertIn(self.base + "/ci/docs?example=all-options", page)
         self.assertNotIn('href="examples/ci/', page)
         status, page = self.request(self.base + "/ci/docs?example=all-options")
@@ -322,49 +352,24 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("Safe first run", page)
         status, page = self.request(self.base + "/ci/docs?guide=migration")
         self.assertEqual(status, 200)
-        self.assertIn("Old field", page)
-        self.assertIn("What remains repository-wide", page)
+        self.assertIn("Build the committed document", page)
+        self.assertIn("Behavior changes at a glance", page)
         for path in ("?guide=../../LICENSE", "?example=../../pygithost.config"):
             status, _page = self.request(self.base + "/ci/docs" + path)
             self.assertEqual(status, 404)
 
-    def test_grouped_configuration_is_saved_and_legacy_is_presented_grouped(self):
-        import html
-
+    def test_grouped_configuration_page_is_repository_owned_and_rejects_saves(self):
         _, page = self.request(self.base + "/ci/config")
-        self.assertIn('<code class="language-json">', page)
-        self.assertIn('src="/static/ci-docs.js"', page)
-        editor = (
-            page.split('name="configuration_json"', 1)[1]
-            .split(">", 1)[1]
-            .split("</textarea>", 1)[0]
-        )
-        migrated = json.loads(html.unescape(editor))
-        self.assertIn("policies", migrated)
-        self.assertNotIn("settings", migrated)
+        self.assertIn("Project pipelines", page)
+        self.assertIn("ci/config.json", page)
+        self.assertNotIn('name="configuration_json"', page)
         document = json.loads(Path("docs/examples/ci/all-options.json").read_text())
         status, page = self.request(
             self.base + "/ci/config", {"configuration_json": json.dumps(document)}
         )
-        self.assertEqual(status, 200)
-        self.assertIn("Configuration saved", page)
-        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
-        self.assertEqual(saved["document"], document)
-        _, page = self.request(self.base + "/ci/config")
-        editor = (
-            page.split('name="configuration_json"', 1)[1]
-            .split(">", 1)[1]
-            .split("</textarea>", 1)[0]
-        )
-        from pygithost.ci_preferences import editor_document
-
-        self.assertEqual(json.loads(html.unescape(editor)), editor_document(document))
-        document["pipelines"][0]["execution"]["working_directory"] = "."
-        _, page = self.request(
-            self.base + "/ci/config", {"configuration_json": json.dumps(document)}
-        )
-        self.assertIn("unsupported fields: working_directory", page)
-        self.assertEqual(json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project")), saved)
+        self.assertEqual(status, 410)
+        self.assertIn("ci/config.json", page)
+        self.assertIsNone(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
 
     def test_server_display_name_is_editable_persistent_and_escaped(self):
         _, home = self.request("/")
@@ -497,7 +502,7 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn('aria-current="page">Branches', page)
         self.assertIn("Default branch", page)
         self.assertIn("Initial UI fixture", page)
-        self.assertIn("UI author", page)
+        self.assertIn("CI fixture", page)
         self.assertIn('name="branch" value="feature/api"', page)
         self.assertNotIn('name="branch" value="release/1"', page)
         self.assertNotIn('name="branch" value="main"', page)
@@ -587,7 +592,6 @@ class RepositoryUITests(unittest.TestCase):
             self.assertIn("Showing 31–35 of 35", last)
             self.assertIn('aria-label="Go to first page"', last)
             self.assertNotIn('aria-label="Go to last page"', last)
-        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
         for index in range(35):
             commit = f"{index:040x}"
             run_id = database.db_ci_run_create(
@@ -659,7 +663,7 @@ class RepositoryUITests(unittest.TestCase):
         table = expanded.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
         self.assertIn("file-00.txt", table)
         self.assertIn("file-29.txt", table)
-        self.assertEqual(table.count('class="repo-entry-message"><a'), 32)
+        self.assertEqual(table.count('class="repo-entry-message"><a'), 33)
 
     def test_wide_directories_are_paginated_per_page(self):
         (self.source / "wide").mkdir()
@@ -699,11 +703,6 @@ class RepositoryUITests(unittest.TestCase):
         self.assertEqual(table.count('<td class="repo-entry-name">'), 50)
 
     def test_pull_requests_and_artifacts_are_paginated(self):
-        database.db_ci_config_set(
-            FLAT_OWNER_UI,
-            "project",
-            json.dumps({"run_retention_count": 0, "artifact_retention_days": 0}),
-        )
         user_id = self.fixture_user()
         for index in range(30):
             database.db_pr_create(
@@ -776,7 +775,6 @@ class RepositoryUITests(unittest.TestCase):
             self.assertIn('rel="prev"', history.split('<tbody id="commitRows">', 1)[0])
 
     def test_run_and_deployment_pagination(self):
-        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
         ids = []
         for index in range(28):
             commit = f"{index:040x}"
@@ -800,7 +798,6 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("status=success&amp;page=1", page)
 
     def test_run_warning_badges_filters_pagination_and_details(self):
-        database.db_ci_config_set(FLAT_OWNER_UI, "project", json.dumps({"run_retention_count": 0}))
         warning_ids = []
         for _ in range(28):
             run_id = database.db_ci_run_create(
@@ -832,65 +829,34 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("&lt;script&gt;unsafe&lt;/script&gt;", detail)
         self.assertNotIn("<script>unsafe</script>", detail)
 
-    def test_retention_settings_are_saved_from_website(self):
-        status, page = self.request(
-            self.base + "/ci/config",
-            {
-                "configuration_json": json.dumps(
-                    {
-                        "pipelines": {},
-                        "settings": {
-                            "artifact_retention_days": 0,
-                            "artifact_retention_count": 12,
-                            "run_retention_count": 0,
-                        },
-                    }
-                )
-            },
-        )
-        self.assertEqual(status, 200)
-        self.assertIn("Configuration saved", page)
-        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
-        self.assertEqual(saved["artifact_retention_days"], 0)
-        self.assertEqual(saved["artifact_retention_count"], 12)
-        self.assertEqual(saved["run_retention_count"], 0)
-        self.assertIn("permanently delete existing data immediately", page)
-        self.assertIn('name="confirm_retention" value="yes" required', page)
-
-    def test_pasted_deployment_script_with_blank_path_saves_in_json_mode(self):
+    def test_retention_and_deployment_editor_posts_are_rejected(self):
         content = 'import sys\nprint("deploying", sys.argv[1])\n'
-        status, page = self.request(
-            self.base + "/ci/config",
+        for document in (
             {
-                "configuration_json": json.dumps(
-                    {
-                        "pipelines": {
-                            "default": {
-                                "steps": [{"name": "Tests", "run": "echo tests"}],
-                                "deployment": {"run_with": "python", "script_content": content},
-                            }
-                        }
-                    }
-                )
+                "pipelines": {},
+                "settings": {
+                    "artifact_retention_days": 0,
+                    "artifact_retention_count": 12,
+                    "run_retention_count": 0,
+                },
             },
-        )
-        self.assertEqual(status, 200)
-        self.assertIn("Configuration saved", page)
-        saved = json.loads(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
-        self.assertTrue(saved["deploy_enabled"])
-        self.assertEqual(saved["deploy_script"], "")
-        self.assertEqual(saved["deploy_script_content"], content)
-        _, reopened = self.request(self.base + "/ci/config")
-        import html
-
-        editor = (
-            reopened.split('name="configuration_json"', 1)[1]
-            .split(">", 1)[1]
-            .split("</textarea>", 1)[0]
-        )
-        self.assertEqual(
-            json.loads(html.unescape(editor))["deployments"][0]["script_content"], content
-        )
+            {
+                "pipelines": {
+                    "default": {
+                        "steps": [{"name": "Tests", "run": "echo tests"}],
+                        "deployment": {"run_with": "python", "script_content": content},
+                    }
+                }
+            },
+        ):
+            with self.subTest(document=document):
+                status, page = self.request(
+                    self.base + "/ci/config",
+                    {"configuration_json": json.dumps(document)},
+                )
+                self.assertEqual(status, 410)
+                self.assertIn("ci/config.json", page)
+        self.assertIsNone(database.db_ci_config_get(FLAT_OWNER_UI, "project"))
 
     def test_branch_to_pr_prefills_source_and_target(self):
         status, page = self.request(self.base + "/pulls?source=feature%2Fapi&target=main")

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .ci import default_config
-from .ci_preferences import RETENTION, validate
+from .ci_preferences import DEFAULT_ENV_SCOPE, ENV_SCOPES, RETENTION, validate
 from .config import AppConfig
 from .rendering import SafeHTML, html_t, join_html, safe_html
 
@@ -21,6 +21,11 @@ RETENTION_FIELDS = (
     ("artifact_retention_days", "Artifact retention (days; 0 = unlimited)", 7),
     ("artifact_retention_count", "Maximum artifact bundles (0 = unlimited)", 0),
     ("run_retention_count", "Maximum completed runs (0 = unlimited)", None),
+)
+ENV_SCOPE_OPTIONS = (
+    ("ordinary", "Ordinary non-PR runs"),
+    ("protected", "Protected branches"),
+    ("deployment", "Deployment only"),
 )
 
 
@@ -41,7 +46,8 @@ def preferences_forms(
         if key not in local and key in legacy:
             local[key] = legacy[key]
     forms: list[str] = []
-    for kind, title, fields in (("retention", "Runs and artifacts", RETENTION_FIELDS),):
+    retention_forms = () if repository else (("retention", "Runs and artifacts", RETENTION_FIELDS),)
+    for kind, title, fields in retention_forms:
         controls: list[str] = []
         for key, label, builtin in fields:
             builtin = default_config()[key] if builtin is None else builtin
@@ -100,8 +106,15 @@ def preferences_forms(
         local.get("pipeline_env", legacy.get("pipeline_env", {})) or {}
     )
     names: list[str] = sorted(set(pipelines) | set(pipeline_values))
+    restrictions: Mapping[str, Mapping[str, str]] = local.get("env_scopes") or {}
 
-    def row(index: int | str, name: str = "", value: str = "", pipeline: str = "") -> str:
+    def row(
+        index: int | str,
+        name: str = "",
+        value: str = "",
+        pipeline: str = "",
+        access: str | None = None,
+    ) -> str:
         options = join_html(
             [
                 html_t(
@@ -119,8 +132,22 @@ def preferences_forms(
             if repository
             else safe_html("")
         )
+        access = access or restrictions.get(pipeline, {}).get(name, DEFAULT_ENV_SCOPE)
+        access_options = join_html(
+            html_t(
+                t'<option value="{key}"{safe_html(" selected" if access == key else "")}>{label}</option>'
+            )
+            for key, label in ENV_SCOPE_OPTIONS
+        )
+        access_control = safe_html(
+            html_t(
+                t'<label>Available to<select name="env_access_{index}" data-env-scope="{index}">{access_options}</select><input type="hidden" name="env_scope_{index}" value="{access}"></label>'
+            )
+            if repository
+            else ""
+        )
         return html_t(
-            t'<div class="settings-env-row"><label>Name<input name="env_name_{index}" value="{name}" autocomplete="off" spellcheck="false"></label><label>Value<input class="settings-env-value" type="password" name="env_value_{index}" value="{value}" autocomplete="off" spellcheck="false"></label>{scope}<label class="settings-remove"><input type="checkbox" name="env_remove_{index}"> Remove</label></div>'
+            t'<div class="settings-env-row"><label>Name<input name="env_name_{index}" value="{name}" autocomplete="off" spellcheck="false"></label><label>Value<input class="settings-env-value" type="password" name="env_value_{index}" value="{value}" autocomplete="off" spellcheck="false"></label>{scope}{access_control}<label class="settings-remove"><input type="checkbox" name="env_remove_{index}"> Remove</label></div>'
         )
 
     rows: list[str]
@@ -135,6 +162,7 @@ def preferences_forms(
                 submitted.get(f"env_name_{index}", ""),
                 submitted.get(f"env_value_{index}", ""),
                 submitted.get(f"env_pipeline_{index}", ""),
+                submitted.get(f"env_access_{index}"),
             )
             for index in range(count)
         ]
@@ -159,7 +187,7 @@ def preferences_forms(
     )
     forms.append(
         html_t(
-            t'<section class="box"><h2>Environment variables</h2>{inherited_note}<form method="POST" action="{action}" class="settings-page-form settings-env-form"><input type="hidden" name="action" value="ci_environment"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="env_count" value="{len(rows)}"><div class="settings-env-rows">{join_html(rows)}</div><template>{safe_html(row("__index__"))}</template><div class="row"><button type="button" class="settings-add-env">Add variable</button><button type="button" class="settings-show-env">Show values</button><button type="submit">Save variables</button></div><p class="muted">Stored in plaintext. CI logs are not secret-redacted. Reserved runner variables are rejected.</p></form></section>'
+            t'<section class="box"><h2>Environment variables</h2>{inherited_note}<form method="POST" action="{action}" class="settings-page-form settings-env-form"><input type="hidden" name="action" value="ci_environment"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="env_count" value="{len(rows)}"><div class="settings-env-rows">{join_html(rows)}</div><template>{safe_html(row("__index__"))}</template><div class="row"><button type="button" class="settings-add-env">Add variable</button><button type="button" class="settings-show-env">Show values</button><button type="submit">Save variables</button></div><p class="muted">Choose ordinary non-PR runs, protected branches, or deployments only for each value. Unmerged pull requests never receive page-managed or server-wide values. Stored in plaintext. CI logs are not secret-redacted. Reserved runner variables are rejected.</p></form></section>'
         )
     )
     return safe_html(join_html(forms))
@@ -194,6 +222,8 @@ def parse_preferences(
             raise ValueError("At most 256 variable rows are supported.")
         env: dict[str, str] = {}
         pipeline_env: dict[str, dict[str, str]] = {}
+        scopes: dict[str, dict[str, str]] = {}
+        previous_scopes = previous.get("env_scopes") or {}
         seen: set[tuple[str, str]] = set()
         for index in range(count):
             if form.get(f"env_remove_{index}"):
@@ -209,9 +239,22 @@ def parse_preferences(
                 raise ValueError(f"Duplicate variable: {name}.")
             seen.add((pipeline, name))
             (pipeline_env.setdefault(pipeline, {}) if pipeline else env)[name] = value
+            if repository:
+                previous_access = previous_scopes.get(pipeline, {}).get(name, DEFAULT_ENV_SCOPE)
+                access = form.get(f"env_access_{index}")
+                if access is None:
+                    access = form.get(f"env_scope_{index}", previous_access)
+                if access not in ENV_SCOPES:
+                    raise ValueError("Select a valid availability scope for each variable.")
+                if access != DEFAULT_ENV_SCOPE:
+                    scopes.setdefault(pipeline, {})[name] = access
         values["env"] = env
         if repository:
             values["pipeline_env"] = pipeline_env
+            if scopes:
+                values["env_scopes"] = scopes
+            else:
+                values.pop("env_scopes", None)
     else:
         raise ValueError("Unknown settings action.")
     return validate(values)

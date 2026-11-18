@@ -58,7 +58,7 @@ async def mutate(
             raise APIError(
                 409, "revision_conflict", "Branch changed. Refresh its SHA before triggering CI."
             )
-        config = await manager.config(owner, repo)
+        config = await manager.config(owner, repo, commit, include_secrets=False)
         selected = next(
             (p for p in manager.pipelines(config) if p["pipeline_id"] == pipeline), None
         )

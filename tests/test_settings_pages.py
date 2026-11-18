@@ -8,9 +8,10 @@ import unittest
 from unittest import mock
 
 from pygithost import application, database
-from pygithost.ci import CIManager
+from pygithost.ci import CIManager, default_config
 from pygithost.settings_pages import BASIC_GROUPS
 from tests import test_repository_ui as ui
+from tests.ci_fixtures import commit_ci_config, seed_verified_retention
 
 
 class SettingsPagesTests(unittest.TestCase):
@@ -26,6 +27,7 @@ class SettingsPagesTests(unittest.TestCase):
         self.owner = application.FLAT_OWNER_UI
         self.base = self.fixture.base
         self.manager = CIManager(lambda *_: str(self.fixture.bare))
+        seed_verified_retention(self.fixture.sha, (self.owner, "project"))
 
     def config(self):
         return asyncio.run(self.manager.config(self.owner, "project"))
@@ -76,12 +78,14 @@ class SettingsPagesTests(unittest.TestCase):
         self.assertNotIn("&lt;select id=&quot;pref-runner", page)
         _, page = self.fixture.request(self.base + "/ci/config")
         self.assertNotIn('name="inherit_timeout_seconds"', page)
+        self.assertNotIn('name="configuration_json"', page)
+        self.assertNotIn('id="ci-config-json"', page)
+        self.assertNotIn('name="run_retention_count"', page)
+        self.assertIn("ci/config.json", page)
         self.assertIn('name="env_name_0"', page)
         self.assertIn('<template><div class="settings-env-row">', page)
 
     def test_execution_uses_pipeline_json_or_builtins_not_preferences(self):
-        from pygithost.ci import default_config
-
         database.db_ci_preferences_set({"timeout_seconds": 60, "cancel_superseded": True})
         self.assertEqual(self.config()["timeout_seconds"], default_config()["timeout_seconds"])
         self.assertFalse(self.config()["cancel_superseded"])
@@ -97,37 +101,52 @@ class SettingsPagesTests(unittest.TestCase):
             "pipelines": [
                 {
                     "name": "checks",
-                    "execution": {"timeout_seconds": 123},
+                    "execution": {"runner": "docker", "timeout_seconds": 123},
                     "steps": [{"name": "Check", "run": "echo test"}],
                 }
             ],
             "deployments": [],
         }
-        self.fixture.request(self.base + "/ci/config", {"configuration_json": json.dumps(document)})
+        commit_ci_config(self.fixture.bare, document)
         self.assertEqual(self.config()["timeout_seconds"], 123)
 
     def test_environment_inheritance_pipeline_scope_and_removing_override(self):
+        commit_ci_config(
+            self.fixture.bare,
+            {
+                "version": 1,
+                "pipelines": [
+                    {"name": name, "steps": [{"name": "Check", "run": "echo test"}]}
+                    for name in ("ci", "lint")
+                ],
+            },
+        )
         self.variables([("MODE", "global", ""), ("GLOBAL_ONLY", "inherited", "")])
         self.assertEqual(self.config()["env"], {"MODE": "global", "GLOBAL_ONLY": "inherited"})
         self.variables(
             [("MODE", "repository", ""), ("SCOPED", "one-pipeline", "ci")], repository=True
         )
+        environments = {
+            pipeline["pipeline_id"]: pipeline["env"]
+            for pipeline in CIManager.pipelines(self.config())
+        }
         self.assertEqual(
-            self.config()["env"],
+            environments["ci"],
             {"MODE": "repository", "GLOBAL_ONLY": "inherited", "SCOPED": "one-pipeline"},
         )
+        self.assertEqual(environments["lint"], {"MODE": "repository", "GLOBAL_ONLY": "inherited"})
         self.variables([], repository=True)
         self.assertEqual(self.config()["env"], {"MODE": "global", "GLOBAL_ONLY": "inherited"})
-        # Preferences alone do not disable file discovery or create CI settings.
+        # Saving secrets doesn't create a database-backed pipeline definition.
         self.assertIsNone(database.db_ci_config_get(self.owner, "project"))
 
-    def test_editor_hides_legacy_environment_retention_without_losing_values(self):
+    def test_legacy_environment_is_preserved_without_restoring_retention_or_editor(self):
         document = {
             "version": 1,
             "pipelines": [
                 {
                     "name": "ci",
-                    "file": ".ci-config.json",
+                    "file": "ci/pipeline.json",
                     "execution": {"env": {"KEEP_ME": "legacy"}},
                 }
             ],
@@ -136,25 +155,27 @@ class SettingsPagesTests(unittest.TestCase):
         }
         asyncio.run(self.manager.save_document(self.owner, "project", document))
         _, page = self.fixture.request(self.base + "/ci/config")
-        from html import unescape
-
-        editor = json.loads(
-            unescape(
-                re.search(r'<textarea id="ci-config-json"[^>]*>(.*?)</textarea>', page, re.S)[1]
-            )
-        )
-        self.assertNotIn("retention", editor)
-        self.assertNotIn("env", editor["pipelines"][0].get("execution", {}))
+        self.assertNotIn('id="ci-config-json"', page)
+        self.assertNotIn('name="configuration_json"', page)
+        self.assertNotIn('name="run_retention_count"', page)
         self.assertIn('value="KEEP_ME"', page)
-        self.assertIn('name="run_retention_count" type="number" value="33"', page)
-        self.fixture.request(self.base + "/ci/config", {"configuration_json": json.dumps(editor)})
         config = self.config()
         self.assertEqual(config["env"]["KEEP_ME"], "legacy")
-        self.assertEqual(config["run_retention_count"], 33)
+        # Legacy page retention is not an execution setting any more.
+        self.assertEqual(config["run_retention_count"], default_config()["run_retention_count"])
+        self.assertEqual(
+            config["artifact_retention_days"], default_config()["artifact_retention_days"]
+        )
+        stored = database.db_ci_config_get(self.owner, "project")
+        status, _ = self.fixture.request(
+            self.base + "/ci/config", {"configuration_json": json.dumps(document)}
+        )
+        self.assertEqual(status, 410)
+        self.assertEqual(database.db_ci_config_get(self.owner, "project"), stored)
         self.variables([], repository=True)
         self.assertEqual(self.config()["env"], {})
 
-    def test_global_retention_applies_to_cleanup_and_repository_can_override(self):
+    def test_global_retention_applies_to_cleanup_and_project_page_cannot_override(self):
         fields = {
             "artifact_retention_days": "0",
             "artifact_retention_count": "1",
@@ -171,7 +192,7 @@ class SettingsPagesTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)  # Two completed plus the queued job.
         self.assertIsNotNone(database.db_ci_run_get(self.owner, "project", queued))
         self.assertEqual(database.db_ci_artifacts_count(self.owner, "project"), 1)
-        self.save(
+        status, body = self.save(
             "ci_retention",
             repository=True,
             artifact_retention_days="0",
@@ -179,16 +200,9 @@ class SettingsPagesTests(unittest.TestCase):
             run_retention_count="0",
             confirm_retention="yes",
         )
-        self.assertEqual(self.config()["run_retention_count"], 0)
-        self.assertEqual(self.config()["artifact_retention_count"], 0)
-        self.save(
-            "ci_retention",
-            repository=True,
-            inherit_artifact_retention_days="on",
-            inherit_artifact_retention_count="on",
-            inherit_run_retention_count="on",
-            confirm_retention="yes",
-        )
+        self.assertEqual(status, 400)
+        self.assertIn("environment variables", body)
+        self.assertEqual(database.db_ci_preferences_get(self.owner, "project")[1], {})
         self.assertEqual(self.config()["run_retention_count"], 2)
         self.assertEqual(self.config()["artifact_retention_count"], 1)
 
@@ -256,15 +270,15 @@ class SettingsPagesTests(unittest.TestCase):
         script = r"""<script>
 (async function() {
  const sleep = () => new Promise(resolve => setTimeout(resolve,50));
- const form = action => document.querySelector('input[name="action"][value="'+action+'"]').form;
+ const form = action => { const input = document.querySelector('input[name="action"][value="'+action+'"]'); return input ? input.form : null; };
  async function wait(test) { for(let i=0;i<180;i++){if(test())return;await sleep();} throw Error("Settings controls did not initialize"); }
- async function submit(node) {
+ async function submit(node, message) {
   let posted;
   node.addEventListener("submit", event => { event.preventDefault(); posted=fetch(node.getAttribute("action"),{method:"POST",body:new URLSearchParams(new FormData(node))}).then(response=>response.text()); }, {once:true});
   node.requestSubmit();
   if(!posted) throw Error("Page form validation blocked " + node.elements.action.value);
   const html=await posted;
-  if(!html.includes("Repository settings saved")) throw Error("Page form did not save " + node.elements.action.value + ": " + (new DOMParser().parseFromString(html,"text/html").querySelector(".warn")?.textContent || "No response message"));
+  if(!html.includes(message)) throw Error("Page form did not save " + node.elements.action.value + ": " + (new DOMParser().parseFromString(html,"text/html").querySelector(".warn")?.textContent || "No response message"));
  }
  try {
   const env=form("ci_environment");
@@ -274,16 +288,16 @@ class SettingsPagesTests(unittest.TestCase):
   env.querySelector(".settings-show-env").click(); env.querySelector(".settings-add-env").click();
   if(env.elements.env_count.value!=="2" || env.elements.env_value_1.type!=="text") throw Error("Add variable/show values failed");
   env.elements.env_name_1.value="PIPE_ONLY"; env.elements.env_value_1.value="scoped"; env.elements.env_pipeline_1.value="ci";
-  await submit(env);
-   if(document.querySelector('[name="execution_json"]')) throw Error("Execution defaults form still exists");
-  const retention=form("ci_retention");
-  if(!retention.elements.run_retention_count.disabled || retention.elements.run_retention_count.value!=="10") throw Error("Global retention not inherited");
-  retention.elements.inherit_run_retention_count.click(); retention.elements.run_retention_count.value="3";
-  retention.elements.confirm_retention.checked=true; await submit(retention);
-  const json=JSON.parse(document.getElementById("ci-config-json").value);
-  if("env" in json || "retention" in json) throw Error("Page settings leaked into editor JSON");
+  await submit(env, "Repository settings saved");
+  if(form("ci_retention")) throw Error("Repository retention form still exists");
+  if(document.querySelector('[name="execution_json"]') || document.getElementById("ci-config-json")) throw Error("Removed JSON editor still exists");
   const admin=new DOMParser().parseFromString(await (await fetch("/admin/settings")).text(),"text/html");
   if(!admin.querySelector('[name="basic_port"]') || !admin.querySelector('[name="basic_require_auth"]')) throw Error("Basic server settings are not real form fields");
+  const retention=admin.querySelector('input[name="action"][value="ci_retention"]').form;
+  const params=new URLSearchParams(new FormData(retention));
+  params.set("run_retention_count","3"); params.set("confirm_retention","yes");
+  const saved=await (await fetch("/admin/settings",{method:"POST",body:params})).text();
+  if(!saved.includes("Server retention defaults saved")) throw Error("Server retention form did not save");
   document.documentElement.dataset.settingsPagesTest="passed";
  }catch(error){document.documentElement.dataset.settingsPagesTest="failed";document.documentElement.dataset.settingsPagesError=error.message;}
 })();</script>"""
@@ -326,8 +340,6 @@ class SettingsPagesTests(unittest.TestCase):
         )
         config = self.config()
         self.assertEqual(config["env"], {"MODE": "repository", "PIPE_ONLY": "scoped"})
-        from pygithost.ci import default_config
-
         self.assertEqual(config["timeout_seconds"], default_config()["timeout_seconds"])
         self.assertEqual(config["run_retention_count"], 3)
 
@@ -363,7 +375,7 @@ class SettingsPagesTests(unittest.TestCase):
         os.name == "posix" and os.environ.get("PYGITHOST_TEST_DOCKER_IMAGE") == "python:3.14-slim",
         "requires Docker test image",
     )
-    def test_page_environment_reaches_real_docker_and_run_keeps_snapshot(self):
+    def test_page_environment_reaches_real_docker_but_is_not_in_run_snapshot(self):
         self.variables([("PAGE_VALUE", "global", "")])
         self.variables([("PAGE_VALUE", "repository", "")], repository=True)
         source = self.fixture.source
@@ -400,4 +412,4 @@ class SettingsPagesTests(unittest.TestCase):
         self.assertIn("page-env=repository", run[5])
         self.variables([("PAGE_VALUE", "changed-after-run", "")], repository=True)
         snapshot = json.loads(database.db_ci_run_metadata(self.owner, "project", run_id)["config"])
-        self.assertEqual(snapshot["env"]["PAGE_VALUE"], "repository")
+        self.assertNotIn("PAGE_VALUE", snapshot["env"])

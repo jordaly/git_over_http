@@ -1,46 +1,68 @@
 # Configuration recipes
 
-[Every option](ci-options.md) · [Quick start](pipelines.md)
+[Every option](ci-options.md) · [Quick start](pipelines.md) · [Migration](ci-migration.md)
 
-Copy a Settings example into **CI → Settings → Configuration JSON**. Saving replaces
-the pipeline/deployment document; retain existing policies when combining examples.
-Variables and retention are separate page controls and are not reset by JSON saves.
-All examples are displayed directly inside **CI → Documentation**.
+Every example is a repository file. Commit it as **`ci/config.json`** (or as a
+referenced file under `ci/`) and push the commit; do not paste it into a page. The
+project settings page manages environment variables and secrets only. All examples
+are displayed directly inside **CI → Documentation**.
 
-## Default repository file
+Retain unrelated pipelines, deployment targets, policies and retention when
+combining examples. Validate before committing with
+`python -m pygithost ci validate` (or `--rev HEAD` for the committed version); it
+checks referenced files without executing them. Environment values belong on the
+project page, not in Git. Enabled deployments additionally require
+administrator authorization in `PYGITHOST_CI_TRUSTED_REPOSITORIES` using exact
+`owner/repo` names; wildcards and malformed entries are rejected.
 
-Unconfigured repositories discover `ci/config.json` automatically. If you want to
-save an explicit reference in Settings, use:
+A malformed committed file fails closed: merges require CI and all direct branches
+are protected until an operator repairs `ci/config.json` through Git or the server
+filesystem. There is no saved-definition fallback.
+
+## Minimal pipeline
+
+Commit the [repository pipeline example](examples/ci/repository-pipeline.json) as
+`ci/config.json`:
 
 ```json
 {
   "version": 1,
-  "file": "ci/config.json"
+  "steps": [
+    {"name": "Python version", "run": "python --version"},
+    {"name": "Tests", "run": "python -m unittest discover -v"}
+  ],
+  "artifacts": {"paths": ["reports/**/*.xml"], "when": "failure"},
+  "timeout_seconds": 300
 }
 ```
 
-Commit the separate [repository pipeline example](examples/ci/repository-pipeline.json)
-as `ci/config.json`; do not commit the reference above as the pipeline file.
-Prepare the Docker image before running. Set variables under **Environment variables**
-and storage limits under **Runs and artifacts**. See
-[Server and repository settings](server-settings.md) for a worked inheritance example.
-Manual runs are always available for runnable pipelines with write access.
+The simple form creates one pipeline named `ci`, uses Docker
+`python:3.14-slim`, enables push and PR opened/updated/reopened events on all
+branches, and always allows manual runs. Prepare the image first. Set environment
+values in **CI → Settings**; administrator retention defaults are under
+**Admin → Settings → Runs and artifacts**. Manual runs never deploy.
 
-The compact reference uses built-in execution settings. For custom execution,
-copy the [expanded Git-managed example](examples/ci/git-managed.json): configure
-`execution.runner`, `execution.image`, `execution.timeout_seconds` and
-`cancellation.superseded` inside its named pipeline. Keep `file` alongside those
-objects. There is no execution-defaults form in Admin or repository settings.
-Omitting an option uses its built-in default; it does not inherit a saved page
-override or another pipeline's value. The inline deployment example intentionally
-omits execution and cancellation to demonstrate this behavior.
+The obsolete Settings-only reference `{"version":1,"file":"ci/config.json"}` is not
+valid as the root of `ci/config.json`.
+
+## Full document
+
+For custom execution, named pipelines, deployments, protections or project
+retention, commit a grouped document. The [all-options example](examples/ci/all-options.json)
+combines checks and release pipelines, disabled staging/production deployments,
+cancellation, artifacts, notifications, policies and retention. Review and adapt it
+before enabling anything.
+
+The [inline deployment example](examples/ci/inline-deployment.json) uses
+`script_content` with `run_with` instead of an external host script. It still runs
+on the host, not in the CI container, and still requires administrator trust.
 
 ## Multiple Git-managed pipelines
 
-Only `ci/config.json` is discovered automatically. To use separate files, commit
-`ci/tests.json` and `ci/build.json`, each using the
-[repository pipeline format](examples/ci/repository-pipeline.json), then save this
-document in **CI → Settings → Configuration JSON**:
+Only `ci/config.json` is the entry point. For separate pipeline files, commit
+`ci/tests.json` and `ci/build.json`, each using the simple pipeline shape, and
+commit a full document like the
+[Git-managed example](examples/ci/git-managed.json) as `ci/config.json`:
 
 ```json
 {
@@ -63,14 +85,18 @@ document in **CI → Settings → Configuration JSON**:
 }
 ```
 
-Replace each file's steps with the appropriate tests or build commands and prepare
-the Docker image first. Retain any existing policies and deployment targets when
-adapting the Settings document. Saved Settings take priority over automatic discovery:
-this document runs the two named pipelines, not an additional `ci/config.json` job.
-Do not commit this Settings document as either pipeline file. References and step
-commands are checkout-root-relative, even when the JSON lives in a nested directory.
+Replace each referenced file's steps with the appropriate tests or build commands
+and prepare the Docker image first. References must be regular JSON files strictly
+inside `ci/`; root filenames, traversal, absolute paths and symlinks are rejected.
+A referenced file cannot itself contain deployments, policies or retention. File
+references and step commands are checkout-root-relative, even when the JSON lives
+in a nested directory. Do not reference `ci/config.json` recursively.
 
-## Two independent checks
+The entry document is the only project configuration source. It runs these two
+named pipelines; there is no additional implicit `ci/config.json` job or saved
+database definition.
+
+## Two independent PR checks
 
 ```json
 {
@@ -96,10 +122,13 @@ commands are checkout-root-relative, even when the JSON lives in a nested direct
 }
 ```
 
-Set `PYTHONUNBUFFERED=1` in the page's variables table if wanted. These commands need
-the prepared Python Docker image. Each pipeline specifies its own configuration. Both PR
-checks must pass for the exact current PR base/head; manual/push success is not a
-substitute. Omitted PR events default to opened, updated and reopened.
+Set non-secret `PYTHONUNBUFFERED=1` in each pipeline's committed `env` rather than
+on the project variables page if these checks must receive it: unmerged PR checks
+never receive page-managed values, including server-wide values. These commands
+need the prepared Python Docker image. Each pipeline specifies its own
+configuration. Both PR checks must pass for the exact current PR base/head;
+manual/push success is not a substitute. Omitted PR events default to opened,
+updated and reopened. PR checks read the target/base commit's `ci/config.json`.
 
 ## One pipeline, separate named targets
 
@@ -115,36 +144,47 @@ substitute. Omitted PR events default to opened, updated and reopened.
         {"name": "Tests", "run": "python -m unittest discover -v"},
         {"name": "Compile", "run": "python -m compileall -q ."}
       ],
+      "artifacts": {"paths": ["reports/**/*.xml"], "when": "always"},
       "notifications": {"email": {"mode": "off", "recipients": []}}
     }
   ],
   "deployments": [
     {"name": "staging", "pipeline": "checks", "enabled": false, "branch": "develop", "script": "/opt/deploy/staging.sh", "timeout_seconds": 600},
     {"name": "production", "pipeline": "checks", "enabled": false, "branch": "main", "script": "/opt/deploy/production.sh", "timeout_seconds": 900, "notifications": {"email": {"mode": "off", "recipients": ["ops@example.com"]}}}
-  ]
+  ],
+  "retention": {"artifacts": {"days": 30, "max_count": 50}, "runs": {"max_count": 100}}
 }
 ```
+
+Both targets are disabled in the example. Install trusted executable deployment
+scripts outside repositories, add the exact `owner/repo` to
+`PYGITHOST_CI_TRUSTED_REPOSITORIES`, and only then enable a reviewed target.
+Deployments run on the host, not in the CI container. Each target matches its own
+exact branch and has independent logs/result/email state. Several targets may use
+the same branch if the same tested update must deploy to several hosts. They
+execute sequentially; one target failure does not change passing tests or overwrite
+another target's result.
+
+Deployment email is configured on the deployment, not inherited from CI. SMTP must
+be configured under **Admin: Email**. Repository page variables scoped to
+**Deployments only** are resolved for deployment execution; ordinary and protected
+CI values are not sent to deployments. Manual runs never deploy; push a real branch
+update to exercise deployment. No approvals, manual deployment, automatic retry or
+rollback exist.
+
+Retention here comes from the default branch's configuration, not a queued run
+snapshot. Feature branches and reruns cannot change it, and a nonzero administrator
+limit caps the project value. Lower limits can delete existing artifacts or runs at
+the next cleanup. See [Retention](ci-retention.md) for refresh and cleanup timing.
 
 Build/publish the image with dependencies included: Docker jobs have no network
 by default. Remote workers download missing registry images according to worker
 policy; local Docker jobs need the image preinstalled.
-For 30-day artifacts, at most 50 bundles and 100 completed runs, enter those values
-in **CI → Settings → Runs and artifacts**, acknowledge cleanup and save.
-Install trusted executable deployment scripts outside repositories before enabling
-targets. Deployments still run on the host, not in the CI container. Each target
-matches its own exact branch and has independent logs/result/email state. Several
-targets may use the same branch if the same tested update must deploy to several
-hosts. They execute sequentially; one target failure does not change passing tests
-or overwrite another target's result.
-
-Deployment emails are configured on the deployment, not inherited from CI. SMTP
-must be configured under **Admin: Email**. Manual runs never deploy; push a real
-branch update to exercise deployment. No approvals, manual deployment or rollback exist.
 
 ## Complete option examples
 
 - [All options](examples/ci/all-options.json): independent checks/release pipelines,
-  separate staging/production targets, artifacts and policies.
+  separate staging/production targets, artifacts, policies and retention.
 - [Inline Python deployment](examples/ci/inline-deployment.json): script_content with
   run_with rather than an external host path.
 - [Git-backed pipeline](examples/ci/git-managed.json) and its separate

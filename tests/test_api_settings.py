@@ -1,10 +1,10 @@
 import shutil
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 
 from pygithost import database
 from tests import test_api as read_tests
 from tests import test_api_writes as write_tests
+from tests.ci_fixtures import commit_ci_config
 from tests.test_server import _which_git_backend
 
 
@@ -50,111 +50,71 @@ class APISettingsTests(unittest.TestCase):
         doc = self.document()
         for token in (self.write_token, self.admin_token):
             self.assertEqual(self.mutate(self.path, doc, method="PUT", token=token)[0], 403)
+        status, _headers, result = self.mutate(
+            self.path, doc, method="PUT", token=self.admin_write_token
+        )
+        self.assertEqual(status, 410, result)
 
-    def test_round_trip_idempotency_audit_and_no_secret_response_cache(self):
-        doc = self.document()
-        status, _, saved = self.save(doc, key="settings-save")
-        self.assertEqual(status, 200, saved)
-        self.assertNotEqual(saved["revision"], doc["expected_revision"])
-        self.assertEqual(set(saved), {"revision"})
+    def test_read_uses_repository_ci_configuration_and_keeps_secrets_separate(self):
+        commit_ci_config(
+            self.bare,
+            {
+                "version": 1,
+                "pipelines": [
+                    {
+                        "name": "checks",
+                        "execution": {"runner": "docker"},
+                        "steps": [{"name": "Tests", "run": "echo repository-owned"}],
+                    }
+                ],
+                "deployments": [],
+            },
+        )
+        database.db_ci_preferences_set(
+            {"env": {"API_SECRET": "DO_NOT_RETURN_FROM_CONFIG"}}, "alice", "project"
+        )
         current = self.current()
-        self.assertIn("SETTINGS_PRIVATE_PAYLOAD", str(current["configuration"]))
-        status, headers, replay = self.save(doc, key="settings-save")
-        self.assertEqual(status, 200)
-        self.assertEqual(replay, saved)
-        self.assertEqual(headers["X-Idempotent-Replay"], "true")
-        conn = database._db_connect()
-        try:
-            row = conn.execute(
-                "SELECT method,path,state,status,response_json FROM api_mutations WHERE path=?",
-                (self.path,),
-            ).fetchone()
-            self.assertEqual(row[:4], ("PUT", self.path, "completed", 200))
-            self.assertNotIn("SETTINGS_PRIVATE_PAYLOAD", row[4])
-        finally:
-            conn.close()
+        self.assertIn("echo repository-owned", str(current["configuration"]))
+        self.assertTrue(current["revision"])
+        self.assertNotIn("DO_NOT_RETURN_FROM_CONFIG", str(current["configuration"]))
 
-    def test_invalid_configuration_does_not_save_and_errors_do_not_echo_payload(self):
-        before = database.db_ci_config_get("alice", "project")
-        for configuration in ([], {"version": 99}, {"PRIVATE_INVALID_FIELD": "SECRET_VALUE"}):
-            doc = {"expected_revision": self.current()["revision"], "configuration": configuration}
-            status, _, result = self.save(doc)
-            self.assertEqual(status, 422, result)
-            self.assertNotIn("SECRET_VALUE", str(result))
-            self.assertEqual(database.db_ci_config_get("alice", "project"), before)
+    def test_put_is_gone_and_does_not_replace_repository_configuration(self):
+        commit_ci_config(
+            self.bare,
+            {
+                "version": 1,
+                "steps": [{"name": "Tests", "run": "echo repository-owned"}],
+            },
+        )
+        before_config = database.db_ci_config_get("alice", "project")
+        before = self.current()
+        status, _headers, result = self.save(self.document())
+        self.assertEqual(status, 410, result)
+        self.assertEqual(result["code"], "gone")
+        self.assertIn("ci/config.json", result["message"])
+        self.assertEqual(self.current(), before)
+        self.assertEqual(database.db_ci_config_get("alice", "project"), before_config)
+
+    def test_put_does_not_validate_or_echo_replaced_payloads(self):
+        doc = {
+            "expected_revision": "invalid",
+            "configuration": {
+                "version": 1,
+                "pipelines": {"tests": {"steps": [{"name": "Tests", "run": "echo SECRET"}]}},
+            },
+        }
+        status, _headers, result = self.save(doc)
+        self.assertEqual(status, 410, result)
+        self.assertNotIn("SECRET", str(result))
+
+    def test_method_validation_and_read_only_schema(self):
         doc = self.document()
-        doc["expected_revision"] = "invalid"
-        self.assertEqual(self.save(doc)[0], 422)
-
-    def test_stale_revision_and_concurrent_replacements(self):
-        doc = self.document()
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda _: self.save(doc)[0], range(2)))
-        self.assertEqual(sorted(results), [200, 409])
-        self.assertEqual(self.save(doc)[0], 409)
-
-    def test_web_configuration_change_invalidates_revision(self):
-        doc = self.document()
-        raw = database.db_ci_config_get("alice", "project")
-        database.db_ci_config_set("alice", "project", raw or "{}")
-        # Ensure a different persisted configuration, using the same UI helper.
-        import asyncio
-
-        asyncio.run_coroutine_threadsafe(
-            self.server.app.ci_manager.save_document(
-                "alice",
-                "project",
-                {
-                    "version": 1,
-                    "pipelines": {"web": {"steps": [{"name": "Web", "run": "echo web"}]}},
-                },
-            ),
-            self.server.loop,
-        ).result(timeout=10)
-        self.assertEqual(self.save(doc)[0], 409)
-
-    def test_schema_and_in_page_documentation(self):
+        self.assertEqual(self.mutate(self.path, doc, token=self.admin_write_token)[0], 405)
         schema = self.request("/api/v1/openapi.json")[2]
         route = schema["paths"]["/repos/{owner}/{repo}/ci/settings"]
         self.assertIn("get", route)
-        self.assertIn("put", route)
-        self.assertIn("Administrator", route["put"]["description"])
-        page = self.request("/api/docs", token=None, decode=False)[2]
-        self.assertIn(b"CI and deployment settings API", page)
-
-    def test_deployment_configuration_round_trip_without_starting_deployment(self):
-        doc = self.document()
-        doc["configuration"]["pipelines"]["tests"]["deployment"] = {
-            "enabled": True,
-            "branch": "main",
-            "script_content": "echo reviewed-deployment",
-            "run_with": "sh",
-            "timeout_seconds": 60,
-        }
-        status, _, result = self.save(doc)
-        self.assertEqual(status, 200, result)
-        self.assertIn("reviewed-deployment", str(self.current()["configuration"]))
-        # The returned editor document must be valid input to the same API.
-        current = self.current()
-        status, _, result = self.save(
-            {"configuration": current["configuration"], "expected_revision": current["revision"]}
-        )
-        self.assertEqual(status, 200, result)
-
-    def test_replay_rechecks_administrator_role(self):
-        doc = self.document()
-        self.assertEqual(self.save(doc, key="admin-before-revocation")[0], 200)
-        conn = database._db_connect()
-        try:
-            conn.execute("UPDATE users SET is_admin=0 WHERE id=?", (self.admin,))
-            conn.commit()
-        finally:
-            conn.close()
-        # Revocation also removes access to Alice's repository.
-        self.assertEqual(self.save(doc, key="admin-before-revocation")[0], 404)
-
-    def test_method_and_oversize_validation(self):
-        doc = self.document()
-        self.assertEqual(self.mutate(self.path, doc, token=self.admin_write_token)[0], 405)
-        doc["configuration"]["padding"] = "x" * 262145
-        self.assertEqual(self.save(doc)[0], 413)
+        self.assertNotIn("put", route)
+        description = route["get"]["description"]
+        self.assertIn("ci/config.json", description)
+        self.assertIn("read-only", description)
+        self.assertIn("Secrets", description)

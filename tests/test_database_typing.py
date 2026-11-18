@@ -46,8 +46,8 @@ class DatabaseTypingTests(unittest.TestCase):
         conn = database._db_connect()
         try:
             conn.execute(
-                "INSERT INTO ci_configs(owner,repo,config_json) VALUES(?,?,?)",
-                ("owner", "repo", "[]"),
+                "INSERT INTO ci_retention_policy(owner,repo,policy_json,commit_hash) "
+                "VALUES ('owner', 'repo', '[]', '')"
             )
             with self.assertRaisesRegex(ValueError, "JSON object"):
                 database._db_ci_retention(conn, "owner", "repo")

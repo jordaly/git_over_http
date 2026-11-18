@@ -36,6 +36,33 @@ from .ci_limits import (
 from .runner_types import JsonObject, RunRow, SourceManager
 
 LEASE = 90
+_SECRET_CONFIG_KEYS = ("env", "pipeline_env", "env_scopes")
+
+
+def _redacted_document(document: object) -> str:
+    """Drop live environment values while retaining durable assignment evidence."""
+    try:
+        decoded: object = json.loads(document) if isinstance(document, str) else document
+    except TypeError, ValueError:
+        return "{}"
+    if not isinstance(decoded, dict):
+        return "{}"
+    config = decoded.get("config")
+    if isinstance(config, dict):
+        for key in _SECRET_CONFIG_KEYS:
+            config.pop(key, None)
+    return json.dumps(decoded)
+
+
+def _close_assignments(
+    conn: sqlite3.Connection, assignments: Iterable[tuple[object, object]]
+) -> None:
+    """Close persisted assignments without leaving injected environment values."""
+    conn.executemany(
+        """UPDATE ci_remote_jobs SET state='closed',document=?,source=X'',source_path=NULL,
+        artifact=NULL WHERE run_id=?""",
+        [(_redacted_document(document), run_id) for run_id, document in assignments],
+    )
 
 
 def connect() -> database._Connection:
@@ -66,6 +93,18 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
                 r[1] for r in conn.execute("PRAGMA table_info(ci_remote_jobs)")
             }:
                 raise
+    # A previous release closed assignments without removing their injected
+    # environment. Scrub terminal rows without changing their terminal state.
+    conn.executemany(
+        "UPDATE ci_remote_jobs SET document=? WHERE run_id=?",
+        [
+            (_redacted_document(document), run_id)
+            for run_id, document in conn.execute(
+                """SELECT run_id,document FROM ci_remote_jobs
+                WHERE state NOT IN ('queued','claimed') AND document LIKE '%env%'"""
+            )
+        ],
+    )
 
 
 def _queue_source_cleanup(conn: sqlite3.Connection, paths: Iterable[str | None]) -> None:
@@ -130,15 +169,16 @@ def recover_jobs() -> None:
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        assignments = [
+            (r[0], r[1]) for r in conn.execute("SELECT run_id,document FROM ci_remote_jobs")
+        ]
         paths = [r[0] for r in conn.execute("SELECT source_path FROM ci_remote_jobs")]
         _queue_source_cleanup(conn, paths)
         conn.execute("""UPDATE ci_runs SET status='interrupted',return_code=-1,
             finished_at=datetime('now'),reason='HTTP runner coordinator restarted; no automatic replay.'
             WHERE status IN ('queued','running') AND id IN
             (SELECT run_id FROM ci_remote_jobs WHERE state IN ('queued','claimed','finished'))""")
-        conn.execute(
-            "UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL"
-        )
+        _close_assignments(conn, assignments)
         conn.commit()
         _delete_sources(paths)
     finally:
@@ -303,9 +343,11 @@ async def execute_remote(manager: SourceManager, row: RunRow, config: Mapping[st
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 _queue_source_cleanup(conn, [source])
-                conn.execute(
-                    "UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL WHERE run_id=?",
-                    (run_id,),
+                assignment = conn.execute(
+                    "SELECT document FROM ci_remote_jobs WHERE run_id=?", (run_id,)
+                ).fetchone()
+                _close_assignments(
+                    conn, [(run_id, assignment[0])] if assignment is not None else []
                 )
                 conn.commit()
             finally:
@@ -351,16 +393,14 @@ def operation(
         conn.execute("BEGIN IMMEDIATE")
         if action == "claim":
             # Startup recovery/retention may have interrupted or removed a run.
-            paths = [
-                r[0]
-                for r in conn.execute("""SELECT source_path FROM ci_remote_jobs
+            abandoned = [
+                (r[0], r[1], r[2])
+                for r in conn.execute("""SELECT run_id,source_path,document FROM ci_remote_jobs
                 WHERE state IN ('queued','claimed') AND NOT EXISTS
                 (SELECT 1 FROM ci_runs r WHERE r.id=run_id AND r.status IN ('queued','running'))""")
             ]
-            _queue_source_cleanup(conn, paths)
-            conn.execute("""UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL
-                WHERE state IN ('queued','claimed') AND NOT EXISTS
-                (SELECT 1 FROM ci_runs r WHERE r.id=run_id AND r.status IN ('queued','running'))""")
+            _queue_source_cleanup(conn, [r[1] for r in abandoned])
+            _close_assignments(conn, [(r[0], r[2]) for r in abandoned])
             # Repeated claim requests after a lost response return the same job.
             row = conn.execute(
                 "SELECT run_id,document,attempt FROM ci_remote_jobs WHERE runner=? AND state='claimed'",
@@ -381,7 +421,7 @@ def operation(
                     row = (candidate_run_id, raw, attempt)
                     break
             conn.commit()
-            _delete_sources(paths)
+            _delete_sources([r[1] for r in abandoned])
             return {"job": dict(json.loads(row[1]), run_id=row[0], attempt=row[2]) if row else None}
         claimed_run_id = document.get("run_id")
         claimed_attempt = document.get("attempt")
@@ -404,10 +444,7 @@ def operation(
         run = conn.execute("SELECT status FROM ci_runs WHERE id=?", (run_id,)).fetchone()
         if not run or run[0] not in ("queued", "running"):
             _queue_source_cleanup(conn, [row[8]])
-            conn.execute(
-                "UPDATE ci_remote_jobs SET state='closed',source=X'',source_path=NULL,artifact=NULL WHERE run_id=?",
-                (run_id,),
-            )
+            _close_assignments(conn, [(run_id, row[7])])
             conn.commit()
             _delete_sources([row[8]])
             return {"cancel": True}
@@ -464,8 +501,8 @@ def operation(
         values, artifact = prepared
         if action == "complete":
             conn.execute(
-                "UPDATE ci_remote_jobs SET state='finished',result=?,artifact=? WHERE run_id=?",
-                (result_json, artifact, run_id),
+                "UPDATE ci_remote_jobs SET state='finished',result=?,artifact=?,document=? WHERE run_id=?",
+                (result_json, artifact, _redacted_document(row[7]), run_id),
             )
         else:
             conn.execute(

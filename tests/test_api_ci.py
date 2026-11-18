@@ -4,7 +4,6 @@ import json
 import os
 import shlex
 import shutil
-import sys
 import threading
 import unittest
 import zipfile
@@ -13,9 +12,16 @@ from unittest import mock
 
 from pygithost import database
 from pygithost.api import ci_operations, data
+from pygithost.ci import default_config, validate_config
 from pygithost.ci_config import compile_document
 from tests import test_api as read_tests
 from tests import test_api_writes as write_tests
+from tests.ci_fixtures import (
+    commit_ci_config,
+    legacy_document,
+    seed_verified_retention,
+    trusted_ci_repositories,
+)
 from tests.test_server import _which_git_backend
 
 
@@ -29,6 +35,7 @@ class APICITests(unittest.TestCase):
 
     def setUp(self):
         read_tests.APITests.setUp(self)
+        seed_verified_retention(self.sha, ("alice", "project"), ("bob", "project"))
         self.write_token = database.db_create_token(self.alice, "CI writer", "write")
         self.admin_write_token = database.db_create_token(self.admin, "CI writer", "write")
         self.manager = self.server.app.ci_manager
@@ -36,10 +43,19 @@ class APICITests(unittest.TestCase):
         self.start_patch.start()
         self.addCleanup(self.start_patch.stop)
         self.ci_base = self.base + "/ci"
+        trust = trusted_ci_repositories("alice/project", "bob/project")
+        trust.__enter__()
+        self.addCleanup(trust.__exit__, None, None, None)
 
     async def paused_start(self):
         # Real enqueue/cancel/rerun logic without a worker racing queued assertions.
         self.manager.started = True
+
+    def commit_branch_config(self, document):
+        commit = commit_ci_config(self.bare, document)
+        self.git("--git-dir", self.bare, "update-ref", "refs/heads/feature/api", commit)
+        self.sha = commit
+        return commit
 
     def save_pipeline(self, **overrides):
         config = {
@@ -48,8 +64,35 @@ class APICITests(unittest.TestCase):
             "events": {"manual": False},
             **overrides,
         }
-        database.db_ci_config_set("alice", "project", json.dumps(config))
+        self.commit_branch_config(legacy_document(config))
         return config
+
+    def save_document(self, document):
+        self.commit_branch_config(document)
+        return compile_document(document)
+
+    def set_retention(self, **values):
+        config = validate_config({**default_config(), "command": "true", **values})
+        database.db_ci_retention_policy_set("alice", "project", values)
+        return config
+
+    def test_manual_run_can_select_a_pipeline_only_on_the_requested_branch(self):
+        self.save_pipeline()
+        commit = commit_ci_config(
+            self.bare,
+            {
+                "version": 1,
+                "pipelines": [
+                    {"name": "branch-only", "steps": [{"name": "Check", "run": "echo branch"}]}
+                ],
+            },
+            branch="feature/api",
+        )
+        status, _, result = self.trigger(branch="feature/api", pipeline="branch-only", sha=commit)
+        self.assertEqual(status, 202, result)
+        self.assertEqual(result["head_sha"], commit)
+        metadata = database.db_ci_run_metadata("alice", "project", result["id"])
+        self.assertEqual(json.loads(metadata["payload"])["configuration_commit"], commit)
 
     def trigger(self, *, key=None, **document):
         return self.mutate(
@@ -83,7 +126,7 @@ class APICITests(unittest.TestCase):
         self.assertEqual(len(self.manager.pending), 1)
 
     def test_trigger_one_named_pipeline_without_fanout(self):
-        config = compile_document(
+        self.save_document(
             {
                 "version": 1,
                 "pipelines": [
@@ -93,7 +136,6 @@ class APICITests(unittest.TestCase):
                 "deployments": [],
             }
         )
-        database.db_ci_config_set("alice", "project", json.dumps(config))
         status, _headers, result = self.trigger(pipeline="build")
         self.assertEqual(status, 202, result)
         self.assertEqual(result["pipeline"], "build")
@@ -188,6 +230,7 @@ class APICITests(unittest.TestCase):
         self.assertNotIn("PRIVATE_COMMAND", logs["content"])
 
     def test_trigger_validation_and_missing_repository_config(self):
+        self.assertEqual(self.trigger(pipeline="ci")[0], 409)  # no ci/config.json
         self.save_pipeline()
         self.assertEqual(self.trigger(sha="f" * 40)[0], 409)
         self.assertEqual(self.trigger(sha="main")[0], 422)
@@ -203,14 +246,7 @@ class APICITests(unittest.TestCase):
             with self.subTest(override=override):
                 self.assertEqual(self.trigger(**override)[0], 422)
         self.assertEqual(self.mutate(self.ci_base + "/runs", {"branch": "main"})[0], 422)
-        database.db_ci_config_set("alice", "project", json.dumps({}))
-        self.assertEqual(self.trigger()[0], 409)
-        conn = database._db_connect()
-        try:
-            conn.execute("DELETE FROM ci_configs WHERE owner='alice' AND repo='project'")
-        finally:
-            conn.close()
-        self.assertEqual(self.trigger(pipeline="ci")[0], 409)  # no ci/config.json
+        self.assertEqual(self.trigger(pipeline="ci")[0], 404)  # pipeline absent
         self.assertEqual(self.manager.pending, {})
 
     def test_queue_failure_is_visible_in_accepted_run(self):
@@ -296,7 +332,9 @@ class APICITests(unittest.TestCase):
         self.assertEqual(database.db_ci_runs_count("alice", "project"), 1)
 
     def test_rerun_uses_old_snapshot_event_commit_and_idempotency(self):
+        original_commit = self.sha
         original = self.save_pipeline(env={"SNAPSHOT": "original"})
+        original["_page_environment_live"] = True
         database.db_ci_run_update(self.run, status="failed")
         conn = database._db_connect()
         try:
@@ -314,7 +352,7 @@ class APICITests(unittest.TestCase):
         self.assertEqual(status, 202, result)
         self.assertNotEqual(result["id"], self.run)
         self.assertEqual(result["event"], "push")
-        self.assertEqual(result["head_sha"], self.sha)
+        self.assertEqual(result["head_sha"], original_commit)
         snapshot = json.loads(
             database.db_ci_run_metadata("alice", "project", result["id"])["config"]
         )
@@ -611,7 +649,7 @@ class APICITests(unittest.TestCase):
             self.assertEqual(self.request(path)[0], 413)
 
     def test_artifact_retention_can_be_disabled_then_reenabled(self):
-        database.db_ci_config_set("alice", "project", json.dumps({"artifact_retention_days": 0}))
+        self.set_retention(artifact_retention_days=0)
         archive = self.archive()
         conn = database._db_connect()
         try:
@@ -625,20 +663,17 @@ class APICITests(unittest.TestCase):
         self.assertEqual(item["created_at"], "2000-01-01T00:00:00Z")
         self.assertIsNone(item["expires_at"])
         self.assertEqual(self.request(item["download_url"], decode=False)[2], archive)
-        database.db_ci_config_set("alice", "project", json.dumps({"artifact_retention_days": 1}))
+        self.set_retention(artifact_retention_days=1)
         self.assertEqual(self.request(self.ci_base + "/artifacts")[2], [])
         self.assertEqual(self.request(item["download_url"])[0], 404)
 
     def test_artifact_count_retention_is_repository_scoped(self):
-        database.db_ci_config_set(
-            "alice",
-            "project",
-            json.dumps({"artifact_retention_days": 0, "artifact_retention_count": 1}),
-        )
+        self.set_retention(artifact_retention_days=0, artifact_retention_count=1)
         self.archive()
         foreign = database.db_ci_run_create("bob", "project", "manual", "main", self.sha, "{}")
         self.archive(foreign)
         newer = database.db_ci_run_create("alice", "project", "manual", "main", self.sha, "{}")
+        self.set_retention(artifact_retention_days=0, artifact_retention_count=1)
         self.archive(newer)
         items = self.request(self.ci_base + "/artifacts")[2]
         self.assertEqual([item["run_id"] for item in items], [newer])
@@ -732,10 +767,7 @@ class APICITests(unittest.TestCase):
         script = self.root / "deployment.sh"
         script.write_text("#!/bin/sh\ntouch " + shlex.quote(str(marker)) + "\n")
         script.chmod(0o700)
-        command = (
-            shlex.quote(sys.executable)
-            + " -c \"from pathlib import Path; Path('report.txt').write_text('real-api-artifact'); print('real-api-ci-ok')\""
-        )
+        command = "printf 'real-api-artifact' > report.txt; echo real-api-ci-ok"
         self.save_pipeline(
             steps=[{"name": "Produce report", "run": command}],
             artifacts={"paths": ["report.txt"], "when": "always"},

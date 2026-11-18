@@ -467,7 +467,15 @@ async def merge_pull(
         )
     await not_checked_out(path, base)
     manager = api.handler.server.ci_manager
+    # CI requirements are repository-wide and come from the default branch.
+    # The exact target commit still selects and verifies the required checks.
     policy = await manager.config(owner, repo)
+    if policy.get("_configuration_git_error"):
+        raise APIError(
+            503,
+            "ci_policy_unavailable",
+            "Repository CI policy cannot be verified; merge rejected.",
+        )
     if policy["require_ci"]:
         check = await manager.merge_check(owner, repo, identity, target, source, base)
         if not check or check[1] != "success":

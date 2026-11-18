@@ -92,7 +92,7 @@ a body. Supported mutations are listed separately below.
 | `/repos/{owner}/{repo}/commits/{ref}/files` | Commit's changed files and line counts |
 | `/repos/{owner}/{repo}/commits/{ref}/diff` | Commit's first-parent patch (root commits supported) |
 | `/repos/{owner}/{repo}/archive` | Source ZIP for optional `ref` |
-| `/repos/{owner}/{repo}/ci/settings` | Administrator-only CI/deployment configuration and revision |
+| `/repos/{owner}/{repo}/ci/settings` | Administrator-only read-only CI configuration with Git source commit/path, status, error and informational revision |
 | `/repos/{owner}/{repo}/issues` | Issues; `state=open` (default), `closed`, or `all` |
 | `/repos/{owner}/{repo}/issues/{id}` | One issue |
 | `/repos/{owner}/{repo}/issues/{id}/comments` | Comments, ordered oldest first |
@@ -134,7 +134,8 @@ CI statuses are `queued`, `running`, `success`, `failed`, `timed_out`, `cancelle
 and `interrupted`. Run/pipeline summaries do not expose environment variables,
 configuration snapshots, scripts, payloads or log/archive contents. Separate log
 and artifact endpoints provide authorized access to job outputs. Pipeline summaries
-describe saved or built-in configuration, not resolved repository pipeline files.
+describe the current repository `ci/config.json` or the built-in missing-file
+fallback, not saved database definitions.
 
 ## Safe write endpoints
 
@@ -166,7 +167,6 @@ The authenticated token owner is always recorded as the author.
 | `POST` | `/repos/{owner}/{repo}/ci/runs` | `branch`, `pipeline`; optional `sha` to verify the branch tip |
 | `POST` | `/repos/{owner}/{repo}/ci/runs/{id}/cancel` | Empty JSON object `{}` |
 | `POST` | `/repos/{owner}/{repo}/ci/runs/{id}/rerun` | Empty JSON object `{}` |
-| `PUT` | `/repos/{owner}/{repo}/ci/settings` | Administrator only; `configuration`, `expected_revision` |
 | `POST` | `/repos/{owner}/{repo}/discussions` | `title`; optional `body`, `category` |
 | `PATCH` | `/repos/{owner}/{repo}/discussions/{id}` | `expected_revision`; one or more discussion fields |
 | `POST` | `/repos/{owner}/{repo}/discussions/{id}/comments` | `body` |
@@ -376,46 +376,65 @@ python -m unittest tests.test_api_browsing tests.test_api_discussions -v
 
 ## CI and deployment settings API
 
-`GET /api/v1/repos/{owner}/{repo}/ci/settings` returns `configuration` and
-`revision`. This endpoint is **administrator-only**, even for repository owners:
-configuration can contain plaintext secrets and code executed as the server user.
-Bearer `read` scope is mandatory; administrator status does not bypass scopes.
+`GET /api/v1/repos/{owner}/{repo}/ci/settings` returns a read-only snapshot of the
+repository's committed CI source. This endpoint is **administrator-only**, even for
+repository owners. Bearer `read` scope is mandatory; administrator status does not
+bypass scopes.
 
-`PUT` on the same URL replaces the CI/deployment configuration using the same
-JSON format and validation as the CI settings page. Supply `configuration`,
-`expected_revision` from GET, bearer `write` scope and `Idempotency-Key`:
+| Field | Meaning |
+| --- | --- |
+| `configuration` | Parsed committed document, or `{}` when the file is missing or unreadable. |
+| `source_commit` | Full SHA inspected on the default branch, or `null` when the revision is unavailable. |
+| `source_path` | Always `ci/config.json`. |
+| `status` | `valid`, `missing`, `invalid`, `blocked` (administrator trust denied), or `unavailable` (revision cannot be resolved). |
+| `error` | Fixed diagnostic for an invalid or blocked source, or `null`. It never includes file contents or environment values. |
+| `revision` | Informational digest of the source commit/path. It changes when the committed configuration changes, not when page values change. |
 
-```json
-{
-  "expected_revision": "<revision from GET>",
-  "configuration": {
-    "version": 1,
-    "pipelines": {
-      "tests": {"steps": [{"name": "Tests", "run": "python -m unittest discover"}]}
-    }
-  }
-}
-```
+Project CI and deployment definitions are owned by the repository, not by the
+database or this API. Commit them to **`ci/config.json`**. This settings endpoint
+shows the default branch configuration; CI runs use their recorded commit (the
+target/base commit for pull-request checks). Validate before committing with
+`python -m pygithost ci validate`; the web **CI → Runs** page provides the same
+read-only branch check with the exact configuration commit and status.
 
-This is replacement, not merge: include every pipeline and deployment to retain.
-Use the configuration JSON reference at the repository's `/ci/docs` page for
-deployment definitions. Separately managed environment and retention preferences
-are preserved; this API does not edit those preferences or server-wide defaults.
-Configuration is limited to 256 KiB, also subject to the API request-body limit.
-Invalid configurations return `422`; stale revisions return `409`. Configuration
-and preference changes invalidate the revision. Saves share the settings page lock.
+The entry file may use the simple pipeline form or a full grouped document with
+named `pipelines` and `deployments`. Referenced pipeline files must be regular JSON
+files strictly under `ci/`; the entry file cannot reference itself. Configuration
+is limited to 256 KiB per regular blob, and invalid configuration fails closed when
+the server reads it.
 
-Successful PUT returns only the new `revision`; GET again to inspect configuration.
-Mutations use the existing durable idempotency and audit records (actor, request
-ID, method/path, request fingerprint, status and time). Configuration bodies and
-secrets are not copied into cached mutation responses. Restrict access to database
-files, which still store settings in plaintext. Replays recheck administrator access.
+A malformed committed file fails closed for repository protection: merges require
+CI and all direct branches are protected until an operator repairs the file through
+Git or the server filesystem. A stale successful check cannot satisfy an invalid
+base configuration. The API cannot repair it; there is no replacement operation or
+saved-definition fallback. Validate configuration before committing.
 
-Saving does **not** start a deployment, grant trust to repository scripts, bypass
-approvals/branch-tip checks, or perform host deployment preflight. This removes
-manual configuration copying, not configuration duplication. See deployment
-diagnostics and the separate advisory preflight below. Repository-managed
-deployment scripts and controlled deployment retries remain separate work.
+`PUT /api/v1/repos/{owner}/{repo}/ci/settings` is **disabled**. A PUT returns
+`410 Gone`; other unsupported methods return `405`. There is no API replacement
+operation, no saved project definition and no writable revision to submit. Use the
+normal Git workflow to commit configuration. The read response exposes only the
+committed document; page-managed environment values are neither returned nor mixed
+into `configuration`.
+
+Repository environment variables and secrets stay on the project page, not in Git.
+Configuration bodies, settings storage and logs are plaintext. Page values are
+resolved when execution begins rather than copied into new stored run snapshots,
+but they can appear in remote job assignments and logs. They are withheld from all
+unmerged pull-request checks. The API does not expose or replace those values.
+Never put credentials in `ci/config.json`; page-managed values override matching
+committed `env` names. Repository rows may be scoped to ordinary non-PR CI,
+administrator-authorized protected branches, or deployments only. Protected values
+additionally require the exact `owner/repo:branch` in
+`PYGITHOST_CI_PROTECTED_SECRET_BRANCHES`, matching default-branch protection rules,
+and the current branch tip.
+
+Host jobs and enabled deployments are trusted server-user code. Adding them to
+`ci/config.json` does not authorize them: an administrator must add the exact
+`owner/repo` to `PYGITHOST_CI_TRUSTED_REPOSITORIES`. Wildcards, patterns and
+malformed names are rejected. Ordinary Docker and remote-Docker pipelines continue
+under the worker's own policy. A parseable document denied by this guard keeps its
+declared branch policies but fails the queued run at configuration. The read
+endpoint does not grant trust, execute a deployment or perform deployment preflight.
 
 Tests: `python -m unittest tests.test_api_settings -v`.
 
@@ -452,25 +471,26 @@ curl --fail-with-body -H "Authorization: Bearer $PYGITHOST_TOKEN" \
   "$PYGITHOST_URL/api/v1/repos/alice/project/deployments/123/logs?limit=16384"
 ```
 
-Preflight examines currently enabled targets under the settings lock and returns
-the settings `revision`, per-target checks, overall `ok` and `advisory: true`.
-It checks configured interpreters, external script readability/executability,
-outside-repository placement, simple direct-script shebang prerequisites and the
-named-step shell. It **does not execute** commands, scripts or deployment code.
-No enabled targets yields `ok: false`. Advanced `/usr/bin/env` shebang flags are
-conservatively reported as unsupported.
+Preflight examines currently enabled targets from the repository's committed
+configuration and returns the settings `revision`, per-target checks, overall `ok`
+and `advisory: true`. It checks configured interpreters, external script
+readability/executability, outside-repository placement, simple direct-script
+shebang prerequisites and the named-step shell. It **does not execute** commands,
+scripts or deployment code. No enabled targets yields `ok: false`. Advanced
+`/usr/bin/env` shebang flags are conservatively reported as unsupported.
 
 Preflight cannot validate arbitrary shell command dependencies, remote credentials,
 network services, deployment destination permissions or future filesystem changes.
 It does not authorize deployment, replace exact-commit CI/branch-tip checks, or
-guarantee a later deployment will succeed. Saving settings remains validation-only;
-call preflight explicitly after saving.
+guarantee a later deployment will succeed. Configuration validation remains
+read-only; call preflight explicitly after committing a change.
 
 ### Shared deployment helper with named steps
 
-A trusted administrator may now combine `script_content` (or an external `script`)
-with named deployment `steps`. The shared helper is staged once and its absolute
-path is available as `PYGITHOST_DEPLOY_SCRIPT`. Named commands invoke it explicitly:
+A project may combine `script_content` (or an external `script`) with named
+deployment `steps` in `ci/config.json`. The shared helper is staged once and its
+absolute path is available as `PYGITHOST_DEPLOY_SCRIPT`. Named commands invoke it
+explicitly:
 
 ```json
 {"name": "Release", "run": "sh \"$PYGITHOST_DEPLOY_SCRIPT\" release"}
@@ -511,7 +531,7 @@ Tests: `python -m unittest tests.test_remote_ci -q`.
 
 Pipeline configuration accepts `execution.docker` resource/capability requests.
 Worker-owned ceilings and secret/network permissions are configured separately,
-not through the repository settings API. A rejected request fails with phase
+not through the repository configuration. A rejected request fails with phase
 `runner policy`. See [Docker profiles](docker-profiles.md) and the
 [new-server installation requirements](remote-runner-setup.md).
 
@@ -537,22 +557,26 @@ curl --fail-with-body \
   "$PYGITHOST_URL/api/v1/repos/alice/project/ci/runs"
 ```
 
-Use the names returned by `GET .../ci/pipelines`, including `ci` for the automatic
-repository-file preset or `default` for legacy single-pipeline settings.
-An explicit pipeline is required; API triggering does not fan out to every pipeline.
+Use the names returned by `GET .../ci/pipelines`. The simple form of
+`ci/config.json` creates the pipeline name `ci`; a full grouped document uses its
+named pipelines. An explicit pipeline is required; API triggering does not fan out
+to every pipeline.
 Optionally include a full commit `sha` to reject a moved branch with `409`.
-The server resolves and records the actual branch commit; arbitrary events, commits
-from another branch, environment overrides, commands, runner settings and deployment
-flags are not accepted. Manual runs remain available even if a legacy manual trigger
-was disabled. Missing automatically discovered `ci/config.json` returns `409`
-without creating a run.
+The web **CI → Runs** page applies the same guard by binding **Queue run** to the
+SHA from its read-only **Check configuration** result. The server resolves and
+records the actual branch commit; arbitrary events, commits from another branch,
+environment overrides, commands, runner settings and deployment flags are not
+accepted. Manual runs remain available even if a legacy manual trigger was disabled.
+A missing `ci/config.json` returns `409` without creating a run.
 
 `202` means a run record was created, not that execution succeeded. A configuration
 error or full CI queue may create an immediately failed run. Poll the returned ID
 with `GET .../ci/runs/{id}` and read its logs when appropriate.
 A malformed repository pipeline, including attempts to override its runner, creates
-a configuration-failed run without executing the supplied commands. Such a run
-may have no usable snapshot; fix the file and trigger a new run rather than rerunning it.
+a configuration-failed run without executing the supplied commands. A malformed
+committed file additionally fails closed for merge and direct-branch protection
+until it is repaired. Such a run may have no usable snapshot; fix the file and
+trigger a new run rather than rerunning it.
 
 Cancel with `POST .../ci/runs/{id}/cancel` and JSON `{}`. Queued jobs are removed
 from the scheduler; running jobs use the CI manager's existing process/container
@@ -561,10 +585,13 @@ cleanup. Already-cancelled runs return their summary. Other terminal states retu
 A job not owned by the local scheduler cannot be cancelled by this API.
 
 Rerun a terminal job with `POST .../ci/runs/{id}/rerun` and JSON `{}`. It creates
-a new run ID using the old commit, configuration/environment snapshot, pipeline,
-payload and event—not today's edited configuration. Pending/running jobs or runs
-without a usable snapshot return `409`. To test new settings, trigger a new manual
-run instead. Do not send snapshot or environment fields in the request.
+a new run ID using the old commit, stored Git configuration, limits, pipeline,
+payload and event—not today's committed configuration. Page-managed values are
+resolved again at execution and remain withheld from unmerged pull-request reruns;
+a protected value also requires the original commit to still be the branch tip.
+Pending/running jobs or runs without a usable snapshot return `409`. To test new
+committed configuration, trigger a new manual run instead. Do not send snapshot or
+environment fields in the request.
 
 **Manual runs never deploy.** Reruns preserve the original event: a manual rerun
 never deploys, while a push/PR-merged rerun retains the existing deployment gates
@@ -646,12 +673,16 @@ Oversized metadata has `downloadable=false`; GET/HEAD download requests return
 oversized BLOB is not loaded into Python. Range downloads are not implemented.
 
 Existing retention rules apply to API lists/downloads, including cleanup of expired
-archives. A run with no retained archive has an empty list; downloading a missing or
-expired archive returns `404`. Unknown/inaccessible runs also return `404`.
-Disabling artifact age retention gives `expires_at: null`; count limits still apply.
-Changing retention back to a lower age can remove previously retained archives.
-Count/age cleanup stays scoped to the selected repository and does not remove
-another repository's archives.
+archives. The active limits follow the default branch's configuration and
+administrator limits. A run with no retained archive has an empty list;
+downloading a missing or expired archive returns `404`. Unknown/inaccessible runs
+also return `404`. Disabling artifact age retention gives `expires_at: null`; count
+limits still apply. The active policy follows the default branch configuration and
+administrator caps; feature branches and reruns cannot change it. A lower default
+branch limit can remove previously retained archives at the next cleanup. Count/age
+cleanup stays scoped to the selected repository and does not remove another
+repository's archives. See [Retention](ci-retention.md) for refresh and cleanup
+timing.
 The server returns the original ZIP without extracting or scanning it.
 
 **Treat logs and archives as sensitive, untrusted job output.** Job commands can
@@ -673,8 +704,10 @@ and verifies that neither the manual run nor its rerun deploys.
 | Concurrent retries | Two simultaneous requests with the same idempotency key queue at most one job; an unfinished claim returns `operation_pending`. |
 | Recovery | Scheduler errors do not expose exception text or cause automatic re-execution; cached results remain authoritative after run retention. |
 | Trigger validation | Explicit pipeline selection avoids fanout; slash-containing branches work; runner/env/event/payload overrides are rejected. |
-| Configuration failures | Invalid repository pipeline settings fail without executing their commands. |
-| Rerun snapshots | Old event, commit, steps and environment are retained; corrupt snapshots fail safely and cached errors require a new key after repair. |
+| Configuration failures | Invalid or malformed repository `ci/config.json` fails without executing its commands; a malformed committed document fails closed with CI required and direct branches protected; saved database commands never act as a fallback. |
+| Repository source | Simple steps and full named documents read from exact commits; PR checks use the trusted base; referenced files stay under `ci/`. |
+| Trust boundary | Host jobs and deployments fail unless the exact repository is authorized; wildcards/malformed names are rejected and historical snapshots are rechecked. |
+| Rerun snapshots | Old event, commit and steps are retained. Page-managed values are resolved again when executing and are withheld from unmerged PRs. |
 | Cancellation races | Pending/running jobs use scheduler cleanup; a job that finishes successfully during cancellation is not rewritten as cancelled. |
 | Log cursors | Mixed Unicode, NUL, quotes and control characters round-trip across byte-limited chunks; changed output and invalid offsets fail clearly. |
 | Log limits | Large logs are sliced in SQLite; diagnostic reasons are bounded; HEAD sends no output. |
@@ -786,7 +819,7 @@ HTTP error format, rather than the API error envelope.
 | --- | --- |
 | File mutations | Multi-file commits, rename/move operations, binary writes and creating an initial commit in an empty repository |
 | Pull requests | Conflict inspection/resolution and frozen historical PR diff snapshots |
-| CI settings | Separate variables/retention preferences and server defaults; CI/deployment document reads/replacements are now available to administrators |
+| CI settings | Read-only configuration inspection; replacement is disabled. Separate environment/retention editing and server defaults are not exposed through the API |
 | CI details | Individual step results and email-delivery retry |
 | Deployments | Controlled retries; history, step results and bounded logs are now available |
 | Repository administration | Settings updates and deletion |

@@ -36,6 +36,8 @@ this is not an untrusted-pull-request sandbox.
 ```
 
 Omitting `image_build` or setting it to `null` preserves download-only behavior.
+Commit this pipeline in `ci/config.json`; referenced pipeline files must remain
+under `ci/`. Build authorization below is administrator-owned and separate from Git.
 Fields above show defaults except `pull` defaults to **true**, and `dockerfile`
 defaults to **Dockerfile**. Paths are checkout-relative (including `dockerfile`
 when context is a subdirectory). Traversal, URL contexts and symlink components

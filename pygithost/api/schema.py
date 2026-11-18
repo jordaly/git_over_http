@@ -416,7 +416,16 @@ def specification() -> DynamicJSONObject:
     endpoint(
         base + "/ci/settings",
         "getCISettings",
-        obj({"configuration": {"type": "object"}, "revision": string}),
+        obj(
+            {
+                "configuration": {"type": "object"},
+                "revision": string,
+                "source_commit": {"type": ["string", "null"]},
+                "source_path": string,
+                "status": {"enum": ["valid", "missing", "invalid", "blocked", "unavailable"]},
+                "error": {"type": ["string", "null"]},
+            }
+        ),
     )
     deployment = obj(
         {
@@ -771,21 +780,12 @@ def specification() -> DynamicJSONObject:
     )
     mutation(base + "/ci/runs/{id}/cancel", "post", "cancelRun", {}, set(), ref("Run"))
     mutation(base + "/ci/runs/{id}/rerun", "post", "rerunRun", {}, set(), ref("Run"), 202)
-    mutation(
-        base + "/ci/settings",
-        "put",
-        "replaceCISettings",
-        {"configuration": {"type": "object"}, "expected_revision": revision},
-        {"configuration", "expected_revision"},
-        obj({"revision": revision}),
+    paths[base + "/ci/settings"]["get"]["description"] = (
+        "Administrator-only read-only repository CI configuration. Requires read scope. "
+        "Commit pipeline and deployment definitions to ci/config.json; replacement "
+        "through this API is disabled. Secrets remain managed on the project page. "
+        "Does not execute a deployment or provide deployment preflight."
     )
-    for operation in ("get", "put"):
-        paths[base + "/ci/settings"][operation]["description"] = (
-            "Administrator-only CI/deployment configuration. Reads require read scope; "
-            "replacement additionally requires write scope and Idempotency-Key. "
-            "Uses the CI settings page JSON format and preserves separate environment/retention preferences. "
-            "Does not execute a deployment or provide deployment preflight."
-        )
     mutation(
         base + "/discussions",
         "post",

@@ -2,15 +2,17 @@
 
 [Quick start](pipelines.md) · [Recipes](pipeline-examples.md) · [Deployment](automatic-deployment.md) · [Retention](ci-retention.md) · [HTTP runner](http-runner.md)
 
-This manual is rendered directly in **CI → Documentation**. Edit the repository
-document under **CI → Settings → Configuration JSON**; it is separate from the
-server's `pygithost.config.json` (network, authentication and storage).
+This manual is rendered directly in **CI → Documentation** from the checked-in
+documentation. Project CI configuration is read from **`ci/config.json`** in the
+repository, separate from the server's `pygithost.config.json` (network,
+authentication and storage). Commit configuration changes to Git; there is no page
+JSON editor and no API replacement endpoint.
 
 ## Contents
 
 - [Complete examples](#complete-examples)
-- [Automatic repository CI](#automatic-repository-ci)
-- [Page settings and inheritance](#page-settings-and-inheritance)
+- [Repository configuration](#repository-configuration)
+- [Secrets, retention and administrator defaults](#secrets-retention-and-administrator-defaults)
 - [Document structure](#document-structure)
 - [Independent configuration](#independent-configuration)
 - [Every execution option](#every-execution-option)
@@ -20,49 +22,74 @@ server's `pygithost.config.json` (network, authentication and storage).
 - [Every deployment option](#every-deployment-option)
 - [Guidance for AI agents](#guidance-for-ai-agents)
 - [Every repository setting](#every-repository-setting)
-- [Compatibility](#compatibility)
+- [Compatibility and file rules](#compatibility-and-file-rules)
 - [Variables, limits and troubleshooting](#variables-limits-and-troubleshooting)
 
 ## Complete examples
 
 | Example | Purpose |
 | --- | --- |
-| [Default file reference](examples/ci/repository-reference.json) | Minimal **Settings** JSON. It references the separate repository file; do not commit this reference as the pipeline file. |
-| [All options](examples/ci/all-options.json) | Independent checks/release pipelines and separately named deployments, cancellation, artifacts, notifications and policies. Variables and retention use page controls. |
-| [Inline deployment](examples/ci/inline-deployment.json) | Python script content rather than a host script path. |
-| [Git-managed configuration](examples/ci/git-managed.json) | Expanded Settings document for a named Git-backed pipeline with explicit execution and automatic triggers. |
-| [Repository pipeline](examples/ci/repository-pipeline.json) | Commit this as `ci/config.json` inside the repository's `ci/` directory. Contains steps, artifacts and a timeout; it is **not** Settings JSON. |
+| [All options](examples/ci/all-options.json) | Full document with checks/release pipelines, separately named deployments, cancellation, artifacts, notifications, policies and retention. Commit as `ci/config.json`. |
+| [Inline deployment](examples/ci/inline-deployment.json) | Full document using Python script content rather than a host script path. Commit as `ci/config.json`. |
+| [Git-managed configuration](examples/ci/git-managed.json) | Full document with named pipelines that reference `ci/tests.json` and `ci/build.json`. Commit the document as `ci/config.json` and the referenced files under `ci/`. |
+| [Repository pipeline](examples/ci/repository-pipeline.json) | Simple single-pipeline document. Commit as `ci/config.json`. |
 
 Example links display complete JSON in the application. Deployments in these files
-are disabled until you review and enable them. Replace example recipients and script
-paths. Prepare Docker images/dependencies before running; validation does not install
-tools or execute the examples. A generic Python image may not include your build tools.
+are disabled until reviewed and enabled. Replace example recipients and script
+paths. Prepare Docker images/dependencies before running; validation does not
+install tools or execute the examples. A generic Python image may not include your
+build tools.
 
-> Saving replaces the entire document, not a patch. Preserve your existing pipeline
-> entries and policies when adapting examples. Retention changes can delete existing
-> data immediately.
+> Commit the file; do not paste it into a page. There is no project configuration
+> editor or replacement API. Every enabled deployment still needs administrator
+> trust authorization.
 
-## Automatic repository CI
+## Repository configuration
 
-Repositories with **no saved CI settings** automatically use a pipeline named
-`ci` that reads **`ci/config.json`** from the recorded commit. No settings save is
-required. Settings presents the compact reference below, which can also be saved
-explicitly. It expands to the same Docker pipeline and automatic triggers:
+Project CI has two supported forms at **`ci/config.json`**:
 
-```json
-{
-  "version": 1,
-  "file": "ci/config.json"
-}
+1. A **simple pipeline** with `version` and `steps` (or the legacy `command`).
+2. A **full grouped document** with named `pipelines` and `deployments` arrays,
+   plus optional root `policies` and `retention`.
+
+A missing `ci/config.json` means no automatic run. An invalid or malformed file
+produces a configuration failure without executing commands. A malformed committed
+file also fails closed for repository protection: merges require CI and all direct
+branches are treated as protected until an operator repairs the file through Git or
+the server filesystem. No stale successful check can satisfy an invalid base
+configuration. There is no web editor, API replacement or saved-definition fallback
+for repair, so validate JSON before committing. Committed configuration is read
+from the recorded commit, never from an uncommitted working tree or a saved
+database definition. Push/manual runs use the run's commit; pull-request checks use
+the recorded target/base commit so unreviewed PR code cannot replace its own
+pipeline.
+
+Validate a checkout or repository without executing or queuing anything:
+
+```sh
+python -m pygithost ci validate                 # working tree, including uncommitted changes
+python -m pygithost ci validate --rev HEAD      # committed HEAD instead
+python -m pygithost ci validate /path/to/repo   # another checkout or bare repository
 ```
 
-The shorthand accepts only `version` and `file`. Use the full named arrays for
-custom execution, automatic triggers, policies or deployments; do not
-mix shorthand and expanded fields. Manual runs are always available to users with
-write access for runnable pipelines, even if a legacy `manual.enabled` is false.
-Empty pipeline lists still disable all runs, and manual runs never deploy.
+The optional path may also be supplied as `--repository`, `--repo` or `--path`.
+With `--rev`/`--revision`, use `HEAD`, a branch reference such as
+`refs/heads/main`, or a full commit SHA. Outside a working tree, the command
+inspects committed `HEAD`. It validates every referenced pipeline file with the
+same parser used by the server and exits nonzero for a missing, invalid or
+unresolvable configuration. Working-tree validation is a pre-commit check; runtime
+CI still reads the recorded commit.
 
-The **repository file itself** contains steps, not the reference above. For example:
+**CI → Runs** validates branch-first. Choose a branch and select **Check
+configuration** to read its committed `ci/config.json` and referenced files without
+queuing a job. The page shows the exact configuration commit SHA and status:
+`valid`, `missing`, `invalid`, `blocked` (administrator authorization denied), or
+`unavailable` (revision cannot be resolved). The manual run form is enabled only for
+a runnable pipeline in a `valid` or parseable `blocked` configuration. It carries
+the validated commit SHA, so a manual run is rejected with a prompt to recheck if
+the branch tip moved.
+
+The simple form is one pipeline named `ci`:
 
 ```json
 {
@@ -75,104 +102,88 @@ The **repository file itself** contains steps, not the reference above. For exam
 }
 ```
 
-The preset enables pushes, PR opened/updated/reopened events and manual runs on
-all branches. The initial execution default is Docker image `python:3.14-slim`;
-per-pipeline execution JSON can change it. Prepare the image on the
-server (`docker pull python:3.14-slim`); tools/dependencies are not auto-installed.
-The file's timeout cannot exceed the effective pipeline timeout from explicit
-pipeline execution or built-in defaults. It may lower that limit.
-No deployments, notifications or protection policies are enabled automatically.
-PRs read the target/base commit's file, not the unreviewed source branch's file.
+It accepts only `version`, `command`, `steps`, `env`, `artifacts` and
+`timeout_seconds`. Built-in execution is Docker with image `python:3.14-slim`.
+Pushes and pull-request opened/updated/reopened events are enabled on all branches;
+manual runs are always available to write-authorized users. The simple form cannot
+define deployments, protection policies or retention.
 
-Without `ci/config.json`, the automatic preset creates **no run**. An existing
-but invalid file produces a configuration failure. Saved configurations always
-take precedence, including explicitly empty/disabled pipelines and legacy
-`.pygithost-ci.json` references. No existing settings or files are renamed.
-To disable discovery, save `{"version":1,"pipelines":[],"deployments":[]}`.
-Saving an explicit file-backed pipeline makes a missing file an error instead
-of silently skipping the run.
+The full grouped form is described below. Up to 16 pipelines and 32 deployments
+are supported. Empty `pipelines` and `deployments` arrays stop new automatic runs
+without deleting history. A pipeline may use inline `steps` or a `file` reference
+to another pipeline file, but not both. Every referenced file must be a regular
+JSON file under `ci/`; `ci/config.json` itself cannot be referenced recursively.
 
-The repository file uses the flat format above (`version`, `steps` or legacy
-`command`, `env`, `artifacts`, `timeout_seconds`). It cannot select a host runner,
-define deployments, change triggers or raise the server timeout ceiling. The
-complete named-array document below belongs to **CI → Settings**, not the file.
-Settings uses a Monaco JSON editor with formatting and syntax diagnostics, and
-falls back to a textarea if the editor cannot load. Server validation on Save is
-authoritative; syntax highlighting does not prove that every option is valid.
+`ci/config.json` cannot be a `{"version":1,"file":"ci/config.json"}` reference to
+itself. That obsolete Settings-only shorthand is not a valid configuration root.
 
-## Page settings and inheritance
+## Secrets, retention and administrator defaults
 
-For trusted HTTP-runner pipelines, `execution.image_build` declares an optional
-build-if-missing recipe (Dockerfile, context, target, args, prerequisites and
-resource/time limits). It defaults to `null`; administrators must also authorize
-the repository/event in worker policy. See [Build missing images](image-builds.md).
-This is a Settings execution option, not an extra field accepted in the restricted
-repository steps file.
+**CI → Settings** is the repository environment-variable and secret page. It does
+not edit pipeline JSON or project retention. **Admin → Settings** retains
+server-wide environment defaults and storage retention defaults.
 
-**Admin → Settings** includes basic server configuration, appearance,
-environment variables, and run/artifact retention. Basic server changes
-are written atomically to the startup config file and take effect **after a
-restart**. The listener, authentication, database and storage paths do not change
-mid-request. Review allowed IPs, account access, cookie security and file paths
-before restarting; changing paths does not move repositories or migrate a database.
-Programmatic servers without a startup file display the basic fields read-only.
-External edits to the startup file are detected before a settings save overwrites it.
+- Server variables are inherited by name. Repository rows override matching names;
+  pipeline-scoped rows override repository-wide rows.
+- Page-managed values also override matching `env` entries committed in
+  `ci/config.json`. Values are resolved when a job executes, not copied into new
+  stored run snapshots. They can still appear in remote job assignments and logs.
+- All page values, including server-wide values, are withheld from unmerged
+  pull-request checks. Those checks receive only committed `env` and built-in
+  variables.
+- Repository rows can be scoped to **Non-PR CI runs** (ordinary), **Authorized
+  protected branch**, or **Deployments only**. Deployment-only values are not sent
+  to CI test jobs. An ordinary value is not sent to a deployment. A restricted
+  repository override also does not fall back to a broader or server-wide value
+  when its scope is not allowed.
+- A protected value additionally requires the server process environment variable
+  `PYGITHOST_CI_PROTECTED_SECRET_BRANCHES` to contain the exact
+  `owner/repo:branch`, the current default branch's committed
+  `block_direct_pushes` and `protected_branches` policy to match the branch, and
+  the execution commit to equal the current branch tip. Entries are comma- or
+  newline-separated; the default is empty. This server-side authorization prevents
+  a repository writer from self-granting protected values by editing Git.
+- Never commit secrets to Git. Settings storage, committed configuration and logs
+  are plaintext, and logs are not secret-redacted. **Show values** changes masking
+  only.
+- A blank repository value is a real empty string. Removing an override restores
+  the server value.
+- The default branch's full grouped document controls cleanup, within nonzero
+  administrator caps. Feature branches and reruns cannot change it. The project
+  page has no retention form.
 
-**CI → Settings** provides repository variable and retention controls. For each
-retention limit, **Use server default** means inherit the server value. Clear it
-for a repository override; `0` means unlimited, not inheritance. Runner, image,
-timeout and cancellation belong to each pipeline's JSON; omitted options use
-built-in defaults, not saved page preferences. Settings changes affect future CI
-snapshots, not queued/running jobs or their reruns. Retention instead applies to
-current stored data immediately, and requires a deletion acknowledgement.
-
-Use the **Environment variables** table rather than embedding `env` in JSON.
-Add/remove rows and select **All pipelines** or one repository pipeline. Server
-variables are inherited by name; repository values override them, and
-pipeline-specific rows override repository-wide values. Removing a repository
-override restores the server value. A blank value is a real empty string.
-Variables remain plaintext in the database, hidden visually until **Show values**;
-logs are not secret-redacted. Built-in/reserved names are rejected. At most 64
-effective variables per pipeline and 8192 characters per value are supported.
-
-Legacy JSON environment and retention values remain accepted. They are shown in
-the page controls, not the Monaco document, and are preserved when pipeline JSON
-is saved. Saving the repository variables form makes those rows authoritative,
-including an empty form used to remove legacy variables; legacy `env` in a Git
-pipeline file no longer overrides those page-managed rows. Until that form is
-saved, legacy variables continue to work with server variables as defaults.
-Page-managed environment variables are CI job variables, not deployment host
-credentials. Repository-file configs cannot grant host access or modify retention.
+See [Retention](ci-retention.md) for limits, administrator caps, refresh and
+deletion timing.
 
 ## Document structure
+
+The full grouped form uses named arrays:
 
 | Option | Default / type | Example and meaning |
 | --- | --- | --- |
 | `version` | Integer `1` | `"version": 1`; the only supported version. |
-| `file` | Compact-reference form only | `"file":"ci/config.json"`; use only with `version`, not with named arrays or policies. |
-| `pipelines` | Required in the expanded form | `"pipelines": [{"name":"checks","steps":[{"name":"Tests","run":"python -m unittest discover -v"}]}]`. Every object requires its own name and independent configuration. |
-| `deployments` | Array, default `[]` | `"deployments":[{"name":"production","pipeline":"checks","enabled":false,"script":"/opt/deploy/app.sh"}]`; separately named targets linked to a pipeline. |
-| `policies` | Protection off | `"policies":{"require_ci":true}`; administrator-controlled, repository-wide. |
-| `retention` | Legacy compatibility only | Use the **Runs and artifacts** page controls for new settings. Old JSON values are preserved as repository overrides until changed there. |
+| `pipelines` | Required array | `"pipelines": [{"name":"checks","steps":[{"name":"Tests","run":"python -m unittest discover -v"}]}]`. Every object requires its own name. |
+| `deployments` | Array, default `[]` | `"deployments":[{"name":"production","pipeline":"checks","enabled":false,"script":"/opt/deploy/app.sh"}]`; separately named host targets linked to a pipeline. |
+| `policies` | Protection off | `"policies":{"require_ci":true}`; repository-wide merge/direct-push protection. |
+| `retention` | Administrator defaults | `"retention":{"artifacts":{"days":30,"max_count":50},"runs":{"max_count":100}}`; set it on the default branch. |
 
 Up to 16 pipelines and 32 deployments. Each object requires `name`, using 1–64 ASCII
 letters, digits, underscores or hyphens, beginning alphanumeric. Names are unique
 within each list; pipeline and deployment names may match. Keep them stable.
-`"pipelines": [], "deployments": []` stops new runs without deleting history or
-cancelling queued commands. Referenced pipelines must exist; remove/repoint their
-deployments when deleting a pipeline.
+Referenced pipelines must exist; remove or repoint their deployments when deleting
+a pipeline.
 
 Pipeline-local groups: `execution`, `triggers`, `cancellation`, `artifacts`,
-`notifications`, `steps`, or `file` instead of steps. Deployment
-configuration belongs only in the separate deployments list. Policies/retention
-remain repository-wide. There is no defaults object or root notifications object.
+`notifications`, `steps`, or `file` instead of steps. Deployment configuration
+belongs only in the separate deployments list. Policies and retention remain at
+the document root. There is no top-level notification policy.
 
 ## Independent configuration
 
 No pipeline or deployment inherits configuration from another pipeline/deployment.
-Omitted execution and cancellation fields use built-in defaults. Other
-fields use their documented built-ins. Enabling email on
-one pipeline does not enable another pipeline's or a deployment's email.
+Omitted execution and cancellation fields use built-in defaults. Other fields use
+their documented built-ins. Enabling email on one pipeline does not enable another
+pipeline's or a deployment's email.
 
 Empty branch arrays match **all** branches; disable a trigger with `enabled: false`
 to stop it. Empty recipients are invalid with enabled email. Empty artifact paths
@@ -180,22 +191,24 @@ disable collection. Empty protected patterns are invalid with direct-push blocki
 
 ## Every execution option
 
-These fields belong in each pipeline object's `execution` group.
-Table examples are **field fragments**; use the complete examples for surrounding JSON.
+These fields belong in each pipeline object's `execution` group. Table examples are
+**field fragments**; use the complete examples for surrounding JSON.
 
 | Option | Type / built-in default | Example | Behavior |
 | --- | --- | --- | --- |
-| `runner` | `"docker"` | `"runner":"remote-docker"` | `host` runs as the server OS user, without a sandbox. `docker` uses local Linux containers; `remote-docker` uses an outbound HTTP worker. Existing concrete legacy host settings remain intact. |
+| `runner` | `"docker"` | `"runner":"remote-docker"` | `host` runs as the server OS user, without a sandbox, and requires administrator trust authorization. `docker` uses local Linux containers; `remote-docker` uses an outbound HTTP worker. |
 | `docker` | Hardened profile | `"docker":{"memory_mb":2048}` | Declarative resources, network, paths, tmpfs and named mounts. Remote requests must fit an administrator-owned worker policy; see [Docker profiles](docker-profiles.md). |
 | `source_limit_mb` | `100` | `"source_limit_mb":500` | Positive integer MiB for the remote source bundle; no hard-coded upper configured size ceiling. |
 | `limits` | Bounded defaults | `"limits":{"log_mb":8,"artifact_mb":128}` | Log/artifact sizes/counts and source/transfer timeouts; see [CI limits](ci-limits.md). |
 | `image` | String `"python:3.14-slim"` | `"image":"registry.example.com/team/ci:2026-10"` | Docker image must already exist locally. Include tools/dependencies and preferably pin a digest. |
 | `timeout_seconds` | Built-in `1800` | `"timeout_seconds":600` | One budget for checkout, PR merge preparation and all steps. Deployment has a separate timeout. |
-| `env` | Legacy compatibility only | Use the **Environment variables** page table | Up to 64 effective entries; valid identifier keys, string values up to 8192 characters, no NUL. Built-in names are reserved. Legacy JSON remains readable; page-managed repository values are authoritative. |
+| `env` | Public defaults only | `"env":{"BUILD_MODE":"release"}` | Up to 64 effective entries; valid identifier keys, string values up to 8192 characters, no NUL. Never put secrets in Git. Page-managed values override matching names at execution and are withheld from unmerged PR checks. |
 
 **Host** commands use `/bin/sh` on POSIX and `cmd.exe` on Windows. A restricted
 environment prevents accidental credential inheritance but does not restrict
-filesystem/process access. Host CI is trusted-code-only.
+filesystem/process access. Host CI is trusted-code-only and additionally requires
+the exact repository name in `PYGITHOST_CI_TRUSTED_REPOSITORIES`; wildcard or
+malformed allowlist entries are rejected.
 
 **Docker** uses `/bin/sh` and overrides the image entrypoint. By default it mounts
 the independent checkout—not the production repository or Docker socket. Defaults:
@@ -244,6 +257,9 @@ fail preparation. Enable opened/updated/reopened when requiring CI. Patterns are
 case-sensitive globs (`release/*`, `feature/?`), not regular expressions; do not
 assume `!pattern` exclusion syntax or another CI product's glob semantics.
 
+The simple pipeline publishes push and PR opened/updated/reopened events by default
+with no branch filters.
+
 ## Steps
 
 | Option | Requirement | Example |
@@ -267,7 +283,9 @@ fail the step. Filters, expressions, loops/calls and recursive expansion are not
 supported. Values are **not shell-escaped**; quote for the runner shell and avoid
 interpolating untrusted executable syntax. Prefer tools reading values directly
 from their environment. JSON strings escape newlines as `\n` and quotes as `\"`.
-Environment/snapshots are plaintext and logs are not secret-redacted.
+Committed configuration and stored snapshots are plaintext; page-managed values are
+resolved live and are not stored in new snapshots. Neither logs nor remote job
+assignments are secret-redacted.
 
 ## Artifacts and notifications
 
@@ -304,10 +322,19 @@ does not change results; see [email operations](../README.md#email-notifications
 
 ## Every deployment option
 
-Each object in top-level `deployments` describes a separately named target. Multiple
-targets can reference the same pipeline. They execute sequentially after that pipeline
-passes, with separate logs, results, attempt identity and notifications. Deployments
-still execute trusted host scripts, even when CI execution uses Docker.
+Each object in top-level `deployments` describes a separately named host target.
+Multiple targets can reference the same pipeline. They execute sequentially after
+that pipeline passes, with separate logs, results, attempt identity and
+notifications.
+
+Deployments execute trusted host scripts or host steps, even when CI execution uses
+Docker. **Every enabled deployment requires the repository to be listed in
+`PYGITHOST_CI_TRUSTED_REPOSITORIES`.** Repository writers cannot grant themselves
+server-user execution by adding a deployment. The allowlist accepts exact
+`owner/repo` entries only; wildcards, patterns, malformed names and `..` are
+rejected rather than matched. A parseable configuration denied by this guard keeps
+its declared branch policies but fails the queued run during configuration, before
+commands execute.
 
 | Option | Type / default | Example | Behavior |
 | --- | --- | --- | --- |
@@ -324,20 +351,19 @@ still execute trusted host scripts, even when CI execution uses Docker.
 | `timeout_seconds` | Integer 1–86400, `600` | `"timeout_seconds":900` | Separate deployment budget, not the CI timeout. |
 
 Supply nonempty steps, script or script_content, without combining execution forms.
-An enabled block requires one; a
-disabled draft may omit it. Windows path example: `C:/deploy/release.py` with
-`run_with: "python"`. Dependencies belong on the host. Quote interpreter paths
-containing spaces. The exact invocation is interpreter arguments + script path +
-tested SHA; there is no configurable script args array.
+An enabled block requires one; a disabled draft may omit it. Windows path example:
+`C:/deploy/release.py` with `run_with: "python"`. Dependencies belong on the host.
+Quote interpreter paths containing spaces. The exact invocation is interpreter
+arguments + script path + tested SHA; there is no configurable script args array.
 
 Deployment steps use fresh host shells in a checkout of the tested commit, not the
-CI job's checkout. Files persist between steps; shell state does not. `run_with` does
-not select their shell. All steps share `timeout_seconds`; failure skips later steps.
-Read the tested SHA from `PYGITHOST_COMMIT` in step commands and resolve repository
-files against the checkout at `PYGITHOST_WORKTREE`, which is also the working
-directory. The Deployments list and detail pages refresh live logs and statuses every
-two seconds, with per-step and combined output. Existing script targets are displayed
-as a single Deploy step.
+CI job's checkout. Files persist between steps; shell state does not. `run_with`
+does not select their shell. All steps share `timeout_seconds`; failure skips later
+steps. Read the tested SHA from `PYGITHOST_COMMIT` in step commands and resolve
+repository files against the checkout at `PYGITHOST_WORKTREE`, which is also the
+working directory. The Deployments list and detail pages refresh live logs and
+statuses every two seconds, with per-step and combined output. Existing script
+targets are displayed as a single Deploy step.
 
 Deployment follows only its **own** successful push/merged run, while the tested
 commit is still the branch tip. It does not wait for another pipeline. Manual and
@@ -348,110 +374,134 @@ working tree or automatic artifact handoff. Submodules are not initialized.
 Retrieve/deploy that exact SHA, not a later fetched branch tip.
 
 Removing/changing/disabling deployment prevents old snapshots from deploying.
-Each repository/deployment/commit gets **one attempt**, including failures: no automatic
-retry or rollback. Restarts mark unfinished attempts interrupted rather than replaying
-them. Verify the real target after interruption. Protect scripts/credentials from
-CI job writes; same-user processes are not isolated by owner-only permissions.
-Read the [deployment walkthrough](automatic-deployment.md) before enabling it.
+Each repository/deployment/commit gets **one attempt**, including failures: no
+automatic retry or rollback. Restarts mark unfinished attempts interrupted rather
+than replaying them. Verify the real target after interruption. Protect
+scripts/credentials from CI job writes; same-user processes are not isolated by
+owner-only permissions. Read the [deployment walkthrough](automatic-deployment.md)
+before enabling it.
 
 ## Guidance for AI agents
 
 When generating or modifying CI/deployment configuration:
 
-1. **Identify the document first.** `ci/config.json` in Git describes repository
-   CI steps. The Settings document uses named `pipelines` and `deployments` arrays
-   (or the compact file reference). Never put deployments or host-runner settings
-   in the repository file, and do not confuse either with `pygithost.config.json`.
-2. **Preserve unrelated settings.** Read the current document before proposing a
-   replacement. Keep existing names, pipeline references, notifications and
-   policies. Saving replaces the document, not a JSON patch. Use page controls
-   for environment variables and retention; do not change retention incidentally.
-3. **Use only supported fields.** Deployment steps contain `name` and `run`, not
+1. **Edit the repository file.** Project configuration is `ci/config.json` in Git.
+   Use the simple form or one full grouped document with named `pipelines` and
+   `deployments` arrays. Referenced files must also be under `ci/`. Do not invent a
+   page editor, a saved database document or a replacement API. Do not confuse the
+   project file with `pygithost.config.json`.
+2. **Never commit secrets.** Put credentials in **CI → Settings** environment
+   rows and choose the least permissive scope that works: ordinary for non-PR CI,
+   protected only for an administrator-authorized protected branch at its current
+   tip, or deployment-only for host deployments. Committed `env` is public
+   configuration only. Page values override matching Git values and are resolved
+   at execution; unmerged PR checks receive none. Logs, remote assignments and
+   committed configuration are not redacted.
+3. **Preserve unrelated configuration.** Read the current file before proposing a
+   replacement. Keep existing names, pipeline references, notifications, policies
+   and retention. Commit the whole resulting document; there is no JSON patch.
+4. **Use only supported fields.** Deployment steps contain `name` and `run`, not
    CI-provider-specific `uses`, `needs`, retries, approvals or per-step timeouts.
-   Use one execution form per target and one target-wide timeout. Validate using
-   server-side Save validation; editor syntax checks alone are insufficient.
-4. **Do not grant host execution implicitly.** Deployment scripts and steps run
-   as the Git server user outside Docker. Propose new targets with `enabled:false`
-   until reviewed. Do not enable deployment, push a release branch, change branch
-   protections or access credentials without explicit authorization.
-5. **Deploy the tested SHA.** Use the script's first argument or
+   Use one execution form per target and one target-wide timeout. Run
+   `python -m pygithost ci validate` before committing; a generic JSON syntax check
+   alone does not validate pipeline fields or referenced files.
+5. **Respect the trust boundary.** Host jobs and enabled deployments require an
+   administrator to add the exact `owner/repo` to
+   `PYGITHOST_CI_TRUSTED_REPOSITORIES`. Wildcards and malformed entries are
+   rejected; repository code cannot self-authorize. Propose new targets with
+   `enabled:false` until reviewed. Do not expand trust, change branch protections
+   or alter credentials without explicit authorization.
+6. **Deploy the tested SHA.** Use the script's first argument or
    `PYGITHOST_COMMIT` in step commands. Do not deploy the latest branch tip instead.
-   Do not assume CI checkout, artifacts or CI variables exist on the deployment
-   host. Never embed credentials in JSON, commands or logs; output is not redacted.
-6. **Verify without triggering a release.** A manual run checks CI and never
+   Do not assume CI checkout, artifacts or CI environment values exist on the
+   deployment host.
+7. **Verify without triggering a release.** A manual run checks CI and never
    deploys. Deployment requires a qualifying successful push or merged-PR run.
-   Inspect CI results separately from deployment results and live step output;
-   a successful CI run does not prove a successful release or healthy service.
-7. **Handle uncertainty safely.** Each repository/target/commit gets one attempt.
+   Inspect CI results separately from deployment results and live step output.
+8. **Handle uncertainty safely.** Each repository/target/commit gets one attempt.
    After timeout or interruption, inspect the real target before proposing recovery.
    Do not rename targets to evade duplicate protection or assume automatic rollback.
 
-For code changes to this feature, update the option reference, deployment guide
-and applicable JSON examples together. Test validation, failure/skipped steps,
-live output persistence, HTML escaping, and independent target results. Report
-which checks actually ran and any failures; do not claim browser verification
-from backend tests alone.
+For code changes to this feature, update the option reference, deployment guide and
+applicable JSON examples together. Test validation, failure/skipped steps, live
+output persistence, HTML escaping and independent target results. Report which
+checks actually ran.
 
 ## Every repository setting
 
-Policies and retention are repository-wide; never repeat them inside pipelines.
+Policies and retention are repository-wide root fields in the full grouped document;
+never repeat them inside pipelines. A simple pipeline cannot set them.
 
 | Option | Type / default | Example | Behavior |
 | --- | --- | --- | --- |
 | `policies.require_ci` | Boolean `false` | `"policies":{"require_ci":true}` | Each applicable PR-check pipeline needs a newest successful check for exact current base/head. Missing/stale/pending/unsuccessful checks block merging; push/manual jobs do not qualify. No qualifying checks means blocked. |
-| `policies.block_direct_pushes` | Boolean `false` | `"policies":{"block_direct_pushes":true}` | Blocks matching direct HTTP branch creations, force pushes and deletions; approved PR merges remain allowed. |
-| `policies.protected_branches` | String array `["main"]` | `"protected_branches":["main","release/*"]` | Case-sensitive globs; nonempty when blocking is enabled. Also prevents matching branch UI creation/deletion. |
-| `retention.artifacts.days` (legacy alias) | Integer 0–36500, initially `7` | Page: Artifact retention | Artifact age expiration; 0 disables it. Use server default to inherit. |
-| `retention.artifacts.max_count` (legacy alias) | Integer 0–1000000, initially `0` | Page: Maximum artifact bundles | Repository-wide bundle count; oldest run IDs removed first. 0 disables it. |
-| `retention.runs.max_count` (legacy alias) | Integer 0–1000000, initially `100` | Page: Maximum completed runs | Repository-wide completed-run limit; 0 disables pruning. Server defaults override the initial `PYGITHOST_CI_RETENTION` fallback. |
+| `policies.block_direct_pushes` | Boolean `false` | `"policies":{"block_direct_pushes":true}` | Blocks matching direct HTTP branch updates, including web conflict resolutions that would write to a protected PR source branch. Approved PR merges remain allowed. |
+| `policies.protected_branches` | String array `["main"]` | `"policies":{"protected_branches":["main","release/*"]}` | Case-sensitive globs; nonempty when blocking is enabled. Also prevents matching branch UI creation/deletion. |
+| `retention.artifacts.days` | Integer 0–36500 | `"retention":{"artifacts":{"days":30}}` | Artifact age expiration; 0 disables it. Omitted uses administrator defaults. |
+| `retention.artifacts.max_count` | Integer 0–1000000 | `"retention":{"artifacts":{"max_count":50}}` | Repository-wide bundle count; oldest run IDs removed first. 0 disables it. |
+| `retention.runs.max_count` | Integer 0–1000000 | `"retention":{"runs":{"max_count":100}}` | Repository-wide completed-run limit; 0 disables pruning. Omitted uses administrator defaults. |
 
-Both protection switches are independent; enable both to require PRs and passing
-CI. Initialize branches first. Existing pre-receive hooks are preserved; chaining
+Both protection switches are read from the default branch. Enable both to
+require PRs and passing CI. The exact PR target commit still defines which checks
+must pass. GitHost rejects protected mutations when it cannot verify the
+repository policy; a verified empty repository has no policy yet.
+Existing pre-receive hooks are preserved; chaining
 requires Git 2.36+. Enforcement covers this HTTP server, not SSH/local filesystem
 changes. Host CI with server-user access cannot enforce a boundary against malicious
 jobs manipulating refs directly.
 
-Retention is current storage policy, not a run snapshot. Both artifact age/count
-apply; set both to zero for indefinite artifact storage. Retained artifacts protect
-parent runs, as do active runs and pending notifications, so the run count may be
-exceeded. Deployment history is independent and is not pruned by these settings.
-Saving applies immediately and can permanently delete existing data. Expiration is
-checked at startup/storage operations, not by an exact-time timer. SQLite may reuse
-freed pages without shrinking its OS file. See [Retention](ci-retention.md).
+Policy changes are configuration changes: commit them and review them with the same
+care as executable code. A malformed committed document fails closed with CI
+required and every direct branch protected; a parseable host/deployment denial keeps
+these declared policies but fails the queued run at configuration. Retention is
+the default branch's storage policy, subject to administrator limits, not a
+per-run setting. Both artifact age/count apply;
+set both to zero to keep artifacts indefinitely. Retained artifacts protect parent
+runs, as do active runs and pending notifications, so the run count may be exceeded.
+Deployment history is independent and is not pruned by these settings. Lower
+limits can permanently delete existing data during the next cleanup. See
+[Retention](ci-retention.md).
 
-## Compatibility
+## Compatibility and file rules
 
-Existing keyed/shared-default documents remain readable. Opening the editor converts
-them to named arrays, resolves inherited values into each pipeline, and moves inline
-deployments to the separate list. Old pipeline IDs become names; old target names
-match those IDs to retain deduplication. Policies/scripts/disabled states survive.
-See the [migration guide](ci-migration.md) for every old-to-new field mapping and
-a comparison with the proposed configuration design.
+Project definitions previously stored only in the database are no longer an
+alternative configuration source. Copy any needed old document into
+`ci/config.json` before upgrading; there is no automatic import, no read-through
+fallback and no replay of old saved commands. Existing page environment values
+remain until the variables form is saved. Historical snapshots that mixed page
+credentials into Git variables are not replayed, and new stored run snapshots
+exclude page credentials. See the [migration guide](ci-migration.md).
 
-Pipeline-local `file` selects a Git-managed source instead of steps:
-`"file":"ci/config.json"`. Existing `.ci-config.json` and `.pygithost-ci.json` references still work.
-Use a regular `.json` file under `ci/`, for example `ci/tests.json`.
-Paths are checkout-relative; absolute paths, traversal, `.git` components and
-symlink files are rejected. Existing explicit root filenames remain supported.
-Do not commit the administrator document: repository code must not
-control trusted host deployment or policies.
+The obsolete Settings-only `{"version":1,"file":"ci/config.json"}` reference is not
+valid as the root of `ci/config.json`. That historical example remains only to
+explain migration.
 
-The separate Git file accepts version 1, named `steps`, optional `env`, `artifacts`
-and `timeout_seconds`; legacy `command` remains readable, mutually exclusive with
-steps. Prefer page-managed variables; legacy file `env` only applies until repository
-variables are page-managed, with server variables supplied as defaults. Its timeout
-cannot exceed the effective pipeline limit. A regular blob is limited to 64 KiB.
-Explicit missing/invalid references fail closed; automatic discovery with no file
-stays idle. Push/manual runs read the recorded commit; PR
-checks read the **recorded target/base commit's file**, not unreviewed PR-head changes.
-Snapshots retain effective settings and SHAs for reruns.
+Pipeline-local `file` selects a separate Git-managed pipeline source instead of
+steps:
+
+```json
+{"name":"tests","file":"ci/tests.json","triggers":{"push":{"enabled":true}}}
+```
+
+Use a regular `.json` file under `ci/`, for example `ci/tests.json`. Paths are
+checkout-relative; outside-`ci`, absolute, traversal, `.git`, backslash and symlink
+files are rejected. A referenced pipeline file uses the simple pipeline fields
+(`version`, `steps` or `command`, `env`, `artifacts`, `timeout_seconds`) and cannot
+itself contain deployments or policies. It is read from the same trusted commit as
+the entry document. Push/manual runs read the recorded commit; PR checks read the
+**recorded target/base commit's file**, not unreviewed PR-head changes.
+
+A regular configuration blob is limited to 256 KiB; duplicate keys, comments and
+non-object roots are rejected. Snapshots retain committed settings, limits and SHAs
+for reruns; page-managed values are resolved live instead of being stored. A rerun
+does not adopt a newer commit's configuration and does not retry deployments.
 
 Unsupported features are rejected, not ignored: execution working_directory,
 per-step timeout/retry/conditions/continue_on_error, arbitrary script args,
-cross-pipeline requires, manual deployment, approvals or
-approver groups, per-pipeline artifact age, and deployment-history retention.
-Use pipeline execution timeout, ordered steps, named host deployments and
-repository-wide retention for the behavior currently available.
+cross-pipeline requires, manual deployment, approvals or approver groups,
+per-pipeline artifact age, and deployment-history retention. Use pipeline execution
+timeout, ordered steps, named host deployments and repository-wide retention for
+the behavior currently available.
 
 ## Variables, limits and troubleshooting
 
@@ -476,7 +526,7 @@ exists there. No documented `PYGITHOST_HEAD_COMMIT` is provided.
 
 | Limit | Value |
 | --- | --- |
-| Administrator JSON | 256 KiB UTF-8; no comments, duplicate keys, unknown fields or trailing commas. |
+| Configuration files | 256 KiB UTF-8 per regular blob; no comments, duplicate keys, unknown fields or trailing commas. |
 | Pipelines/deployments/steps | 16 pipelines, 32 deployments; 1–64 steps per pipeline, step names 1–120 trimmed characters, run strings up to 8192 characters. |
 | Environment | 64 effective entries, identifier names, string values up to 8192 characters, no NUL; Docker forbids CR/LF. |
 | Branch arrays | Nonempty string entries without CR/LF/NUL; each complete filter field at most 2048 joined characters. |
@@ -493,16 +543,19 @@ exists there. No documented `PYGITHOST_HEAD_COMMIT` is provided.
 
 | Symptom | Check |
 | --- | --- |
-| No runs appear | Enable the effective trigger and inspect case-sensitive branch arrays. Manual also needs an existing branch/write access. |
+| No runs appear | Commit `ci/config.json`; enable the effective trigger and inspect case-sensitive branch arrays. In **CI → Runs**, choose the branch and select **Check configuration** for its exact commit/status, or run `python -m pygithost ci validate --rev HEAD`. Manual also needs an existing branch/write access. A missing file creates no run; an invalid file fails configuration. |
+| Manual run says the branch changed | The validated configuration SHA no longer matches the branch tip. Select **Check configuration** again, review the new commit, then queue from that result. |
 | A branch array fails | Use `["main"]`, not a scalar/newline-separated string. `[]` matches all; disable trigger to stop it. |
 | Another object's setting has no effect | Expected: configurations are independent. Put values explicitly on the affected pipeline/deployment. |
 | Step loses cd/export | Fresh shell per step; combine dependent operations. |
 | Docker cannot install/build | Prebuild dependencies/tools in the image; containers have no network by default. Remote image downloads use the worker host and its `image_pull` policy. |
 | Another pipeline passed but merge is blocked | Each applicable pipeline needs its own exact-commit PR check, not a push/manual run. |
-| Deployment did not run | Check push/merged event, enabled block, exact branch tip, changed settings and prior attempt. |
-| Rerun uses old settings | Expected: original snapshot and SHAs. Queue a new run for new settings. |
-| Artifacts disappeared | Current retention applies immediately; raising limits does not restore deleted data. |
-| JSON rejected | Correct the displayed error in the same editor. Unsupported proposed features are not silently accepted; saved data stays unchanged. |
+| Deployment did not run | Check administrator trust authorization, push/merged event, enabled block, exact branch tip, changed settings and prior attempt. |
+| Host configuration fails closed | Add the exact `owner/repo` to `PYGITHOST_CI_TRUSTED_REPOSITORIES`; wildcards and malformed names are rejected. The parseable document keeps its declared policies but the queued run fails at configuration. |
+| Malformed `ci/config.json` | Merges require CI and all direct branches are protected until the file is repaired through Git or the server filesystem. Fix and validate the JSON, then commit it; there is no saved-definition fallback. |
+| Rerun uses old settings | Expected: original Git configuration and SHAs. Page-managed values are resolved again at execution and are withheld from unmerged PR reruns. Queue a new run for new committed configuration. |
+| Artifacts disappeared | Check the default branch's retention and administrator limits. Raising limits does not restore deleted data. |
+| JSON rejected | Correct the committed `ci/config.json`; validation happens when the server reads that commit. Unsupported proposed features are not silently accepted. |
 
 See [Runs, queues and recovery](../README.md#runs-queues-and-recovery) for scheduler
 limits, shutdown, process-tree/container cleanup and the single-server boundary.

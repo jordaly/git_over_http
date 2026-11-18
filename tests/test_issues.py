@@ -81,13 +81,15 @@ class IssuesTests(unittest.TestCase):
         issue_id = self.create_issue("Broken link", "**bold** body")
         status, page = self.request(self.base + "/issues?status=open")
         self.assertEqual(status, 200, page)
-        self.assertIn(f"Issue #{issue_id}: Broken link", page)
+        self.assertIn(f'href="{self.base}/issues/{issue_id}">Broken link</a>', page)
+        self.assertIn(f"#{issue_id} · Opened", page)
         self.assertIn("pill-open", page)
         status, page = self.request(self.base + f"/issues/{issue_id}")
         self.assertEqual(status, 200, page)
         # GitHub-style first-post block and the markdown body container.
         self.assertIn("issue-first-post", page)
-        self.assertIn('class="pr-comment-body md-body"', page)
+        self.assertIn('class="md-body">**bold** body</div>', page)
+        self.assertIn('aria-label="Issue details"', page)
         self.assertIn("/static/vendor/tui-editor/toastui-editor-all.min.js", page)
         self.assertIn("data-markdown", page)
         self.assertIn("Close issue", page)
@@ -100,9 +102,10 @@ class IssuesTests(unittest.TestCase):
         self.assertEqual(database.db_issue_get(issue_id)[7], "closed")
         self.assertIn("Issue closed.", page)
         status, page = self.request(self.base + "/issues?status=closed")
-        self.assertIn(f"Issue #{issue_id}: Regression", page)
+        self.assertIn(f'href="{self.base}/issues/{issue_id}">Regression</a>', page)
+        self.assertIn('id="issues-tab-closed" aria-current="page"', page)
         status, page = self.request(self.base + "/issues?status=open")
-        self.assertNotIn(f"Issue #{issue_id}: Regression", page)
+        self.assertNotIn(f'href="{self.base}/issues/{issue_id}">Regression</a>', page)
         status, page = self.request(self.base + f"/issues/{issue_id}/reopen", {})
         self.assertEqual(status, 200, page)
         self.assertEqual(database.db_issue_get(issue_id)[7], "open")
@@ -121,6 +124,7 @@ class IssuesTests(unittest.TestCase):
         status, page = self.request(self.base + f"/issues/{issue_id}/comments", {"body": ""})
         self.assertIn("required", page)
         cid = comments[0][0]
+        self.assertIn(f'href="#comment-{cid}"', page)
         status, _ = self.request(self.base + f"/issues/{issue_id}/comments/{cid}/delete", {})
         self.assertEqual(status, 200)
         self.assertEqual(database.db_issue_comment_count(issue_id), 0)
@@ -138,7 +142,7 @@ class IssuesTests(unittest.TestCase):
     def test_markdown_body_wrapped_in_md_body(self):
         issue_id = self.create_issue("MD", "# Heading\n\n**bold**")
         status, page = self.request(self.base + f"/issues/{issue_id}")
-        self.assertIn('class="pr-comment-body md-body"', page)
+        self.assertIn('class="md-body"># Heading', page)
         self.assertIn("# Heading", page)  # raw markdown escaped server-side; rendered client-side
 
     def test_long_inline_image_comment_is_stored_intact(self):

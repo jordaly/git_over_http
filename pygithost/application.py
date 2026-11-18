@@ -4209,29 +4209,21 @@ document.addEventListener("DOMContentLoaded", function() {{
             db_issue_comment_counts, [row[0] for row in rows_db]
         )
         rows: list[str] = []
-        for issue_id, title, st, created_at, author_id, username in rows_db:
+        for issue_id, title, st, created_at, _author_id, username in rows_db:
             count = comment_counts.get(issue_id, 0)
-            count_suffix = safe_html(
-                f'<small title="{count} comment(s)">💬 {count}</small>' if count else ""
-            )
-            comment_by = (
-                safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>'))
-                if author_id
-                else safe_html("")
-            )
             rows.append(
                 html_t(
-                    t"""<tr class="issue-list-row">
-<td><span class="issue-status-icon issue-status-{st}" aria-hidden="true">{("🞅" if st == "open" else "✓")}</span> <a href="{base}/issues/{issue_id}">Issue #{issue_id}: {title}</a></td>
-<td>{count_suffix}{comment_by}</td>
-<td><span class="pill pill-{st}">{st}</span></td>
-<td class="muted"><small title="{created_at}">{_relative_time(created_at)}</small></td></tr>"""
+                    t"""<li class="topic-list-row issue-list-row">
+<span class="issue-status-icon issue-status-{st}" aria-hidden="true">{"◉" if st == "open" else "✓"}</span>
+<div><a class="review-row-title" href="{base}/issues/{issue_id}">{title}</a>
+<div class="review-row-meta">#{issue_id} · Opened <time title="{created_at}">{_relative_time(created_at)}</time> by {username or "anonymous"}</div></div>
+<div class="topic-row-badges"><span class="pill pill-{st}">{st.capitalize()}</span><small class="muted">{count} {"comment" if count == 1 else "comments"}</small></div></li>"""
                 )
             )
         rows_html = (
             join_html(rows)
             if rows
-            else safe_html('<tr><td class="muted">No issues.</td><td></td><td></td><td></td></tr>')
+            else safe_html('<li class="topic-list-empty muted">No issues.</li>')
         )
         pagination = _pagination(
             str_t(t"/r/{q(owner)}/{q(repo)}/issues"),
@@ -4256,13 +4248,11 @@ document.addEventListener("DOMContentLoaded", function() {{
             else safe_html("")
         )
         body = html_t(
-            t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>Issues</h2>
-<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/pulls">Pull requests</a> <a class="pill" href="/">Home</a></div></div>
+            t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>Issues</h2>{new_pill}</div>
 {notice_html}
-<div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>
-<a class="pill pull-tab{" pull-tab-active" if status == "open" else ""}" href="{base}/issues?status=open" id="issues-tab-open">Open</a> <a class="pill pull-tab{" pull-tab-active" if status == "closed" else ""}" href="{base}/issues?status=closed" id="issues-tab-closed">Closed</a> <a class="pill pull-tab{" pull-tab-active" if status == "all" else ""}" href="{base}/issues?status=all" id="issues-tab-all">All</a>
-</div><div>{new_pill}</div></div></div>
-<div class="box"><table>{rows_html}</table>{pagination}</div>"""
+<section class="topic-list-panel" aria-label="Issue list"><div class="topic-list-heading"><nav aria-label="Issue status">
+{join_html(html_t(t'''<a href="{base}/issues?status={key}" id="issues-tab-{key}"{safe_html(' aria-current="page"' if status == key else "")}>{label}</a>''') for key, label in (("open", "Open"), ("closed", "Closed"), ("all", "All")))}
+</nav><span class="muted">{total} {"issue" if total == 1 else "issues"}</span></div><ul class="topic-list">{safe_html(rows_html)}</ul></section>{pagination}"""
         )
         await _send_html(
             self.request,
@@ -4409,7 +4399,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 )
             comment_rows.append(
                 html_t(
-                    t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
+                    t'<article id="comment-{cid}" class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <a class="muted" href="#comment-{cid}"><time title="{c_created}">{when}</time>{edited}</a>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></article>'
                 )
             )
         comments_inner = (
@@ -4419,7 +4409,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         comments_box = safe_html(
             html_t(
-                t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Comments ({len(comments)})</h2>{comments_inner}</div>'
+                t'<section class="pr-conversation topic-replies"><h2>Comments ({len(comments)})</h2>{comments_inner}</section>'
             )
         )
         notice_html = safe_html("")
@@ -4454,19 +4444,20 @@ document.addEventListener("DOMContentLoaded", function() {{
         else:
             comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
         body = html_t(
-            t"""{_repo_tabs(base, "issues")}<div class="topbar"><div><h2>Issue #{issue_id}: {title}</h2>
-<div class="muted"><span class="pill pill-{status}">{status}</span> {author_label} opened this issue <time title="{created_at}">{_relative_time(created_at)}</time> · by {username or "anonymous"}</div></div>
-<div><a class="pill" href="{base}/issues">All issues</a> <a class="pill" href="{base}">Repo</a></div></div>
-{notice_html}
-<div class="box" style="margin-bottom:14px"><div class="pr-comment issue-first-post"><div class="pr-comment-head"><b>Opened by {author_label}</b> <span class="muted"><time title="{created_at}">{_relative_time(created_at)}</time></span></div><div class="pr-comment-body md-body">{body_md}</div></div>{title_form}</div>
-{controls_area}{comments_box}{comment_form}{self._issue_editor_assets()}"""
+            t"""{_repo_tabs(base, "issues")}<div class="review-breadcrumb"><a href="{base}/issues">Issues</a> <span>/</span> Issue #{issue_id}</div>
+<header class="pr-detail-header"><div><h2>{title} <span>#{issue_id}</span></h2><div class="pr-detail-meta"><span class="pill pill-{status}">{status.capitalize()}</span>{author_label} opened this issue <time title="{created_at}">{_relative_time(created_at)}</time></div></div></header>
+{notice_html}<div class="review-layout topic-thread"><div class="review-main">
+<article class="pr-comment issue-first-post"><div class="pr-comment-head"><b>{author_label}</b><span class="muted">opened this issue</span></div><div class="pr-comment-body"><div class="md-body">{body_md}</div>{title_form}</div></article>
+{comments_box}{comment_form}</div>
+<aside class="review-sidebar" aria-label="Issue details"><h3>Issue details</h3><dl><dt>Status</dt><dd>{status.capitalize()}</dd><dt>Updated</dt><dd><time title="{updated_at}">{_relative_time(updated_at)}</time></dd></dl>{controls_area}</aside>
+</div>{self._issue_editor_assets()}"""
         )
         await _send_html(
             self.request,
             200,
             _html_page(
                 str_t(t"Issue #{issue_id} · {owner}/{repo}"),
-                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+                safe_html(html_t(t'<main class="repo-page review-page">{safe_html(body)}</main>')),
             ),
         )
 
@@ -4617,35 +4608,26 @@ document.addEventListener("DOMContentLoaded", function() {{
             db_discussion_comment_counts, [row[0] for row in rows_db]
         )
         rows: list[str] = []
-        for discussion_id, title, cat, created_at, author_id, username, answered_id in rows_db:
+        for discussion_id, title, cat, created_at, _author_id, username, answered_id in rows_db:
             count = comment_counts.get(discussion_id, 0)
-            suffixes: str = safe_html(
-                f'<small title="{count} comment(s)">💬 {count}</small>' if count else ""
-            )
-            if answered_id:
-                suffixes = (
-                    safe_html(' <small class="ok" title="Answered">✓ Answered</small>') + suffixes
-                )
-            by = (
-                safe_html(html_t(t'<span class="muted"> · by {username or "anonymous"}</span>'))
-                if author_id
+            answer = (
+                safe_html('<span class="pill pill-open">✓ Answered</span>')
+                if answered_id
                 else safe_html("")
             )
             rows.append(
                 html_t(
-                    t"""<tr class="discussion-list-row">
-<td><span class="issue-status-icon discussion-cat" aria-hidden="true">💬</span> <a href="{base}/discussions/{discussion_id}">{title}</a></td>
-<td><span class="pill">{cat}</span></td>
-<td>{suffixes}{by}</td>
-<td class="muted"><small title="{created_at}">{_relative_time(created_at)}</small></td></tr>"""
+                    t"""<li class="topic-list-row discussion-list-row">
+<span class="issue-status-icon discussion-cat" aria-hidden="true">◇</span>
+<div><a class="review-row-title" href="{base}/discussions/{discussion_id}">{title}</a>
+<div class="review-row-meta">#{discussion_id} · Started <time title="{created_at}">{_relative_time(created_at)}</time> by {username or "anonymous"}</div></div>
+<div class="topic-row-badges"><span class="pill">{cat}</span>{answer}<small class="muted">{count} {"reply" if count == 1 else "replies"}</small></div></li>"""
                 )
             )
         rows_html = (
             join_html(rows)
             if rows
-            else safe_html(
-                '<tr><td class="muted">No discussions.</td><td></td><td></td><td></td></tr>'
-            )
+            else safe_html('<li class="topic-list-empty muted">No discussions.</li>')
         )
         pagination = _pagination(
             str_t(t"/r/{q(owner)}/{q(repo)}/discussions"),
@@ -4673,11 +4655,13 @@ document.addEventListener("DOMContentLoaded", function() {{
         counts: dict[str, int] = {}
         for cat in self._discussion_categories():
             counts[cat] = await asyncio.to_thread(db_discussion_count, owner, repo, cat)
-        counts["all"] = total
+        counts["all"] = (
+            await asyncio.to_thread(db_discussion_count, owner, repo) if category else total
+        )
         tab_links = [
             safe_html(
                 html_t(
-                    t'<a class="pill pull-tab{" pull-tab-active" if category == "" else ""}" href="{base}/discussions?category=" id="discussions-tab-all">All {counts["all"]}</a>'
+                    t'''<a href="{base}/discussions" id="discussions-tab-all"{safe_html(' aria-current="page"' if not category else "")}>All discussions <span>{counts["all"]}</span></a>'''
                 )
             )
         ]
@@ -4685,16 +4669,15 @@ document.addEventListener("DOMContentLoaded", function() {{
             tab_links.append(
                 safe_html(
                     html_t(
-                        t'<a class="pill pull-tab{" pull-tab-active" if category == cat else ""}" href="{base}/discussions?category={q(cat)}" id="discussions-tab-{q(cat)}">{cat} {counts[cat]}</a>'
+                        t'''<a href="{base}/discussions?category={q(cat)}" id="discussions-tab-{q(cat)}"{safe_html(' aria-current="page"' if category == cat else "")}>{cat} <span>{counts[cat]}</span></a>'''
                     )
                 )
             )
         body = html_t(
-            t"""{_repo_tabs(base, "discussions")}<div class="topbar"><h2>Discussions</h2>
-<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/issues">Issues</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
+            t"""{_repo_tabs(base, "discussions")}<div class="topbar"><h2>Discussions</h2>{new_pill}</div>
 {notice_html}
-<div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>{join_html(tab_links)}</div><div>{new_pill}</div></div></div>
-<div class="box"><table>{rows_html}</table>{pagination}</div>"""
+<div class="topic-browser"><nav class="topic-category-nav" aria-label="Discussion categories"><h3>Categories</h3>{join_html(tab_links)}</nav>
+<div><section class="topic-list-panel" aria-label="Discussion list"><div class="topic-list-heading"><strong>{category or "All discussions"}</strong><span class="muted">{total} {"discussion" if total == 1 else "discussions"}</span></div><ul class="topic-list">{safe_html(rows_html)}</ul></section>{pagination}</div></div>"""
         )
         await _send_html(
             self.request,
@@ -4839,7 +4822,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             highlight = safe_html(" discussion-answered") if cid == answered_id else safe_html("")
             comment_rows.append(
                 html_t(
-                    t'<div class="pr-comment{highlight}"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b>{answer_badge} <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}{answer_toggle}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
+                    t'<article id="reply-{cid}" class="pr-comment{highlight}"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b>{answer_badge} <a class="muted" href="#reply-{cid}"><time title="{c_created}">{when}</time>{edited}</a>{controls}{answer_toggle}</div><div class="pr-comment-body md-body">{c_body}</div></article>'
                 )
             )
         comments_inner = (
@@ -4849,7 +4832,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         comments_box = safe_html(
             html_t(
-                t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Replies ({len(comments)})</h2>{comments_inner}</div>'
+                t'<section class="pr-conversation topic-replies"><h2>Replies ({len(comments)})</h2>{comments_inner}</section>'
             )
         )
         notice_html = safe_html("")
@@ -4911,20 +4894,26 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         elif not locked:
             comment_form = safe_html('<p class="muted">Write scope is required to reply.</p>')
+        answer_link = (
+            safe_html(html_t(t'<p><a href="#reply-{answered_id}">Jump to accepted answer</a></p>'))
+            if answered
+            else safe_html("")
+        )
         body = html_t(
-            t"""{_repo_tabs(base, "discussions")}<div class="topbar"><div><h2>{title}</h2>
-<div class="muted">{state_bits}{locked_pill}</div></div>
-<div><a class="pill" href="{base}/discussions">All discussions</a> <a class="pill" href="{base}">Repo</a></div></div>
-{notice_html}{lock_note}
-<div class="box" style="margin-bottom:14px"><div class="pr-comment issue-first-post"><div class="pr-comment-head"><b>Opened by {username or "anonymous"}</b> <span class="muted"><time title="{created_at}">{_relative_time(created_at)}</time></span></div><div class="pr-comment-body md-body">{body_md}</div></div>{title_form}</div>
-{controls_area}{comments_box}{comment_form}{self._issue_editor_assets()}"""
+            t"""{_repo_tabs(base, "discussions")}<div class="review-breadcrumb"><a href="{base}/discussions">Discussions</a> <span>/</span> #{discussion_id}</div>
+<header class="pr-detail-header"><div><h2>{title} <span>#{discussion_id}</span></h2><div class="pr-detail-meta">{state_bits}{locked_pill}</div></div></header>
+{notice_html}{lock_note}<div class="review-layout topic-thread"><div class="review-main">
+<article class="pr-comment issue-first-post"><div class="pr-comment-head"><b>{username or "anonymous"}</b><span class="muted">started this discussion</span></div><div class="pr-comment-body"><div class="md-body">{body_md}</div>{title_form}</div></article>
+{comments_box}{comment_form}</div>
+<aside class="review-sidebar" aria-label="Discussion details"><h3>Discussion details</h3><dl><dt>Category</dt><dd><a href="{base}/discussions?category={q(category)}">{category}</a></dd><dt>Replies</dt><dd>{len(comments)}</dd></dl>{answer_link}{controls_area}</aside>
+</div>{self._issue_editor_assets()}"""
         )
         await _send_html(
             self.request,
             200,
             _html_page(
                 str_t(t"Discussion #{discussion_id} · {owner}/{repo}"),
-                safe_html(html_t(t'<main class="repo-page">{safe_html(body)}</main>')),
+                safe_html(html_t(t'<main class="repo-page review-page">{safe_html(body)}</main>')),
             ),
         )
 

@@ -1086,6 +1086,11 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn('id="ci-run-title">Initial UI fixture</h2>', page)
         self.assertIn(f"Run #{run_id}", page)
         self.assertIn('class="ci-run-summary"', page)
+        self.assertIn('class="ci-run-sidebar" aria-label="Run navigation"', page)
+        self.assertIn('href="#ci-run-overview">Summary</a>', page)
+        self.assertIn('href="#ci-run-job"', page)
+        self.assertIn('href="#ci-run-output">Combined log</a>', page)
+        self.assertNotIn('id="ci-run-artifacts"', page)
         self.assertIn('<details id="ci-run-metadata" class="ci-run-disclosure">', page)
         self.assertIn('<details id="ci-run-config" class="ci-run-disclosure">', page)
         self.assertIn('<details id="ci-run-output" class="box ci-run-output" open>', page)
@@ -1103,8 +1108,12 @@ class RepositoryUITests(unittest.TestCase):
             }
         ]
         database.db_ci_steps_set(run_id, json.dumps(steps))
+        database.db_ci_artifact_set(run_id, b"fixture")
         _, page = self.request(path)
         self.assertIn("Combined run log", page)
+        self.assertIn('id="ci-run-job-title">default</h2>', page)
+        self.assertIn('href="#ci-run-artifacts"', page)
+        self.assertIn(f"ci-{run_id}-artifacts.zip", page)
         self.assertIn('<details id="ci-run-output" class="box ci-run-output">', page)
         self.assertIn('<details id="ci-step-0" class="ci-step">', page)
         self.assertIn("step-output-marker", page)
@@ -1112,6 +1121,7 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("positions.get(item.id)", page)
         _, fragment = self.request(path + "?partial=1")
         self.assertIn('id="ci-run-result"', fragment)
+        self.assertIn('id="ci-run-job"', fragment)
         self.assertNotIn('id="ci-run-title"', fragment)
         self.assertNotIn('class="app-header"', fragment)
 

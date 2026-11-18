@@ -73,6 +73,40 @@
 .ci-log-toolbar .muted { font-size: 12px; }
 .ci-run-output #ci-log { max-height: 52vh; margin-bottom: 0; padding: 16px; font-size: 12px; }
 #ci-run-title { overflow-wrap: anywhere; }
+.ci-run-layout { display: grid; grid-template-columns: minmax(145px, 210px) minmax(0, 1fr); gap: 24px; }
+.ci-run-sidebar { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding-inline-end: 16px; border-inline-end: 1px solid var(--border); }
+.ci-run-sidebar h3 { margin: 10px 0 0; padding: 4px 10px; font-size: 12px; color: var(--muted); }
+.ci-run-sidebar > a { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; color: inherit; overflow-wrap: anywhere; }
+.ci-run-sidebar > a:hover { background: var(--surface-hover); }
+.ci-run-sidebar > .ci-run-sidebar-summary { background: var(--accent-bg); color: var(--link); font-weight: 600; }
+.ci-run-sidebar > .ci-run-sidebar-job { align-items: flex-start; flex-direction: column-reverse; gap: 4px; font-weight: 600; }
+.ci-run-content { display: grid; gap: 16px; min-width: 0; }
+.ci-run-content > .box { margin: 0; }
+.ci-run-overview .ci-section-heading, .ci-run-artifacts .ci-section-heading { margin-bottom: 14px; }
+.ci-run-overview .ci-run-actions { margin-top: 0; }
+.ci-run-overview h2, .ci-run-job h2, .ci-run-artifacts h2 { margin: 0; font-size: 16px; }
+.ci-run-job { min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; }
+.ci-run-job-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; background: var(--pre-bg); border-bottom: 1px solid var(--border); }
+.ci-run-job-header > div { min-width: 0; overflow-wrap: anywhere; }
+.ci-run-job-header .muted { font-size: 12px; }
+.ci-run-job > :is(.ci-run-steps, .ci-run-output) { margin: 0; border: 0; border-radius: 0; }
+.ci-run-job > .ci-run-steps { padding: 0; }
+.ci-run-job .ci-run-steps > .ci-section-heading { margin: 0; padding: 12px 16px; }
+.ci-run-job .ci-run-steps .ci-step { margin: 0; padding: 0 16px 10px; border: 0; border-top: 1px solid var(--border); border-radius: 0; }
+.ci-run-job .ci-run-steps .ci-step:not([open]) { padding-bottom: 0; }
+.ci-run-job .ci-step > summary { padding: 8px 0; }
+.ci-run-job .ci-step > summary:hover { color: var(--link); }
+.ci-run-job .ci-step > summary .ci-status { margin-inline-start: auto; }
+.ci-run-job .ci-step > summary .muted { margin-inline-start: 0; }
+.ci-run-job .ci-run-steps + .ci-run-output { border-top: 1px solid var(--border); }
+.ci-run-artifact-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.ci-run-artifact-row small { margin-inline-start: 6px; }
+@media (max-width: 760px) {
+  .ci-run-layout { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .ci-run-sidebar { flex-direction: row; align-items: center; flex-wrap: wrap; padding: 0 0 10px; border-inline-end: 0; border-bottom: 1px solid var(--border); }
+  .ci-run-sidebar h3 { margin: 0; }
+  .ci-run-sidebar > .ci-run-sidebar-job { flex-direction: row; align-items: center; }
+}
 .ci-guide { scroll-margin-top: 20px; }
 .ci-guide details { border-top: 1px solid var(--border); padding: 16px 0; scroll-margin-top: 20px; }
 .ci-guide summary { cursor: pointer; font-size: 14px; font-weight: 600; }

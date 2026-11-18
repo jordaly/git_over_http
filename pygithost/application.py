@@ -6181,6 +6181,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._not_found()
         snapshot = json.loads(meta["config"] or "{}")
         payload = json.loads(meta["payload"] or "{}")
+        workflow = str(payload.get("pipeline_id") or "default")
         command_details = safe_html("")
         if not REQUIRE_AUTH or _require_admin(self):
             saved_command = (
@@ -6234,7 +6235,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         steps_html = join_html(
             [
                 html_t(
-                    t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><strong>{step["name"]}</strong><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>'''
+                    t'''<details id="ci-step-{index}" class="ci-step"{safe_html(" open" if step["status"] in ("running", "failed", "timed_out") else "")}><summary><strong>{step["name"]}</strong><span class="ci-status" data-status="{step["status"]}">{step["status"].replace("_", " ")}</span><span class="muted">{step["duration"]}</span></summary><p class="muted">Started: {step["started_at"] or "—"} · Finished: {step["finished_at"] or "—"} · Exit: {step["return_code"] if step["return_code"] is not None else "—"}</p><pre id="ci-step-log-{index}" data-ci-scroll tabindex="0" aria-label="Output for {step["name"]}">{step["output"] or "No output."}</pre></details>'''
                 )
                 for index, step in enumerate(steps)
             ]
@@ -6242,7 +6243,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         steps_section = (
             safe_html(
                 html_t(
-                    t'<section class="box ci-run-steps"><div class="ci-section-heading"><h2>Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>'
+                    t'<section class="box ci-run-steps" aria-labelledby="ci-run-steps-title"><div class="ci-section-heading"><h2 id="ci-run-steps-title">Steps</h2><span class="muted">{len(steps)} steps · select a step to view output</span></div>{steps_html}</section>'
                 )
             )
             if steps
@@ -6264,13 +6265,19 @@ document.addEventListener("DOMContentLoaded", function() {{
             entry[2] == "running" or entry[4] in ("queued", "sending") for entry in deployments
         )
         active = active or bool(run[4] == "success" and run_id in self.server.ci_manager.active)
+        has_artifact = isinstance(artifact_size, int) and artifact_size > 0
         artifact_html = (
             safe_html(
                 html_t(
-                    t'<a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts · {artifact_size / 1024:.1f} KiB</a>'
+                    t'<section id="ci-run-artifacts" class="box ci-run-artifacts"><div class="ci-section-heading"><h2>Artifacts</h2><span class="muted">1 archive</span></div><div class="ci-run-artifact-row"><span>ci-{run_id}-artifacts.zip <small class="muted">{artifact_size / 1024:.1f} KiB</small></span><a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts</a></div></section>'
                 )
             )
-            if isinstance(artifact_size, int) and artifact_size
+            if isinstance(artifact_size, int) and has_artifact
+            else safe_html("")
+        )
+        artifact_nav = (
+            safe_html('<a href="#ci-run-artifacts">Artifacts <span class="muted">1</span></a>')
+            if has_artifact
             else safe_html("")
         )
         reason = waiting or meta["reason"]
@@ -6290,11 +6297,22 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         result_html = safe_html(
             html_t(t'''<div id="ci-run-result" data-active="{"true" if active or meta["notification"] in ("queued", "sending") else "false"}">
-<section class="box ci-run-overview" aria-label="Run summary"><div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
-{warning_html}{reason_html}<div class="ci-run-actions">{actions}{artifact_html}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div>
+<div class="ci-run-layout">
+<nav class="ci-run-sidebar" aria-label="Run navigation">
+<a class="ci-run-sidebar-summary" href="#ci-run-overview">Summary</a>
+<h3>Jobs</h3><a class="ci-run-sidebar-job" href="#ci-run-job"><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span><span>{workflow}</span></a>
+<a href="#ci-run-output">Combined log</a>{artifact_nav}
+</nav>
+<div class="ci-run-content">
+<section id="ci-run-overview" class="box ci-run-overview" aria-label="Run summary"><div class="ci-section-heading"><h2>Summary</h2><div class="ci-run-actions">{actions}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div></div>
+<div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
+{warning_html}{reason_html}
 <details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Pipeline</dt><dd>{payload.get("pipeline_id", "default")}</dd><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Configuration commit</dt><dd><code>{payload.get("configuration_commit", "—")}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
+<section id="ci-run-job" class="ci-run-job" aria-labelledby="ci-run-job-title">
+<header class="ci-run-job-header"><div><span class="muted">Job</span><h2 id="ci-run-job-title">{workflow}</h2></div><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></header>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
-<pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details>{deployment_html}</div>''')
+<pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details></section>
+{artifact_html}{deployment_html}</div></div></div>''')
         )
         if partial:
             return await _send_response(
@@ -6319,13 +6337,21 @@ document.addEventListener("DOMContentLoaded", function() {{
             or pr_title
             or str_t(t"{run[1].replace('_', ' ').capitalize()} run on {run[2] or 'repository'}")
         )
-        workflow = str(payload.get("pipeline_id") or "default")
         workflow_href = base + "/ci?" + urlencode({"pipeline": workflow})
         body = safe_html(
             html_t(t'''{_ci_tabs(base, "runs")}<div class="topbar"><div><h2 id="ci-run-title">{run_title}</h2><div class="ci-run-meta"><a href="{workflow_href}">{workflow}</a><span>Run #{run_id}</span>{origin}<span class="ci-run-branch">{head_branch or run[2]}</span></div></div>
 <div><a class="pill" href="{base}/ci">← All runs</a></div></div>
 {result_html}
 <script>(function() {{
+function revealLog(hash) {{
+ if (hash !== "#ci-run-output") return;
+ const log = document.getElementById("ci-run-output"); if (log) log.open = true;
+}}
+revealLog(window.location.hash);
+window.addEventListener("hashchange", () => revealLog(window.location.hash));
+document.addEventListener("click", event => {{
+ if (event.target.closest('.ci-run-sidebar a[href="#ci-run-output"]')) revealLog("#ci-run-output");
+}});
 document.addEventListener("click", async event => {{ if (!event.target.closest("#ci-copy-output")) return;
  const log = document.getElementById("ci-log"); const feedback = document.getElementById("ci-copy-feedback");
  try {{ await navigator.clipboard.writeText(log.textContent); feedback.textContent = "Copied."; }}

@@ -94,6 +94,7 @@ These lists default to **25 entries per page**:
   filters are preserved during pagination.
   Runs show the triggering commit's subject as their title, along with the
   workflow name. Pull request runs use the recorded head commit.
+  Open a run to jump between its summary, job steps, combined log, and available artifacts.
   The Warnings filter supports all runs, only runs with warnings, or only runs
   without warnings. Click a Warning badge to inspect the recorded issue. Warnings
   do not change a successful run into a failure.

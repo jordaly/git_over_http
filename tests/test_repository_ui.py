@@ -1160,8 +1160,10 @@ class RepositoryUITests(unittest.TestCase):
         status, page = self.request(self.base + f"/ci/runs/{run_id}")
         self.assertEqual(status, 200)
         blob = f"/blob/{recorded}/ci/config.json"
-        self.assertIn(f'href="{self.base}{blob}"', page)
-        self.assertIn(f'href="{self.base}{blob}?raw=1"', page)
+        disclosure = page.split('<details id="ci-run-config"', 1)[1].split("</details>", 1)[0]
+        self.assertIn(f'href="{self.base}{blob}"', disclosure)
+        self.assertIn(f'href="{self.base}{blob}?raw=1"', disclosure)
+        self.assertNotIn('href="#ci-run-configuration"', page)
         self.assertNotIn(f"/blob/{later}/ci/config.json", page)
         status, contents = self.request(self.base + blob + "?raw=1")
         self.assertEqual(status, 200)

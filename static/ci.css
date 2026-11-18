@@ -103,8 +103,6 @@
 .ci-run-artifact-row small { margin-inline-start: 6px; }
 .ci-run-source-files { margin: 0; padding: 0; list-style: none; }
 .ci-run-source-files li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0; overflow-wrap: anywhere; }
-#ci-run-configuration .ci-section-heading { margin-bottom: 12px; }
-#ci-run-configuration h2 { font-size: 16px; }
 @media (max-width: 760px) {
   .ci-run-layout { grid-template-columns: minmax(0, 1fr); gap: 14px; }
   .ci-run-sidebar { flex-direction: row; align-items: center; flex-wrap: wrap; padding: 0 0 10px; border-inline-end: 0; border-bottom: 1px solid var(--border); }

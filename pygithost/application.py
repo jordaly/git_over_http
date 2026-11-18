@@ -6222,9 +6222,14 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
             command_details = safe_html(
                 html_t(
-                    t'<details id="ci-run-config" class="ci-run-disclosure"><summary>Configuration snapshot</summary><p class="muted">Image: {snapshot.get("image", "—")}</p><pre>{saved_command}</pre></details>'
+                    t'<h3>Execution snapshot</h3><p class="muted">Image: {snapshot.get("image", "—")}</p><pre>{saved_command}</pre>'
                 )
             )
+        configuration_snapshot = safe_html(
+            html_t(
+                t'<details id="ci-run-config" class="ci-run-disclosure"><summary>Configuration snapshot</summary>{configuration_files}{command_details}</details>'
+            )
+        )
         can_write = _has_write_scope(self)
         actions = safe_html("")
         if can_write:
@@ -6332,18 +6337,17 @@ document.addEventListener("DOMContentLoaded", function() {{
 <nav class="ci-run-sidebar" aria-label="Run navigation">
 <a class="ci-run-sidebar-summary" href="#ci-run-overview">Summary</a>
 <h3>Jobs</h3><a class="ci-run-sidebar-job" href="#ci-run-job"><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span><span>{workflow}</span></a>
-<a href="#ci-run-output">Combined log</a><a href="#ci-run-configuration">Configuration</a>{artifact_nav}
+<a href="#ci-run-output">Combined log</a>{artifact_nav}
 </nav>
 <div class="ci-run-content">
 <section id="ci-run-overview" class="box ci-run-overview" aria-label="Run summary"><div class="ci-section-heading"><h2>Summary</h2><div class="ci-run-actions">{actions}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div></div>
 <div class="ci-run-summary"><div><span>Status</span><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></div><div><span>Duration</span><strong>{_ci_elapsed(run[9], run[10])}</strong></div><div><span>Runner</span><strong>{snapshot.get("runner", "legacy host")}</strong></div><div><span>Exit code</span><strong>{exit_code}</strong></div></div>
 {warning_html}{reason_html}
-<details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Pipeline</dt><dd>{payload.get("pipeline_id", "default")}</dd><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Configuration commit</dt><dd><code>{payload.get("configuration_commit", "—")}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{command_details}</section>
+<details id="ci-run-metadata" class="ci-run-disclosure"><summary>Run details</summary><dl class="ci-run-metadata"><dt>Pipeline</dt><dd>{payload.get("pipeline_id", "default")}</dd><dt>Created</dt><dd>{run[8]}</dd><dt>Started</dt><dd>{started_at}</dd><dt>Finished</dt><dd>{finished_at}</dd><dt>Queue wait</dt><dd>{_ci_elapsed(run[8], run[9] or run[10])}</dd><dt>Phase</dt><dd>{meta["phase"] or "queued"}</dd><dt>Email</dt><dd>{meta["notification"] or "not sent"}</dd><dt>Commit</dt><dd><code>{run[3]}</code></dd><dt>Configuration commit</dt><dd><code>{payload.get("configuration_commit", "—")}</code></dd><dt>Base</dt><dd><code>{payload.get("base_commit", "—")}</code></dd><dt>Head</dt><dd><code>{payload.get("head_commit", "—")}</code></dd></dl>{email_action}</details>{configuration_snapshot}</section>
 <section id="ci-run-job" class="ci-run-job" aria-labelledby="ci-run-job-title">
 <header class="ci-run-job-header"><div><span class="muted">Job</span><h2 id="ci-run-job-title">{workflow}</h2></div><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></header>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
 <pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details></section>
-<section id="ci-run-configuration" class="box"><div class="ci-section-heading"><h2>Configuration</h2></div>{configuration_files}</section>
 {artifact_html}{deployment_html}</div></div></div>''')
         )
         if partial:

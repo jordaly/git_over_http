@@ -95,7 +95,7 @@ These lists default to **25 entries per page**:
   Runs show the triggering commit's subject as their title, along with the
   workflow name. Pull request runs use the recorded head commit.
   Open a run to jump between its summary, job steps, combined log, and artifact
-  ZIP if one was retained. **Configuration** links to the full committed file
+  ZIP if one was retained. **Configuration snapshot** links to the full committed file
   at the run's recorded configuration SHA, which may differ from its head SHA
   for pull requests. Runs without recorded provenance do not link to the
   current branch configuration.

@@ -1168,6 +1168,36 @@ def _ci_run_origin(
     return safe_html(html_t(t"<span>{label}</span>{pr_link}{commit_link}{author_html}"))
 
 
+def _ci_run_source_files(
+    base: str, payload: Mapping[str, object], snapshot: Mapping[str, object]
+) -> SafeHTML:
+    from .repository_ci import CONFIG_FILE, configuration_path
+
+    commit = payload.get("configuration_commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
+        return safe_html(
+            '<p class="muted">This run has no recorded repository configuration commit.</p>'
+        )
+    files = [CONFIG_FILE]
+    referenced = payload.get("configuration_file") or snapshot.get("repository_file")
+    if isinstance(referenced, str) and referenced != CONFIG_FILE:
+        try:
+            files.append(configuration_path(referenced))
+        except ValueError:
+            pass  # Legacy or invalid paths are not repository CI sources.
+    links = join_html(
+        html_t(
+            t'<li><a href="{base}/blob/{commit}/{q(path, safe="/")}"><code>{path}</code></a> <a class="pill" href="{base}/blob/{commit}/{q(path, safe="/")}?raw=1" aria-label="Raw contents of {path}">Raw</a></li>'
+        )
+        for path in files
+    )
+    return safe_html(
+        html_t(
+            t'<p class="muted">Committed files at <code>{commit}</code>. This is the source used to configure the run, not the current branch or its injected settings.</p><ul class="ci-run-source-files">{links}</ul>'
+        )
+    )
+
+
 async def _git_commit_name_status(repo_git: str, commit: str) -> list[tuple[str, str]]:
     code, out, _ = await _run_git(repo_git, ["show", "--name-status", "--format=", commit])
     if code != 0:
@@ -6182,6 +6212,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         snapshot = json.loads(meta["config"] or "{}")
         payload = json.loads(meta["payload"] or "{}")
         workflow = str(payload.get("pipeline_id") or "default")
+        configuration_files = _ci_run_source_files(base, payload, snapshot)
         command_details = safe_html("")
         if not REQUIRE_AUTH or _require_admin(self):
             saved_command = (
@@ -6269,14 +6300,14 @@ document.addEventListener("DOMContentLoaded", function() {{
         artifact_html = (
             safe_html(
                 html_t(
-                    t'<section id="ci-run-artifacts" class="box ci-run-artifacts"><div class="ci-section-heading"><h2>Artifacts</h2><span class="muted">1 archive</span></div><div class="ci-run-artifact-row"><span>ci-{run_id}-artifacts.zip <small class="muted">{artifact_size / 1024:.1f} KiB</small></span><a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download artifacts</a></div></section>'
+                    t'<section id="ci-run-artifacts" class="box ci-run-artifacts"><div class="ci-section-heading"><h2>Artifact archive</h2></div><div class="ci-run-artifact-row"><span>ci-{run_id}-artifacts.zip <small class="muted">{artifact_size / 1024:.1f} KiB</small></span><a class="pill" href="{base}/ci/runs/{run_id}/artifacts">Download ZIP</a></div></section>'
                 )
             )
             if isinstance(artifact_size, int) and has_artifact
             else safe_html("")
         )
         artifact_nav = (
-            safe_html('<a href="#ci-run-artifacts">Artifacts <span class="muted">1</span></a>')
+            safe_html('<a href="#ci-run-artifacts">Artifact archive</a>')
             if has_artifact
             else safe_html("")
         )
@@ -6301,7 +6332,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <nav class="ci-run-sidebar" aria-label="Run navigation">
 <a class="ci-run-sidebar-summary" href="#ci-run-overview">Summary</a>
 <h3>Jobs</h3><a class="ci-run-sidebar-job" href="#ci-run-job"><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span><span>{workflow}</span></a>
-<a href="#ci-run-output">Combined log</a>{artifact_nav}
+<a href="#ci-run-output">Combined log</a><a href="#ci-run-configuration">Configuration</a>{artifact_nav}
 </nav>
 <div class="ci-run-content">
 <section id="ci-run-overview" class="box ci-run-overview" aria-label="Run summary"><div class="ci-section-heading"><h2>Summary</h2><div class="ci-run-actions">{actions}<a class="pill" href="{base}/ci/runs/{run_id}/log">Download raw log</a></div></div>
@@ -6312,6 +6343,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <header class="ci-run-job-header"><div><span class="muted">Job</span><h2 id="ci-run-job-title">{workflow}</h2></div><span class="ci-status" data-status="{run[4]}">{run[4].replace("_", " ")}</span></header>
 {steps_section}<details id="ci-run-output" class="box ci-run-output"{safe_html(" open" if not steps else "")}><summary>{"Combined run log" if steps else "Output"}</summary><div class="ci-log-toolbar"><label><input id="ci-follow" type="checkbox" checked> Follow output</label><button id="ci-copy-output" type="button">Copy output</button><span id="ci-copy-feedback" class="muted" role="status"></span></div>
 <pre id="ci-log" data-ci-scroll tabindex="0" aria-label="Run output">{output}</pre>{truncated_notice}</details></section>
+<section id="ci-run-configuration" class="box"><div class="ci-section-heading"><h2>Configuration</h2></div>{configuration_files}</section>
 {artifact_html}{deployment_html}</div></div></div>''')
         )
         if partial:

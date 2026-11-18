@@ -1090,6 +1090,7 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn('href="#ci-run-overview">Summary</a>', page)
         self.assertIn('href="#ci-run-job"', page)
         self.assertIn('href="#ci-run-output">Combined log</a>', page)
+        self.assertIn("This run has no recorded repository configuration commit.", page)
         self.assertNotIn('id="ci-run-artifacts"', page)
         self.assertIn('<details id="ci-run-metadata" class="ci-run-disclosure">', page)
         self.assertIn('<details id="ci-run-config" class="ci-run-disclosure">', page)
@@ -1114,6 +1115,7 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn('id="ci-run-job-title">default</h2>', page)
         self.assertIn('href="#ci-run-artifacts"', page)
         self.assertIn(f"ci-{run_id}-artifacts.zip", page)
+        self.assertIn("Download ZIP", page)
         self.assertIn('<details id="ci-run-output" class="box ci-run-output">', page)
         self.assertIn('<details id="ci-step-0" class="ci-step">', page)
         self.assertIn("step-output-marker", page)
@@ -1131,6 +1133,40 @@ class RepositoryUITests(unittest.TestCase):
         )
         _, page = self.request(self.base + f"/ci/runs/{run_id}")
         self.assertIn('id="ci-run-title">Manual run on main</h2>', page)
+
+    def test_ci_run_links_to_full_configuration_at_recorded_commit(self):
+        recorded = self.save_document(
+            {
+                "pipelines": {
+                    "lint": {"steps": [{"name": "Lint", "run": "echo original-run-config"}]}
+                }
+            }
+        )
+        later = self.save_document(
+            {
+                "pipelines": {
+                    "lint": {"steps": [{"name": "Lint", "run": "echo newer-branch-config"}]}
+                }
+            }
+        )
+        run_id = database.db_ci_run_create(
+            FLAT_OWNER_UI,
+            "project",
+            "pull_request",
+            "main",
+            later,
+            json.dumps({"configuration_commit": recorded, "head_commit": later}),
+        )
+        status, page = self.request(self.base + f"/ci/runs/{run_id}")
+        self.assertEqual(status, 200)
+        blob = f"/blob/{recorded}/ci/config.json"
+        self.assertIn(f'href="{self.base}{blob}"', page)
+        self.assertIn(f'href="{self.base}{blob}?raw=1"', page)
+        self.assertNotIn(f"/blob/{later}/ci/config.json", page)
+        status, contents = self.request(self.base + blob + "?raw=1")
+        self.assertEqual(status, 200)
+        self.assertIn("original-run-config", contents)
+        self.assertNotIn("newer-branch-config", contents)
 
     def test_file_view_has_read_only_actions_breadcrumbs_and_line_links(self):
         status, page = self.request(self.base + "/blob/main/README.md")

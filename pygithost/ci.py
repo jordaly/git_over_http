@@ -1240,6 +1240,8 @@ class CIManager:
                 run_payload: JsonObject = {**(payload or {})}
                 if source.get("_configuration_commit"):
                     run_payload["configuration_commit"] = source["_configuration_commit"]
+                if config["repository_config"] and config["repository_file"] != "ci/config.json":
+                    run_payload["configuration_file"] = config["repository_file"]
                 if identity != "default":
                     run_payload["pipeline_id"] = identity
                 else:

@@ -88,8 +88,10 @@ values up to 1000000, subject to administrator defaults where a field is omitted
 These lists default to **25 entries per page**:
 
 - **Home → Repositories:** sorted by owner and repository name; search is preserved.
-- **CI → Runs:** newest run first. Expand **Filters** to narrow the list; active
-  filters are counted in the collapsed heading and preserved during pagination.
+- **CI → Runs:** **All workflows** shows the newest runs first. Use the workflow
+  sidebar to narrow the list to one pipeline, including pipelines with retained
+  history. Expand **Filters** for more options; the selected workflow and active
+  filters are preserved during pagination.
   The Warnings filter supports all runs, only runs with warnings, or only runs
   without warnings. Click a Warning badge to inspect the recorded issue. Warnings
   do not change a successful run into a failure.

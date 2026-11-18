@@ -2304,6 +2304,25 @@ def db_ci_run_update(run_id: int, **values: SQLValue) -> None:
         conn.close()
 
 
+_CI_PIPELINE_ID = """COALESCE(CASE WHEN json_valid(payload_json)
+    THEN json_extract(payload_json,'$.pipeline_id') END,'default')"""
+
+
+def db_ci_run_workflows(owner: str, repo: str) -> list[str]:
+    conn = _db_connect()
+    try:
+        return [
+            row[0]
+            for row in conn.execute(
+                f"""SELECT DISTINCT {_CI_PIPELINE_ID} FROM ci_runs
+                WHERE owner=? AND repo=? AND typeof({_CI_PIPELINE_ID})='text' ORDER BY 1""",
+                (owner, repo),
+            )
+        ]
+    finally:
+        conn.close()
+
+
 def db_ci_runs_count(
     owner: str,
     repo: str,
@@ -2314,11 +2333,15 @@ def db_ci_runs_count(
     query: str = "",
     before: int | None = None,
     warnings: str = "",
+    pipeline: str = "",
 ) -> int:
     conn = _db_connect()
     try:
         conditions: list[str] = ["owner=?", "repo=?"]
         params: list[SQLValue] = [owner, repo]
+        if pipeline:
+            conditions.append(f"{_CI_PIPELINE_ID}=?")
+            params.append(pipeline)
         if warnings in ("yes", "no"):
             conditions.append("warnings!=''" if warnings == "yes" else "warnings=''")
         if before is not None:
@@ -2365,6 +2388,7 @@ def db_ci_runs_list(
     warnings: str = "",
     include_warnings: Literal[True],
     include_pipeline: Literal[True],
+    pipeline: str = "",
 ) -> list[CIRunListWarningsPipelineRow]: ...
 
 
@@ -2384,6 +2408,7 @@ def db_ci_runs_list(
     warnings: str = "",
     include_warnings: Literal[True],
     include_pipeline: Literal[False] = False,
+    pipeline: str = "",
 ) -> list[CIRunListWarningsRow]: ...
 
 
@@ -2403,6 +2428,7 @@ def db_ci_runs_list(
     warnings: str = "",
     include_warnings: Literal[False] = False,
     include_pipeline: Literal[True],
+    pipeline: str = "",
 ) -> list[CIRunListPipelineRow]: ...
 
 
@@ -2422,6 +2448,7 @@ def db_ci_runs_list(
     warnings: str = "",
     include_warnings: Literal[False] = False,
     include_pipeline: Literal[False] = False,
+    pipeline: str = "",
 ) -> list[CIRunListRow]: ...
 
 
@@ -2441,6 +2468,7 @@ def db_ci_runs_list(
     warnings: str = "",
     include_warnings: bool = False,
     include_pipeline: bool = False,
+    pipeline: str = "",
 ) -> list[
     CIRunListRow | CIRunListWarningsRow | CIRunListPipelineRow | CIRunListWarningsPipelineRow
 ]: ...
@@ -2461,11 +2489,15 @@ def db_ci_runs_list(
     warnings: str = "",
     include_warnings: bool = False,
     include_pipeline: bool = False,
+    pipeline: str = "",
 ) -> list[Any]:
     conn = _db_connect()
     try:
         conditions = ["owner=?", "repo=?"]
         params: list[SQLValue] = [owner, repo]
+        if pipeline:
+            conditions.append(f"{_CI_PIPELINE_ID}=?")
+            params.append(pipeline)
         if warnings in ("yes", "no"):
             conditions.append("warnings!=''" if warnings == "yes" else "warnings=''")
         if before is not None:
@@ -2487,11 +2519,7 @@ def db_ci_runs_list(
         params.append(max(1, min(int(limit), 500)))
         params.append(max(0, int(offset)))
         output_column = "''" if summary else "output"
-        pipeline_column = (
-            ",COALESCE(json_extract(payload_json,'$.pipeline_id'),'default')"
-            if include_pipeline
-            else ""
-        )
+        pipeline_column = f",{_CI_PIPELINE_ID}" if include_pipeline else ""
         return conn.execute(
             f"SELECT id,event,branch,commit_hash,status,{output_column},truncated,return_code,created_at,started_at,finished_at{',warnings' if include_warnings else ''}{pipeline_column} "
             f"FROM ci_runs WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ? OFFSET ?",

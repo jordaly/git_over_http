@@ -161,6 +161,45 @@ fieldset { border:1px solid var(--border); border-radius:8px; margin:12px 0; pad
 .ci-page .ci-compact { padding: 10px 14px; margin-bottom: 10px; }
 .ci-run-filters > summary { cursor: pointer; font-weight: 600; }
 .ci-page .ci-run-filters[open] > .ci-toolbar { margin-top: 10px; }
+.ci-workflows-layout { display: grid; grid-template-columns: minmax(150px, 215px) minmax(0, 1fr); gap: 24px; }
+.ci-workflow-nav { border-inline-end: 1px solid var(--border); padding-inline-end: 16px; min-width: 0; }
+.ci-workflow-nav h2 { font-size: 15px; margin: 0 0 10px; padding: 4px 10px; }
+.ci-workflow-nav-link { display: flex; align-items: baseline; gap: 9px; padding: 7px 10px; border-radius: 6px; color: inherit; overflow-wrap: anywhere; }
+.ci-workflow-nav-link span { color: var(--muted); }
+.ci-workflow-nav-link:hover, .ci-workflow-run:hover { background: var(--surface-hover); }
+.ci-workflow-nav-link[aria-current="page"] { background: var(--accent-bg); color: var(--link); font-weight: 600; }
+.ci-workflows-main { min-width: 0; }
+.ci-workflows-heading, .ci-workflow-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.ci-workflows-heading { margin-bottom: 16px; }
+.ci-workflows-heading h2 { margin: 0; overflow-wrap: anywhere; }
+.ci-workflows-heading p { margin: 4px 0 0; }
+.ci-workflow-panel { border: 1px solid var(--border); border-radius: 8px; }
+.ci-workflow-panel-header { background: var(--pre-bg); border-radius: 7px 7px 0 0; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.ci-workflow-panel-header .muted { font-size: 12px; }
+.ci-workflow-list { list-style: none; margin: 0; padding: 0; }
+.ci-workflow-run { display: grid; grid-template-columns: 20px minmax(0, 1fr) minmax(0, 110px) minmax(0, 155px); gap: 12px; align-items: start; padding: 11px 14px; }
+.ci-workflow-run + .ci-workflow-run { border-top: 1px solid var(--border); }
+.ci-workflow-run:last-child { border-radius: 0 0 7px 7px; }
+.ci-run-primary { min-width: 0; overflow-wrap: anywhere; }
+.ci-run-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 3px; }
+.ci-run-meta, .ci-run-when { color: var(--muted); font-size: 12px; }
+.ci-run-when { display: grid; gap: 3px; text-align: end; overflow-wrap: anywhere; }
+.ci-run-branch { justify-self: start; min-width: 0; max-width: 100%; padding: 2px 8px; border-radius: 999px; background: var(--accent-bg); color: var(--link); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ci-run-marker { display: grid; place-items: center; width: 17px; height: 17px; border: 1px solid currentColor; border-radius: 50%; color: var(--muted); font-size: 12px; font-weight: 700; line-height: 1; }
+.ci-run-marker[data-status="success"] { color: var(--ok-fg); }
+.ci-run-marker[data-status="failed"] { color: var(--error-fg); }
+.ci-run-marker:is([data-status="timed_out"], [data-status="queued"]) { color: var(--warn-fg); }
+.ci-run-marker[data-status="running"] { color: var(--link); }
+.ci-workflow-empty { margin: 0; padding: 24px 14px; text-align: center; }
+@media (max-width: 760px) {
+  .ci-workflows-layout { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .ci-workflow-nav { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; border-inline-end: 0; border-bottom: 1px solid var(--border); padding: 0 0 10px; }
+  .ci-workflow-nav h2 { margin: 0; }
+}
+@media (max-width: 520px) {
+  .ci-workflow-run { grid-template-columns: 17px minmax(0, 1fr) minmax(0, 95px); gap: 6px 8px; }
+  .ci-run-when { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 8px; text-align: start; }
+}
 .ci-page .ci-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; }
 .ci-page .ci-toolbar input, .ci-page .ci-toolbar select { width: auto; min-width: 120px; flex: 0 1 auto; margin: 0; padding: 6px 8px; }
 .ci-page .ci-toolbar input[name="q"] { flex: 1 1 200px; }

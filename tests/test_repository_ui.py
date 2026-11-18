@@ -848,6 +848,44 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("&lt;script&gt;unsafe&lt;/script&gt;", detail)
         self.assertNotIn("<script>unsafe</script>", detail)
 
+    def test_workflow_sidebar_filters_runs_and_preserves_selection(self):
+        self.save_document(
+            {
+                "pipelines": {
+                    "lint": {"steps": [{"name": "Lint", "run": "true"}]},
+                    "build": {"steps": [{"name": "Build", "run": "true"}]},
+                }
+            }
+        )
+        lint_run = database.db_ci_run_create(
+            FLAT_OWNER_UI, "project", "push", "main", self.sha, '{"pipeline_id":"lint"}'
+        )
+        older = database.db_ci_run_create(
+            FLAT_OWNER_UI, "project", "manual", "main", self.sha, '{"pipeline_id":"retired"}'
+        )
+        database.db_ci_run_update(lint_run, status="success")
+        database.db_ci_run_update(older, status="success")
+        status, page = self.request(self.base + "/ci")
+        self.assertEqual(status, 200)
+        self.assertIn("All workflows", page)
+        self.assertIn("2 workflow runs", page)
+        self.assertIn('class="ci-workflow-list"', page)
+        self.assertIn("pipeline=retired", page)
+        self.assertIn("pipeline=build", page)
+        self.assertIn('class="ci-run-marker" data-status="success"', page)
+        path = self.base + "/ci?pipeline=lint&status=success"
+        status, filtered = self.request(path)
+        self.assertEqual(status, 200)
+        self.assertIn('name="pipeline" value="lint"', filtered)
+        self.assertIn("1 workflow run", filtered)
+        self.assertIn("lint #", filtered)
+        self.assertNotIn(f"/ci/runs/{older}", filtered)
+        status, fragment = self.request(path + "&partial=1")
+        self.assertEqual(status, 200)
+        self.assertIn("1 workflow run", fragment)
+        self.assertNotIn("ci-workflow-nav", fragment)
+        self.assertNotIn(f"/ci/runs/{older}", fragment)
+
     def test_retention_and_deployment_editor_posts_are_rejected(self):
         content = 'import sys\nprint("deploying", sys.argv[1])\n'
         for document in (

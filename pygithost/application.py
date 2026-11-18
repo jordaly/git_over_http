@@ -5789,11 +5789,12 @@ document.addEventListener("DOMContentLoaded", function() {{
         if filters["warnings"] not in ("yes", "no"):
             filters["warnings"] = ""
         filters["q"] = filters["q"][:128]
+        pipeline = (query_params.get("pipeline") or [""])[0][:64]
         cursor = (query_params.get("before") or [""])[0]
         before = (
             int(cursor) if cursor.isascii() and cursor.isdigit() and len(cursor) <= 18 else None
         )
-        from .database import db_ci_runs_count
+        from .database import db_ci_run_workflows, db_ci_runs_count
 
         size = _page_size(query_params)
         total = await _call_in_thread(
@@ -5806,6 +5807,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             query=filters["q"],
             before=before,
             warnings=filters["warnings"],
+            pipeline=pipeline,
         )
         page = _clamp_page(_page_number(query_params), total, size)
         runs = await _call_in_thread(
@@ -5821,12 +5823,22 @@ document.addEventListener("DOMContentLoaded", function() {{
             warnings=filters["warnings"],
             include_warnings=True,
             include_pipeline=True,
+            pipeline=pipeline,
             before=before,
             offset=(page - 1) * size,
         )
         has_next = page * size < total
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         rows: list[str] = []
+        status_symbols = {
+            "success": "✓",
+            "failed": "×",
+            "timed_out": "!",
+            "running": "◌",
+            "queued": "·",
+            "cancelled": "−",
+            "interrupted": "!",
+        }
         for run in runs:
             run_event = str(run[1])
             run_branch = str(run[2])
@@ -5839,23 +5851,33 @@ document.addEventListener("DOMContentLoaded", function() {{
                     )
                 )
                 if run[11]
-                else safe_html('<span class="muted">—</span>')
+                else safe_html("")
             )
             rows.append(
                 html_t(
-                    t'<tr><td><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">#{run[0]}</a><br><small>{run[12]}</small></td><td>{run_event.replace("_", " ")}</td><td>{run_branch}</td><td><code>{run_commit[:8]}</code></td><td><span class="ci-status" data-status="{run_status}">{run_status.replace("_", " ")}</span></td><td>{warning}</td><td>{run[7] if run[7] is not None else "—"}</td><td>{run[8]}</td><td>{_ci_elapsed(run[9], run[10])}</td></tr>'
+                    t'''<li class="ci-workflow-run">
+<span class="ci-run-marker" data-status="{run_status}" aria-hidden="true">{status_symbols.get(run_status, "·")}</span>
+<div class="ci-run-primary"><a class="ci-run-link" href="{base}/ci/runs/{run[0]}">{run[12]} #{run[0]}</a>
+<div class="ci-run-meta"><span>{run_event.replace("_", " ")}</span><code>{run_commit[:8]}</code><span>{run_status.replace("_", " ")}</span>{warning}</div></div>
+<span class="ci-run-branch" title="{run_branch}">{run_branch or "—"}</span>
+<div class="ci-run-when"><span>{run[8]}</span><span>{_ci_elapsed(run[9], run[10])}</span></div>
+</li>'''
                 )
             )
-        empty = "No runs match these filters." if any(filters.values()) else "No CI runs yet."
-        runs_html = (
-            join_html(rows)
-            if rows
-            else safe_html(html_t(t'<tr><td colspan="9" class="muted">{empty}</td></tr>'))
+        empty = (
+            "No runs match this view." if pipeline or any(filters.values()) else "No CI runs yet."
         )
+        runs_html = (
+            safe_html(html_t(t'<ul class="ci-workflow-list">{join_html(rows)}</ul>'))
+            if rows
+            else safe_html(html_t(t'<p class="ci-workflow-empty muted">{empty}</p>'))
+        )
+        view_params = {"pipeline": pipeline} if pipeline else {}
         pagination = _pagination(
             base + "/ci",
             {
                 **{key: value for key, value in filters.items() if value},
+                **view_params,
                 **({"before": str(before)} if before is not None else {}),
             },
             page,
@@ -5863,9 +5885,10 @@ document.addEventListener("DOMContentLoaded", function() {{
             total=total,
             per_page=size,
         )
+        run_count = f"{total:,} workflow {'run' if total == 1 else 'runs'}"
         results_html = safe_html(
             html_t(t"""<div id="ci-results">
-<div class="box"><div class="ci-section-heading"><h2>CI runs</h2><span class="muted">Refreshes every 5 seconds</span></div><div class="ci-table-scroll"><table><tr><th>ID</th><th>Event</th><th>Branch</th><th>Commit</th><th>Status</th><th>Warnings</th><th>Exit</th><th>Created</th><th>Duration</th></tr>{runs_html}</table></div>{pagination}</div></div>""")
+<div class="ci-workflow-panel"><div class="ci-workflow-panel-header"><strong>{run_count}</strong><span class="muted">Refreshes every 5 seconds</span></div>{runs_html}</div>{pagination}</div>""")
         )
         if partial:
             return await _send_response(
@@ -5875,6 +5898,33 @@ document.addEventListener("DOMContentLoaded", function() {{
                 [("Content-Type", "text/html; charset=utf-8"), ("Cache-Control", "no-store")],
             )
         branches = await _git_list_branches(_repo_bare_path(owner, repo))
+        workflow_names = set(await _call_in_thread(db_ci_run_workflows, owner, repo))
+        config = await self.server.ci_manager.config(owner, repo, include_secrets=False)
+        workflow_names.update(
+            item["pipeline_id"]
+            for item in CIManager.pipelines(config)
+            if item.get("command") or item.get("steps") or item.get("repository_config")
+        )
+        if pipeline:
+            workflow_names.add(pipeline)
+
+        def workflow_href(name: str, *, keep_filters: bool = True) -> str:
+            params = {key: value for key, value in filters.items() if value and keep_filters}
+            if name:
+                params["pipeline"] = name
+            if query_params.get("per_page"):
+                params["per_page"] = str(size)
+            return base + "/ci" + ("?" + urlencode(params) if params else "")
+
+        links = join_html(
+            html_t(
+                t'''<a class="ci-workflow-nav-link" href="{workflow_href(name)}"{safe_html(' aria-current="page"' if name == pipeline else "")}><span aria-hidden="true">{icon}</span>{label}</a>'''
+            )
+            for name, label, icon in [
+                ("", "All workflows", "▤"),
+                *((name, name, "◇") for name in sorted(workflow_names)),
+            ]
+        )
         filter_options = {
             "warnings": [
                 ("", "All warnings"),
@@ -5924,19 +5974,26 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         active_filters = sum(bool(value) for value in filters.values())
         filter_label = f"Filters ({active_filters} active)" if active_filters else "Filters"
+        pipeline_input = (
+            safe_html(html_t(t'<input type="hidden" name="pipeline" value="{pipeline}">'))
+            if pipeline
+            else safe_html("")
+        )
         filter_form = safe_html(
             html_t(t'''<details class="box ci-compact ci-run-filters"><summary>{filter_label}</summary><form method="GET" action="{base}/ci" class="ci-toolbar">
-<input type="hidden" name="per_page" value="{size}">
+<input type="hidden" name="per_page" value="{size}">{pipeline_input}
 <input aria-label="Search runs" name="q" value="{filters["q"]}" placeholder="Run ID, commit, or output text">
 <select aria-label="Status" name="status">{options_html["status"]}</select><select aria-label="Event" name="event">{options_html["event"]}</select>
 <select aria-label="Warnings" name="warnings">{options_html["warnings"]}</select>
 <select aria-label="Branch" name="branch">{branch_options}</select><button type="submit">Filter runs</button>
-<a class="pill" href="{base}/ci">Clear filters</a></form></details>''')
+<a class="pill" href="{workflow_href(pipeline, keep_filters=False)}">Clear filters</a></form></details>''')
         )
         notice_html = (
             safe_html(html_t(t'<div class="ok">{notice}</div>')) if notice else safe_html("")
         )
-        body = html_t(t"""{_ci_tabs(base, "runs")}{notice_html}{filter_form}{results_html}
+        body = html_t(t"""{_ci_tabs(base, "runs")}{notice_html}
+<div class="ci-workflows-layout"><nav class="ci-workflow-nav" aria-label="Workflows"><h2>Workflows</h2>{links}</nav>
+<section class="ci-workflows-main"><header class="ci-workflows-heading"><div><h2>{pipeline or "All workflows"}</h2><p class="muted">{("Run history for " + pipeline + ".") if pipeline else "Run history for all workflows."}</p></div><a class="pill" href="{base}/ci/run">Run pipeline</a></header>{filter_form}{results_html}</section></div>
 <script>(function() {{ let polling = false; let timer = null; async function update() {{ if (polling) return; polling = true; try {{ const url = new URL(window.location.href); url.searchParams.set("partial", "1"); const response = await fetch(url, {{cache:"no-store", credentials:"same-origin"}}); if (response.redirected || !response.ok) {{ clearInterval(timer); return; }} const fragment = await response.text(); const current = document.getElementById("ci-results"); if (!current) {{ clearInterval(timer); return; }} current.outerHTML = fragment; }} catch (_error) {{ /* Keep the current results and retry on the next interval. */ }} finally {{ polling = false; }} }} timer = setInterval(update, 5000); }})();</script>""")
         await _send_html(
             self.request,

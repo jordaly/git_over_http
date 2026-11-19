@@ -464,7 +464,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             "No runs appear",
             "PYGITHOST_WORKTREE",
             "trailing commas",
-            "PYGITHOST_CI_TRUSTED_REPOSITORIES",
+            "Trusted CI repositories",
         ):
             self.assertIn(text, guide)
         self.assertIn('id="ci-configuration-guide"', guide)

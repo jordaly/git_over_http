@@ -113,11 +113,16 @@ branches and reruns cannot change the active policy.
 
 ## Host and deployment authorization
 
-Host jobs and enabled deployments are trusted server-user code. They are rejected
-unless the exact `owner/repo` is listed in the server environment variable
-`PYGITHOST_CI_TRUSTED_REPOSITORIES` (comma- or newline-separated, default empty).
-Use exact names only; wildcards, patterns and malformed entries are rejected. This
-is administrator authorization outside Git; adding a deployment or setting
+Host jobs and enabled deployments run as the GitHost operating-system account.
+An authenticated administrator can grant access in **Admin → Settings → Trusted
+CI repositories**. Enter exact `owner/repo` names separated by commas or
+newlines; wildcards and malformed names are rejected. Changes take effect without
+a restart. Existing `PYGITHOST_CI_TRUSTED_REPOSITORIES` process environment entries
+remain additive and can only be removed from the launch environment.
+If authentication is disabled, saved page grants are retained but ignored;
+environment entries are unaffected. Stale edits are rejected, and each grant or
+revocation is recorded in the security audit log with the repository and actor.
+This is authorization outside Git; adding a deployment or setting
 `runner: "host"` in the repository cannot grant it. The check is repeated for
 reruns and historical snapshots. A parseable document denied by the guard keeps its
 declared branch policies but fails the queued run during configuration.

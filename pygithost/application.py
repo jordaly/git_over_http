@@ -2637,8 +2637,22 @@ class GitHTTPHandler:
     async def _ui_admin_settings(
         self, *, save: bool = False, notice_message: str = "", notice_kind: str = "ok"
     ) -> None:
-        from .database import db_ci_preferences_get, db_ci_preferences_set, db_display_name_set
-        from .settings_pages import basic_form, parse_preferences, preferences_forms, save_basic
+        from .ci import parse_execution_trust
+        from .database import (
+            db_ci_execution_trust_get,
+            db_ci_execution_trust_set,
+            db_ci_preferences_get,
+            db_ci_preferences_set,
+            db_display_name_set,
+        )
+        from .settings_pages import (
+            EXECUTION_TRUST_INPUT_LIMIT,
+            basic_form,
+            execution_trust_form,
+            parse_preferences,
+            preferences_forms,
+            save_basic,
+        )
 
         if REQUIRE_AUTH and not _require_admin(self):
             return await self._forbidden(b"403 Forbidden: admin required.\n")
@@ -2655,6 +2669,8 @@ class GitHTTPHandler:
             else safe_html("")
         )
         submitted_preferences: dict[str, str] | None = None
+        can_manage_trust = REQUIRE_AUTH and _require_admin(self)
+        response_status = 200
         value = await self.server.display_name()
         if save:
             form = await self._read_form_urlencoded()
@@ -2662,7 +2678,34 @@ class GitHTTPHandler:
             if action != "appearance" and not self._valid_settings_csrf(form):
                 return await self._forbidden(b"403 Forbidden: invalid security token.\n")
             try:
-                if action.startswith("ci_"):
+                if action == "ci_execution_trust":
+                    if not can_manage_trust:
+                        return await self._forbidden(
+                            b"403 Forbidden: authenticated admin required.\n"
+                        )
+                    raw = form.get("trusted_repositories")
+                    if raw is None or form.get("confirm_execution_trust") != "yes":
+                        raise ValueError("Confirm the trusted repository changes before saving.")
+                    if len(raw) > EXECUTION_TRUST_INPUT_LIMIT:
+                        raise ValueError("The trusted repository list is too long.")
+                    trusted = parse_execution_trust(raw)
+                    async with self.server.settings_lock:
+                        saved = await _call_in_thread(
+                            db_ci_execution_trust_set,
+                            "\n".join(sorted(trusted)),
+                            form.get("trust_revision", ""),
+                            actor=self.remote_user,
+                            actor_user_id=self.remote_user_id,
+                            ip=self._client_ip(),
+                        )
+                    if not saved:
+                        response_status = 409
+                        raise ValueError(
+                            "Trusted CI repositories changed since you opened this page. "
+                            "Review the current list before saving again."
+                        )
+                    message = "Trusted CI repositories saved. No restart is required."
+                elif action.startswith("ci_"):
                     async with self.server.settings_lock:
                         global_values, _repo = await _call_in_thread(db_ci_preferences_get)
                         values = parse_preferences(form, global_values)
@@ -2686,9 +2729,10 @@ class GitHTTPHandler:
                     message = "Settings saved."
                 else:
                     raise ValueError("Unknown settings action.")
-                await self._audit(
-                    "settings_save", "success", target=action, detail=f"fields={len(form)}"
-                )
+                if action != "ci_execution_trust":
+                    await self._audit(
+                        "settings_save", "success", target=action, detail=f"fields={len(form)}"
+                    )
                 notice = safe_html(html_t(t'<p class="ok" role="status">{message}</p>'))
             except (ValueError, OSError) as exc:
                 await self._audit(
@@ -2698,6 +2742,16 @@ class GitHTTPHandler:
                 submitted_preferences = form if action.startswith("ci_") else None
         global_values, _repo = await _call_in_thread(db_ci_preferences_get)
         token = self._settings_csrf_token()
+        execution_trust = safe_html("")
+        if can_manage_trust:
+            trusted_repositories, trust_revision = await _call_in_thread(db_ci_execution_trust_get)
+            execution_trust = execution_trust_form(
+                "/admin/settings",
+                token,
+                trusted_repositories,
+                trust_revision,
+                os.environ.get("PYGITHOST_CI_TRUSTED_REPOSITORIES", ""),
+            )
         custom_favicon = await _call_in_thread(db_favicon_get)
         if custom_favicon:
             favicon_type, favicon_data = custom_favicon
@@ -2741,8 +2795,10 @@ class GitHTTPHandler:
             "/admin/settings", token, global_values, submitted=submitted_preferences
         )
         body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><nav class="row"><a class="pill" href="/admin/email">Email delivery</a><a class="pill" href="/admin/users">Users</a><a class="pill" href="/">Home</a></nav></div>{notice}
-<section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form>{favicon_html}</section>{basic}{preferences}<script src="/static/settings-pages.js" defer></script></main>''')
-        return await _send_html(self.request, 200, _html_page("Server settings", safe_html(body)))
+<section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form>{favicon_html}</section>{basic}{execution_trust}{preferences}<script src="/static/settings-pages.js" defer></script></main>''')
+        return await _send_html(
+            self.request, response_status, _html_page("Server settings", safe_html(body))
+        )
 
     async def _ui_favicon_save(self) -> None:
         if REQUIRE_AUTH and not _require_admin(self):
@@ -8516,7 +8572,9 @@ class AsyncGitServer:
         self.context = context or AppContext(AppConfig.from_mapping(default_config_for_platform()))
         apply_config(self.context.config)
         self.allowlist = allowlist if allowlist is not None else ALLOWED_CLIENT_IPS
-        self.ci_manager = CIManager(_repo_bare_path)
+        self.ci_manager = CIManager(
+            _repo_bare_path, allow_page_trust=self.context.config.require_auth
+        )
         self.push_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.push_requests: set[asyncio.Task[Any]] = set()
         self.push_finalizers: set[asyncio.Task[Any]] = set()

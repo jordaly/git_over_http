@@ -430,7 +430,7 @@ and the current branch tip.
 
 Host jobs and enabled deployments are trusted server-user code. Adding them to
 `ci/config.json` does not authorize them: an administrator must add the exact
-`owner/repo` to `PYGITHOST_CI_TRUSTED_REPOSITORIES`. Wildcards, patterns and
+`owner/repo` under **Admin → Settings → Trusted CI repositories**. Wildcards, patterns and
 malformed names are rejected. Ordinary Docker and remote-Docker pipelines continue
 under the worker's own policy. A parseable document denied by this guard keeps its
 declared branch policies but fails the queued run at configuration. The read

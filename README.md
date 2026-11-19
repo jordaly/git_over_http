@@ -213,8 +213,8 @@ instead of working-tree changes. See
 [Migration](docs/ci-migration.md).
 
 Host jobs and every enabled deployment additionally require administrator
-authorization in `PYGITHOST_CI_TRUSTED_REPOSITORIES` (exact `owner/repo`,
-comma- or newline-separated, default empty). Wildcards, patterns and malformed
+authorization in **Admin → Settings → Trusted CI repositories** (exact
+`owner/repo`, comma- or newline-separated). Wildcards, patterns and malformed
 names are rejected. This trust check is separate from repository configuration and
 is repeated for reruns and historical snapshots. Missing authorization fails the
 queued run at configuration while preserving a parseable document's declared branch
@@ -448,8 +448,8 @@ again.
 - Configure execution in each pipeline's committed JSON; omitted options use
   built-in defaults, initially **Docker**.
 - **Host** is **trusted-code-only** and is disabled for a repository unless an
-  administrator lists its exact `owner/repo` in
-  `PYGITHOST_CI_TRUSTED_REPOSITORIES`. Jobs run as the server's OS user, not in a
+  administrator lists its exact `owner/repo` under **Trusted CI repositories**.
+  Jobs run as the server's OS user, not in a
   sandbox. A restricted environment prevents accidental credential inheritance,
   but does not prevent filesystem access or access to other processes. Use a
   dedicated unprivileged server account. Do not run untrusted PR code on the host
@@ -634,7 +634,7 @@ Only one job per repository runs at once. Server environment settings:
 | `PYGITHOST_CI_CONCURRENCY` | `2` | Global simultaneous jobs |
 | `PYGITHOST_CI_QUEUE_LIMIT` | `100` | Global waiting jobs, excluding running jobs |
 | `PYGITHOST_CI_RETENTION` | `100` | Default completed-run limit when project configuration omits it (0–10000; 0 = unlimited) |
-| `PYGITHOST_CI_TRUSTED_REPOSITORIES` | empty | Exact `owner/repo` entries, comma- or newline-separated, allowed to run host jobs and enabled deployments from Git; wildcards and malformed names are rejected |
+| `PYGITHOST_CI_TRUSTED_REPOSITORIES` | empty | Additional grants inherited by GitHost. Exact `owner/repo` entries, comma- or newline-separated; these are additive to **Admin → Settings → Trusted CI repositories** |
 | `PYGITHOST_CI_PROTECTED_SECRET_BRANCHES` | empty | Exact `owner/repo:branch` entries, comma- or newline-separated, allowed to receive protected page-managed values; a matching default-branch protection rule and current branch tip are also required |
 
 A full queue produces a failed run with a queue-specific reason instead of
@@ -680,7 +680,7 @@ Add an object to `deployments` in the full grouped `ci/config.json` with `name`,
 `pipeline`, `branch`, `script` (absolute host path), and optional `timeout_seconds`.
 Alternatively use `script_content` and `run_with` for inline scripts. A deployment
 block enables it unless `enabled` is false. Every enabled deployment requires the
-exact `owner/repo` in `PYGITHOST_CI_TRUSTED_REPOSITORIES`; adding the object in Git
+exact `owner/repo` in **Trusted CI repositories**; adding the object in Git
 cannot authorize itself. `run_with: "python"` selects the Git server's interpreter
 and virtual environment; install dependencies there, not just in the CI image.
 Direct POSIX execution requires a shebang. Script content is UTF-8, at most 64 KiB,

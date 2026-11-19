@@ -207,7 +207,7 @@ These fields belong in each pipeline object's `execution` group. Table examples 
 **Host** commands use `/bin/sh` on POSIX and `cmd.exe` on Windows. A restricted
 environment prevents accidental credential inheritance but does not restrict
 filesystem/process access. Host CI is trusted-code-only and additionally requires
-the exact repository name in `PYGITHOST_CI_TRUSTED_REPOSITORIES`; wildcard or
+the exact repository name under **Admin → Settings → Trusted CI repositories**; wildcard or
 malformed allowlist entries are rejected.
 
 **Docker** uses `/bin/sh` and overrides the image entrypoint. By default it mounts
@@ -328,8 +328,8 @@ that pipeline passes, with separate logs, results, attempt identity and
 notifications.
 
 Deployments execute trusted host scripts or host steps, even when CI execution uses
-Docker. **Every enabled deployment requires the repository to be listed in
-`PYGITHOST_CI_TRUSTED_REPOSITORIES`.** Repository writers cannot grant themselves
+Docker. **Every enabled deployment requires an administrator grant under
+Trusted CI repositories.** Repository writers cannot grant themselves
 server-user execution by adding a deployment. The allowlist accepts exact
 `owner/repo` entries only; wildcards, patterns, malformed names and `..` are
 rejected rather than matched. A parseable configuration denied by this guard keeps
@@ -407,7 +407,7 @@ When generating or modifying CI/deployment configuration:
    alone does not validate pipeline fields or referenced files.
 5. **Respect the trust boundary.** Host jobs and enabled deployments require an
    administrator to add the exact `owner/repo` to
-   `PYGITHOST_CI_TRUSTED_REPOSITORIES`. Wildcards and malformed entries are
+   **Admin → Settings → Trusted CI repositories**. Wildcards and malformed entries are
    rejected; repository code cannot self-authorize. Propose new targets with
    `enabled:false` until reviewed. Do not expand trust, change branch protections
    or alter credentials without explicit authorization.
@@ -551,7 +551,7 @@ exists there. No documented `PYGITHOST_HEAD_COMMIT` is provided.
 | Docker cannot install/build | Prebuild dependencies/tools in the image; containers have no network by default. Remote image downloads use the worker host and its `image_pull` policy. |
 | Another pipeline passed but merge is blocked | Each applicable pipeline needs its own exact-commit PR check, not a push/manual run. |
 | Deployment did not run | Check administrator trust authorization, push/merged event, enabled block, exact branch tip, changed settings and prior attempt. |
-| Host configuration fails closed | Add the exact `owner/repo` to `PYGITHOST_CI_TRUSTED_REPOSITORIES`; wildcards and malformed names are rejected. The parseable document keeps its declared policies but the queued run fails at configuration. |
+| Host configuration fails closed | An administrator can add the exact `owner/repo` under **Trusted CI repositories**. Wildcards and malformed names are rejected. The parseable document keeps its declared policies but the queued run fails at configuration. |
 | Malformed `ci/config.json` | Merges require CI and all direct branches are protected until the file is repaired through Git or the server filesystem. Fix and validate the JSON, then commit it; there is no saved-definition fallback. |
 | Rerun uses old settings | Expected: original Git configuration and SHAs. Page-managed values are resolved again at execution and are withheld from unmerged PR reruns. Queue a new run for new committed configuration. |
 | Artifacts disappeared | Check the default branch's retention and administrator limits. Raising limits does not restore deleted data. |

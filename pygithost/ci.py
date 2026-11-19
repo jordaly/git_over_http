@@ -147,33 +147,41 @@ def unconfigured_repository_config() -> JsonObject:
     return config
 
 
-def authorize_repository_execution(owner: str, repo: str, config: Mapping[str, Any]) -> None:
-    """Repository writers cannot grant themselves server-user execution."""
-    trusted = {
-        name.strip()
-        for name in os.environ.get("PYGITHOST_CI_TRUSTED_REPOSITORIES", "")
-        .replace(",", "\n")
-        .splitlines()
-        if name.strip()
-    }
+def parse_execution_trust(value: str) -> set[str]:
+    """Accept only exact repository identities, separated by commas or newlines."""
+    trusted = {name.strip() for name in value.replace(",", "\n").splitlines() if name.strip()}
     if any(
-        not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", name) or ".." in name
+        not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", name)
+        or ".." in name
+        or "." in name.split("/")
         for name in trusted
     ):
-        raise ValueError(
-            "PYGITHOST_CI_TRUSTED_REPOSITORIES requires exact owner/repo names, not patterns."
-        )
-    if f"{owner}/{repo}" in trusted:
-        return
-    if (
+        raise ValueError("Trusted repositories must use exact owner/repo names, not patterns.")
+    return trusted
+
+
+def authorize_repository_execution(
+    owner: str, repo: str, config: Mapping[str, Any], *, allow_page_trust: bool = False
+) -> None:
+    """Repository writers cannot grant themselves server-user execution."""
+    inherited = parse_execution_trust(os.environ.get("PYGITHOST_CI_TRUSTED_REPOSITORIES", ""))
+    if not (
         config.get("runner") == "host"
         or config.get("deploy_enabled")
         or any(target.get("deploy_enabled") for target in config.get("deployment_targets", []))
     ):
-        raise ValueError(
-            "Host jobs and deployments require administrator authorization in "
-            "PYGITHOST_CI_TRUSTED_REPOSITORIES."
-        )
+        return
+    identity = f"{owner}/{repo}"
+    if identity in inherited:
+        return
+    if allow_page_trust and identity in parse_execution_trust(
+        database.db_ci_execution_trust_get()[0]
+    ):
+        return
+    raise ValueError(
+        "Host jobs and deployments require administrator authorization in "
+        "Admin → Settings → Trusted CI repositories."
+    )
 
 
 def validate_config(raw: object, *, nested: bool = False) -> JsonObject:
@@ -754,8 +762,11 @@ class CIManager:
     docker_policy: dict[str, Any]
     image_cache_dir: Path | None
 
-    def __init__(self, repo_path: Callable[[str, str], str]) -> None:
+    def __init__(
+        self, repo_path: Callable[[str, str], str], *, allow_page_trust: bool = False
+    ) -> None:
         self.repo_path = repo_path
+        self.allow_page_trust = allow_page_trust
         self.pending: dict[int, RunRow] = {}
         self.active: dict[int, tuple[RunRow, asyncio.Task[None]]] = {}
         self.dispatcher: asyncio.Task[None] | None = None
@@ -973,7 +984,7 @@ class CIManager:
                 item["_repository_config_error"] = source_error
                 continue
             try:
-                authorize_repository_execution(owner, repo, item)
+                await self._authorize_execution(owner, repo, item)
             except ValueError as exc:
                 item["_repository_config_error"] = str(exc)
                 if status == "valid":
@@ -987,6 +998,15 @@ class CIManager:
             _configuration_git_error=source.git_error,
         )
         return merged
+
+    async def _authorize_execution(self, owner: str, repo: str, config: Mapping[str, Any]) -> None:
+        await _db_call(
+            authorize_repository_execution,
+            owner,
+            repo,
+            config,
+            allow_page_trust=self.allow_page_trust,
+        )
 
     async def secret_preferences(self, owner: str, repo: str) -> tuple[JsonObject, JsonObject]:
         global_values, repository_values = await _db_call(
@@ -1323,13 +1343,13 @@ class CIManager:
         if snapshot is None and not config_error:
             try:
                 config = validate_config(config)
-                authorize_repository_execution(owner, repo, config)
+                await self._authorize_execution(owner, repo, config)
                 config["_page_environment_live"] = True
             except ValueError as exc:
                 config_error = f"CI preferences: {exc}"
         if snapshot is not None:
             try:
-                authorize_repository_execution(owner, repo, config)
+                await self._authorize_execution(owner, repo, config)
             except ValueError as exc:
                 config_error = str(exc)
         if not self.started:
@@ -1588,8 +1608,8 @@ class CIManager:
             )
 
         try:
-            authorize_repository_execution(owner, repo, config)
-            authorize_repository_execution(owner, repo, snapshot)
+            await self._authorize_execution(owner, repo, config)
+            await self._authorize_execution(owner, repo, snapshot)
         except ValueError as exc:
             await skip(str(exc))
             return
@@ -2049,7 +2069,7 @@ class CIManager:
         if not stored:
             raise ValueError("CI run has no execution snapshot; queue a new run.")
         config = validate_config(stored)
-        authorize_repository_execution(owner, repo, config)
+        await self._authorize_execution(owner, repo, config)
         git_values = config["env"] if stored.get("_page_environment_live") is True else {}
         config["env"] = await self.execution_environment(row, config["pipeline_id"], git_values)
         config = validate_config(config)

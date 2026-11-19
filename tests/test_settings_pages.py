@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from pygithost import application, database
-from pygithost.ci import CIManager, default_config
+from pygithost.ci import CIManager, authorize_repository_execution, default_config
 from pygithost.settings_pages import BASIC_GROUPS
 from tests import test_repository_ui as ui
 from tests.ci_fixtures import commit_ci_config, seed_verified_retention
@@ -84,6 +84,79 @@ class SettingsPagesTests(unittest.TestCase):
         self.assertIn("ci/config.json", page)
         self.assertIn('name="env_name_0"', page)
         self.assertIn('<template><div class="settings-env-row">', page)
+
+    def test_trusted_ci_repositories_require_authenticated_admin_and_csrf(self):
+        fields = {
+            "trusted_repositories": f"{self.owner}/project",
+            "confirm_execution_trust": "yes",
+        }
+        _, page = self.fixture.request("/admin/settings")
+        self.assertNotIn('name="trusted_repositories"', page)
+        self.assertEqual(self.save("ci_execution_trust", **fields)[0], 403)
+        with (
+            mock.patch.object(application, "REQUIRE_AUTH", True),
+            mock.patch.object(application, "_require_admin", return_value=True) as admin,
+            mock.patch.object(
+                application.GitHTTPHandler,
+                "_require_session_auth",
+                new_callable=mock.AsyncMock,
+                return_value=True,
+            ),
+            mock.patch.dict(os.environ, {"PYGITHOST_CI_TRUSTED_REPOSITORIES": "ops/legacy"}),
+        ):
+            _, page = self.fixture.request("/admin/settings")
+            self.assertIn('name="trusted_repositories"', page)
+            self.assertIn("ops/legacy", page)
+            revision = re.search(r'name="trust_revision" value="([^"]+)"', page)[1]
+            fields["trust_revision"] = revision
+            self.assertEqual(
+                self.fixture.request("/admin/settings", {"action": "ci_execution_trust", **fields})[
+                    0
+                ],
+                403,
+            )
+            _, page = self.save("ci_execution_trust", **{**fields, "trusted_repositories": "ops/*"})
+            self.assertIn("exact owner/repo", page)
+            self.assertEqual(database.db_ci_execution_trust_get(), ("", revision))
+            _, page = self.save("ci_execution_trust", **fields)
+            self.assertIn("No restart is required", page)
+            current, new_revision = database.db_ci_execution_trust_get()
+            self.assertEqual(current, fields["trusted_repositories"])
+            self.assertNotEqual(new_revision, revision)
+            self.assertEqual(
+                self.save("ci_execution_trust", **{**fields, "trusted_repositories": ""})[0], 409
+            )
+            self.assertEqual(database.db_ci_execution_trust_get(), (current, new_revision))
+            admin.return_value = False
+            self.assertEqual(self.fixture.request("/admin/settings")[0], 403)
+
+    def test_saved_trust_is_additive_exact_and_revocable(self):
+        host = {"runner": "host"}
+        with mock.patch.dict(os.environ, {"PYGITHOST_CI_TRUSTED_REPOSITORIES": "ops/legacy"}):
+            with self.assertRaisesRegex(ValueError, "administrator authorization"):
+                authorize_repository_execution(self.owner, "project", host)
+            identity = f"{self.owner}/project"
+            actor = {"actor": "admin", "actor_user_id": None, "ip": "127.0.0.1"}
+            self.assertTrue(database.db_ci_execution_trust_set(identity, "0", **actor))
+            authorize_repository_execution(self.owner, "project", host, allow_page_trust=True)
+            with self.assertRaisesRegex(ValueError, "administrator authorization"):
+                authorize_repository_execution(self.owner, "project", host, allow_page_trust=False)
+            authorize_repository_execution("ops", "legacy", host)
+            with self.assertRaisesRegex(ValueError, "administrator authorization"):
+                authorize_repository_execution(
+                    self.owner, "project-other", host, allow_page_trust=True
+                )
+            revision = database.db_ci_execution_trust_get()[1]
+            self.assertTrue(database.db_ci_execution_trust_set("", revision, **actor))
+            self.assertFalse(database.db_ci_execution_trust_set(identity, revision, **actor))
+            with self.assertRaisesRegex(ValueError, "administrator authorization"):
+                authorize_repository_execution(self.owner, "project", host, allow_page_trust=True)
+            authorize_repository_execution("ops", "legacy", host)
+            for action in ("ci_execution_trust_grant", "ci_execution_trust_revoke"):
+                events = database.db_audit_list(action=action)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["target"], identity)
+                self.assertEqual(events[0]["actor"], "admin")
 
     def test_execution_uses_pipeline_json_or_builtins_not_preferences(self):
         database.db_ci_preferences_set({"timeout_seconds": 60, "cancel_superseded": True})

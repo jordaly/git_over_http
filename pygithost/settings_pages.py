@@ -28,6 +28,27 @@ ENV_SCOPE_OPTIONS = (
     ("deployment", "Deployment only"),
 )
 
+EXECUTION_TRUST_INPUT_LIMIT = 8192
+
+
+def execution_trust_form(
+    action: str, token: str, saved: str, revision: str, inherited: str
+) -> SafeHTML:
+    return safe_html(
+        html_t(t'''<section class="box" id="trusted-ci-repositories"><h2>Trusted CI repositories</h2>
+<p>Host jobs and deployments run as the GitHost operating-system account. Only allow repositories whose CI configuration writers you trust. Docker runner permissions are separate.</p>
+<form method="POST" action="{action}" class="settings-page-form">
+<input type="hidden" name="action" value="ci_execution_trust">
+<input type="hidden" name="csrf" value="{token}">
+<input type="hidden" name="trust_revision" value="{revision}">
+<label for="ci-trusted-repositories">Page-managed repositories (exact owner/repo, comma- or newline-separated)</label>
+<textarea id="ci-trusted-repositories" name="trusted_repositories" maxlength="{EXECUTION_TRUST_INPUT_LIMIT}" spellcheck="false">{saved}</textarea>
+<p class="muted">Grants from <code>PYGITHOST_CI_TRUSTED_REPOSITORIES</code> also apply and cannot be removed here: <code>{inherited or "none"}</code>.</p>
+<label><input type="checkbox" name="confirm_execution_trust" value="yes" required> I understand this permits Windows or Linux host execution as the GitHost account.</label>
+<button type="submit">Save trusted repositories</button>
+</form></section>''')
+    )
+
 
 def preferences_forms(
     action: str,

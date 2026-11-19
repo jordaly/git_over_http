@@ -181,9 +181,9 @@ The project settings page has no retention form. See
 
 Repository writers cannot grant themselves execution as the server user by
 editing code. Host jobs and enabled deployments are rejected unless the exact
-`owner/repo` name appears in the server environment variable
-**`PYGITHOST_CI_TRUSTED_REPOSITORIES`** (comma- or newline-separated, default
-empty). Use exact names only: wildcards, patterns, malformed entries and `..` are
+`owner/repo` name is listed under **Admin → Settings → Trusted CI repositories**
+or inherited from the process environment. Use exact names only: wildcards,
+patterns, malformed entries and `..` are
 rejected, and a bad allowlist value is a configuration error rather than a broad
 match. Administrator authorization is separate from `ci/config.json`; it is not
 another pipeline setting.

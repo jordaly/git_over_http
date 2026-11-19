@@ -2170,6 +2170,68 @@ def db_ci_config_set(
         conn.close()
 
 
+def _ci_execution_trust(conn: sqlite3.Connection) -> tuple[str, str]:
+    values: dict[str, str] = dict(
+        conn.execute(
+            """SELECT key,value FROM server_settings
+               WHERE key IN ('ci_execution_trust','ci_execution_trust_revision')"""
+        )
+    )
+    return values.get("ci_execution_trust", ""), values.get("ci_execution_trust_revision", "0")
+
+
+def db_ci_execution_trust_get() -> tuple[str, str]:
+    conn = _db_connect()
+    try:
+        return _ci_execution_trust(conn)
+    finally:
+        conn.close()
+
+
+def db_ci_execution_trust_set(
+    value: str,
+    expected_revision: str,
+    *,
+    actor: str | None,
+    actor_user_id: int | None,
+    ip: str,
+) -> bool:
+    """Replace the exact grants and record each change atomically."""
+    conn = _db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        previous, revision = _ci_execution_trust(conn)
+        if revision != expected_revision:
+            return False
+        before, after = set(previous.splitlines()), set(value.splitlines())
+        if before == after:
+            return True
+        conn.executemany(
+            """INSERT INTO server_settings(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (
+                ("ci_execution_trust", value),
+                ("ci_execution_trust_revision", secrets.token_hex(16)),
+            ),
+        )
+        conn.executemany(
+            """INSERT INTO audit_events(actor,actor_user_id,action,outcome,target,ip)
+            VALUES(?,?,?,'success',?,?)""",
+            [
+                (actor, actor_user_id, action, identity, ip)
+                for action, identities in (
+                    ("ci_execution_trust_grant", after - before),
+                    ("ci_execution_trust_revoke", before - after),
+                )
+                for identity in sorted(identities)
+            ],
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 def db_ci_preferences_get(
     owner: str | None = None, repo: str | None = None
 ) -> tuple[JSONObject, JSONObject]:

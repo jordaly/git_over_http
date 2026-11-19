@@ -12,7 +12,7 @@ combining examples. Validate before committing with
 `python -m pygithost ci validate` (or `--rev HEAD` for the committed version); it
 checks referenced files without executing them. Environment values belong on the
 project page, not in Git. Enabled deployments additionally require
-administrator authorization in `PYGITHOST_CI_TRUSTED_REPOSITORIES` using exact
+administrator authorization under **Admin → Settings → Trusted CI repositories** using exact
 `owner/repo` names; wildcards and malformed entries are rejected.
 
 A malformed committed file fails closed: merges require CI and all direct branches
@@ -158,7 +158,7 @@ updated and reopened. PR checks read the target/base commit's `ci/config.json`.
 
 Both targets are disabled in the example. Install trusted executable deployment
 scripts outside repositories, add the exact `owner/repo` to
-`PYGITHOST_CI_TRUSTED_REPOSITORIES`, and only then enable a reviewed target.
+**Trusted CI repositories**, and only then enable a reviewed target.
 Deployments run on the host, not in the CI container. Each target matches its own
 exact branch and has independent logs/result/email state. Several targets may use
 the same branch if the same tested update must deploy to several hosts. They

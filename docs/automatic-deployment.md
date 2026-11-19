@@ -8,9 +8,9 @@ independently configured pipeline. There are no shared defaults or inherited
 deployment notification settings.
 
 Deployments are trusted host execution. Every enabled deployment requires the
-exact `owner/repo` to appear in the server environment variable
-**`PYGITHOST_CI_TRUSTED_REPOSITORIES`** (comma- or newline-separated, default
-empty). Use exact names only; wildcards, patterns and malformed entries are
+exact `owner/repo` to be listed under **Admin → Settings → Trusted CI repositories**
+or inherited from the process environment. Use exact names only; wildcards,
+patterns and malformed entries are
 rejected. Adding a deployment or setting a host runner in Git does not authorize
 it. The check is repeated at execution time, including for reruns and historical
 snapshots. Removing authorization stops future host execution. A parseable
@@ -210,7 +210,7 @@ assignments and logs. Use a dedicated unprivileged account and restrict backups.
 
 Repository writers cannot grant themselves host execution by editing
 `ci/config.json`. An administrator must explicitly authorize the exact
-`owner/repo` in `PYGITHOST_CI_TRUSTED_REPOSITORIES`; wildcards and malformed names
+`owner/repo` under **Trusted CI repositories**; wildcards and malformed names
 are rejected. Ordinary Docker and remote-Docker jobs do not require that entry.
 The trust check also applies when a historical snapshot is rerun after authorization
 changes. A malformed committed configuration separately fails closed, requiring CI

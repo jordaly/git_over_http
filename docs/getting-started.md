@@ -183,7 +183,7 @@ direct branches protected until repaired through Git or the server filesystem.
 Manual runs always require write access and a runnable pipeline; they never deploy,
 and a manual request is rejected if the branch moved after the configuration check.
 Host jobs and enabled deployments additionally require administrator authorization
-in `PYGITHOST_CI_TRUSTED_REPOSITORIES` using exact `owner/repo` names; wildcards and
+under **Admin → Settings → Trusted CI repositories** using exact `owner/repo` names; wildcards and
 malformed entries are rejected.
 
 ## Development checks

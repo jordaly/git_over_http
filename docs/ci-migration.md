@@ -130,14 +130,14 @@ Git variables are not replayed as page values.
 Ordinary `docker` and `remote-docker` pipelines need no new trust entry and keep
 their existing worker-policy boundaries. A repository that requests
 `runner: "host"`, or that enables any deployment, cannot run that job unless its
-exact `owner/repo` appears in the server environment variable
-**`PYGITHOST_CI_TRUSTED_REPOSITORIES`**:
+exact `owner/repo` is granted under **Admin → Settings → Trusted CI repositories**:
 
-```sh
-PYGITHOST_CI_TRUSTED_REPOSITORIES=alice/project,ops/tools
+```text
+alice/project,ops/tools
 ```
 
 Comma-separated or newline-separated values are accepted; the default is empty.
+Existing process-environment grants remain active.
 Use exact `owner/repo` names only. Wildcards, patterns, malformed entries and `..`
 are rejected, and an invalid allowlist value is a configuration error rather than a
 broad match. Match the namespace used in repository URLs. This is administrator
@@ -211,6 +211,6 @@ than replaying it. Verify the real target after any interruption.
 | Page variables were copied into every run snapshot | New snapshots exclude page credentials. Values are resolved live at execution, withheld from all unmerged PR checks, and may appear in remote assignments/logs. |
 | Configuration was validated only when a run was queued | Run `python -m pygithost ci validate` or use **CI → Run pipeline → Check configuration** to read the exact commit and status without queueing. |
 | Root file references were supported | Entry point is `ci/config.json`; referenced pipeline files must be under `ci/`. |
-| Repository JSON could not grant host execution | Host jobs and enabled deployments require `PYGITHOST_CI_TRUSTED_REPOSITORIES`. |
+| Repository JSON could not grant host execution | Host jobs and enabled deployments require an administrator grant under **Trusted CI repositories**. |
 | Historical definitions might load implicitly | No automatic migration, no implicit deployment and no historical retry. |
 | Malformed configuration was only a failed run | It now fails closed: merges require CI and all direct branches are protected until an administrator repairs the file. |

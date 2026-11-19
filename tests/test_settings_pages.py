@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from pygithost import application, database
@@ -157,6 +158,54 @@ class SettingsPagesTests(unittest.TestCase):
                 self.assertEqual(len(events), 1)
                 self.assertEqual(events[0]["target"], identity)
                 self.assertEqual(events[0]["actor"], "admin")
+
+    def test_ip_only_trust_requires_configured_peer_and_keeps_csrf(self):
+        app = self.fixture.server.app
+        identity = f"{self.owner}/project"
+        fields = {
+            "trusted_repositories": identity,
+            "confirm_execution_trust": "yes",
+            "trust_revision": "0",
+        }
+        with mock.patch.object(app, "ci_trust_admin_ips", frozenset({"192.0.2.9"})):
+            self.assertEqual(self.save("ci_execution_trust", **fields)[0], 403)
+        with mock.patch.object(app, "ci_trust_admin_ips", frozenset({"127.0.0.1"})):
+            _, page = self.fixture.request("/admin/settings")
+            self.assertIn('name="trusted_repositories"', page)
+            self.assertIn("IP-only mode", page)
+            self.assertEqual(
+                self.fixture.request("/admin/settings", {"action": "ci_execution_trust", **fields})[
+                    0
+                ],
+                403,
+            )
+            self.assertEqual(self.save("ci_execution_trust", **fields)[0], 200)
+        self.assertEqual(database.db_ci_execution_trust_get()[0], identity)
+        event = database.db_audit_list(action="ci_execution_trust_grant")[0]
+        self.assertEqual(event["actor"], "ip:127.0.0.1")
+
+    def test_ip_only_trust_startup_requires_ip_filter_and_eligible_peer(self):
+        app = self.fixture.server.app
+        for value in ("*", "192.0.2.0/24", "127.0.0.1/32"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "exact IP"):
+                application._ci_trust_admin_ips(value)
+        config = app.context.config
+        with mock.patch.dict(os.environ, {"PYGITHOST_CI_TRUST_ADMIN_IPS": "127.0.0.1,192.0.2.9"}):
+            other = application.AsyncGitServer(app.context, allowlist={"192.0.2.10"})
+            self.assertEqual(other.ci_trust_admin_ips, frozenset())
+            self.assertFalse(other.ci_manager.allow_page_trust)
+            eligible = application.AsyncGitServer(app.context, allowlist={"127.0.0.1"})
+            self.assertEqual(eligible.ci_trust_admin_ips, frozenset({"127.0.0.1"}))
+            self.assertTrue(eligible.ci_manager.allow_page_trust)
+            try:
+                unfiltered = application.AsyncGitServer(
+                    application.AppContext(replace(config, filter_ips=False)),
+                    allowlist={"127.0.0.1"},
+                )
+                self.assertEqual(unfiltered.ci_trust_admin_ips, frozenset())
+                self.assertFalse(unfiltered.ci_manager.allow_page_trust)
+            finally:
+                application.apply_config(config)
 
     def test_execution_uses_pipeline_json_or_builtins_not_preferences(self):
         database.db_ci_preferences_set({"timeout_seconds": 60, "cancel_superseded": True})

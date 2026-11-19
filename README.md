@@ -635,6 +635,7 @@ Only one job per repository runs at once. Server environment settings:
 | `PYGITHOST_CI_QUEUE_LIMIT` | `100` | Global waiting jobs, excluding running jobs |
 | `PYGITHOST_CI_RETENTION` | `100` | Default completed-run limit when project configuration omits it (0–10000; 0 = unlimited) |
 | `PYGITHOST_CI_TRUSTED_REPOSITORIES` | empty | Additional grants inherited by GitHost. Exact `owner/repo` entries, comma- or newline-separated; these are additive to **Admin → Settings → Trusted CI repositories** |
+| `PYGITHOST_CI_TRUST_ADMIN_IPS` | empty | Exact client IPs allowed to manage trusted CI repositories in IP-only mode. Requires IP filtering and an IP allowed by the normal client allowlist |
 | `PYGITHOST_CI_PROTECTED_SECRET_BRANCHES` | empty | Exact `owner/repo:branch` entries, comma- or newline-separated, allowed to receive protected page-managed values; a matching default-branch protection rule and current branch tip are also required |
 
 A full queue produces a failed run with a queue-specific reason instead of

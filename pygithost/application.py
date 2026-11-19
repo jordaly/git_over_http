@@ -1425,6 +1425,17 @@ def _ip_allowed(ip: str, allow: set[str]) -> bool:
     return False
 
 
+def _ci_trust_admin_ips(value: str) -> frozenset[str]:
+    """Only individual peer addresses may administer trust without a session."""
+    entries = (entry.strip() for entry in value.replace(",", "\n").splitlines())
+    try:
+        return frozenset(str(ipaddress.ip_address(entry)) for entry in entries if entry)
+    except ValueError:
+        raise ValueError(
+            "PYGITHOST_CI_TRUST_ADMIN_IPS must contain exact IP addresses, not networks."
+        ) from None
+
+
 def _clip_markdown(body: str) -> str:
     """Trim a Markdown body to the storage cap without splitting an image.
 
@@ -2669,7 +2680,7 @@ class GitHTTPHandler:
             else safe_html("")
         )
         submitted_preferences: dict[str, str] | None = None
-        can_manage_trust = REQUIRE_AUTH and _require_admin(self)
+        can_manage_trust = _require_admin(self) if REQUIRE_AUTH else self._is_ci_trust_admin_peer()
         response_status = 200
         value = await self.server.display_name()
         if save:
@@ -2681,7 +2692,7 @@ class GitHTTPHandler:
                 if action == "ci_execution_trust":
                     if not can_manage_trust:
                         return await self._forbidden(
-                            b"403 Forbidden: authenticated admin required.\n"
+                            b"403 Forbidden: an admin session or configured CI trust admin IP is required.\n"
                         )
                     raw = form.get("trusted_repositories")
                     if raw is None or form.get("confirm_execution_trust") != "yes":
@@ -2694,8 +2705,8 @@ class GitHTTPHandler:
                             db_ci_execution_trust_set,
                             "\n".join(sorted(trusted)),
                             form.get("trust_revision", ""),
-                            actor=self.remote_user,
-                            actor_user_id=self.remote_user_id,
+                            actor=self.remote_user if REQUIRE_AUTH else "ip:" + self._client_ip(),
+                            actor_user_id=self.remote_user_id if REQUIRE_AUTH else None,
                             ip=self._client_ip(),
                         )
                     if not saved:
@@ -2751,6 +2762,7 @@ class GitHTTPHandler:
                 trusted_repositories,
                 trust_revision,
                 os.environ.get("PYGITHOST_CI_TRUSTED_REPOSITORIES", ""),
+                ip_only=not REQUIRE_AUTH,
             )
         custom_favicon = await _call_in_thread(db_favicon_get)
         if custom_favicon:
@@ -2824,6 +2836,13 @@ class GitHTTPHandler:
         return await _send_redirect(
             self.request, "/admin/settings?favicon=" + ("reset" if action == "reset" else "updated")
         )
+
+    def _is_ci_trust_admin_peer(self) -> bool:
+        try:
+            peer = str(ipaddress.ip_address(self._client_ip()))
+        except ValueError:
+            return False
+        return peer in self.server.ci_trust_admin_ips
 
     def _settings_csrf_token(self) -> str:
         import hashlib
@@ -8572,8 +8591,17 @@ class AsyncGitServer:
         self.context = context or AppContext(AppConfig.from_mapping(default_config_for_platform()))
         apply_config(self.context.config)
         self.allowlist = allowlist if allowlist is not None else ALLOWED_CLIENT_IPS
+        configured_trust_ips = (
+            _ci_trust_admin_ips(os.environ.get("PYGITHOST_CI_TRUST_ADMIN_IPS", ""))
+            if self.context.config.filter_ips and not self.context.config.require_auth
+            else frozenset()
+        )
+        self.ci_trust_admin_ips = frozenset(
+            ip for ip in configured_trust_ips if _ip_allowed(ip, self.allowlist)
+        )
         self.ci_manager = CIManager(
-            _repo_bare_path, allow_page_trust=self.context.config.require_auth
+            _repo_bare_path,
+            allow_page_trust=self.context.config.require_auth or bool(self.ci_trust_admin_ips),
         )
         self.push_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.push_requests: set[asyncio.Task[Any]] = set()

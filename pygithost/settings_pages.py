@@ -32,11 +32,19 @@ EXECUTION_TRUST_INPUT_LIMIT = 8192
 
 
 def execution_trust_form(
-    action: str, token: str, saved: str, revision: str, inherited: str
+    action: str, token: str, saved: str, revision: str, inherited: str, *, ip_only: bool = False
 ) -> SafeHTML:
+    ip_warning = (
+        safe_html(
+            '<p class="warn">IP-only mode: only trusted clients should have write access. Any client that can modify a trusted repository can change the commands it runs on the host.</p>'
+        )
+        if ip_only
+        else safe_html("")
+    )
     return safe_html(
         html_t(t'''<section class="box" id="trusted-ci-repositories"><h2>Trusted CI repositories</h2>
 <p>Host jobs and deployments run as the GitHost operating-system account. Only allow repositories whose CI configuration writers you trust. Docker runner permissions are separate.</p>
+{ip_warning}
 <form method="POST" action="{action}" class="settings-page-form">
 <input type="hidden" name="action" value="ci_execution_trust">
 <input type="hidden" name="csrf" value="{token}">

@@ -119,9 +119,18 @@ CI repositories**. Enter exact `owner/repo` names separated by commas or
 newlines; wildcards and malformed names are rejected. Changes take effect without
 a restart. Existing `PYGITHOST_CI_TRUSTED_REPOSITORIES` process environment entries
 remain additive and can only be removed from the launch environment.
-If authentication is disabled, saved page grants are retained but ignored;
-environment entries are unaffected. Stale edits are rejected, and each grant or
-revocation is recorded in the security audit log with the repository and actor.
+With sign-in disabled, set `PYGITHOST_CI_TRUST_ADMIN_IPS` in the GitHost launch
+environment to opt in to IP-only administration. Use exact client IP addresses
+separated by commas or newlines, not subnets. GitHost must have IP filtering
+enabled, and the admin IP must also be on the normal client allowlist. GitHost
+checks the direct connection IP, not forwarded headers. Do not use a shared
+proxy or NAT address as an admin IP. In IP-only mode, anyone allowed to write to
+a trusted repository can change the commands it runs on the host; restrict the
+normal allowlist to trusted writers before granting repository trust.
+Without an eligible admin IP or sign-in, saved page grants are retained but
+ignored; environment grants are unaffected. Stale edits are rejected, and each
+grant or revocation is recorded with the repository and the administrator's
+username or peer IP.
 This is authorization outside Git; adding a deployment or setting
 `runner: "host"` in the repository cannot grant it. The check is repeated for
 reruns and historical snapshots. A parseable document denied by the guard keeps its

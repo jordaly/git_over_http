@@ -161,9 +161,16 @@ def parse_execution_trust(value: str) -> set[str]:
 
 
 def authorize_repository_execution(
-    owner: str, repo: str, config: Mapping[str, Any], *, allow_page_trust: bool = False
+    owner: str,
+    repo: str,
+    config: Mapping[str, Any],
+    *,
+    allow_page_trust: bool = False,
+    trust_all_repositories: bool = False,
 ) -> None:
     """Repository writers cannot grant themselves server-user execution."""
+    if trust_all_repositories:
+        return
     inherited = parse_execution_trust(os.environ.get("PYGITHOST_CI_TRUSTED_REPOSITORIES", ""))
     if not (
         config.get("runner") == "host"
@@ -763,10 +770,15 @@ class CIManager:
     image_cache_dir: Path | None
 
     def __init__(
-        self, repo_path: Callable[[str, str], str], *, allow_page_trust: bool = False
+        self,
+        repo_path: Callable[[str, str], str],
+        *,
+        allow_page_trust: bool = False,
+        trust_all_repositories: bool = False,
     ) -> None:
         self.repo_path = repo_path
         self.allow_page_trust = allow_page_trust
+        self.trust_all_repositories = trust_all_repositories
         self.pending: dict[int, RunRow] = {}
         self.active: dict[int, tuple[RunRow, asyncio.Task[None]]] = {}
         self.dispatcher: asyncio.Task[None] | None = None
@@ -1006,6 +1018,7 @@ class CIManager:
             repo,
             config,
             allow_page_trust=self.allow_page_trust,
+            trust_all_repositories=self.trust_all_repositories,
         )
 
     async def secret_preferences(self, owner: str, repo: str) -> tuple[JsonObject, JsonObject]:

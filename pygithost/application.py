@@ -1436,6 +1436,23 @@ def _ci_trust_admin_ips(value: str) -> frozenset[str]:
         ) from None
 
 
+def _ip_filter_trusts_ci_repositories(config: AppConfig, allowlist: set[str]) -> bool:
+    if (
+        not config.ip_trust_all_ci_repositories
+        or config.require_auth
+        or not config.filter_ips
+        or not allowlist
+    ):
+        return False
+    # No CIDRs, wildcard entries, or malformed addresses in trust-all mode.
+    try:
+        for entry in allowlist:
+            ipaddress.ip_address(entry)
+    except ValueError:
+        return False
+    return True
+
+
 def _clip_markdown(body: str) -> str:
     """Trim a Markdown body to the storage cap without splitting an image.
 
@@ -2680,7 +2697,10 @@ class GitHTTPHandler:
             else safe_html("")
         )
         submitted_preferences: dict[str, str] | None = None
-        can_manage_trust = _require_admin(self) if REQUIRE_AUTH else self._is_ci_trust_admin_peer()
+        trust_all_repositories = self.server.ci_manager.trust_all_repositories
+        can_manage_trust = not trust_all_repositories and (
+            _require_admin(self) if REQUIRE_AUTH else self._is_ci_trust_admin_peer()
+        )
         response_status = 200
         value = await self.server.display_name()
         if save:
@@ -2754,7 +2774,14 @@ class GitHTTPHandler:
         global_values, _repo = await _call_in_thread(db_ci_preferences_get)
         token = self._settings_csrf_token()
         execution_trust = safe_html("")
-        if can_manage_trust:
+        if trust_all_repositories:
+            execution_trust = safe_html(
+                '<section class="box" id="trusted-ci-repositories"><h2>Trusted CI repositories</h2>'
+                '<p class="warn">IP-only mode trusts all repositories for host jobs and deployments. '
+                "Every allowed client with write access can change the commands that run on GitHost. "
+                "Per-repository authorization resumes when sign-in is enabled.</p></section>"
+            )
+        elif can_manage_trust:
             trusted_repositories, trust_revision = await _call_in_thread(db_ci_execution_trust_get)
             execution_trust = execution_trust_form(
                 "/admin/settings",
@@ -8602,6 +8629,9 @@ class AsyncGitServer:
         self.ci_manager = CIManager(
             _repo_bare_path,
             allow_page_trust=self.context.config.require_auth or bool(self.ci_trust_admin_ips),
+            trust_all_repositories=_ip_filter_trusts_ci_repositories(
+                self.context.config, self.allowlist
+            ),
         )
         self.push_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.push_requests: set[asyncio.Task[Any]] = set()
@@ -8617,6 +8647,16 @@ class AsyncGitServer:
             backup_count=server_config.log_backup_count,
             log_format=server_config.log_format,
         )
+        if self.ci_manager.trust_all_repositories:
+            logger.warning(
+                "IP-only CI trust enabled: every repository can run host jobs and deployments.",
+                extra={"event": "ci_ip_trust_all_enabled"},
+            )
+        elif server_config.ip_trust_all_ci_repositories and not server_config.require_auth:
+            logger.warning(
+                "IP-only CI trust ignored: enable IP filtering with exact allowed addresses.",
+                extra={"event": "ci_ip_trust_all_ignored"},
+            )
         self.access_log = bool(server_config.access_log)
         self.audit_log = bool(server_config.audit_log)
         self.settings_lock = asyncio.Lock()

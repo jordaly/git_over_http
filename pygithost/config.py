@@ -73,6 +73,7 @@ class AppConfig:
     allowed_client_ips: tuple[str, ...]
     require_auth: bool
     filter_ips: bool
+    ip_trust_all_ci_repositories: bool
     realm: str
     flat_owner_ui: str
     pr_patch_max_bytes: int
@@ -117,6 +118,7 @@ class AppConfig:
             ),
             require_auth=False,
             filter_ips=True,
+            ip_trust_all_ci_repositories=False,
             realm="Git Repositories",
             flat_owner_ui="root",
             pr_patch_max_bytes=800_000,
@@ -175,6 +177,8 @@ class AppConfig:
             "audit_log",
         ):
             values[key] = bool(values[key])
+        if type(values["ip_trust_all_ci_repositories"]) is not bool:
+            raise ValueError("ip_trust_all_ci_repositories must be a JSON boolean")
 
         values["log_level"] = str(values["log_level"]).strip().upper()
         values["log_format"] = str(values["log_format"]).strip().lower()

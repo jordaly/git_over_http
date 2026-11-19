@@ -127,8 +127,21 @@ checks the direct connection IP, not forwarded headers. Do not use a shared
 proxy or NAT address as an admin IP. In IP-only mode, anyone allowed to write to
 a trusted repository can change the commands it runs on the host; restrict the
 normal allowlist to trusted writers before granting repository trust.
+
+To use the client IP filter as the **only** trust boundary for all repositories,
+set `"ip_trust_all_ci_repositories": true` in the server's startup JSON and
+restart GitHost. This is off by default. It takes effect only with sign-in
+disabled, IP filtering enabled, and a nonempty allowlist of exact IP addresses
+(no CIDRs). No per-repository grants or CI trust admin IPs are needed in this
+mode. All allowed clients with write access can change commands that run as the
+GitHost account. Review the entire network allowlist before enabling it.
+Enabling sign-in restores the per-repository authorization checks even if this
+setting remains true. This setting does not change CI triggers or runner policy,
+and enabling it does not queue or replay runs.
+
 Without an eligible admin IP or sign-in, saved page grants are retained but
-ignored; environment grants are unaffected. Stale edits are rejected, and each
+ignored. Environment grants are unaffected when per-repository checks apply.
+Stale edits are rejected, and each
 grant or revocation is recorded with the repository and the administrator's
 username or peer IP.
 This is authorization outside Git; adding a deployment or setting

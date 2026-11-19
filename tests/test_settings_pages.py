@@ -207,6 +207,35 @@ class SettingsPagesTests(unittest.TestCase):
             finally:
                 application.apply_config(config)
 
+    def test_trust_all_is_opt_in_and_never_applies_with_sign_in(self):
+        config = self.fixture.server.app.context.config
+        opt_in = replace(config, ip_trust_all_ci_repositories=True)
+        checker = application._ip_filter_trusts_ci_repositories
+        allowed = {"192.0.2.9"}
+        self.assertFalse(checker(config, allowed))
+        self.assertTrue(checker(opt_in, allowed))
+        self.assertFalse(checker(replace(opt_in, require_auth=True), allowed))
+        self.assertFalse(checker(replace(opt_in, filter_ips=False), allowed))
+        for unsafe in (set(), {"0.0.0.0/0"}, {"192.0.2.0/24"}, {"*"}):
+            with self.subTest(unsafe=unsafe):
+                self.assertFalse(checker(opt_in, unsafe))
+        with self.assertRaisesRegex(ValueError, "JSON boolean"):
+            application.AppConfig.from_mapping({"ip_trust_all_ci_repositories": "false"})
+
+        with mock.patch.dict(os.environ, {"PYGITHOST_CI_TRUSTED_REPOSITORIES": ""}):
+            unsigned = CIManager(
+                self.manager.repo_path, trust_all_repositories=checker(opt_in, allowed)
+            )
+            signed = CIManager(
+                self.manager.repo_path,
+                allow_page_trust=True,
+                trust_all_repositories=checker(replace(opt_in, require_auth=True), allowed),
+            )
+            for requested in ({"runner": "host"}, {"deploy_enabled": True}):
+                asyncio.run(unsigned._authorize_execution(self.owner, "any-project", requested))
+                with self.assertRaisesRegex(ValueError, "administrator authorization"):
+                    asyncio.run(signed._authorize_execution(self.owner, "any-project", requested))
+
     def test_execution_uses_pipeline_json_or_builtins_not_preferences(self):
         database.db_ci_preferences_set({"timeout_seconds": 60, "cancel_superseded": True})
         self.assertEqual(self.config()["timeout_seconds"], default_config()["timeout_seconds"])

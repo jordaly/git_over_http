@@ -360,9 +360,12 @@ async def execute_remote(manager: SourceManager, row: RunRow, config: Mapping[st
 
 
 def operation(
-    digest: str, repositories: Collection[str], action: str, document: Mapping[str, Any]
+    digest: str,
+    repositories: Collection[str] | None,
+    action: str,
+    document: Mapping[str, Any],
 ) -> JsonObject:
-    """All claims and attempt transitions are serialized by SQLite."""
+    """Serialize claims and transitions. None means server-authorized all-repository access."""
     conn = connect()
     try:
         prepared: tuple[JsonObject, bytes | None] | None = None
@@ -381,7 +384,7 @@ def operation(
             ).fetchone()
             if (
                 candidate
-                and f"{candidate[0]}/{candidate[1]}" in repositories
+                and (repositories is None or f"{candidate[0]}/{candidate[1]}" in repositories)
                 and isinstance(document.get("attempt"), str)
                 and hmac.compare_digest(candidate[3] or "", document["attempt"])
                 and time.time() - candidate[4] <= LEASE
@@ -403,22 +406,30 @@ def operation(
             _close_assignments(conn, [(r[0], r[2]) for r in abandoned])
             # Repeated claim requests after a lost response return the same job.
             row = conn.execute(
-                "SELECT run_id,document,attempt FROM ci_remote_jobs WHERE runner=? AND state='claimed'",
+                "SELECT run_id,document,attempt,owner,repo FROM ci_remote_jobs WHERE runner=? AND state='claimed'",
                 (digest,),
             ).fetchone()
+            if row and repositories is not None and f"{row[3]}/{row[4]}" not in repositories:
+                # A policy change must not expose or replay an out-of-scope assignment.
+                conn.commit()
+                _delete_sources([r[1] for r in abandoned])
+                return {"job": None}
             if not row:
                 for candidate in conn.execute(
                     "SELECT run_id,owner,repo,document FROM ci_remote_jobs WHERE state='queued' ORDER BY run_id"
                 ):
                     candidate_run_id, candidate_owner, candidate_repo, raw = candidate
-                    if f"{candidate_owner}/{candidate_repo}" not in repositories:
+                    if (
+                        repositories is not None
+                        and f"{candidate_owner}/{candidate_repo}" not in repositories
+                    ):
                         continue
                     attempt = secrets.token_hex(32)
                     conn.execute(
                         "UPDATE ci_remote_jobs SET state='claimed',runner=?,attempt=?,heartbeat=? WHERE run_id=?",
                         (digest, attempt, time.time(), candidate_run_id),
                     )
-                    row = (candidate_run_id, raw, attempt)
+                    row = (candidate_run_id, raw, attempt, candidate_owner, candidate_repo)
                     break
             conn.commit()
             _delete_sources([r[1] for r in abandoned])
@@ -434,7 +445,7 @@ def operation(
         ).fetchone()
         if (
             not row
-            or f"{row[0]}/{row[1]}" not in repositories
+            or (repositories is not None and f"{row[0]}/{row[1]}" not in repositories)
             or row[3] != digest
             or not hmac.compare_digest(row[4] or "", attempt)
         ):
@@ -616,7 +627,9 @@ def validate_progress(
     return raw
 
 
-def assigned_limits(digest: str, repositories: Collection[str], run_id: str) -> dict[str, int]:
+def assigned_limits(
+    digest: str, repositories: Collection[str] | None, run_id: str
+) -> dict[str, int]:
     """Resolve upload bounds from a token-owned assignment, never request JSON."""
     if not run_id.isascii() or not run_id.isdecimal() or len(run_id) > 18:
         raise APIError(422, "validation_error", "Invalid X-Runner-Run-ID.")
@@ -626,7 +639,7 @@ def assigned_limits(digest: str, repositories: Collection[str], run_id: str) -> 
             "SELECT owner,repo,document FROM ci_remote_jobs WHERE run_id=? AND runner=?",
             (int(run_id), digest),
         ).fetchone()
-        if not row or f"{row[0]}/{row[1]}" not in repositories:
+        if not row or (repositories is not None and f"{row[0]}/{row[1]}" not in repositories):
             raise APIError(404, "not_found", "Active assignment not found.")
         return execution_limits(json.loads(row[2]).get("config", {}).get("limits"))
     finally:
@@ -669,12 +682,15 @@ class RunnerAPI(API):
                 raise APIError(405, "method_not_allowed", "Runner operations use POST.")
             if action not in ("claim", "source", "heartbeat", "complete"):
                 raise APIError(404, "not_found", "Unknown runner operation.")
+            repositories: Collection[str] | None = (
+                None
+                if self.handler.server.ci_manager.trust_all_repositories
+                else json.loads(token[0])
+            )
             limits = execution_limits()
             run_id = self.request.headers.get("X-Runner-Run-ID", "")
             if run_id and action in ("heartbeat", "complete"):
-                limits = await asyncio.to_thread(
-                    assigned_limits, digest, json.loads(token[0]), run_id
-                )
+                limits = await asyncio.to_thread(assigned_limits, digest, repositories, run_id)
             maximum = (
                 completion_bytes(limits)
                 if action == "complete"
@@ -724,7 +740,7 @@ class RunnerAPI(API):
                     if not isinstance(document, dict):
                         raise APIError(422, "validation_error", "Expected a JSON object.")
                     result = await asyncio.to_thread(
-                        operation, digest, json.loads(token[0]), action, document
+                        operation, digest, repositories, action, document
                     )
             body = json.dumps(result).encode()
             await self.app._send_response(

@@ -25,7 +25,7 @@ Check every item before proceeding:
 | Account | Dedicated unprivileged service account. Docker group membership effectively grants root access to the machine; use a dedicated VM/server. |
 | GitHost version | Same tested supporting code revision on GitHost and worker; `/api/runner/v1` available. |
 | GitHost allowlist | Permits the worker's actual observed source IP, accounting for NAT. Do not disable filtering globally to make it work. |
-| Credential | Unique dedicated runner token restricted to explicit repositories, not a personal API token or a token shared by another worker. |
+| Credential | Unique dedicated runner token, not a personal API token or a token shared by another worker. Explicit repository scopes apply unless [IP-only CI trust-all](server-settings.md#host-and-deployment-authorization) is active. |
 | Workload | Linux-compatible commands and prebuilt dependencies. Windows paths such as `/mnt/c/...` are not automatically available. |
 | Private inputs | Test-only credentials/fixtures and an administrator-reviewed policy when network or secret mounts are needed. No production credentials. |
 

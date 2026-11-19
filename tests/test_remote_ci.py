@@ -789,6 +789,39 @@ class RunnerHTTPTests(unittest.TestCase):
             conn.close()
         self.assertEqual(self.post("claim", {}, token)[0], 401)
 
+    def test_trust_all_runner_lifecycle_and_scope_restoration(self):
+        token = create_token("worker", ["alice/project"])
+        other_token = create_token("other worker", ["alice/project"])
+        run = database.db_ci_run_create("bob", "other", "manual", "main", self.sha, "{}", "{}")
+        conn = connect()
+        try:
+            conn.execute(
+                "INSERT INTO ci_remote_jobs(run_id,owner,repo,document,source) VALUES(?,?,?,?,?)",
+                (run, "bob", "other", "{}", b"bundle"),
+            )
+        finally:
+            conn.close()
+        self.assertEqual(self.post("claim", {}, token)[2], {"job": None})
+        client = Client(f"http://127.0.0.1:{self.server.port}", token)
+        with mock.patch.object(self.server.app.ci_manager, "trust_all_repositories", True):
+            self.assertEqual(self.post("claim", {}, None)[0], 401)
+            self.assertEqual(self.post("claim", {}, self.token)[0], 401)
+            job = client.request("claim", {})["job"]
+            self.assertEqual(job["run_id"], run)
+            identity = {"run_id": run, "attempt": job["attempt"]}
+            self.assertEqual(self.post("claim", {}, other_token)[2], {"job": None})
+            self.assertEqual(self.post("source", identity, other_token)[0], 404)
+            self.assertEqual(client.request("source", identity)["bundle"], "YnVuZGxl")
+            self.assertTrue(client.request("heartbeat", identity)["accepted"])
+        self.assertEqual(self.post("claim", {}, token)[2], {"job": None})
+        self.assertEqual(self.post("source", identity, token)[0], 404)
+        self.assertEqual(self.post("heartbeat", identity, token)[0], 404)
+        with mock.patch.object(self.server.app.ci_manager, "trust_all_repositories", True):
+            completed = client.request(
+                "complete", dict(identity, progress={"status": "success", "return_code": 0})
+            )
+            self.assertTrue(completed["accepted"])
+
     def test_real_http_execution_bridge_and_secret_filtering(self):
         from pygithost.ci import CIManager
         from pygithost.remote_ci import execute_remote

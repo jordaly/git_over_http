@@ -135,9 +135,13 @@ disabled, IP filtering enabled, and a nonempty allowlist of exact IP addresses
 (no CIDRs). No per-repository grants or CI trust admin IPs are needed in this
 mode. All allowed clients with write access can change commands that run as the
 GitHost account. Review the entire network allowlist before enabling it.
-Enabling sign-in restores the per-repository authorization checks even if this
-setting remains true. This setting does not change CI triggers or runner policy,
-and enabling it does not queue or replay runs.
+In this mode, a Docker runner connecting from an allowed IP must still present
+a valid runner bearer token, but it can claim jobs from any repository. Treat
+every registered runner as trusted with jobs and their authorized secrets.
+Enabling sign-in restores per-repository authorization, including runner token
+scopes, even if this setting remains true. Docker worker policy, concurrency,
+and CI triggers are unchanged. Enabling this mode does not queue or replay
+runs, but runners can pick up already-queued jobs that they could not claim before.
 
 Without an eligible admin IP or sign-in, saved page grants are retained but
 ignored. Environment grants are unaffected when per-repository checks apply.

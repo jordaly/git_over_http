@@ -2779,6 +2779,7 @@ class GitHTTPHandler:
                 '<section class="box" id="trusted-ci-repositories"><h2>Trusted CI repositories</h2>'
                 '<p class="warn">IP-only mode trusts all repositories for host jobs and deployments. '
                 "Every allowed client with write access can change the commands that run on GitHost. "
+                "Authenticated Docker runners may claim jobs for any repository; worker limits still apply. "
                 "Per-repository authorization resumes when sign-in is enabled.</p></section>"
             )
         elif can_manage_trust:
@@ -8649,7 +8650,7 @@ class AsyncGitServer:
         )
         if self.ci_manager.trust_all_repositories:
             logger.warning(
-                "IP-only CI trust enabled: every repository can run host jobs and deployments.",
+                "IP-only CI trust enabled for all repositories: host jobs, deployments, and authenticated runners.",
                 extra={"event": "ci_ip_trust_all_enabled"},
             )
         elif server_config.ip_trust_all_ci_repositories and not server_config.require_auth:

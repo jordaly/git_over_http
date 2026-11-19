@@ -259,6 +259,9 @@ class AppContext(Protocol):
 
 
 class CIManager(Protocol):
+    @property
+    def trust_all_repositories(self) -> bool: ...
+
     async def config(
         self, owner: str, repo: str, revision: str = "HEAD", *, include_secrets: bool = True
     ) -> DynamicJSONObject: ...

@@ -33,7 +33,10 @@ makes outbound HTTP requests only: no SSH and no inbound worker ports.
 
 This initial version supports one job at a time per token. Use a separate token
 and private work directory for each worker. Matching uses explicit repository
-restrictions, not labels. Local `host` and `docker` runners remain available.
+restrictions, not labels, unless GitHost has opted into
+[IP-only CI trust for all repositories](server-settings.md#host-and-deployment-authorization).
+In that mode an allowed client IP and a valid runner token are still required.
+Local `host` and `docker` runners remain available.
 
 Container restrictions below describe the **defaults**. Pipelines may request a
 validated `execution.docker` profile; the worker must separately authorize higher

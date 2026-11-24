@@ -344,6 +344,10 @@ class RepositoryUITests(unittest.TestCase):
         status, _ = self.request(delete, {"csrf": "forged", "confirm": name})
         self.assertEqual(status, 403)
         self.assertTrue(self.bare.exists())
+        # Git leaves read-only objects; Windows cannot unlink them without help.
+        for obj in (self.bare / "objects").rglob("*"):
+            if obj.is_file():
+                obj.chmod(0o444)
 
         status, page = self.request(delete, {"csrf": csrf, "confirm": name})
         self.assertEqual(status, 200)

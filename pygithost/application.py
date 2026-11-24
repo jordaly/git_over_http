@@ -2983,7 +2983,18 @@ class GitHTTPHandler:
                 return await self._ui_repo_settings(
                     owner, repo, "Failed to delete repository data; nothing was removed.", "warn"
                 )
-            await asyncio.to_thread(shutil.rmtree, trash, ignore_errors=True)
+            # remove_checkout clears Windows read-only Git objects and retries
+            # briefly held handles. The repository is already gone either way.
+            from .ci import remove_checkout
+
+            try:
+                await asyncio.to_thread(remove_checkout, str(trash))
+            except OSError as e:
+                logging.getLogger(__name__).warning(
+                    "Deleted repository folder could not be fully removed: path=%s error=%s",
+                    trash,
+                    type(e).__name__,
+                )
         await self._audit("repo_delete", "success", target=full_name)
         return await self._ui_home(str_t(t"Repository {full_name} was deleted."), "ok")
 

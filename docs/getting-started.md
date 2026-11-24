@@ -86,6 +86,7 @@ compared with the native executable.
 | --- | --- |
 | `host`, `port` | Bind address and port. An empty host listens on all interfaces; use `127.0.0.1` for local access only. |
 | `git_project_root` | Repository storage directory. The server account needs access to repositories and write permission for mutations. |
+| `deleted_repos_root` | Optional. Where **Settings → Danger zone → Delete** moves repositories; defaults to a sibling of `git_project_root` named `<root>-deleted` (for example `C:\Servidor_Git-deleted`). Must be outside `git_project_root` so the Git service cannot reach it. See [Restoring a deleted repository](#restoring-a-deleted-repository). |
 | `git_http_backend` | Path to the Git Smart HTTP backend executable, not the main `git` executable. If the file does not exist, or the value is `builtin`, the server uses its built-in pure-Python backend (see below). |
 | `db_path` | SQLite database for users, sessions, settings, CI history, and artifacts. Keep it outside publicly served directories. |
 | `url_prefix` | Git HTTP endpoint prefix; defaults to `/git`. This is not a prefix for all web-interface routes. |
@@ -212,3 +213,30 @@ python -m unittest discover -v
 
 Integration tests execute the real Git HTTP backend and bind a loopback port.
 Docker tests are opt-in; see [Additional CI tests](../README.md#additional-ci-tests).
+
+## Restoring a deleted repository
+
+Deleting a repository from the web interface does not erase anything. Each
+deletion creates `<deleted_repos_root>/<owner>/<repo>-<timestamp>-<id>/` with:
+
+- the Git directory exactly as it was (for example `project.git/`);
+- `data.sqlite`, holding the repository's issues, pull requests, discussions,
+  comments, CI runs, steps, artifacts, deployments and settings rows;
+- `manifest.json`, recording who deleted it, when, and the original path.
+
+To restore, stop the server, back up the database, and move the Git directory
+back to `original_path` from the manifest (no repository with that name may
+exist). Then copy the rows back with the `sqlite3` shell, children last:
+
+```sql
+ATTACH 'C:/Servidor_Git-deleted/root/project-20261124-130000-ab12cd/data.sqlite' AS a;
+BEGIN;
+INSERT INTO pull_requests SELECT * FROM a.pull_requests;  -- repeat for each table in a
+INSERT INTO pr_comments SELECT * FROM a.pr_comments;
+COMMIT;
+```
+
+Insert parent tables (`pull_requests`, `issues`, `discussions`, `ci_runs`)
+before their child tables (`pr_comments`, `issue_comments`,
+`discussion_comments`, `ci_steps`, `ci_artifacts`). To free disk space instead,
+delete the archived folder once it is no longer needed.

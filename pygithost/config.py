@@ -95,6 +95,15 @@ class AppConfig:
     log_backup_count: int
     access_log: bool
     audit_log: bool
+    # Where deleted repositories are moved. None means a sibling of
+    # git_project_root named "<root>-deleted"; never inside git_project_root.
+    deleted_repos_root: str | None = None
+
+    def deleted_repos_dir(self) -> Path:
+        if self.deleted_repos_root:
+            return Path(self.deleted_repos_root)
+        root = Path(self.git_project_root)
+        return root.parent / (root.name + "-deleted")
 
     @classmethod
     def default_for_platform(cls, target: str | None = None) -> AppConfig:
@@ -194,6 +203,13 @@ class AppConfig:
             values["log_file"] = str(values["log_file"]).strip() or None
             if values["log_file"] is not None and len(values["log_file"]) > 4096:
                 raise ValueError("log_file path is too long")
+
+        if values.get("deleted_repos_root") is not None:
+            values["deleted_repos_root"] = str(values["deleted_repos_root"]).strip() or None
+        archive = cls(**values).deleted_repos_dir().absolute()
+        root = Path(values["git_project_root"]).absolute()
+        if archive == root or root in archive.parents:
+            raise ValueError("deleted_repos_root must be outside git_project_root")
 
         if not 0 <= values["port"] <= 65535:
             raise ValueError("port must be between 0 and 65535")

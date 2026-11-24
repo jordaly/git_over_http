@@ -1,5 +1,6 @@
 """SQLite persistence for users, sessions, tokens, and pull requests."""
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -3188,8 +3189,8 @@ def db_pr_reopen(pr_id: int) -> None:
         conn.close()
 
 
-# Every table keyed by repository. Child rows (comments, CI steps and artifacts)
-# are removed by ON DELETE CASCADE.
+# Tables keyed by repository, and child tables keyed through a parent's id.
+# Optional tables only exist on some installations (for example remote CI).
 _REPOSITORY_TABLES = (
     "pull_requests",
     "issues",
@@ -3201,6 +3202,14 @@ _REPOSITORY_TABLES = (
     "repository_ci_settings",
     "repository_languages",
     "repository_overviews",
+    "ci_remote_jobs",
+)
+_REPOSITORY_CHILD_TABLES = (
+    ("pr_comments", "pr_id", "pull_requests"),
+    ("issue_comments", "issue_id", "issues"),
+    ("discussion_comments", "discussion_id", "discussions"),
+    ("ci_steps", "run_id", "ci_runs"),
+    ("ci_artifacts", "run_id", "ci_runs"),
 )
 
 
@@ -3220,17 +3229,58 @@ def db_repository_active_ci(owner: str, repo: str) -> bool:
         conn.close()
 
 
-def db_repository_delete(owner: str, repo: str) -> None:
-    """Remove all stored data for a repository in one transaction."""
+def db_repository_archive(owner: str, repo: str, archive_path: str) -> dict[str, int]:
+    """Move all stored data for a repository into a new SQLite file.
+
+    The rows are copied to *archive_path* and removed from the live database in
+    one transaction, so a deleted repository can be inspected or restored later
+    while a new repository with the same name starts empty. Returns row counts.
+    """
+    if os.path.exists(archive_path):
+        raise FileExistsError(archive_path)
     conn = _db_connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        existing = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        conn.execute("ATTACH DATABASE ? AS archive", (archive_path,))
+        counts: dict[str, int] = {}
         try:
-            for table in _REPOSITORY_TABLES:
-                conn.execute(f"DELETE FROM {table} WHERE owner=? AND repo=?", (owner, repo))
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                key = (owner, repo)
+                for child, column, parent in _REPOSITORY_CHILD_TABLES:
+                    if child not in existing:
+                        continue
+                    where = f"{column} IN (SELECT id FROM main.{parent} WHERE owner=? AND repo=?)"
+                    conn.execute(
+                        f"CREATE TABLE archive.{child} AS SELECT * FROM main.{child} WHERE {where}",
+                        key,
+                    )
+                    counts[child] = conn.execute(
+                        f"DELETE FROM main.{child} WHERE {where}", key
+                    ).rowcount
+                for table in _REPOSITORY_TABLES:
+                    if table not in existing:
+                        continue
+                    where = "owner=? AND repo=?"
+                    conn.execute(
+                        f"CREATE TABLE archive.{table} AS SELECT * FROM main.{table} WHERE {where}",
+                        key,
+                    )
+                    counts[table] = conn.execute(
+                        f"DELETE FROM main.{table} WHERE {where}", key
+                    ).rowcount
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.execute("DETACH DATABASE archive")
+        return counts
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(archive_path)
+        raise
     finally:
         conn.close()

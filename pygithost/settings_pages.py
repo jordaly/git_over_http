@@ -297,6 +297,7 @@ BASIC_GROUPS = {
         "db_path",
         "trace_log",
         "flat_owner_ui",
+        "deleted_repos_root",
     ),
     "Security": (
         "require_auth",
@@ -336,6 +337,7 @@ LABELS = {
     "git_http_backend": 'Git HTTP backend executable (or "builtin")',
     "db_path": "Database path",
     "trace_log": "Git trace log (optional)",
+    "deleted_repos_root": "Deleted repositories folder (optional; default <storage>-deleted)",
     "require_auth": "Require authentication",
     "filter_ips": "Restrict client IPs",
     "allowed_client_ips": "Allowed IP addresses (one per line)",
@@ -429,7 +431,11 @@ def save_basic(config_path: str | Path | None, form: Mapping[str, str]) -> None:
         else:
             if len(text) > 4096 or any(ord(char) < 32 for char in text):
                 raise ValueError(f"Invalid {key}.")
-            current[key] = None if key in ("trace_log", "log_file") and not text else text
+            current[key] = (
+                None
+                if key in ("trace_log", "log_file", "deleted_repos_root") and not text
+                else text
+            )
     for key in (
         "git_project_root",
         "git_http_backend",

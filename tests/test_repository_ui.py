@@ -5,6 +5,7 @@ import io
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -349,13 +350,30 @@ class RepositoryUITests(unittest.TestCase):
             if obj.is_file():
                 obj.chmod(0o444)
 
+        archive = self.root.parent / (self.root.name + "-deleted")
+        self.addCleanup(shutil.rmtree, archive, ignore_errors=True)
         status, page = self.request(delete, {"csrf": csrf, "confirm": name})
         self.assertEqual(status, 200)
-        self.assertIn(f"Repository {name} was deleted.", page)
+        self.assertIn(f"Repository {name} was deleted and moved to the archive.", page)
         self.assertFalse(self.bare.exists())
-        self.assertEqual([p.name for p in self.root.glob(".deleting-*")], [])
         self.assertEqual(database.db_issue_list(FLAT_OWNER_UI, "project", None), [])
         self.assertEqual(self.request(self.base)[0], 404)
+        self.assertEqual(self.request(f"/git/{FLAT_OWNER_UI}/project.git/info/refs")[0], 404)
+
+        # Nothing was erased: Git history and rows are kept in the archive.
+        [kept] = (archive / FLAT_OWNER_UI).iterdir()
+        self.assertTrue(kept.name.startswith("project-"))
+        history = self.git("--git-dir", kept / "project.git", "rev-parse", "main")
+        self.assertEqual(history, self.sha)
+        manifest = json.loads((kept / "manifest.json").read_text())
+        self.assertEqual((manifest["owner"], manifest["repo"]), (FLAT_OWNER_UI, "project"))
+        self.assertEqual(manifest["rows"]["issues"], 1)
+        archived = sqlite3.connect(kept / "data.sqlite")
+        try:
+            titles = archived.execute("SELECT title FROM issues").fetchall()
+        finally:
+            archived.close()
+        self.assertEqual(titles, [("Doomed issue",)])
 
     def test_delete_repository_requires_admin(self):
         _, page = self.request(self.base + "/settings")

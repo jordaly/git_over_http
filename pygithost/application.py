@@ -922,6 +922,27 @@ def _repo_git_path(owner_ui: str, repo: str) -> str:
     return str(bare_dotgit)
 
 
+def _move_directory(source: Path, target: Path) -> None:
+    """Rename a directory, copying across filesystems when a rename is impossible."""
+    try:
+        os.rename(source, target)
+        return
+    except OSError as e:
+        import errno
+
+        # EXDEV on POSIX; ERROR_NOT_SAME_DEVICE (17) on Windows.
+        if e.errno != errno.EXDEV and getattr(e, "winerror", None) != 17:
+            raise
+    from .ci import remove_checkout
+
+    try:
+        shutil.copytree(source, target, symlinks=True)
+    except BaseException:
+        remove_checkout(str(target))
+        raise
+    remove_checkout(str(source))
+
+
 def _repo_bare_path(owner_ui: str, repo: str) -> str:
     """
     Backward-compatible name used by the rest of the code.
@@ -2880,7 +2901,7 @@ class GitHTTPHandler:
                     t"""<details class="repo-delete"><summary class="btn danger">Delete this repository</summary>
 <form method="POST" action="{base}/settings/delete" class="repo-delete-form" data-expected="{full_name}">
 <input type="hidden" name="csrf" value="{self._settings_csrf_token()}">
-<p class="warn" role="alert">This permanently deletes the <strong>{full_name}</strong> repository, its Git history, and all of its issues, pull requests, discussions, CI runs, deployments, and artifacts. This cannot be undone.</p>
+<p class="warn" role="alert">This removes the <strong>{full_name}</strong> repository from the server: it can no longer be cloned or pushed, and its issues, pull requests, discussions, CI runs, deployments, and artifacts disappear from the web interface. The repository and its data are moved to the deleted-repositories archive, where only an administrator with access to the server can restore them.</p>
 <label for="repo-delete-confirm">To confirm, type <strong>{full_name}</strong> in the box below</label>
 <input id="repo-delete-confirm" name="confirm" autocomplete="off" spellcheck="false" required>
 <button type="submit" class="danger" disabled>I understand, delete this repository</button>
@@ -2891,7 +2912,7 @@ class GitHTTPHandler:
     const button = form.querySelector("button[type=submit]");
     input.addEventListener("input", function() {{ button.disabled = input.value !== form.dataset.expected; }});
     form.addEventListener("submit", function(event) {{
-      if (input.value !== form.dataset.expected || !window.confirm("Permanently delete " + form.dataset.expected + "? This cannot be undone.")) event.preventDefault();
+      if (input.value !== form.dataset.expected || !window.confirm("Delete " + form.dataset.expected + "? It will be moved to the deleted-repositories archive.")) event.preventDefault();
     }});
   }});
 }})();</script>"""
@@ -2901,7 +2922,7 @@ class GitHTTPHandler:
             t"""<main class="repo-page">{_repo_tabs(base, "settings")}<div class="topbar"><div><h2>Settings</h2><p class="muted">Repository administration.</p></div></div>
 {notice_html}
 <section class="box repo-danger-zone"><h2>Danger zone</h2>
-<div class="repo-danger-row"><div><strong>Delete this repository</strong><p class="muted">Once you delete a repository, there is no going back. Please be certain.</p></div></div>
+<div class="repo-danger-row"><div><strong>Delete this repository</strong><p class="muted">The repository is moved to the server's deleted-repositories archive. Restoring it requires server access. Please be certain.</p></div></div>
 {delete_html}</section></main>"""
         )
         await _send_html(
@@ -2911,7 +2932,7 @@ class GitHTTPHandler:
         )
 
     async def _ui_repo_delete(self, owner: str, repo: str) -> None:
-        from .database import db_repository_active_ci, db_repository_delete
+        from .database import db_repository_active_ci, db_repository_archive
 
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
@@ -2963,40 +2984,62 @@ class GitHTTPHandler:
                     "warn",
                     409,
                 )
-            # Move the directory aside first so the repository disappears
-            # atomically, then drop its data, then reclaim the disk space.
-            trash = repo_git.with_name(f".deleting-{repo_git.name}-{secrets.token_hex(6)}")
+            # Nothing is erased: the folder moves to the archive (outside the Git
+            # root, so the Git service cannot reach it) and the database rows move
+            # into a SQLite file beside it, so an administrator can restore both.
+            config = self.server.context.config
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest = (
+                config.deleted_repos_dir().absolute()
+                / owner
+                / f"{repo}-{stamp}-{secrets.token_hex(3)}"
+            )
+            archived_git = dest / repo_git.name
             try:
-                os.rename(repo_git, trash)
+                dest.mkdir(parents=True)
+                await asyncio.to_thread(_move_directory, repo_git, archived_git)
             except OSError as e:
-                await self._audit("repo_delete", "failure", target=full_name, detail=str(e))
-                return await self._ui_repo_settings(
-                    owner, repo, str_t(t"Failed to delete repository: {e}"), "warn", 500
-                )
-            try:
-                await _call_in_thread(db_repository_delete, owner, repo)
-            except Exception as e:
-                os.rename(trash, repo_git)
+                with contextlib.suppress(OSError):
+                    dest.rmdir()
                 await self._audit(
                     "repo_delete", "failure", target=full_name, detail=type(e).__name__
                 )
                 return await self._ui_repo_settings(
-                    owner, repo, "Failed to delete repository data; nothing was removed.", "warn"
+                    owner,
+                    repo,
+                    str_t(t"Failed to move repository to the archive: {e}"),
+                    "warn",
+                    500,
                 )
-            # remove_checkout clears Windows read-only Git objects and retries
-            # briefly held handles. The repository is already gone either way.
-            from .ci import remove_checkout
-
             try:
-                await asyncio.to_thread(remove_checkout, str(trash))
-            except OSError as e:
-                logging.getLogger(__name__).warning(
-                    "Deleted repository folder could not be fully removed: path=%s error=%s",
-                    trash,
-                    type(e).__name__,
+                counts = await _call_in_thread(
+                    db_repository_archive, owner, repo, str(dest / "data.sqlite")
                 )
-        await self._audit("repo_delete", "success", target=full_name)
-        return await self._ui_home(str_t(t"Repository {full_name} was deleted."), "ok")
+            except Exception as e:
+                await asyncio.to_thread(_move_directory, archived_git, repo_git)
+                with contextlib.suppress(OSError):
+                    dest.rmdir()
+                await self._audit(
+                    "repo_delete", "failure", target=full_name, detail=type(e).__name__
+                )
+                return await self._ui_repo_settings(
+                    owner, repo, "Failed to archive repository data; nothing was changed.", "warn"
+                )
+            manifest = {
+                "owner": owner,
+                "repo": repo,
+                "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "deleted_by": self.remote_user or ("ip:" + self._client_ip()),
+                "original_path": str(repo_git),
+                "git_dir": repo_git.name,
+                "rows": counts,
+            }
+            with contextlib.suppress(OSError):
+                (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        await self._audit("repo_delete", "success", target=full_name, detail=str(dest))
+        return await self._ui_home(
+            str_t(t"Repository {full_name} was deleted and moved to the archive."), "ok"
+        )
 
     # ========================================================
     # UI: Admin Users

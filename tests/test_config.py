@@ -27,6 +27,23 @@ class AppConfigTests(unittest.TestCase):
             self.assertEqual(loaded, original)
             self.assertIsInstance(json.loads(path.read_text()), dict)
 
+    def test_deleted_repos_root_defaults_beside_and_never_inside_git_root(self):
+        config = AppConfig.from_mapping({"platform": "Linux", "git_project_root": "/srv/git"})
+        self.assertEqual(config.deleted_repos_dir(), Path("/srv/git-deleted"))
+        custom = AppConfig.from_mapping(
+            {"platform": "Linux", "git_project_root": "/srv/git", "deleted_repos_root": "/bk"}
+        )
+        self.assertEqual(custom.deleted_repos_dir(), Path("/bk"))
+        for inside in ("/srv/git", "/srv/git/.trash"):
+            with self.assertRaises(ValueError):
+                AppConfig.from_mapping(
+                    {
+                        "platform": "Linux",
+                        "git_project_root": "/srv/git",
+                        "deleted_repos_root": inside,
+                    }
+                )
+
     def test_invalid_port_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "port"):
             AppConfig.from_mapping({"platform": "Linux", "port": 70000})

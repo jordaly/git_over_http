@@ -333,7 +333,7 @@ LABELS = {
     "url_prefix": "Git URL prefix",
     "realm": "Authentication realm",
     "git_project_root": "Repository storage directory",
-    "git_http_backend": "Git HTTP backend executable",
+    "git_http_backend": 'Git HTTP backend executable (or "builtin")',
     "db_path": "Database path",
     "trace_log": "Git trace log (optional)",
     "require_auth": "Require authentication",

@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import secrets
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -970,6 +971,36 @@ def _git_dir_path_info(owner_ui: str, repo: str, rest: list[str]) -> str | None:
 
     path_parts = [*rel_parts, *rest]
     return "/" + "/".join(path_parts)
+
+
+# Values of `git_http_backend` that explicitly select the built-in Python backend.
+_BUILTIN_GIT_BACKEND_NAMES = frozenset({"", "builtin", "python"})
+_FALLBACK_BACKEND_SCRIPT = Path(__file__).resolve().with_name("git_http_fallback.py")
+_fallback_backend_logged = False
+
+
+def _git_backend_uses_fallback() -> bool:
+    """True when the configured git-http-backend executable is unavailable."""
+    configured = (GIT_HTTP_BACKEND or "").strip()
+    return configured.lower() in _BUILTIN_GIT_BACKEND_NAMES or not os.path.isfile(configured)
+
+
+def _git_backend_command() -> list[str]:
+    """Command for the Git Smart HTTP CGI program.
+
+    Uses the configured `git-http-backend` when it exists; otherwise the pure-Python
+    replacement in `git_http_fallback.py`, which speaks the same CGI contract.
+    """
+    global _fallback_backend_logged
+    if not _git_backend_uses_fallback():
+        return [GIT_HTTP_BACKEND]
+    if not _fallback_backend_logged:
+        _fallback_backend_logged = True
+        logger.warning(
+            "git-http-backend not found at %r; using the built-in Python Git HTTP backend",
+            GIT_HTTP_BACKEND,
+        )
+    return [sys.executable, "-I", str(_FALLBACK_BACKEND_SCRIPT)]
 
 
 def _map_git_http_path_info(path_info: str) -> str:
@@ -8279,7 +8310,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             await self._send_continue_if_needed()
 
             proc = await asyncio.create_subprocess_exec(
-                GIT_HTTP_BACKEND,
+                *_git_backend_command(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=stderr_target,
@@ -9015,9 +9046,23 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
         print(str_t(t"ERROR: Could not load config file '{config_path}': {exc}"), file=sys.stderr)
         sys.exit(1)
 
-    if not os.path.isfile(GIT_HTTP_BACKEND):
-        print(str_t(t"ERROR: GIT_HTTP_BACKEND not found: {GIT_HTTP_BACKEND}"), file=sys.stderr)
-        sys.exit(1)
+    if _git_backend_uses_fallback():
+        if shutil.which("git") is None:
+            print(
+                str_t(
+                    t"ERROR: GIT_HTTP_BACKEND not found ('{GIT_HTTP_BACKEND}') and no `git` "
+                    t"executable is on PATH for the built-in Python backend."
+                ),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(
+            str_t(
+                t"WARNING: GIT_HTTP_BACKEND not found ('{GIT_HTTP_BACKEND}'); "
+                t"using the built-in Python Git HTTP backend."
+            ),
+            file=sys.stderr,
+        )
     if not os.path.isdir(GIT_PROJECT_ROOT):
         print(str_t(t"ERROR: GIT_PROJECT_ROOT does not exist: {GIT_PROJECT_ROOT}"), file=sys.stderr)
         sys.exit(1)

@@ -58,7 +58,8 @@ are also rendered directly in each repository's **CI → Documentation** page.
 ## Requirements
 
 - Python 3.14 or newer (the UI renderer uses Python t-strings)
-- Git and `git-http-backend`
+- Git. `git-http-backend` is used when present; otherwise a built-in pure-Python
+  replacement serves Git Smart HTTP (see [Getting started](docs/getting-started.md)).
 
 ## Configuration and startup
 
@@ -168,7 +169,16 @@ Run the suite with the project virtual environment:
 .venv/bin/python -m unittest discover -v
 ```
 
-The integration tests use the real `git-http-backend` and bind a loopback port.
+The integration tests use the real `git-http-backend` when it is installed and bind a
+loopback port. `tests/test_git_http_fallback.py` runs real clones and pushes through
+the built-in Python backend.
+`tests/test_git_http_conformance.py` runs the same wire-level request matrix and git
+client workflows against every Git HTTP backend and compares each one with
+`git-http-backend` byte for byte. To compare backend performance:
+
+```sh
+.venv/bin/python scripts/bench_git_http.py          # add --quick for a short run
+```
 
 Per-option CI validation and configuration-mapping tests run with the regular suite.
 To also check documentation and CI example highlighting in a real Chromium

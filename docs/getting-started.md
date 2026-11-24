@@ -64,13 +64,29 @@ its platform-specific paths. In particular, verify `git_http_backend` against
 your Git installation. Keep HTTP and insecure cookies confined to loopback;
 use HTTPS and secure cookies for remote access.
 
+### Built-in Git HTTP backend
+
+When `git_http_backend` points to a missing file, the server prints
+`WARNING: GIT_HTTP_BACKEND not found ...; using the built-in Python Git HTTP backend`
+and keeps running. Set `"git_http_backend": "builtin"` to choose it explicitly.
+
+The built-in backend is a pure-Python implementation of the same CGI program
+(`pygithost/git_http_fallback.py`). It drives `git upload-pack` and
+`git receive-pack`, exactly like `git-http-backend`, so the `git` executable must
+still be on `PATH`. It supports protocol v0, v1 and v2, gzip request bodies, the
+read-only dumb HTTP protocol, and the per-repository `http.uploadpack`,
+`http.receivepack` and `http.getanyfile` settings. Authentication, write scopes,
+branch protection and CI triggers behave identically with either backend. Each
+request starts a short-lived Python process, which adds a few tens of milliseconds
+compared with the native executable.
+
 ### Essential configuration fields
 
 | Field | Purpose / guidance |
 | --- | --- |
 | `host`, `port` | Bind address and port. An empty host listens on all interfaces; use `127.0.0.1` for local access only. |
 | `git_project_root` | Repository storage directory. The server account needs access to repositories and write permission for mutations. |
-| `git_http_backend` | Path to the Git Smart HTTP backend executable, not the main `git` executable. |
+| `git_http_backend` | Path to the Git Smart HTTP backend executable, not the main `git` executable. If the file does not exist, or the value is `builtin`, the server uses its built-in pure-Python backend (see below). |
 | `db_path` | SQLite database for users, sessions, settings, CI history, and artifacts. Keep it outside publicly served directories. |
 | `url_prefix` | Git HTTP endpoint prefix; defaults to `/git`. This is not a prefix for all web-interface routes. |
 | `filter_ips` | Enables client IP filtering; defaults to `true`. |
@@ -144,7 +160,7 @@ Never embed credentials in a clone URL or commit them in scripts.
 | Configuration file not found | Pass the same `--config` path to both generation and startup. |
 | Browser cannot connect | Check startup errors, bind address, port, firewall, and whether another process occupies the port. |
 | Request denied by IP filtering | Check `allowed_client_ips` against the actual connecting address. For this guide, use `127.0.0.1`, not an IPv6 localhost address. |
-| Git clone/push fails | Confirm `git_http_backend` exists, copy the repository's clone URL, and check credentials, token scope, filesystem permissions, and branch protection. |
+| Git clone/push fails | Confirm `git_http_backend` exists (or that the built-in backend is in use, as reported at startup), copy the repository's clone URL, and check credentials, token scope, filesystem permissions, and branch protection. |
 | Login does not persist | Check whether `session_cookie_secure` is enabled while accessing the site over plain HTTP. |
 | Styles or scripts are missing | Check that `static_root` points to this checkout's `static/` directory. |
 | PR creation fails with an author foreign-key or NOT NULL constraint | Back up the database and restart the updated server. Startup migrates legacy NOT NULL authors to nullable authors while preserving PR history. Do not create user ID 0 or disable foreign keys. |

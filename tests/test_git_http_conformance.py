@@ -39,7 +39,9 @@ from tests.git_http_backends import (
     build_project_root,
     git,
     git_env,
+    isolate_git_config,
     make_source,
+    restore_git_config,
 )
 from tests.test_server import ServerRunner, _which_git
 
@@ -64,6 +66,9 @@ class Scenario:
     compare_body: bool = True
     # Documented, intentional status difference from the reference backend.
     status_may_differ: bool = False
+    # Response carries a side-band pack. git may build a byte-different but
+    # equivalent pack for the same request, so packs compare by object set.
+    pack_response: bool = False
 
 
 def scenarios(facts: dict[str, str]) -> list[Scenario]:
@@ -136,6 +141,7 @@ def scenarios(facts: dict[str, str]) -> list[Scenario]:
             "POST",
             {"Content-Type": UPLOAD_REQ},
             v0_want,
+            pack_response=True,
             expect_type=result,
         ),
         Scenario(
@@ -144,6 +150,7 @@ def scenarios(facts: dict[str, str]) -> list[Scenario]:
             "POST",
             {"Content-Type": UPLOAD_REQ, "Content-Encoding": "gzip"},
             gzip.compress(v0_want, mtime=0),
+            pack_response=True,
             expect_type=result,
         ),
         Scenario(
@@ -160,6 +167,7 @@ def scenarios(facts: dict[str, str]) -> list[Scenario]:
             "POST",
             {"Content-Type": UPLOAD_REQ, **V2},
             v2_fetch,
+            pack_response=True,
             expect_type=result,
         ),
         Scenario(
@@ -169,6 +177,7 @@ def scenarios(facts: dict[str, str]) -> list[Scenario]:
             {"Content-Type": UPLOAD_REQ, **V2},
             v2_fetch,
             chunked=True,
+            pack_response=True,
             expect_type=result,
         ),
         Scenario(
@@ -299,6 +308,47 @@ def normalize_headers(headers: dict[str, str]) -> dict[str, str]:
     return headers
 
 
+def split_sideband(body: bytes) -> tuple[list[bytes], bytes]:
+    """Split a pkt-line response into protocol lines and side-band 1 pack data."""
+    lines: list[bytes] = []
+    pack = bytearray()
+    pos = 0
+    while pos + 4 <= len(body):
+        size = int(body[pos : pos + 4], 16)
+        if size < 4:
+            lines.append(body[pos : pos + 4])
+            pos += 4
+            continue
+        payload = body[pos + 4 : pos + size]
+        pos += size
+        if payload[:1] == b"\x01":
+            pack.extend(payload[1:])
+        else:
+            lines.append(payload)
+    assert pos == len(body), "trailing bytes after pkt-lines"
+    return lines, bytes(pack)
+
+
+def pack_object_ids(pack: bytes) -> list[str]:
+    """Validate a pack with git index-pack and return its sorted object ids."""
+    with tempfile.TemporaryDirectory(prefix="pack-check-") as tmp:
+        pack_path = Path(tmp) / "check.pack"
+        pack_path.write_bytes(pack)
+        subprocess.run(["git", "index-pack", str(pack_path)], check=True, capture_output=True)
+        with open(pack_path.with_suffix(".idx"), "rb") as idx:
+            listing = subprocess.run(
+                ["git", "show-index"], stdin=idx, check=True, capture_output=True, text=True
+            ).stdout
+    return sorted(line.split()[1] for line in listing.splitlines())
+
+
+def normalize_pack_body(body: bytes) -> bytes:
+    lines, pack = split_sideband(body)
+    assert pack.startswith(b"PACK"), "no pack in response"
+    objects = pack_object_ids(pack)
+    return b"\n".join([*lines, b"PACK objects: " + ",".join(objects).encode()])
+
+
 def send(port: int, scenario: Scenario) -> Record:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
@@ -324,6 +374,8 @@ def send(port: int, scenario: Scenario) -> Record:
             for name, value in response.getheaders()
             if name.lower() not in IGNORED_HEADERS
         }
+        if scenario.pack_response and response.status == 200:
+            body = normalize_pack_body(body)
         return Record(response.status, normalize_headers(headers), body)
     finally:
         conn.close()
@@ -388,7 +440,9 @@ class WireConformanceTests(unittest.TestCase):
                 self.assertIn(b"symref-target:refs/heads/main", records["rpc-v2-ls-refs"].body)
                 self.assertIn(b"peeled:", records["rpc-v2-ls-refs"].body)
                 for name in ("rpc-v0-fetch", "rpc-v0-fetch-gzip", "rpc-v2-fetch"):
-                    self.assertIn(b"PACK", records[name].body, name)
+                    # Normalised to the validated object list: commits, trees, blobs and tags.
+                    self.assertIn(b"PACK objects: ", records[name].body, name)
+                    self.assertIn(main, records[name].body, name)
                 self.assertEqual(records["rpc-v2-fetch"].body, records["rpc-v2-fetch-chunked"].body)
                 self.assertEqual(records["dumb-head-file"].body, b"ref: refs/heads/main\n")
                 self.assertIn(main + b"\trefs/heads/main\n", records["dumb-info-refs"].body)
@@ -780,6 +834,14 @@ for _name, _path in BACKENDS.items():
         _cls = unittest.skip(f"{_name} backend not available")(_cls)
     globals()[_cls.__name__] = _cls
 del _name, _path, _cls
+
+
+def setUpModule() -> None:
+    isolate_git_config()
+
+
+def tearDownModule() -> None:
+    restore_git_config()
 
 
 if __name__ == "__main__":

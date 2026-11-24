@@ -14,6 +14,7 @@ from pygithost import application
 from pygithost.ci import validate_config
 from pygithost.git_http_fallback import Backend, pkt_line
 from tests.ci_fixtures import commit_legacy_config
+from tests.git_http_backends import isolate_git_config, restore_git_config
 from tests.test_server import ServerRunner, _which_git, _which_git_backend
 
 MISSING_BACKEND = "/nonexistent/git-http-backend"
@@ -305,6 +306,14 @@ class FallbackEndToEndTests(unittest.TestCase):
                 finally:
                     conn.close()
         self.assertEqual(bodies[0], bodies[1])
+
+
+def setUpModule() -> None:
+    isolate_git_config()
+
+
+def tearDownModule() -> None:
+    restore_git_config()
 
 
 if __name__ == "__main__":

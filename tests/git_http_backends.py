@@ -28,6 +28,27 @@ REFERENCE_BACKEND = "native"
 
 FIXED_DATE = "2026-01-02T03:04:05+00:00"
 
+# Machine-wide git settings (Git for Windows sets http.receivepack=true in its
+# system gitconfig, for example) must not leak into backend behaviour under test.
+_ISOLATION = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+_saved_environment: dict[str, str | None] = {}
+
+
+def isolate_git_config() -> None:
+    """Make the server, backends and git clients ignore system/global git config."""
+    for key, value in _ISOLATION.items():
+        _saved_environment[key] = os.environ.get(key)
+        os.environ[key] = value
+
+
+def restore_git_config() -> None:
+    for key, value in _saved_environment.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    _saved_environment.clear()
+
 
 def git_env(**extra: str) -> dict[str, str]:
     env = os.environ.copy()

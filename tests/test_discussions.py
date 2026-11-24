@@ -109,7 +109,7 @@ class DiscussionsTests(unittest.TestCase):
         # Mark the answer, badge appears, row is stored on the discussion.
         status, page = self.request(self.base + f"/discussions/{discussion_id}/answer/{cid}", {})
         self.assertEqual(status, 200, page)
-        self.assertIn("✓ Answer", page)
+        self.assertRegex(page, r"octicon-check-circle-fill.*?</svg>Answer")
         self.assertIn(f'href="#reply-{cid}">Jump to accepted answer</a>', page)
         self.assertIn(f'id="reply-{cid}" class="pr-comment discussion-answered"', page)
         self.assertEqual(database.db_discussion_get(discussion_id)[10], cid)

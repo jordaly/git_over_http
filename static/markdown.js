@@ -39,6 +39,8 @@
             const editor = new window.toastui.Editor({
                 el: holder, height: "240px", initialEditType: "markdown",
                 previewStyle: "tab", usageStatistics: false, hideModeSwitch: true,
+                // Don't steal focus or scroll the page down to the comment box on load.
+                autofocus: false,
                 initialValue: textarea.value || "",
                 extendedAutolinks: true,
                 linkAttribute: {rel: "noreferrer noopener", target: "_blank"},

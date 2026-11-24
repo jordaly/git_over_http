@@ -236,7 +236,9 @@ class GitHTTPServerRealBackendTests(unittest.TestCase):
                 self.assertNotIn("USERNAME:PASSWORD", body)
                 self.assertNotIn("TOKEN_VALUE", body)
                 self.assertIn('href="/r/root/repo/blob/main/source.txt"', body)
-                self.assertLess(body.index(">Files</h2>"), body.index(">README.md</h2>"))
+                self.assertLess(
+                    body.index('class="box repo-files-panel"'), body.index('id="repo-readme"')
+                )
             finally:
                 conn.close()
 

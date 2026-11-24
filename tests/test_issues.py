@@ -74,7 +74,7 @@ class IssuesTests(unittest.TestCase):
         self.assertEqual(status, 200, page)
         self.assertIn('id="issues-tab-open"', page)
         self.assertIn('id="issues-tab-closed"', page)
-        self.assertIn("No issues.", page)
+        self.assertIn("No issues", page)
         self.assertIn('href="' + self.base + '/issues/new"', page)
 
     def test_create_list_and_view_issue(self):

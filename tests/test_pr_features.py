@@ -207,7 +207,7 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertIn(">Open 1<", page)
         self.assertIn(">All 1<", page)
         self.assertIn('href="' + self.base + '/pulls/new"', page)
-        self.assertIn("💬 1", page)
+        self.assertRegex(page, r"octicon-comment.*?</svg>1</a>")
         self.assertIn("just now", page)
         self.assertIn("pill-open", page)
         status, page = self.request(self.base + "/pulls?status=all")

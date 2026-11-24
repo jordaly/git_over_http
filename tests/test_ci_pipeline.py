@@ -918,7 +918,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(b"PYGITHOST_PIPELINE", body)
             status, body, _ = await asyncio.to_thread(fetch, f"/r/{FLAT_OWNER_UI}/repo/artifacts")
             self.assertEqual(status, 200)
-            self.assertIn(b'aria-current="page">Artifacts', body)
+            self.assertRegex(
+                body, rb'aria-current="page"><svg[^>]*>.*?</svg><span>Artifacts</span>'
+            )
             self.assertIn(f"ci-{run_id}-artifacts.zip".encode(), body)
             self.assertIn(f"/ci/runs/{run_id}/artifacts".encode(), body)
             status, body, _ = await asyncio.to_thread(fetch, f"/r/{FLAT_OWNER_UI}/repo")

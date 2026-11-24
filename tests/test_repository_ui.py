@@ -526,7 +526,7 @@ class RepositoryUITests(unittest.TestCase):
     def test_branches_show_metadata_filters_and_safe_actions(self):
         status, page = self.request(self.base + "/branches")
         self.assertEqual(status, 200)
-        self.assertIn('aria-current="page">Branches', page)
+        self.assertRegex(page, r'aria-current="page"><svg[^>]*>.*?</svg><span>Branches</span>')
         self.assertIn("Default branch", page)
         self.assertIn("Initial UI fixture", page)
         self.assertIn("CI fixture", page)
@@ -1001,7 +1001,9 @@ class RepositoryUITests(unittest.TestCase):
                 status, page = self.request(self.base + path)
                 self.assertEqual(status, 200)
                 self.assertIn('aria-label="Repository navigation"', page)
-                self.assertIn('aria-current="page">Code', page)
+                self.assertRegex(
+                    page, r'aria-current="page">(<svg[^>]*>.*?</svg>)?<span>Code</span>'
+                )
 
     def test_repository_header_is_identical_and_precedes_tab_content(self):
         headers = []
@@ -1359,8 +1361,8 @@ class RepositoryUITests(unittest.TestCase):
         self.assertIn("Update overview docs", page)
         self.assertIn("UI author", page)
         self.assertIn('aria-label="Repository files navigation"', page)
-        self.assertIn('href="#repo-readme">README', page)
-        self.assertIn('href="#repo-license">MIT license', page)
+        self.assertRegex(page, r'href="#repo-readme"[^>]*>(<svg[^>]*>.*?</svg>)?README')
+        self.assertRegex(page, r'href="#repo-license">(<svg[^>]*>.*?</svg>)?MIT license')
         self.assertIn("<strong>useful</strong>", page)
         self.assertIn("3 commits", page)
         self.assertIn("v1.0", page)

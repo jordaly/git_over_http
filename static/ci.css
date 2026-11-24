@@ -6,14 +6,28 @@
 #ci-config-json { font-family: ui-monospace, Consolas, monospace; line-height: 1.5; tab-size: 2; resize: vertical; }
 #ci-json-status { display: inline-block; margin-inline-start: 12px; }
 .ci-page .topbar { margin-bottom: 0; }
-.repo-navigation { min-width: 0; width: 100%; max-width: 1200px; margin-inline: auto; }
-.repo-header { margin: 0 0 16px; }
-.repo-header h1 { margin: 4px 0 0; font-size: 28px; line-height: 1.25; font-weight: 400; }
+/* Repository header band: full-bleed, attached to the app header like GitHub's repo UnderlineNav. */
+.repo-navigation {
+  min-width: 0;
+  margin-inline: calc(50% - 50vw);
+  padding-inline: calc(50vw - 50%);
+  padding-top: 16px;
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--border);
+}
+.repo-ci-navigation { min-width: 0; }
+.app-container > main > :is(.repo-navigation, .repo-ci-navigation):first-child,
+.app-container > :is(.repo-navigation, .repo-ci-navigation):first-child { margin-top: -24px; }
+body:has(.repo-navigation) .app-header { border-bottom: 0; }
+.repo-header { margin: 0 0 8px; }
+.repo-header h1 { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 0; font-size: 20px; line-height: 30px; font-weight: 400; }
+.repo-header-icon { color: var(--muted); margin-right: 4px; }
 .repo-header h1 a { color: var(--link); }
-.repo-header h1 strong { font-weight: 650; }
-.repo-header .repo-eyebrow { margin: 0; font-size: 11px; line-height: 1.8; }
-.repo-navigation > .repo-tabs { margin: 0; }
-.repo-ci-navigation > .ci-tabs { margin-top: 16px; }
+.repo-header-owner { color: var(--link); }
+.repo-header-sep { color: var(--muted); margin: 0 2px; }
+.repo-header h1 strong { font-weight: 600; }
+.repo-navigation > .repo-tabs { margin: 0; border-bottom: 0; }
+.repo-ci-navigation > .ci-tabs:not(.repo-tabs) { margin-top: 24px; }
 .repo-page > .topbar, .ci-page > .topbar { align-items: flex-start; }
 .repo-page > .topbar h2, .ci-page > .topbar h2 { margin: 0; font-size: 20px; line-height: 1.4; }
 .ci-page .row { align-items: center; }
@@ -117,10 +131,22 @@
 .ci-guide pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
 .ci-guide nav { margin-bottom: 20px; font-size: 13px; }
 .ci-guide .ci-variable-list { columns: 2 280px; font-size: 13px; }
-.ci-tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--border-strong); }
-.ci-tabs a { padding: 10px 14px; color: var(--muted); border-bottom: 2px solid transparent; font-size: 13px; }
-.ci-tabs a:hover { background: var(--surface-hover); text-decoration: none; }
-.ci-tabs a[aria-current="page"] { color: var(--link); border-bottom-color: var(--link); background: var(--accent-bg); font-weight: 600; }
+/* UnderlineNav (repo tabs) and sub-navigation (CI tabs). */
+.ci-tabs { display: flex; gap: 8px; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+.ci-tabs a { position: relative; display: inline-flex; align-items: center; gap: 8px; padding: 0 8px; min-height: 32px; margin-bottom: 8px; color: var(--fg); font-size: 14px; line-height: 30px; border-radius: 6px; white-space: nowrap; }
+.ci-tabs a .octicon { color: var(--muted); }
+.ci-tabs a:hover { background: var(--btn-hover); text-decoration: none; }
+.ci-tabs a[aria-current="page"] { font-weight: 600; }
+.ci-tabs a[aria-current="page"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: -9px; height: 2px; border-radius: 6px; background: #fd8c73; }
+.ci-tabs a[aria-current="page"] .octicon { color: var(--fg); }
+.repo-tabs { flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; padding-bottom: 1px; }
+.repo-tabs::-webkit-scrollbar { display: none; }
+/* Secondary (CI) nav: GitHub "subnav" segmented links. */
+.repo-ci-navigation > .ci-tabs:not(.repo-tabs) { display: inline-flex; flex-wrap: nowrap; gap: 0; border: 1px solid var(--border-strong); border-radius: 6px; overflow: hidden; max-width: 100%; overflow-x: auto; }
+.repo-ci-navigation > .ci-tabs:not(.repo-tabs) a { margin: 0; border-radius: 0; padding: 0 16px; border-right: 1px solid var(--border-strong); font-weight: 500; }
+.repo-ci-navigation > .ci-tabs:not(.repo-tabs) a:last-child { border-right: 0; }
+.repo-ci-navigation > .ci-tabs:not(.repo-tabs) a[aria-current="page"] { color: #ffffff; background: var(--accent-emphasis); }
+.repo-ci-navigation > .ci-tabs:not(.repo-tabs) a[aria-current="page"]::after { display: none; }
 .repo-tabs { margin-bottom: 20px; }
 .ci-page .repo-tabs { margin-bottom: 0; }
 .ci-artifact-name { display: block; font-weight: 600; margin-bottom: 5px; }

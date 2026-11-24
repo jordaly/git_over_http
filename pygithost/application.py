@@ -122,6 +122,7 @@ from .database_types import CommentIdentityRow, DiscussionRow, IssueRow
 from .languages import LanguageStat, repository_languages
 from .logging_setup import access as log_access
 from .logging_setup import configure_logging, safe_target
+from .octicons import octicon
 from .readme import render_readme
 from .repository_info import RepositoryOverview, repository_overview
 
@@ -165,6 +166,9 @@ if TYPE_CHECKING:
 
 
 _display_name = ContextVar("display_name", default="pygithost")
+# Per-request view state used by the shared page shell (header menus and context).
+_request_path: ContextVar[str] = ContextVar("request_path", default="")
+_viewer: ContextVar[tuple[str | None, bool]] = ContextVar("viewer", default=(None, False))
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -383,20 +387,23 @@ def _pr_create_form_html(base: str, opt_src: str, opt_tgt: str, warn_merge: str)
 def _repo_tabs(base: str, active: str) -> SafeHTML:
     owner, repo = [unquote(part) for part in base.rstrip("/").split("/")[-2:]]
     links: list[str] = []
-    for key, suffix, label in (
-        ("code", "", "Code"),
-        ("branches", "/branches", "Branches"),
-        ("issues", "/issues", "Issues"),
-        ("pulls", "/pulls", "Pull requests"),
-        ("discussions", "/discussions", "Discussions"),
-        ("ci", "/ci", "CI"),
-        ("artifacts", "/artifacts", "Artifacts"),
+    for key, suffix, icon, label in (
+        ("code", "", "code", "Code"),
+        ("issues", "/issues", "issue-opened", "Issues"),
+        ("pulls", "/pulls", "git-pull-request", "Pull requests"),
+        ("discussions", "/discussions", "comment-discussion", "Discussions"),
+        ("ci", "/ci", "play", "CI"),
+        ("artifacts", "/artifacts", "package", "Artifacts"),
+        ("branches", "/branches", "git-branch", "Branches"),
     ):
         current = safe_html(' aria-current="page"' if key == active else "")
-        links.append(html_t(t'<a href="{base}{suffix}"{current}>{label}</a>'))
+        links.append(
+            html_t(t'<a href="{base}{suffix}"{current}>{octicon(icon)}<span>{label}</span></a>')
+        )
+    owner_href = "/?" + urlencode({"q": owner})
     return safe_html(
         html_t(
-            t'<div class="repo-navigation"><header class="repo-header"><div class="repo-eyebrow"><a href="/">Repositories</a></div><h1><a href="{base}">{owner} / <strong>{repo}</strong></a></h1></header><nav class="ci-tabs repo-tabs" aria-label="Repository navigation">{join_html(links)}</nav></div>'
+            t'<div class="repo-navigation"><header class="repo-header"><h1>{octicon("repo", cls="repo-header-icon")}<a class="repo-header-owner" href="{owner_href}">{owner}</a><span class="repo-header-sep">/</span><strong><a href="{base}">{repo}</a></strong></h1></header><nav class="ci-tabs repo-tabs" aria-label="Repository navigation">{join_html(links)}</nav></div>'
         )
     )
 
@@ -490,7 +497,7 @@ def _repo_code_menu(
         else str_t(t"{URL_PREFIX}/{q(owner)}/{q(repo)}.git")
     )
     return safe_html(
-        html_t(t'''<details class="repo-code-menu"><summary>〈〉 Code <span aria-hidden="true">▾</span></summary><div class="repo-code-popover">
+        html_t(t'''<details class="repo-code-menu"><summary>{octicon("code")}Code{octicon("triangle-down")}</summary><div class="repo-code-popover">
 <div class="repo-panel-heading"><strong>Clone repository</strong><span class="repo-clone-protocol">HTTP(S)</span></div><div class="repo-clone-body">
 <label>Clone URL</label><div class="repo-copy-row"><input class="repo-clone-url" data-path="{clone_path}" value="{clone_path}" readonly aria-label="Repository clone URL"><button class="repo-copy-button" type="button">Copy</button></div><p class="muted repo-copy-status" role="status" aria-live="polite">Use Git to clone the full repository and its history.</p><p class="muted">If authentication is enabled, enter your username and password or access token when Git asks. Never share a URL containing credentials.</p></div>
 {ide_link}<a class="repo-zip-link" href="{base}/archive.zip?{urlencode({"ref": ref})}"><strong>↓ Download ZIP</strong><small>Source snapshot of <code>{ref}</code>; no Git history.</small></a></div></details>
@@ -637,24 +644,23 @@ def write_config_file(
 apply_config(default_config_for_platform())
 
 TREE_FOLDER_ICON = safe_html(
-    """<span class="tree-icon folder" aria-hidden="true">
-<svg viewBox="0 0 24 24" focusable="false">
-<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4.2l2 2.2h6.8A2.5 2.5 0 0 1 21 9.7v7.8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5v-10Z"></path>
-<path d="M3.2 9h17.6"></path>
-</svg>
-</span>"""
+    f'<span class="tree-icon folder" aria-hidden="true">{octicon("file-directory-fill")}</span>'
 )
 
 TREE_FILE_ICON = safe_html(
-    """<span class="tree-icon file" aria-hidden="true">
-<svg viewBox="0 0 24 24" focusable="false">
-<path d="M6 3.5h8l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 20V3.5Z"></path>
-<path d="M14 3.5v4h4"></path>
-<path d="M8.5 12h7"></path>
-<path d="M8.5 15.5h7"></path>
-</svg>
-</span>"""
+    f'<span class="tree-icon file" aria-hidden="true">{octicon("file")}</span>'
 )
+
+
+_PULL_STATE_ICONS = {
+    "open": octicon("git-pull-request", label="Open"),
+    "merged": octicon("git-merge", label="Merged"),
+    "closed": octicon("git-pull-request-closed", label="Closed"),
+}
+_ISSUE_STATE_ICONS = {
+    "open": octicon("issue-opened", label="Open"),
+    "closed": octicon("issue-closed", label="Closed"),
+}
 
 
 def _clean_repo_path(value: str | None) -> str:
@@ -1472,51 +1478,171 @@ def _clip_markdown(body: str) -> str:
     return clipped
 
 
+def _initials(name: str) -> str:
+    """Up to two initials for an avatar placeholder."""
+    letters = "".join(part[0] for part in re.split(r"[\s._-]+", name) if part)[:2]
+    return letters.upper() or "?"
+
+
+def _repo_context(path: str) -> tuple[str, str] | None:
+    """Return (owner, repo) when *path* is inside a repository page."""
+    parts = path.split("/")
+    if len(parts) >= 4 and parts[1] == "r" and parts[2] and parts[3]:
+        return unquote(parts[2]), unquote(parts[3])
+    return None
+
+
+def _app_header() -> SafeHTML:
+    user, is_admin = _viewer.get()
+    path = _request_path.get()
+    signed_out = REQUIRE_AUTH and not user
+    context = _repo_context(path)
+
+    create_items: list[str] = [
+        html_t(t'<a role="menuitem" href="/#new-repository">{octicon("repo")}New repository</a>')
+    ]
+    if context:
+        base = str_t(t"/r/{q(context[0])}/{q(context[1])}")
+        create_items.append(safe_html('<div class="app-menu-divider" role="separator"></div>'))
+        create_items.append(html_t(t'<div class="app-menu-heading">This repository</div>'))
+        create_items.extend(
+            html_t(t'<a role="menuitem" href="{base}{suffix}">{octicon(icon)}{label}</a>')
+            for suffix, icon, label in (
+                ("/issues/new", "issue-opened", "New issue"),
+                ("/pulls/new", "git-pull-request", "New pull request"),
+                ("/discussions/new", "comment-discussion", "New discussion"),
+                ("/branches", "git-branch", "New branch"),
+            )
+        )
+
+    if signed_out:
+        account = safe_html(
+            html_t(t'<a class="btn btn-sm app-sign-in" href="{LOGIN_PATH}">Sign in</a>')
+        )
+        create_menu = safe_html("")
+    else:
+        admin_items: list[str] = []
+        if is_admin or not REQUIRE_AUTH:
+            admin_items.append(safe_html('<div class="app-menu-divider" role="separator"></div>'))
+            admin_items.append(safe_html('<div class="app-menu-heading">Administration</div>'))
+            admin_items.append(
+                html_t(
+                    t'<a role="menuitem" href="/admin/settings">{octicon("gear")}Server settings</a>'
+                )
+            )
+            if REQUIRE_AUTH:
+                admin_items.append(
+                    html_t(t'<a role="menuitem" href="/admin/users">{octicon("people")}Users</a>')
+                )
+            admin_items.append(
+                html_t(
+                    t'<a role="menuitem" href="/admin/email">{octicon("mail")}Email notifications</a>'
+                )
+            )
+        name = user or "Local user"
+        sign_out = (
+            html_t(
+                t'<div class="app-menu-divider" role="separator"></div><a role="menuitem" href="/logout">{octicon("sign-out")}Sign out</a>'
+            )
+            if REQUIRE_AUTH
+            else ""
+        )
+        account = safe_html(
+            html_t(
+                t"""<details class="app-menu app-user-menu"><summary class="app-avatar-button" aria-label="Open user menu" title="{name}"><span class="avatar" aria-hidden="true">{_initials(name)}</span></summary>
+<div class="app-menu-list" role="menu"><div class="app-menu-header"><span class="avatar avatar-lg" aria-hidden="true">{_initials(name)}</span><div><strong>{name}</strong><span class="muted">{"Signed in" if user else "Authentication disabled"}</span></div></div>
+<div class="app-menu-divider" role="separator"></div>
+<a role="menuitem" href="/">{octicon("repo")}Your repositories</a>
+<a role="menuitem" href="/tokens">{octicon("key")}Access tokens</a>
+<a role="menuitem" href="/api/docs">{octicon("book")}API documentation</a>
+{join_html(admin_items)}{safe_html(sign_out)}</div></details>"""
+            )
+        )
+        create_menu = safe_html(
+            html_t(
+                t'<details class="app-menu app-create-menu"><summary class="btn btn-sm app-icon-button" aria-label="Create new…" title="Create new…">{octicon("plus")}{octicon("triangle-down", cls="app-caret")}</summary><div class="app-menu-list" role="menu">{join_html(create_items)}</div></details>'
+            )
+        )
+
+    return safe_html(
+        html_t(
+            t"""<header class="app-header"><div class="app-header-inner">
+<a class="app-logo" href="/" aria-label="Home"><img src="/favicon.ico" alt="" width="32" height="32"></a><a class="app-brand" href="/">{_display_name.get()}</a>
+<nav class="app-header-nav" aria-label="Workspace navigation">{safe_html("" if signed_out else html_t(t'<a href="/"{safe_html(' aria-current="page"' if path == "/" else "")}>Repositories</a>'))}</nav>
+<div class="app-header-actions">
+{safe_html("" if signed_out else html_t(t'<form class="app-search" method="GET" action="/" role="search">{octicon("search")}<input type="search" name="q" placeholder="Search repositories" aria-label="Search repositories" autocomplete="off"><kbd aria-hidden="true">/</kbd></form>'))}
+{create_menu}<button id="theme-toggle" class="btn btn-sm app-icon-button theme-toggle" type="button" title="Toggle dark mode" aria-label="Toggle dark mode">{octicon("moon", cls="theme-icon-dark")}{octicon("sun", cls="theme-icon-light")}</button>
+{account}</div></div></header>"""
+        )
+    )
+
+
+_SHELL_SCRIPT = safe_html(
+    """<script>
+(function() {
+    const button = document.getElementById("theme-toggle");
+    function updateButton() {
+        if (!button) return;
+        const dark = (document.documentElement.getAttribute("data-theme") || "light") === "dark";
+        const label = dark ? "Switch to light mode" : "Switch to dark mode";
+        button.setAttribute("aria-label", label);
+        button.title = label;
+    }
+    if (button) button.addEventListener("click", function() {
+        const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        try { localStorage.setItem("pygithost_theme", next); } catch (_error) {}
+        updateButton();
+    });
+    updateButton();
+
+    // GitHub-style dropdown menus: one open at a time, close on outside click / Escape.
+    const menus = Array.from(document.querySelectorAll("details.app-menu"));
+    menus.forEach(function(menu) {
+        menu.addEventListener("toggle", function() {
+            if (menu.open) menus.forEach(function(other) { if (other !== menu) other.open = false; });
+        });
+    });
+    document.addEventListener("click", function(event) {
+        menus.forEach(function(menu) { if (menu.open && !menu.contains(event.target)) menu.open = false; });
+    });
+    document.addEventListener("keydown", function(event) {
+        if (event.key === "Escape") {
+            menus.forEach(function(menu) {
+                if (menu.open) { menu.open = false; menu.querySelector("summary").focus(); }
+            });
+            return;
+        }
+        // Press "/" anywhere to jump to search, like GitHub.
+        if (event.key === "/" && !event.ctrlKey && !event.metaKey && !event.altKey &&
+            !event.target.closest("input, textarea, select, [contenteditable=true], .monaco-editor")) {
+            const local = document.querySelector("[data-hotkey-search]");
+            const search = local || document.querySelector(".app-search input");
+            if (search) { event.preventDefault(); search.focus(); search.select(); }
+        }
+    });
+})();
+</script>"""
+)
+
+
 def _html_page(title: str, body_html: str | SafeHTML, *, wide: bool = False) -> bytes:
     body = safe_html(body_html)
     body_class = "wide-page" if wide else ""
+    name = _display_name.get()
     rendered = html_t(
-        t"""<!doctype html><html><head><meta charset="utf-8">
+        t"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <link rel="icon" href="/favicon.ico">
-<title>{title}</title>
-<style>
-*{{box-sizing:border-box}}
-body{{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:1200px;background:var(--bg);color:var(--fg)}}
-body.wide-page{{max-width:none}}
-a{{text-decoration:none;color:var(--link)}} a:hover{{text-decoration:underline}}
-code,pre{{font-family:ui-monospace,Consolas,monospace}}
-pre{{padding:12px;border:1px solid var(--border-strong);border-radius:10px;overflow:auto;background:var(--pre-bg);color:var(--fg)}}
-table{{border-collapse:collapse;width:100%}}
-td{{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}}
-.muted{{color:var(--muted)}}
-.pill{{display:inline-block;padding:2px 10px;border:1px solid var(--border-strong);border-radius:999px;font-size:12px;color:var(--pill-fg);background:var(--pill-bg)}}
-.topbar{{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}}
-.box{{border:1px solid var(--border);border-radius:14px;padding:14px;background:var(--box)}}
-.row{{display:flex;gap:10px;flex-wrap:wrap;align-items:end}}
-label{{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}}
-input,select,textarea{{padding:10px;border:1px solid var(--border-strong);border-radius:10px;font-size:14px;background:var(--input-bg);color:var(--input-fg)}}
-textarea{{width:100%;min-height:90px}}
-button{{padding:10px 14px;border:1px solid var(--button-bg);border-radius:10px;background:var(--button-bg);color:var(--button-fg);cursor:pointer}}
-button:hover{{opacity:.92}}
-.danger{{border-color:var(--danger-bg);background:var(--danger-bg);color:var(--danger-fg)}}
-.danger:hover{{opacity:.92}}
-.warn{{background:var(--warn-bg);border:1px solid var(--warn-border);color:var(--warn-fg);padding:10px;border-radius:12px}}
-.ok{{background:var(--ok-bg);border:1px solid var(--ok-border);color:var(--ok-fg);padding:10px;border-radius:12px}}
-.theme-toggle{{position:fixed;right:18px;bottom:18px;z-index:9999;border-radius:999px;box-shadow:0 10px 30px rgba(0,0,0,.18)}}
-.tree-icon{{display:inline-flex;width:22px;height:22px;align-items:center;justify-content:center;vertical-align:-6px;color:var(--muted)}}
-.tree-icon svg{{display:block;width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}}
-.tree-icon.folder{{color:var(--folder-fg)}}
-.tree-icon.file{{color:var(--muted)}}
-.tree-name{{padding-left:2px}}
-@media (max-width:700px){{body{{margin:14px}}.topbar{{align-items:flex-start;flex-direction:column}}.theme-toggle{{right:12px;bottom:12px}}}}
-</style>
+<title>{title} · {name}</title>
 <script>
 (function() {{
-    const saved = localStorage.getItem("pygithost_theme");
+    let saved = null;
+    try {{ saved = localStorage.getItem("pygithost_theme"); }} catch (_error) {{}}
     const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const theme = saved || (prefersDark ? "dark" : "light");
-    document.documentElement.setAttribute("data-theme", theme);
+    document.documentElement.setAttribute("data-theme", saved || (prefersDark ? "dark" : "light"));
+    document.documentElement.classList.add("js");
 }})();
 </script>
 <link rel="stylesheet" href="/static/assets/prismjs/prism-okaidia.min.css" />
@@ -1525,35 +1651,15 @@ button:hover{{opacity:.92}}
 <link rel="stylesheet" href="/static/repository.css" />
 </head>
 <body class="{body_class}">
-<header class="app-header"><a class="app-brand" href="/">{_display_name.get()}</a><nav aria-label="Workspace navigation"><a href="/">Repositories</a></nav><button id="theme-toggle" class="theme-toggle" type="button" title="Toggle dark mode">Dark mode</button></header>
-
+<a class="skip-link" href="#app-content">Skip to content</a>
+{_app_header()}
+<div id="app-content" class="app-container">
 {body}
-
+</div>
+<footer class="app-footer"><div class="app-footer-inner"><span class="app-footer-brand"><img src="/favicon.ico" alt="" width="20" height="20">{name}</span><nav aria-label="Footer"><a href="/">Repositories</a><a href="/tokens">Access tokens</a><a href="/api/docs">API</a></nav></div></footer>
 <script src="/static/assets/prismjs/prism.js"></script>
-<script>
-(function() {{
-    const button = document.getElementById("theme-toggle");
-    if (!button) return;
-
-    function updateButton() {{
-        const theme = document.documentElement.getAttribute("data-theme") || "light";
-        button.textContent = theme === "dark" ? "Light mode" : "Dark mode";
-        button.setAttribute("aria-label", theme === "dark" ? "Switch to light mode" : "Switch to dark mode");
-    }}
-
-    button.addEventListener("click", function() {{
-        const current = document.documentElement.getAttribute("data-theme") || "light";
-        const next = current === "dark" ? "light" : "dark";
-        document.documentElement.setAttribute("data-theme", next);
-        localStorage.setItem("pygithost_theme", next);
-        updateButton();
-    }});
-
-    updateButton();
-}})();
-</script>
+{_SHELL_SCRIPT}
 <div id="load_scripts"></div>
-
 </body>
 </html>"""
     )
@@ -2133,6 +2239,7 @@ class GitHTTPHandler:
         self.request.remote_user = self.remote_user
         self.request.remote_user_id = self.remote_user_id
         self.request.remote_is_admin = self.remote_is_admin
+        _viewer.set((self.remote_user, self.remote_is_admin))
         self.request.remote_scopes = self.remote_scopes
 
     async def _audit(
@@ -2201,20 +2308,20 @@ class GitHTTPHandler:
             )
 
         body = html_t(
-            t"""<div style="max-width:440px;margin:80px auto">
-<div class="box">
-<h1 style="margin:0 0 6px 0">Sign in</h1>
-<p class="muted" style="margin-top:0">Use your server username and password to manage repositories, branches, PRs, and tokens.</p>
+            t"""<main class="auth-page">
+<img class="auth-logo" src="/favicon.ico" alt="" width="48" height="48">
+<h1>Sign in to {_display_name.get()}</h1>
 {notice_html}
+<div class="box auth-box">
 <form method="POST" action="/login">
 <input type="hidden" name="next" value="{next_url}" />
-<div style="margin-bottom:10px"><label>Username</label><input name="username" autocomplete="username" autofocus required style="width:100%;box-sizing:border-box" /></div>
-<div style="margin-bottom:14px"><label>Password</label><input name="password" type="password" autocomplete="current-password" required style="width:100%;box-sizing:border-box" /></div>
-<button type="submit" style="width:100%">Sign in</button>
+<label for="login-username">Username</label><input id="login-username" name="username" autocomplete="username" autofocus required />
+<label for="login-password">Password</label><input id="login-password" name="password" type="password" autocomplete="current-password" required />
+<button type="submit">Sign in</button>
 </form>
-<p class="muted" style="font-size:12px;margin-bottom:0">Git clients should continue to use <code>username:token</code> or <code>token:TOKEN_VALUE</code> against <code>{URL_PREFIX}</code>.</p>
 </div>
-</div>"""
+<div class="box auth-note"><p class="muted">Git clients should use <code>username:token</code> or <code>token:TOKEN_VALUE</code> against <code>{URL_PREFIX}</code>.</p></div>
+</main>"""
         )
         await _send_html(self.request, 200, _html_page("Sign in", safe_html(body)))
 
@@ -2421,7 +2528,7 @@ class GitHTTPHandler:
         for owner, repo, rel in repos:
             rows.append(
                 html_t(
-                    t"""<article class="repo-list-item"><div><h2><a href="/r/{q(owner)}/{q(repo)}"><span class="muted">{owner} / </span>{repo}</a></h2><p class="muted"><code>{rel}</code></p></div><nav aria-label="Links for {owner}/{repo}"><a href="/r/{q(owner)}/{q(repo)}">Code</a><a href="/r/{q(owner)}/{q(repo)}/branches">Branches</a><a href="/r/{q(owner)}/{q(repo)}/ci">CI</a><a href="/r/{q(owner)}/{q(repo)}/artifacts">Artifacts</a></nav></article>"""
+                    t"""<article class="repo-list-item"><div><h2>{octicon("repo", cls="repo-list-icon")}<a href="/r/{q(owner)}/{q(repo)}"><span class="repo-list-owner">{owner} / </span>{repo}</a></h2><p class="muted"><code>{rel}</code></p></div><nav aria-label="Links for {owner}/{repo}"><a href="/r/{q(owner)}/{q(repo)}/issues">{octicon("issue-opened")}Issues</a><a href="/r/{q(owner)}/{q(repo)}/pulls">{octicon("git-pull-request")}Pull requests</a><a href="/r/{q(owner)}/{q(repo)}/branches">{octicon("git-branch")}Branches</a><a href="/r/{q(owner)}/{q(repo)}/ci">{octicon("play")}CI</a></nav></article>"""
                 )
             )
 
@@ -2432,46 +2539,61 @@ class GitHTTPHandler:
                 html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
             )
 
-        admin_link = safe_html("")
-        if _require_admin(self):
-            admin_link = safe_html(
-                '<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/users">Admin: Users</a> <a class="pill" href="/admin/email">Admin: Email</a>'
-            )
-        elif not REQUIRE_AUTH:
-            admin_link = safe_html(
-                '<a class="pill" href="/admin/settings">Admin: Settings</a> <a class="pill" href="/admin/email">Admin: Email</a>'
-            )
-
         rows_html = (
             join_html(rows)
             if rows
             else safe_html(
                 html_t(
-                    t'<div class="repo-empty"><h2>{"No matching repositories" if search else "No repositories yet"}</h2><p class="muted">{"Try a different name or clear your search." if search else "Create a repository to get started."}</p></div>'
+                    t'<div class="repo-empty">{octicon("repo", size=24)}<h2>{"No matching repositories" if search else "No repositories yet"}</h2><p class="muted">{"Try a different name or clear your search." if search else "Create a repository to get started."}</p></div>'
                 )
             )
         )
-        clear = safe_html('<a class="pill" href="/">Clear search</a>') if search else safe_html("")
+        clear = (
+            safe_html(html_t(t'<a class="btn" href="/">{octicon("x")}Clear search</a>'))
+            if search
+            else safe_html("")
+        )
+        heading = (
+            html_t(t"{total} results for “{search}”")
+            if search
+            else html_t(t"{total} {'repository' if total == 1 else 'repositories'}")
+        )
         body = html_t(
-            t"""<main class="repo-page"><div class="topbar">
-<div><div class="repo-eyebrow">YOUR WORKSPACE</div><h1>Repositories</h1><p class="muted">Browse your projects and keep your work moving.</p></div>
-<div>{admin_link} <a class="pill" href="/tokens">Tokens</a> <a class="pill" href="/api/docs">API documentation</a> <span class="pill">User: <code>{self.remote_user or "?"}</code></span> <a class="pill" href="/logout">Logout</a></div>
+            t"""<main class="repo-page repo-home"><div class="topbar">
+<div><h1>Repositories</h1><p class="muted">Repositories hosted on this server. Clone them over HTTP(S) or browse code, issues and pull requests here.</p></div>
 </div>
 {notice_html}
-<form class="repo-search" method="GET" action="/" role="search"><input type="hidden" name="per_page" value="{size}"><label for="repo-search">Find a repository</label><div class="row"><input id="repo-search" type="search" name="q" value="{search}" placeholder="Search by repository, owner, or path…" maxlength="128"><button type="submit">Search</button>{clear}</div></form>
-<details class="box repo-create"{safe_html(" open" if not all_repos or notice_kind == "warn" else "")}><summary>Create repository</summary>
+<div class="repo-home-toolbar"><form class="repo-search" method="GET" action="/" role="search"><input type="hidden" name="per_page" value="{size}"><label class="visually-hidden" for="repo-search">Find a repository</label><div class="repo-search-field">{octicon("search")}<input id="repo-search" type="search" name="q" value="{search}" placeholder="Find a repository…" maxlength="128" data-hotkey-search></div><button type="submit">Search</button>{clear}</form>
+<a class="btn btn-primary repo-new-button" href="#new-repository">{octicon("repo")}New</a></div>
+<details id="new-repository" class="box repo-create"{safe_html(" open" if not all_repos or notice_kind == "warn" else "")}><summary>Create a new repository</summary>
+<p class="muted">A repository contains all project files, including the revision history. Requires <code>write</code> scope.</p>
 <form method="POST" action="/create-repo">
-<div class="row">
-<div><label for="repo-owner">Owner (optional)</label><input id="repo-owner" name="owner" placeholder="{FLAT_OWNER_UI} for flat layout" /></div>
-<div><label for="repo-name">Repo name</label><input id="repo-name" name="repo" placeholder="my-repo" required /></div>
-<div><button type="submit">Create</button></div>
+<div class="row repo-create-fields">
+<div><label for="repo-owner">Owner <span class="muted">(optional)</span></label><input id="repo-owner" name="owner" placeholder="{FLAT_OWNER_UI}" /></div>
+<span class="repo-create-slash" aria-hidden="true">/</span>
+<div><label for="repo-name">Repository name <span class="repo-required">*</span></label><input id="repo-name" name="repo" placeholder="my-repo" required /></div>
 </div>
-<p class="muted" style="margin:10px 0 0 0">Create requires <code>write</code> scope.</p>
+<p class="muted repo-create-hint">Great repository names are short and memorable. Leave owner empty to use the flat layout.</p>
+<div class="repo-create-actions"><button type="submit">Create repository</button></div>
 </form>
 </details>
-<section class="box repo-list"><div class="repo-panel-heading"><h2>{total} {"matching repositories" if search else "repositories"}</h2><span class="muted">{len(all_repos)} total</span></div>{rows_html}{pagination}</section></main>"""
+<script>(function() {{
+  const panel = document.getElementById("new-repository");
+  function reveal() {{
+    if (window.location.hash !== "#new-repository") return;
+    panel.open = true;
+    const name = document.getElementById("repo-name");
+    if (name) setTimeout(function() {{ name.focus(); }}, 0);
+  }}
+  window.addEventListener("hashchange", reveal);
+  document.querySelectorAll('a[href$="#new-repository"]').forEach(function(link) {{
+    link.addEventListener("click", function() {{ if (window.location.hash === "#new-repository") reveal(); }});
+  }});
+  reveal();
+}})();</script>
+<section class="box repo-list"><div class="repo-panel-heading"><h2>{heading}</h2><span class="muted">{len(all_repos)} total</span></div>{rows_html}{pagination}</section></main>"""
         )
-        await _send_html(self.request, 200, _html_page("Repos", safe_html(body)))
+        await _send_html(self.request, 200, _html_page("Repositories", safe_html(body)))
 
     async def _ui_tokens(
         self, notice: str = "", notice_kind: str = "ok", new_token: str = ""
@@ -2550,7 +2672,7 @@ class GitHTTPHandler:
         body = html_t(
             t"""<div class="topbar">
 <h1 style="margin:0">Tokens</h1>
-<div><a class="pill" href="/">Home</a> <span class="pill">User: <code>{self.remote_user or "?"}</code></span></div>
+<div></div>
 </div>
 {notice_html}
 {new_token_html}
@@ -2834,7 +2956,7 @@ class GitHTTPHandler:
         preferences = preferences_forms(
             "/admin/settings", token, global_values, submitted=submitted_preferences
         )
-        body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><nav class="row"><a class="pill" href="/admin/email">Email delivery</a><a class="pill" href="/admin/users">Users</a><a class="pill" href="/">Home</a></nav></div>{notice}
+        body = html_t(t'''<main class="repo-page"><div class="topbar"><h1>Server settings</h1><nav class="row"><a class="pill" href="/admin/email">Email delivery</a><a class="pill" href="/admin/users">Users</a></nav></div>{notice}
 <section class="box"><h2>Appearance</h2><form method="POST" action="/admin/settings"><label for="display-name">Display name</label><input id="display-name" name="display_name" value="{value}" maxlength="80" placeholder="pygithost"><p class="muted">Shown in the top-left header on all pages. Leave blank to restore pygithost. This does not change repository URLs or email sender settings.</p><button type="submit">Save settings</button></form>{favicon_html}</section>{basic}{execution_trust}{preferences}<script src="/static/settings-pages.js" defer></script></main>''')
         return await _send_html(
             self.request, response_status, _html_page("Server settings", safe_html(body))
@@ -2977,7 +3099,7 @@ class GitHTTPHandler:
         )
 
         body = html_t(
-            t"""<div class="topbar"><h1 style="margin:0">Admin · Users</h1><div><a class="pill" href="/">Home</a></div></div>
+            t"""<div class="topbar"><h1 style="margin:0">Admin · Users</h1></div>
 {notice_html}
 <div class="box" style="margin-bottom:14px">
 <h2 style="margin:0 0 10px 0;font-size:16px">Create user</h2>
@@ -3157,7 +3279,6 @@ class GitHTTPHandler:
             readme_html = safe_html(
                 html_t(
                     t"""<section id="repo-readme" class="box repo-document">
-<h2 style="margin:0 0 10px 0;font-size:16px">README.md</h2>
 <div class="repo-markdown">{render_readme(readme_text)}</div><details><summary>View Markdown source</summary><pre><code id="readmeSource" class="language-markdown">{readme_text}</code></pre></details>
 <script>
 document.addEventListener("DOMContentLoaded", function() {{
@@ -3180,18 +3301,18 @@ document.addEventListener("DOMContentLoaded", function() {{
                 ci_status = "stale"
             ci_badge = safe_html(
                 html_t(
-                    t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI ({default_branch}): {ci_status}</a>'
+                    t'<a class="ci-status" data-status="{ci_status}" href="{base}/ci/runs/{latest_ci[0]}" title="{default_branch}: {latest_ci[2]} · {latest_ci[4][:8]}">CI: {ci_status}</a>'
                 )
             )
         else:
-            ci_badge = safe_html(html_t(t'<a class="pill" href="{base}/ci">CI: no runs</a>'))
+            ci_badge = safe_html("")
         latest = overview["latest"]
         latest_html = safe_html("")
         if latest:
             initials = "".join(part[0] for part in latest["author"].split()[:2]).upper() or "?"
             latest_html = safe_html(
                 html_t(
-                    t'<div class="repo-latest-commit"><span class="repo-avatar" aria-hidden="true">{initials}</span><strong>{latest["author"]}</strong><a class="repo-latest-subject" href="{base}/commit/{latest["hash"]}">{latest["subject"]}</a><a href="{base}/commit/{latest["hash"]}"><code>{latest["hash"][:7]}</code></a><time class="muted" datetime="{latest["date"]}" title="{latest["date"]}">{_relative_time(latest["date"])}</time></div>'
+                    t'<div class="repo-latest-commit"><span class="repo-avatar" aria-hidden="true">{initials}</span><strong>{latest["author"]}</strong><a class="repo-latest-subject" href="{base}/commit/{latest["hash"]}">{latest["subject"]}</a>{ci_badge}<span class="repo-latest-meta"><a class="repo-latest-sha" href="{base}/commit/{latest["hash"]}">{latest["hash"][:7]}</a> · <time class="muted" datetime="{latest["date"]}" title="{latest["date"]}">{_relative_time(latest["date"])}</time></span><a class="repo-latest-history" href="{base}/commits?ref={q(default_branch)}">{octicon("history")}<span><strong>{overview["commit_count"] if overview["commit_count"] is not None else ""}</strong> Commits</span></a></div>'
                 )
             )
         file_rows: list[str] = []
@@ -3250,7 +3371,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             join_html(
                 [
                     html_t(
-                        t'<li><a href="{base}/tree/{q(tag)}/">{tag}</a><a href="{base}/archive.zip?{urlencode({"ref": tag})}" aria-label="Download source for tag {tag}">ZIP ↓</a></li>'
+                        t'<li><a href="{base}/tree/{q(tag)}/">{tag}</a><a href="{base}/archive.zip?{urlencode({"ref": tag})}" aria-label="Download source for tag {tag}">{octicon("download")}</a></li>'
                     )
                     for tag in tags[:5]
                 ]
@@ -3263,7 +3384,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             join_html(
                 [
                     html_t(
-                        t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>'
+                        t'<li><span class="repo-avatar" aria-hidden="true">{_initials(str(person["name"]))}</span><strong>{person["name"]}</strong><span class="muted">{person["commits"]} {"commit" if person["commits"] == 1 else "commits"}</span></li>'
                     )
                     for person in contributors[:5]
                 ]
@@ -3276,7 +3397,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             remaining = join_html(
                 [
                     html_t(
-                        t'<li><strong>{person["name"]}</strong><span class="muted">{person["commits"]} commits</span></li>'
+                        t'<li><span class="repo-avatar" aria-hidden="true">{_initials(str(person["name"]))}</span><strong>{person["name"]}</strong><span class="muted">{person["commits"]} {"commit" if person["commits"] == 1 else "commits"}</span></li>'
                     )
                     for person in contributors[5:]
                 ]
@@ -3296,6 +3417,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         summary = summary[:240] + ("…" if len(summary) > 240 else "")
         license_html, license_link = safe_html(""), safe_html("")
+        license_label_text = ""
         for kind, filename in root_entries:
             if kind == "blob" and filename.casefold() in (
                 "license",
@@ -3314,7 +3436,10 @@ document.addEventListener("DOMContentLoaded", function() {{
                         if "Permission is hereby granted, free of charge" in license_text
                         else "License"
                     )
-                    license_link = safe_html(html_t(t'<a href="#repo-license">{license_label}</a>'))
+                    license_label_text = license_label
+                    license_link = safe_html(
+                        html_t(t'<a href="#repo-license">{octicon("law")}{license_label}</a>')
+                    )
                     license_html = safe_html(
                         html_t(
                             t'<section id="repo-license" class="box repo-document"><h2>{license_label}</h2><pre>{license_text}</pre><a href="{base}/blob/{q(default_branch)}/{q(filename)}">View full license file</a></section>'
@@ -3324,7 +3449,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         document_nav = (
             safe_html(
                 html_t(
-                    t'<nav class="repo-document-nav" aria-label="Repository files navigation">{safe_html('<a href="#repo-readme">README</a>') if readme_text else safe_html("")}{license_link}</nav>'
+                    t'<nav class="repo-document-nav" aria-label="Repository files navigation">{safe_html(html_t(t'<a href="#repo-readme" aria-current="true">{octicon("book")}README</a>')) if readme_text else safe_html("")}{license_link}</nav>'
                 )
             )
             if readme_text or license_html
@@ -3332,7 +3457,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         about_html = safe_html(
             html_t(
-                t'<section class="box"><h2>About</h2><p class="muted">{summary or "No description available in README."}</p><div class="repo-about-counts"><a href="{base}/commits?ref={q(default_branch)}">{overview["commit_count"] if overview["commit_count"] is not None else "—"} commits</a><a href="{base}/branches">{len(branches)} branches</a><a href="#repo-tags">{len(tags)} tags</a></div>{license_link}</section><section id="repo-tags" class="box"><h2>Tags</h2><ul class="repo-summary-list">{tags_html}</ul></section><section class="box"><h2>Contributors <span class="muted">{len(contributors)}</span></h2><ul class="repo-summary-list">{contributors_html}</ul>{more_contributors}</section>'
+                t'<section class="box"><h2>About</h2><p class="repo-about-summary">{summary or "No description available in README."}</p><div class="repo-about-counts">{safe_html(html_t(t'<a href="#repo-readme">{octicon("book")}Readme</a>') if readme_text else "")}{safe_html(html_t(t'<a href="#repo-license">{octicon("law")}{license_label_text}</a>') if license_label_text else "")}<a href="{base}/commits?ref={q(default_branch)}">{octicon("history")}<strong>{overview["commit_count"] if overview["commit_count"] is not None else "—"}</strong> commits</a><a href="{base}/branches">{octicon("git-branch")}<strong>{len(branches)}</strong> {"branch" if len(branches) == 1 else "branches"}</a><a href="#repo-tags">{octicon("tag")}<strong>{len(tags)}</strong> {"tag" if len(tags) == 1 else "tags"}</a></div></section><section id="repo-tags" class="box"><h2>Tags</h2><ul class="repo-summary-list">{tags_html}</ul></section><section class="box"><h2>Contributors <span class="Counter">{len(contributors)}</span></h2><ul class="repo-summary-list">{contributors_html}</ul>{more_contributors}</section>'
             )
         )
 
@@ -3342,17 +3467,25 @@ document.addEventListener("DOMContentLoaded", function() {{
             options.append(html_t(t'<option value="{b}"{selected}>{b}</option>'))
         options_html = join_html(options) if options else safe_html("<option>(none)</option>")
 
+        tag_count = len(tags)
+        readme_panel = (
+            safe_html(
+                html_t(
+                    t'<div class="box repo-readme-panel">{document_nav}{readme_html}{license_html}</div>'
+                )
+            )
+            if readme_text or license_html
+            else safe_html("")
+        )
         body = html_t(
-            t"""{_repo_tabs(base, "code")}<div class="topbar">
-<div><h2>Code</h2><div class="muted">Default branch: <code>{default_branch}</code></div></div>
-<div>{ci_badge}</div>
-</div>
-<div class="box">
-<div class="row repo-code-toolbar"><div><label for="branchSel">Switch branch</label><select id="branchSel">{options_html}</select></div><div><button type="button" onclick="goBranch()">Browse</button></div><a class="pill" href="{base}/commits?ref={q(default_branch)}">Commits</a>{_repo_code_menu(owner, repo, default_branch, can_edit=_has_write_scope(self))}</div>
+            t"""{_repo_tabs(base, "code")}
+<div class="repo-content-layout"><div class="repo-content-main">
+<div class="repo-code-toolbar"><label class="repo-branch-picker" title="Switch branches">{octicon("git-branch")}<span class="visually-hidden">Switch branch</span><select id="branchSel" onchange="goBranch()">{options_html}</select></label>
+<a class="repo-toolbar-link" href="{base}/branches">{octicon("git-branch")}<strong>{len(branches)}</strong> {"Branch" if len(branches) == 1 else "Branches"}</a><a class="repo-toolbar-link" href="#repo-tags">{octicon("tag")}<strong>{tag_count}</strong> {"Tag" if tag_count == 1 else "Tags"}</a>
+<noscript><button type="button">Browse</button></noscript>{_repo_code_menu(owner, repo, default_branch, can_edit=_has_write_scope(self))}</div>
 <script>function goBranch(){{var b=document.getElementById('branchSel').value;if(!b)return;window.location='{base}/tree/' + encodeURIComponent(b) + '/';}}</script>
-</div>
-<div class="repo-content-layout"><div class="repo-content-main"><div class="box repo-files-panel"><h2 style="margin:0 0 10px 0;font-size:16px">Files</h2>{latest_html}<div class="repo-files-scroll"><table><thead><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div>{files_pagination}</div>
-{document_nav}{readme_html}{license_html}</div><aside class="repo-sidebar">{about_html}{language_html}</aside></div>"""
+<div class="box repo-files-panel">{latest_html}<div class="repo-files-scroll"><table><thead class="visually-hidden"><tr><th>Name</th><th>Last commit message</th><th>Last commit date</th></tr></thead><tbody>{files_html}</tbody></table></div>{files_pagination}</div>
+{readme_panel}</div><aside class="repo-sidebar">{about_html}{language_html}</aside></div>"""
         )
         await _send_html(
             self.request,
@@ -3651,33 +3784,48 @@ document.addEventListener("DOMContentLoaded", function() {{
         for pr_id, title, src, tgt, st, created_at in rows_db:
             count = comment_counts.get(pr_id, 0)
             when = _relative_time(created_at) or created_at
-            count_suffix = safe_html(
-                f'<small title="{count} comment(s)">💬 {count}</small>' if count else ""
+            count_suffix = (
+                safe_html(
+                    html_t(
+                        t'<a class="topic-row-comments" href="{base}/pulls/{pr_id}" title="{count} comment(s)">{octicon("comment")}{count}</a>'
+                    )
+                )
+                if count
+                else safe_html("")
             )
-            icon = "&#10003;" if st == "merged" else "…" if st == "open" else "—"
             rows.append(
                 html_t(
-                    t"""<tr class="pr-list-row">
-<td><a class="review-row-title" href="{base}/pulls/{pr_id}"><span class="pull-status-icon pull-status-{st}" aria-hidden="true">{icon}</span> {title}</a><div class="review-row-meta">!{pr_id} · Pull request</div></td>
-<td class="muted"><code>{src}</code> → <code>{tgt}</code> {count_suffix}</td>
-<td><span class="pill pill-{st}">{st}</span></td><td class="muted"><small title="{created_at}">{when}</small></td></tr>"""
+                    t"""<li class="topic-list-row pr-list-row">
+<span class="pull-status-icon pull-status-{st}" title="{st.capitalize()}">{_PULL_STATE_ICONS.get(st, _PULL_STATE_ICONS["open"])}</span>
+<div><a class="review-row-title" href="{base}/pulls/{pr_id}">{title}</a> <span class="pill pill-{st}">{st}</span>
+<div class="review-row-meta">#{pr_id} opened <time title="{created_at}">{when}</time> · <code>{src}</code> → <code>{tgt}</code></div></div>
+<div class="topic-row-badges">{count_suffix}</div></li>"""
                 )
             )
         rows_html = (
             join_html(rows)
             if rows
             else safe_html(
-                '<tr><td class="muted">No pull requests.</td><td></td><td></td><td></td></tr>'
+                html_t(
+                    t'<li class="topic-list-empty">{octicon("git-pull-request", size=24)}<h3>No pull requests</h3><p class="muted">Pull requests let you propose, review and merge changes between branches.</p></li>'
+                )
+            )
+        )
+        tab_links = join_html(
+            html_t(
+                t'<a href="{base}/pulls?status={key}"{safe_html(' aria-current="page"' if status == key else "")}>{octicon(icon)}{label} {totals[key]}</a>'
+            )
+            for key, icon, label in (
+                ("open", "git-pull-request", "Open"),
+                ("merged", "git-merge", "Merged"),
+                ("closed", "git-pull-request-closed", "Closed"),
+                ("all", "git-commit", "All"),
             )
         )
         body = html_t(
-            t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Pull requests</h2>
-<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="/">Home</a></div></div>
+            t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Pull requests</h2><a class="btn btn-primary" href="{base}/pulls/new">New pull request</a></div>
 {notice_html}
-<div class="box" style="margin-bottom:14px"><div class="row" style="justify-content:space-between;align-items:center"><div>
-<a class="pill pull-tab{" pull-tab-active" if status == "open" else ""}" href="{base}/pulls?status=open">Open {totals["open"]}</a> <a class="pill pull-tab{" pull-tab-active" if status == "merged" else ""}" href="{base}/pulls?status=merged">Merged {totals["merged"]}</a> <a class="pill pull-tab{" pull-tab-active" if status == "closed" else ""}" href="{base}/pulls?status=closed">Closed {totals["closed"]}</a> <a class="pill pull-tab{" pull-tab-active" if status == "all" else ""}" href="{base}/pulls?status=all">All {totals["all"]}</a>
-</div><div><a class="pill pull-tab-active" href="{base}/pulls/new">+ New pull request</a></div></div></div>
-<div class="box"><table>{rows_html}</table>{pagination}</div>"""
+<section class="topic-list-panel" aria-label="Pull request list"><div class="topic-list-heading"><nav aria-label="Pull request status">{tab_links}</nav><span class="muted">{total} {"pull request" if total == 1 else "pull requests"}</span></div><ul class="topic-list">{rows_html}</ul></section>{pagination}"""
         )
         await _send_html(
             self.request,
@@ -3745,7 +3893,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         body = html_t(
             t"""{_repo_tabs(base, "pulls")}<div class="topbar"><h2>Open a pull request</h2>
-<div><a class="pill" href="{base}/pulls">All pull requests</a> <a class="pill" href="{base}">Repo</a></div></div>
+</div>
 {notice_html}
 <div class="box" style="margin-bottom:14px">{_pr_create_form_html(base, opt_src, opt_tgt, warn_merge)}</div>"""
         )
@@ -3992,7 +4140,7 @@ document.addEventListener("DOMContentLoaded", function() {{
 <div class="muted">This server supports <b>fast-forward only</b> merges.</div>
 {conflict_html}
 <form method="POST" action="{base}/pulls/{pr_id}/merge" style="margin-top:10px"><button type="submit"{merge_disabled}>Merge (ff-only)</button></form>
-<form method="POST" action="{base}/pulls/{pr_id}/close" style="margin-top:10px"><button class="danger" type="submit">Close PR</button></form></div>"""
+<form method="POST" action="{base}/pulls/{pr_id}/close" style="margin-top:10px"><button class="secondary" type="submit">{octicon("git-pull-request-closed", cls="issue-action-icon-close-pr")}Close pull request</button></form></div>"""
                     )
                 )
             else:
@@ -4002,7 +4150,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         elif status == "closed" and can_write:
             merge_box = safe_html(
                 html_t(
-                    t'<div class="box"><form method="POST" action="{base}/pulls/{pr_id}/reopen"><button type="submit">Reopen PR</button></form></div>'
+                    t'<div class="box"><form method="POST" action="{base}/pulls/{pr_id}/reopen"><button class="secondary" type="submit">Reopen pull request</button></form></div>'
                 )
             )
 
@@ -4317,7 +4465,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             rows.append(
                 html_t(
                     t"""<li class="topic-list-row issue-list-row">
-<span class="issue-status-icon issue-status-{st}" aria-hidden="true">{"◉" if st == "open" else "✓"}</span>
+<span class="issue-status-icon issue-status-{st}">{_ISSUE_STATE_ICONS.get(st, _ISSUE_STATE_ICONS["open"])}</span>
 <div><a class="review-row-title" href="{base}/issues/{issue_id}">{title}</a>
 <div class="review-row-meta">#{issue_id} · Opened <time title="{created_at}">{_relative_time(created_at)}</time> by {username or "anonymous"}</div></div>
 <div class="topic-row-badges"><span class="pill pill-{st}">{st.capitalize()}</span><small class="muted">{count} {"comment" if count == 1 else "comments"}</small></div></li>"""
@@ -4326,7 +4474,11 @@ document.addEventListener("DOMContentLoaded", function() {{
         rows_html = (
             join_html(rows)
             if rows
-            else safe_html('<li class="topic-list-empty muted">No issues.</li>')
+            else safe_html(
+                html_t(
+                    t'<li class="topic-list-empty">{octicon("issue-opened", size=24)}<h3>No issues</h3><p class="muted">Issues track bugs, ideas and tasks for this repository.</p></li>'
+                )
+            )
         )
         pagination = _pagination(
             str_t(t"/r/{q(owner)}/{q(repo)}/issues"),
@@ -4344,9 +4496,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         can_write = _has_write_scope(self)
         new_pill = (
-            safe_html(
-                '<a class="pill pull-tab-active" href="{0}/issues/new">+ New issue</a>'.format(base)
-            )
+            safe_html('<a class="btn btn-primary" href="{0}/issues/new">New issue</a>'.format(base))
             if can_write
             else safe_html("")
         )
@@ -4354,7 +4504,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>Issues</h2>{new_pill}</div>
 {notice_html}
 <section class="topic-list-panel" aria-label="Issue list"><div class="topic-list-heading"><nav aria-label="Issue status">
-{join_html(html_t(t'''<a href="{base}/issues?status={key}" id="issues-tab-{key}"{safe_html(' aria-current="page"' if status == key else "")}>{label}</a>''') for key, label in (("open", "Open"), ("closed", "Closed"), ("all", "All")))}
+{join_html(html_t(t'''<a href="{base}/issues?status={key}" id="issues-tab-{key}"{safe_html(' aria-current="page"' if status == key else "")}>{octicon(icon)}{label}</a>''') for key, icon, label in (("open", "issue-opened", "Open"), ("closed", "check", "Closed"), ("all", "issue-opened", "All")))}
 </nav><span class="muted">{total} {"issue" if total == 1 else "issues"}</span></div><ul class="topic-list">{safe_html(rows_html)}</ul></section>{pagination}"""
         )
         await _send_html(
@@ -4419,7 +4569,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         body = html_t(
             t"""{_repo_tabs(base, "issues")}<div class="topbar"><h2>New issue</h2>
-<div><a class="pill" href="{base}/issues">All issues</a> <a class="pill" href="{base}">Repo</a></div></div>
+</div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><form method="POST" action="{base}/issues/create">
 <label>Title</label><input name="title" required maxlength="300" placeholder="Describe the problem or request" style="width:100%">
@@ -4527,7 +4677,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             route = "close" if status == "open" else "reopen"
             controls_area = safe_html(
                 html_t(
-                    t'<form method="POST" action="{base}/issues/{issue_id}/{route}" style="margin-top:10px"><button type="submit">{action}</button></form>'
+                    t'<form method="POST" action="{base}/issues/{issue_id}/{route}" style="margin-top:10px"><button class="secondary" type="submit">{octicon("issue-closed" if route == "close" else "issue-opened", cls="issue-action-icon-" + route)}{action}</button></form>'
                 )
             )
         title_form = safe_html("")
@@ -4714,14 +4864,18 @@ document.addEventListener("DOMContentLoaded", function() {{
         for discussion_id, title, cat, created_at, _author_id, username, answered_id in rows_db:
             count = comment_counts.get(discussion_id, 0)
             answer = (
-                safe_html('<span class="pill pill-open">✓ Answered</span>')
+                safe_html(
+                    html_t(
+                        t'<span class="pill pill-open">{octicon("check-circle-fill")}Answered</span>'
+                    )
+                )
                 if answered_id
                 else safe_html("")
             )
             rows.append(
                 html_t(
                     t"""<li class="topic-list-row discussion-list-row">
-<span class="issue-status-icon discussion-cat" aria-hidden="true">◇</span>
+<span class="issue-status-icon discussion-cat" aria-hidden="true">{octicon("comment-discussion")}</span>
 <div><a class="review-row-title" href="{base}/discussions/{discussion_id}">{title}</a>
 <div class="review-row-meta">#{discussion_id} · Started <time title="{created_at}">{_relative_time(created_at)}</time> by {username or "anonymous"}</div></div>
 <div class="topic-row-badges"><span class="pill">{cat}</span>{answer}<small class="muted">{count} {"reply" if count == 1 else "replies"}</small></div></li>"""
@@ -4749,7 +4903,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         new_pill = (
             safe_html(
                 html_t(
-                    t'<a class="pill pull-tab-active" href="{base}/discussions/new">+ New discussion</a>'
+                    t'<a class="btn btn-primary" href="{base}/discussions/new">New discussion</a>'
                 )
             )
             if _has_write_scope(self)
@@ -4819,7 +4973,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         )
         body = html_t(
             t"""{_repo_tabs(base, "discussions")}<div class="topbar"><h2>New discussion</h2>
-<div><a class="pill" href="{base}/discussions">All discussions</a> <a class="pill" href="{base}">Repo</a></div></div>
+</div>
 {notice_html}
 <div class="box" style="margin-bottom:14px"><form method="POST" action="{base}/discussions/create">
 <label>Category</label><select name="category" required>{category_options}</select>
@@ -4897,7 +5051,11 @@ document.addEventListener("DOMContentLoaded", function() {{
             when = _relative_time(c_created) or c_created
             edited = " (edited)" if c_edited else ""
             answer_badge = (
-                safe_html(' <span class="pill pill-open">✓ Answer</span>')
+                safe_html(
+                    html_t(
+                        t' <span class="pill pill-open">{octicon("check-circle-fill")}Answer</span>'
+                    )
+                )
                 if cid == answered_id
                 else safe_html("")
             )
@@ -4913,13 +5071,13 @@ document.addEventListener("DOMContentLoaded", function() {{
                 if cid == answered_id:
                     answer_toggle = safe_html(
                         html_t(
-                            t'<form method="POST" action="{base}/discussions/{discussion_id}/unanswer/{cid}" class="issue-comment-actions"><button type="submit">Unmark answer</button></form>'
+                            t'<form method="POST" action="{base}/discussions/{discussion_id}/unanswer/{cid}" class="issue-comment-actions"><button class="secondary btn-sm" type="submit">Unmark answer</button></form>'
                         )
                     )
                 else:
                     answer_toggle = safe_html(
                         html_t(
-                            t'<form method="POST" action="{base}/discussions/{discussion_id}/answer/{cid}" class="issue-comment-actions"><button type="submit">Mark as answer</button></form>'
+                            t'<form method="POST" action="{base}/discussions/{discussion_id}/answer/{cid}" class="issue-comment-actions"><button class="secondary btn-sm" type="submit">{octicon("check-circle-fill")}Mark as answer</button></form>'
                         )
                     )
             highlight = safe_html(" discussion-answered") if cid == answered_id else safe_html("")
@@ -4945,7 +5103,11 @@ document.addEventListener("DOMContentLoaded", function() {{
                 html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
             )
         answered_pill = (
-            safe_html(' <span class="pill pill-open">✓ Answered</span>')
+            safe_html(
+                html_t(
+                    t' <span class="pill pill-open">{octicon("check-circle-fill")}Answered</span>'
+                )
+            )
             if answered
             else safe_html("")
         )
@@ -4970,7 +5132,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             lock_route = "lock" if not locked else "unlock"
             controls_area = safe_html(
                 html_t(
-                    t'<form method="POST" action="{base}/discussions/{discussion_id}/{lock_route}" style="margin-top:10px"><button type="submit">{lock_action}</button></form>'
+                    t'<form method="POST" action="{base}/discussions/{discussion_id}/{lock_route}" style="margin-top:10px"><button class="secondary" type="submit">{octicon("lock")}{lock_action}</button></form>'
                 )
             )
         title_form = safe_html("")
@@ -6583,7 +6745,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             )
         body = safe_html(
             html_t(
-                t'<main class="ci-page"><div class="topbar"><h1>API documentation</h1><a href="/">Home</a></div><nav class="row" aria-label="API documentation sections"><a href="#repository-browsing-and-comparisons">Repository browsing</a><a href="#discussions">Discussions</a><a href="#ci-automation">CI automation</a><a href="#ci-api-safety-and-test-coverage">CI safety and tests</a><a href="#responses-pagination-and-errors">Responses and errors</a><a href="#remaining-api-coverage-gaps">Remaining API gaps</a></nav><article class="box ci-guide">{content}</article></main>'
+                t'<main class="ci-page"><div class="topbar"><h1>API documentation</h1></div><nav class="row" aria-label="API documentation sections"><a href="#repository-browsing-and-comparisons">Repository browsing</a><a href="#discussions">Discussions</a><a href="#ci-automation">CI automation</a><a href="#ci-api-safety-and-test-coverage">CI safety and tests</a><a href="#responses-pagination-and-errors">Responses and errors</a><a href="#remaining-api-coverage-gaps">Remaining API gaps</a></nav><article class="box ci-guide">{content}</article></main>'
             )
         )
         return await _send_html(self.request, 200, _html_page("API documentation", body))
@@ -7020,7 +7182,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         )
         body = html_t(
             t"""{_repo_tabs(base, "code")}<div class="review-breadcrumb"><a href="{base}">{owner} / {repo}</a> <span>/</span> Commits</div><div class="topbar"><h2>Commits</h2>
-<div><a class="pill" href="{base}">Repo</a> <a class="pill" href="{base}/branches">Branches</a> <a class="pill" href="{base}/pulls">Pull requests</a></div></div>
+</div>
 <div class="box"><div class="topbar"><p class="muted">ref: <code>{ref}</code> {history_path}</p>{pagination}</div><table><tbody id="commitRows">{rows_html}</tbody></table>
 <div id="loadMoreStatus" class="muted" style="margin-top:10px">{load_more}</div>{pagination}</div>
 <script>
@@ -8600,6 +8762,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return
         if not _is_static_request_path(path) and not path.startswith(URL_PREFIX + "/"):
             _display_name.set(await self.server.display_name())
+            _request_path.set(path)
+            _viewer.set((None, False))
         if self.command == "GET":
             return await self.do_GET()
         if self.command == "POST":

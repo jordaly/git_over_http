@@ -148,7 +148,7 @@ The authenticated token owner is always recorded as the author.
 
 | Method | Path | Required JSON fields |
 | --- | --- | --- |
-| `POST` | `/user/repos` | `name`; optional `default_branch` (default `main`) |
+| `POST` | `/user/repos` | `name`; optional `default_branch` (default `main`), `auto_init` (`true` adds a `README.md`), `gitignore_template` (`C`, `C#`, `C++`, `Go`, `Java`, `Node`, `Python`, `Rust`), `license_template` (`MIT`, `Apache-2.0`, `GPL-3.0`, `MPL-2.0`, `BSD-3-Clause`, `Unlicense`); any of these creates an initial commit |
 | `POST` | `/repos/{owner}/{repo}/branches` | `name`, `sha` (full source commit SHA) |
 | `DELETE` | `/repos/{owner}/{repo}/branches/{branch}` | `expected_head` (full current commit SHA) |
 | `PUT` | `/repos/{owner}/{repo}/contents/{path}` | `branch`, `expected_head`, `message`, `content` (base64 UTF-8) |

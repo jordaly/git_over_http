@@ -204,6 +204,27 @@ class APIWriteTests(unittest.TestCase):
         self.assertEqual(self.mutate("/api/v1/user/repos", {"name": "../bad"})[0], 422)
         self.assertEqual(self.mutate("/api/v1/user/repos", {"name": "bad", "owner": "bob"})[0], 422)
 
+    def test_repository_create_with_readme(self):
+        document = {
+            "name": "with-readme",
+            "default_branch": "trunk",
+            "auto_init": True,
+            "gitignore_template": "Python",
+            "license_template": "Apache-2.0",
+        }
+        status, _headers, result = self.mutate("/api/v1/user/repos", document)
+        self.assertEqual(status, 201, result)
+        repo = str(self.root / "alice/with-readme.git")
+        self.assertEqual(self.git("--git-dir", repo, "show", "trunk:README.md"), "# with-readme")
+        author = self.git("--git-dir", repo, "log", "-1", "--format=%an %s", "trunk")
+        self.assertEqual(author, "alice Initial commit")
+        self.assertIn("__pycache__/", self.git("--git-dir", repo, "show", "trunk:.gitignore"))
+        self.assertIn("Apache License", self.git("--git-dir", repo, "show", "trunk:LICENSE"))
+        for bad in ({"auto_init": "yes"}, {"gitignore_template": "Cobol"}, {"license_template": 1}):
+            status = self.mutate("/api/v1/user/repos", {"name": "bad-init", **bad})[0]
+            self.assertEqual(status, 422, bad)
+        self.assertFalse((self.root / "alice/bad-init.git").exists())
+
     def test_file_read_write_delete_and_stale_branch_rejection(self):
         status, _headers, old = self.request(self.base + "/contents/README.md?branch=main")
         self.assertEqual(status, 200, old)

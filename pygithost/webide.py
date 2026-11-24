@@ -92,6 +92,39 @@ def git(
     return result.stdout
 
 
+def _identity(username: str | None) -> dict[str, str]:
+    """Author/committer variables; inherited identity must not impersonate another user."""
+    name = re.sub(r"[<>\r\n\x00]", "", username or "Browser user")[:100] or "Browser user"
+    email = re.sub(r"[^a-zA-Z0-9_.-]", "_", name) + "@users.pygithost.local"
+    return {
+        "GIT_AUTHOR_NAME": name,
+        "GIT_AUTHOR_EMAIL": email,
+        "GIT_COMMITTER_NAME": name,
+        "GIT_COMMITTER_EMAIL": email,
+    }
+
+
+def initial_commit(repo: str, branch: str, files: Mapping[str, bytes], username: str | None) -> str:
+    """Commit top-level files as the first commit of an empty bare repository.
+
+    Returns the new commit SHA. The ref update only succeeds if the branch does
+    not exist yet, so a concurrent first push is never overwritten.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(_identity(username))
+    records = b""
+    for filename, content in files.items():
+        if not filename or "/" in filename or any(c in filename for c in "\t\n\0"):
+            raise IDEError("Invalid initial file name.")
+        oid = git(repo, "hash-object", "-w", "--stdin", data=content, env=env).strip()
+        records += b"100644 blob " + oid + b"\t" + filename.encode() + b"\n"
+    tree = git(repo, "mktree", data=records, env=env).decode().strip()
+    commit = git(repo, "commit-tree", tree, data=b"Initial commit\n", env=env).decode().strip()
+    zero = "0" * len(commit)
+    git(repo, "update-ref", "refs/heads/" + branch, commit, zero, env=env)
+    return commit
+
+
 def path(value: object) -> str:
     if (
         not isinstance(value, str)
@@ -393,15 +426,7 @@ def commit_changes(
     with tempfile.TemporaryDirectory(prefix="pygithost-ide-") as directory:
         env = os.environ.copy()
         env["GIT_INDEX_FILE"] = os.path.join(directory, "index")
-        # Do not permit inherited identity to impersonate another user.
-        name = re.sub(r"[<>\r\n\x00]", "", username or "Browser user")[:100] or "Browser user"
-        email = re.sub(r"[^a-zA-Z0-9_.-]", "_", name) + "@users.pygithost.local"
-        env.update(
-            GIT_AUTHOR_NAME=name,
-            GIT_AUTHOR_EMAIL=email,
-            GIT_COMMITTER_NAME=name,
-            GIT_COMMITTER_EMAIL=email,
-        )
+        env.update(_identity(username))
         git(repo, "read-tree", base, env=env)
         for filename, file_mode, file_oid in updates:
             if file_oid is not None:

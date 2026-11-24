@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 from .. import database, webide
 from ..ci import protected_branch
+from ..repo_templates import GITIGNORE_TEMPLATES, LICENSES, initial_files
 from . import data, git, text_mutations
 from .errors import APIError
 from .types import (
@@ -133,7 +134,11 @@ async def route(
     owner, repo, path, tail = target
     doc, method = api.document, api.request.method
     if tail == "create_repository":
-        fields(doc, {"name", "default_branch"}, {"name"})
+        fields(
+            doc,
+            {"name", "default_branch", "auto_init", "gitignore_template", "license_template"},
+            {"name"},
+        )
         repo = name(doc["name"])
         lock = api.handler.server.push_locks.setdefault((owner, repo), asyncio.Lock())
         async with lock:
@@ -291,6 +296,7 @@ async def create_repository(
     if (directory / repo).exists() or (directory / repo).is_symlink():
         raise APIError(409, "repository_conflict", "Repository already exists.")
     default = await branch(str(directory), doc.get("default_branch", "main"))
+    starter = starter_files(doc, repo, owner)
     try:
         target.mkdir()
     except FileExistsError:
@@ -309,7 +315,32 @@ async def create_repository(
         raise APIError(
             503, "repository_unavailable", "Repository exists but push configuration failed."
         )
+    if starter:
+        try:
+            await asyncio.to_thread(
+                webide.initial_commit, str(target), default, starter, api.identity["username"]
+            )
+        except webide.IDEError:
+            raise APIError(
+                503, "repository_unavailable", "Repository exists but the initial commit failed."
+            ) from None
     return {**api.repo_object(owner, repo), "default_branch": default}
+
+
+def starter_files(doc: Mapping[str, object], repo: str, owner: str) -> dict[str, bytes]:
+    """Validate the optional initial-commit fields and build the files they request."""
+    auto_init = doc.get("auto_init", False)
+    gitignore = doc.get("gitignore_template", "")
+    license = doc.get("license_template", "")
+    if not isinstance(auto_init, bool):
+        raise APIError(422, "validation_error", "auto_init must be a boolean.")
+    if not isinstance(gitignore, str) or (gitignore and gitignore not in GITIGNORE_TEMPLATES):
+        allowed = ", ".join(GITIGNORE_TEMPLATES)
+        raise APIError(422, "validation_error", f"gitignore_template must be one of: {allowed}.")
+    if not isinstance(license, str) or (license and license not in LICENSES):
+        allowed = ", ".join(LICENSES)
+        raise APIError(422, "validation_error", f"license_template must be one of: {allowed}.")
+    return initial_files(repo, readme=auto_init, gitignore=gitignore, license=license, holder=owner)
 
 
 async def create_entity(

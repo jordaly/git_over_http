@@ -125,6 +125,7 @@ from .logging_setup import access as log_access
 from .logging_setup import configure_logging, safe_target
 from .octicons import octicon
 from .readme import render_readme
+from .repo_templates import GITIGNORE_TEMPLATES, LICENSES, initial_files
 from .repository_info import RepositoryOverview, repository_overview
 
 logger = logging.getLogger(__name__)
@@ -396,6 +397,7 @@ def _repo_tabs(base: str, active: str) -> SafeHTML:
         ("ci", "/ci", "play", "CI"),
         ("artifacts", "/artifacts", "package", "Artifacts"),
         ("branches", "/branches", "git-branch", "Branches"),
+        ("settings", "/settings", "gear", "Settings"),
     ):
         current = safe_html(' aria-current="page"' if key == active else "")
         links.append(
@@ -2605,6 +2607,14 @@ class GitHTTPHandler:
 <div><label for="repo-name">Repository name <span class="repo-required">*</span></label><input id="repo-name" name="repo" placeholder="my-repo" required /></div>
 </div>
 <p class="muted repo-create-hint">Great repository names are short and memorable. Leave owner empty to use the flat layout.</p>
+<fieldset class="repo-create-init"><legend>Initialize this repository with:</legend>
+<label class="repo-create-readme"><input type="checkbox" name="readme" value="1" /> Add a README file <span class="muted">— a <code>README.md</code> with the repository name.</span></label>
+<div class="row repo-create-templates">
+<div><label for="repo-gitignore">Add .gitignore</label><select id="repo-gitignore" name="gitignore"><option value="">None</option>{join_html([html_t(t'<option value="{g}">{g}</option>') for g in GITIGNORE_TEMPLATES])}</select></div>
+<div><label for="repo-license">Choose a license</label><select id="repo-license" name="license"><option value="">None</option>{join_html([html_t(t'<option value="{k}">{v}</option>') for k, v in LICENSES.items()])}</select></div>
+</div>
+<p class="muted">Choosing any of these creates an initial commit on the default branch.</p>
+</fieldset>
 <div class="repo-create-actions"><button type="submit">Create repository</button></div>
 </form>
 </details>
@@ -2778,6 +2788,17 @@ class GitHTTPHandler:
         if not _safe_seg(repo):
             return await self._ui_home("Invalid repo name.", "warn")
 
+        try:
+            starter = initial_files(
+                repo,
+                readme=form.get("readme") == "1",
+                gitignore=(form.get("gitignore") or "").strip(),
+                license=(form.get("license") or "").strip(),
+                holder=self.remote_user or (owner if owner_ui != FLAT_OWNER_UI else repo),
+            )
+        except KeyError:
+            return await self._ui_home("Unknown .gitignore or license template.", "warn")
+
         repo_git = _repo_bare_path(owner_ui, repo)
         try:
             if owner_ui == FLAT_OWNER_UI:
@@ -2810,7 +2831,161 @@ class GitHTTPHandler:
                 str_t(t"Repo created, but failed to enable push: {msg}"), "warn"
             )
 
+        if starter:
+            from .webide import IDEError, initial_commit
+
+            branch = await _git_default_branch(repo_git)
+            try:
+                await asyncio.to_thread(initial_commit, repo_git, branch, starter, self.remote_user)
+            except IDEError as e:
+                return await self._ui_home(
+                    str_t(t"Repo created, but the initial commit failed: {e}"), "warn"
+                )
+
         return await self._ui_home(str_t(t"Repo created: {owner_ui}/{repo}"), "ok")
+
+    def _can_delete_repo(self) -> bool:
+        # Deleting is irreversible, so it requires an administrator. Without
+        # authentication the IP allowlist is the boundary, as for other writes.
+        return _require_admin(self) if REQUIRE_AUTH else True
+
+    async def _ui_repo_settings(
+        self, owner: str, repo: str, notice: str = "", notice_kind: str = "ok", status: int = 200
+    ) -> None:
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._forbidden(b"403 Forbidden\n")
+        repo_git = _repo_bare_path(owner, repo)
+        if not os.path.isdir(repo_git):
+            return await self._not_found()
+        base = str_t(t"/r/{q(owner)}/{q(repo)}")
+        full_name = f"{owner}/{repo}"
+        notice_html = (
+            safe_html(html_t(t'<p class="{notice_kind}" role="status">{notice}</p>'))
+            if notice
+            else safe_html("")
+        )
+        if not self._can_delete_repo():
+            delete_html = safe_html(
+                '<p class="muted">Only administrators can delete repositories.</p>'
+            )
+        elif Path(repo_git).name == ".git":
+            delete_html = safe_html(
+                '<p class="muted">This repository has a working tree on the server, so it '
+                "cannot be deleted from the web interface. Remove its folder on disk instead.</p>"
+            )
+        else:
+            delete_html = safe_html(
+                html_t(
+                    t"""<details class="repo-delete"><summary class="btn danger">Delete this repository</summary>
+<form method="POST" action="{base}/settings/delete" class="repo-delete-form" data-expected="{full_name}">
+<input type="hidden" name="csrf" value="{self._settings_csrf_token()}">
+<p class="warn" role="alert">This permanently deletes the <strong>{full_name}</strong> repository, its Git history, and all of its issues, pull requests, discussions, CI runs, deployments, and artifacts. This cannot be undone.</p>
+<label for="repo-delete-confirm">To confirm, type <strong>{full_name}</strong> in the box below</label>
+<input id="repo-delete-confirm" name="confirm" autocomplete="off" spellcheck="false" required>
+<button type="submit" class="danger" disabled>I understand, delete this repository</button>
+</form></details>
+<script>(function() {{
+  document.querySelectorAll(".repo-delete-form").forEach(function(form) {{
+    const input = form.querySelector("input[name=confirm]");
+    const button = form.querySelector("button[type=submit]");
+    input.addEventListener("input", function() {{ button.disabled = input.value !== form.dataset.expected; }});
+    form.addEventListener("submit", function(event) {{
+      if (input.value !== form.dataset.expected || !window.confirm("Permanently delete " + form.dataset.expected + "? This cannot be undone.")) event.preventDefault();
+    }});
+  }});
+}})();</script>"""
+                )
+            )
+        body = html_t(
+            t"""<main class="repo-page">{_repo_tabs(base, "settings")}<div class="topbar"><div><h2>Settings</h2><p class="muted">Repository administration.</p></div></div>
+{notice_html}
+<section class="box repo-danger-zone"><h2>Danger zone</h2>
+<div class="repo-danger-row"><div><strong>Delete this repository</strong><p class="muted">Once you delete a repository, there is no going back. Please be certain.</p></div></div>
+{delete_html}</section></main>"""
+        )
+        await _send_html(
+            self.request,
+            status,
+            _html_page(str_t(t"Settings · {owner}/{repo}"), safe_html(body)),
+        )
+
+    async def _ui_repo_delete(self, owner: str, repo: str) -> None:
+        from .database import db_repository_active_ci, db_repository_delete
+
+        owner, repo = unquote(owner), unquote(repo)
+        if not (_safe_seg(owner) and _safe_seg(repo)):
+            return await self._forbidden(b"403 Forbidden\n")
+        full_name = f"{owner}/{repo}"
+        if not self._can_delete_repo():
+            await self._audit("repo_delete", "failure", target=full_name, detail="forbidden")
+            return await self._ui_repo_settings(
+                owner, repo, "Only administrators can delete repositories.", "warn", 403
+            )
+        form = await self._read_form_urlencoded()
+        if not self._valid_settings_csrf(form):
+            return await self._ui_repo_settings(
+                owner, repo, "The form expired. Reload the page and try again.", "warn", 403
+            )
+        if form.get("confirm", "") != full_name:
+            return await self._ui_repo_settings(
+                owner,
+                repo,
+                str_t(t"Confirmation did not match. Type {full_name} exactly to delete it."),
+                "warn",
+                422,
+            )
+
+        lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
+        async with lock:
+            repo_git = Path(_repo_bare_path(owner, repo))
+            root = Path(GIT_PROJECT_ROOT).resolve()
+            parent = root if owner == FLAT_OWNER_UI else root / owner
+            if not _is_git_dir(repo_git):
+                return await self._not_found()
+            # Only delete a real bare repository directly inside its namespace:
+            # never a symlinked alias or a working tree with uncommitted files.
+            if (
+                repo_git.name == ".git"
+                or repo_git.is_symlink()
+                or repo_git.parent.is_symlink()
+                or repo_git.resolve().parent != parent
+            ):
+                await self._audit("repo_delete", "failure", target=full_name, detail="unsafe_path")
+                return await self._ui_repo_settings(
+                    owner, repo, "This repository cannot be deleted from the web interface.", "warn"
+                )
+            if await _call_in_thread(db_repository_active_ci, owner, repo):
+                return await self._ui_repo_settings(
+                    owner,
+                    repo,
+                    "CI is running for this repository. Cancel or wait for it, then try again.",
+                    "warn",
+                    409,
+                )
+            # Move the directory aside first so the repository disappears
+            # atomically, then drop its data, then reclaim the disk space.
+            trash = repo_git.with_name(f".deleting-{repo_git.name}-{secrets.token_hex(6)}")
+            try:
+                os.rename(repo_git, trash)
+            except OSError as e:
+                await self._audit("repo_delete", "failure", target=full_name, detail=str(e))
+                return await self._ui_repo_settings(
+                    owner, repo, str_t(t"Failed to delete repository: {e}"), "warn", 500
+                )
+            try:
+                await _call_in_thread(db_repository_delete, owner, repo)
+            except Exception as e:
+                os.rename(trash, repo_git)
+                await self._audit(
+                    "repo_delete", "failure", target=full_name, detail=type(e).__name__
+                )
+                return await self._ui_repo_settings(
+                    owner, repo, "Failed to delete repository data; nothing was removed.", "warn"
+                )
+            await asyncio.to_thread(shutil.rmtree, trash, ignore_errors=True)
+        await self._audit("repo_delete", "success", target=full_name)
+        return await self._ui_home(str_t(t"Repository {full_name} was deleted."), "ok")
 
     # ========================================================
     # UI: Admin Users
@@ -8552,6 +8727,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches$", p)
         if m:
             return await self._ui_branches(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/settings$", p)
+        if m:
+            return await self._ui_repo_settings(m.group(1), m.group(2))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls$", p)
         if m:
             return await self._ui_pulls(m.group(1), m.group(2))
@@ -8759,6 +8937,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/branches/delete$", parsed.path)
         if m:
             return await self._ui_branch_delete(m.group(1), m.group(2))
+        m = re.match(r"^/r/([^/]+)/([^/]+)/settings/delete$", parsed.path)
+        if m:
+            return await self._ui_repo_delete(m.group(1), m.group(2))
         return await self._not_found()
 
     async def do_HEAD(self) -> None:

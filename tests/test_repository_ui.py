@@ -304,6 +304,77 @@ class RepositoryUITests(unittest.TestCase):
         _, page = self.request("/?" + urlencode({"q": '"><script>alert(1)</script>'}))
         self.assertNotIn("<script>alert(1)</script>", page)
 
+    def test_create_repository_with_starter_files(self):
+        _, page = self.request("/")
+        self.assertIn('name="readme"', page)
+        self.assertIn('<option value="C#">C#</option>', page)
+        self.assertIn('<option value="MIT">MIT License</option>', page)
+        fields = {"repo": "starter", "readme": "1", "gitignore": "C#", "license": "MIT"}
+        status, page = self.request("/create-repo", fields)
+        self.assertEqual(status, 200)
+        self.assertIn("Repo created", page)
+        repo = str(self.root / "starter.git")
+
+        def show(name):
+            return subprocess.check_output(
+                ["git", "--git-dir=" + repo, "show", "HEAD:" + name], text=True
+            )
+
+        self.assertEqual(show("README.md"), "# starter\n")
+        self.assertIn("[Bb]in/", show(".gitignore"))
+        self.assertIn("MIT License", show("LICENSE"))
+        self.assertNotIn("[year]", show("LICENSE"))
+        status, page = self.request("/create-repo", {"repo": "bad", "license": "nope"})
+        self.assertIn("Unknown .gitignore or license template", page)
+        self.assertFalse((self.root / "bad.git").exists())
+
+    def test_delete_repository_requires_typed_confirmation(self):
+        name = f"{FLAT_OWNER_UI}/project"
+        database.db_issue_create(FLAT_OWNER_UI, "project", "Doomed issue", "", None)
+        status, page = self.request(self.base + "/settings")
+        self.assertEqual(status, 200)
+        self.assertIn("Danger zone", page)
+        self.assertIn(f'data-expected="{name}"', page)
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', page)[1]
+        delete = self.base + "/settings/delete"
+
+        status, page = self.request(delete, {"csrf": csrf, "confirm": "project"})
+        self.assertEqual(status, 422)
+        self.assertIn("Confirmation did not match", page)
+        status, _ = self.request(delete, {"csrf": "forged", "confirm": name})
+        self.assertEqual(status, 403)
+        self.assertTrue(self.bare.exists())
+
+        status, page = self.request(delete, {"csrf": csrf, "confirm": name})
+        self.assertEqual(status, 200)
+        self.assertIn(f"Repository {name} was deleted.", page)
+        self.assertFalse(self.bare.exists())
+        self.assertEqual([p.name for p in self.root.glob(".deleting-*")], [])
+        self.assertEqual(database.db_issue_list(FLAT_OWNER_UI, "project", None), [])
+        self.assertEqual(self.request(self.base)[0], 404)
+
+    def test_delete_repository_requires_admin(self):
+        _, page = self.request(self.base + "/settings")
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', page)[1]
+        with mock.patch.object(application.GitHTTPHandler, "_can_delete_repo", return_value=False):
+            status, page = self.request(self.base + "/settings")
+            self.assertIn("Only administrators can delete repositories", page)
+            self.assertNotIn('name="confirm"', page)
+            fields = {"csrf": csrf, "confirm": f"{FLAT_OWNER_UI}/project"}
+            status, _ = self.request(self.base + "/settings/delete", fields)
+        self.assertEqual(status, 403)
+        self.assertTrue(self.bare.exists())
+
+    def test_delete_repository_refuses_working_tree(self):
+        status, page = self.request(f"/r/{FLAT_OWNER_UI}/source/settings")
+        self.assertEqual(status, 200)
+        self.assertIn("cannot be deleted from the web interface", page)
+        _, home = self.request(self.base + "/settings")
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', home)[1]
+        fields = {"csrf": csrf, "confirm": f"{FLAT_OWNER_UI}/source"}
+        self.request(f"/r/{FLAT_OWNER_UI}/source/settings/delete", fields)
+        self.assertTrue((self.source / ".git").is_dir())
+
     def test_multiple_pipeline_settings_and_manual_selection(self):
         self.save_document(
             {

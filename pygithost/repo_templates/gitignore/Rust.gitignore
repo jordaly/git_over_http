@@ -1,0 +1,9 @@
+# Build output
+/target/
+debug/
+
+# Backup files from rustfmt
+**/*.rs.bk
+
+# MSVC debug information
+*.pdb

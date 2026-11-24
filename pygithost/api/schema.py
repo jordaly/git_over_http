@@ -4,6 +4,7 @@ from collections.abc import Collection, Sequence
 from typing import Any
 
 from ..discussion_rules import CATEGORIES
+from ..repo_templates import GITIGNORE_TEMPLATES, LICENSES
 from .types import DynamicJSONObject
 
 
@@ -657,6 +658,9 @@ def specification() -> DynamicJSONObject:
         {
             "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"},
             "default_branch": string,
+            "auto_init": {"type": "boolean"},
+            "gitignore_template": {"type": "string", "enum": ["", *GITIGNORE_TEMPLATES]},
+            "license_template": {"type": "string", "enum": ["", *LICENSES]},
         },
         {"name"},
         ref("RepositoryDetail"),

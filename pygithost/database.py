@@ -3186,3 +3186,51 @@ def db_pr_reopen(pr_id: int) -> None:
         )
     finally:
         conn.close()
+
+
+# Every table keyed by repository. Child rows (comments, CI steps and artifacts)
+# are removed by ON DELETE CASCADE.
+_REPOSITORY_TABLES = (
+    "pull_requests",
+    "issues",
+    "discussions",
+    "ci_deployments",
+    "ci_runs",
+    "ci_configs",
+    "ci_retention_policy",
+    "repository_ci_settings",
+    "repository_languages",
+    "repository_overviews",
+)
+
+
+def db_repository_active_ci(owner: str, repo: str) -> bool:
+    """True while a CI run or deployment for the repository is still in progress."""
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            """SELECT 1 FROM ci_runs WHERE owner=? AND repo=? AND status IN ('queued','running')
+               UNION ALL
+               SELECT 1 FROM ci_deployments WHERE owner=? AND repo=? AND status='running'
+               LIMIT 1""",
+            (owner, repo, owner, repo),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def db_repository_delete(owner: str, repo: str) -> None:
+    """Remove all stored data for a repository in one transaction."""
+    conn = _db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table in _REPOSITORY_TABLES:
+                conn.execute(f"DELETE FROM {table} WHERE owner=? AND repo=?", (owner, repo))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()

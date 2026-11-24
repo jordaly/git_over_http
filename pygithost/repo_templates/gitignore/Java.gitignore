@@ -1,0 +1,24 @@
+# Compiled classes and archives
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+
+# Logs and crash dumps
+*.log
+hs_err_pid*
+replay_pid*
+
+# Build tools
+target/
+build/
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE files
+.idea/
+*.iml
+.classpath
+.project
+.settings/

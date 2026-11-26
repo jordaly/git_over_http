@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
@@ -128,7 +129,7 @@ from .octicons import octicon
 from .readme import render_readme
 from .repo_templates import GITIGNORE_TEMPLATES, LICENSES, initial_files
 from .repository_info import RepositoryOverview, repository_overview
-from .sentinel import SentinelExporter, set_current
+from .sentinel import SentinelExporter, _parse_traceparent, set_current
 
 logger = logging.getLogger(__name__)
 
@@ -938,28 +939,41 @@ def _git_path_info_is_safe(path_info: str) -> bool:
     return not any(part in (".", "..") for part in path_info.split("/"))
 
 
-def _repo_identity_from_git_path_info(path_info: str) -> tuple[str, str] | None:
-    """Best-effort owner/repo for a public smart-HTTP path; never used for auth."""
-    parts = [part for part in path_info.strip("/").split("/") if part]
-    if len(parts) < 3:
-        return None
-    first = parts[0]
-    flat = first.endswith(".git") or parts[1] in (
-        "info",
-        "git-upload-pack",
-        "git-receive-pack",
-        "HEAD",
-        "objects",
+def _git_query_services(query: str) -> set[str]:
+    """Service names in a smart-HTTP ``?service=`` query string."""
+    return {value for values in parse_qs(query or "").values() for value in values}
+
+
+def _git_service_kind(path_info: str, query: str) -> str:
+    """Low-cardinality service label for a Git smart-HTTP request."""
+    services = _git_query_services(query)
+    if path_info.endswith("/git-receive-pack") or "git-receive-pack" in services:
+        return "receive-pack"
+    if path_info.endswith("/git-upload-pack") or "git-upload-pack" in services:
+        return "upload-pack"
+    if path_info.endswith("/info/refs"):
+        return "info-refs"
+    return "other"
+
+
+def _git_fetch_advertisement(method: str, path_info: str, query: str) -> bool:
+    """True for the one ``info/refs?service=git-upload-pack`` request per fetch."""
+    return (
+        method.upper() == "GET"
+        and path_info.endswith("/info/refs")
+        and "git-upload-pack" in _git_query_services(query)
     )
-    if flat:
-        repo = first[:-4] if first.endswith(".git") else first
-        return (FLAT_OWNER_UI, repo) if _safe_seg(repo) else None
-    owner, repo = first, parts[1]
-    if repo.endswith(".git"):
-        repo = repo[:-4]
-    if _safe_seg(owner) and _safe_seg(repo):
-        return owner, repo
-    return None
+
+
+def _canonical_repo_from_git_path_info(path_info: str) -> tuple[str, str] | None:
+    """Resolve an existing repository from a mapped ``.../info/refs`` path."""
+    suffix = "/info/refs"
+    if not path_info.endswith(suffix):
+        return None
+    parts = [part for part in path_info[: -len(suffix)].split("/") if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        return None
+    return _canonical_repo_for_git_dir(Path(GIT_PROJECT_ROOT).joinpath(*parts))
 
 
 def _repo_git_path(owner_ui: str, repo: str) -> str:
@@ -2322,6 +2336,11 @@ class BadForm(Exception):
 
 
 def _emit_auth_failure(surface: str, method: str, reason: str) -> None:
+    if reason == "missing_credentials":
+        # Browsers and Git clients probe without credentials first and retry
+        # after the 401 challenge; that handshake is not a failure.
+        sentinel.count("auth.challenge.count", attributes={"surface": surface})
+        return
     sentinel.emit_event(
         "auth_failure",
         level="Warning",
@@ -8154,9 +8173,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
     # Git smart HTTP backend
     # ========================================================
     def _git_request_needs_write(self, path_info: str, query: str) -> bool:
-        qs = parse_qs(query or "")
-        services = {s for values in qs.values() for s in values}
-        return path_info.endswith("/git-receive-pack") or "git-receive-pack" in services
+        return path_info.endswith("/git-receive-pack") or "git-receive-pack" in _git_query_services(
+            query
+        )
 
     async def _send_continue_if_needed(self) -> None:
         """Support clients that send: Expect: 100-continue."""
@@ -8284,12 +8303,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._not_found()
         path_info = _map_git_http_path_info(path_info)
         query = parsed.query or ""
-        if path_info.endswith("/git-upload-pack") or "git-upload-pack" in query:
-            identity = _repo_identity_from_git_path_info(public_path_info)
-            if identity:
-                sentinel.count(
-                    "git.fetch.count", attributes={"repo": f"{identity[0]}/{identity[1]}"}
-                )
+        service_kind = _git_service_kind(path_info, query)
 
         if self.remote_repository and not self._git_path_in_repository(
             path_info, *self.remote_repository
@@ -8299,6 +8313,16 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
 
         if self._git_request_needs_write(path_info, query) and not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required for git push.\n")
+
+        if _git_fetch_advertisement(self.command, path_info, query):
+            # One upload-pack ref advertisement per fetch/clone. Counting here
+            # needs an authorized request and an existing, resolved repository.
+            fetch_identity = await asyncio.to_thread(_canonical_repo_from_git_path_info, path_info)
+            if fetch_identity is not None:
+                sentinel.count(
+                    "git.fetch.count",
+                    attributes={"repo": f"{fetch_identity[0]}/{fetch_identity[1]}"},
+                )
 
         raw_clen = self.headers.get("Content-Length")
         try:
@@ -8361,6 +8385,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         before_refs: dict[str, str] | None = {}
         protection_hooks: tempfile.TemporaryDirectory[str] | None = None
         connected = True
+        backend_started: float | None = None
+        backend_outcome = "error"
         is_receive_pack_post = self.command == "POST" and path_info.endswith("/git-receive-pack")
         if is_receive_pack_post:
             git_dir = Path(GIT_PROJECT_ROOT).joinpath(
@@ -8420,6 +8446,7 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
 
             await self._send_continue_if_needed()
 
+            backend_started = time.monotonic()
             proc = await asyncio.create_subprocess_exec(
                 *_git_backend_command(),
                 stdin=asyncio.subprocess.PIPE,
@@ -8464,6 +8491,13 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                         extra_headers.append((k.strip(), v.strip()))
 
             has_conn = any(k.lower() == "connection" for k, _ in extra_headers)
+            backend_outcome = (
+                "success"
+                if status_code < 400
+                else "client_error"
+                if status_code < 500
+                else "server_error"
+            )
             response_lines = [str_t(t"HTTP/1.1 {status_code} {reason}\r\n")]
             for k, v in extra_headers:
                 response_lines.append(str_t(t"{k}: {v}\r\n"))
@@ -8501,6 +8535,12 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
                         os.killpg(proc.pid, signal.SIGKILL)
                 await proc.wait()
         finally:
+            if backend_started is not None:
+                sentinel.observe(
+                    "git.backend.duration",
+                    max(0.0, (time.monotonic() - backend_started) * 1000),
+                    {"service": service_kind, "outcome": backend_outcome},
+                )
             try:
                 if push_identity and push_lock_acquired:
                     if proc is not None and proc.returncode is None:
@@ -8973,6 +9013,102 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         return await _send_text(self.request, 400, "Unsupported method.\n")
 
 
+class _CachedGauge:
+    """Thread-safe gauge callback evaluated at most once per interval."""
+
+    def __init__(self, callback: Callable[[], float | int | None], interval: float = 300.0) -> None:
+        self._callback = callback
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._computed_at = 0.0
+        self._value: float | int | None = None
+        self._has_value = False
+
+    def __call__(self) -> float | int | None:
+        now = time.monotonic()
+        with self._lock:
+            if self._has_value and now - self._computed_at < self._interval:
+                return self._value
+            try:
+                value = self._callback()
+            except Exception:
+                value = None
+            self._value = value
+            self._computed_at = now
+            self._has_value = True
+            return value
+
+
+def _database_size_bytes() -> int | None:
+    """Main SQLite file plus its write-ahead log, excluding spool files."""
+    if not DB_PATH:
+        return None
+    total = 0
+    found = False
+    for suffix in ("", "-wal"):
+        try:
+            total += Path(DB_PATH + suffix).stat().st_size
+            found = True
+        except OSError:
+            continue
+    return total if found else None
+
+
+def _disk_free_bytes(path: str) -> int | None:
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def _read_only_database() -> sqlite3.Connection | None:
+    """Short-lived reader for gauge callbacks; never creates a missing database."""
+    path = Path(DB_PATH)
+    if not DB_PATH or not path.is_file():
+        return None
+    try:
+        return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+        return None
+
+
+def _active_session_count() -> int | None:
+    conn = _read_only_database()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT count(*) FROM sessions WHERE revoked_at IS NULL "
+            "AND expires_at > datetime('now', 'localtime')"
+        ).fetchone()
+        return int(row[0]) if row is not None else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _remote_runner_last_seen_age() -> float | None:
+    """Seconds since the most recent remote-runner claim or heartbeat."""
+    conn = _read_only_database()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute("SELECT max(heartbeat) FROM ci_remote_jobs").fetchone()
+        heartbeat = row[0] if row is not None else None
+        if not isinstance(heartbeat, int | float) or isinstance(heartbeat, bool):
+            return None
+        return max(0.0, time.time() - float(heartbeat))
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _repository_count() -> int:
+    return len(_scan_repos(GIT_PROJECT_ROOT))
+
+
 class AsyncGitServer:
     def __init__(
         self,
@@ -9026,6 +9162,8 @@ class AsyncGitServer:
         self.access_log = bool(server_config.access_log)
         self.audit_log = bool(server_config.audit_log)
         self.sentinel: SentinelExporter | None = None
+        self._active_requests = 0
+        self._active_requests_lock = threading.Lock()
         self.settings_lock = asyncio.Lock()
         # Loaded from the database on first use (the database is initialised after
         # construction) so form tokens survive restarts and deploys.
@@ -9072,8 +9210,14 @@ class AsyncGitServer:
         return refs
 
     async def _queue_push_changes(
-        self, owner: str, repo: str, before_refs: dict[str, str] | None
+        self,
+        owner: str,
+        repo: str,
+        before_refs: dict[str, str] | None,
+        *,
+        source: str = "push",
     ) -> None:
+        source_kind = "pull_request_merge" if source == "pull_request_merge" else "push"
         after_refs = await self._branch_refs(owner, repo)
         if after_refs is None or before_refs is None:
             return
@@ -9087,11 +9231,15 @@ class AsyncGitServer:
                 "repo": repository,
                 "refs_updated": len(changed),
                 "outcome": "success",
+                "source": source_kind,
             }
             if len(changed) == 1:
                 attributes["branch"] = next(iter(changed))
             sentinel.emit_event("git_push", attributes=attributes)
-            sentinel.count("git.push.count", attributes={"repo": repository, "outcome": "success"})
+            sentinel.count(
+                "git.push.count",
+                attributes={"repo": repository, "outcome": "success", "source": source_kind},
+            )
         if after_refs != before_refs:
             try:
                 await self.ci_manager.refresh_retention(owner, repo)
@@ -9182,6 +9330,18 @@ class AsyncGitServer:
                         },
                     )
 
+    def _active_request_opened(self) -> None:
+        with self._active_requests_lock:
+            self._active_requests += 1
+
+    def _active_request_closed(self) -> None:
+        with self._active_requests_lock:
+            self._active_requests = max(0, self._active_requests - 1)
+
+    def _active_request_count(self) -> int:
+        with self._active_requests_lock:
+            return self._active_requests
+
     async def shutdown(self) -> None:
         pending = tuple(self.push_requests)
         if pending:
@@ -9203,6 +9363,7 @@ class AsyncGitServer:
         error_type: str | None = None
         peer = writer.get_extra_info("peername")
         ip = peer[0] if peer else ""
+        self._active_request_opened()
         try:
             req = await _read_http_request(reader, writer)
             handler = GitHTTPHandler(req, self)
@@ -9243,6 +9404,7 @@ class AsyncGitServer:
             )
             logger.debug("Unhandled request traceback", exc_info=True)
         finally:
+            self._active_request_closed()
             duration_ms = (time.monotonic() - started) * 1000
             if (
                 self.sentinel is not None
@@ -9259,6 +9421,7 @@ class AsyncGitServer:
                 else:
                     group = "web"
                 status = req.status or 500
+                trace_context = _parse_traceparent(req.headers.get("traceparent"))
                 try:
                     self.sentinel.record_request(
                         req.method,
@@ -9267,6 +9430,9 @@ class AsyncGitServer:
                         duration_ms,
                         error_type=error_type,
                         request_id=req.request_id,
+                        trace_id=trace_context[0] if trace_context is not None else None,
+                        parent_span_id=trace_context[1] if trace_context is not None else None,
+                        sampled=trace_context[2] if trace_context is not None else False,
                     )
                 except Exception:  # pragma: no cover - telemetry must never break requests
                     logger.debug("Fuente Sentinel request telemetry failed", exc_info=True)
@@ -9286,6 +9452,29 @@ class AsyncGitServer:
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
+
+
+def _register_health_gauges(
+    app: AsyncGitServer, exporter: SentinelExporter, config: AppConfig
+) -> None:
+    """Register cheap, thread-safe level gauges sampled by the exporter thread."""
+    exporter.register_gauge("ci.runs.queued", "{run}", lambda: len(app.ci_manager.pending))
+    exporter.register_gauge("ci.runs.active", "{run}", lambda: len(app.ci_manager.active))
+    exporter.register_gauge("http.server.active_requests", "{request}", app._active_request_count)
+    exporter.register_gauge("db.size", "By", _database_size_bytes)
+    exporter.register_gauge(
+        "disk.repositories.free", "By", lambda: _disk_free_bytes(GIT_PROJECT_ROOT)
+    )
+    exporter.register_gauge(
+        "disk.database.free",
+        "By",
+        lambda: _disk_free_bytes(str(Path(config.db_path).expanduser().parent)),
+    )
+    exporter.register_gauge("repositories.count", "{repository}", _CachedGauge(_repository_count))
+    exporter.register_gauge("sessions.active", "{session}", _CachedGauge(_active_session_count))
+    exporter.register_gauge(
+        "ci.remote_runner.last_seen_age", "s", _CachedGauge(_remote_runner_last_seen_age)
+    )
 
 
 async def main_async(config_path: str | os.PathLike[str]) -> None:
@@ -9348,9 +9537,21 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     assert server is not None
     try:
         if exporter is not None:
+            exporter.set_registration_metadata(
+                {
+                    "platform": CURRENT_PLATFORM,
+                    "port": PORT,
+                    "url_prefix": URL_PREFIX,
+                    "ci_trust_all": app.ci_manager.trust_all_repositories,
+                    "remote_runner_enabled": True,
+                    "request_logs": exporter.request_logs,
+                    "trace_sample_rate": exporter.trace_sample_rate,
+                }
+            )
             exporter.start()
             app.sentinel = exporter
             set_current(exporter)
+            _register_health_gauges(app, exporter, config)
             exporter.emit("server_start", "Information")
     except (OSError, RuntimeError, ValueError) as exc:
         logger.warning(

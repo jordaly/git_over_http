@@ -114,13 +114,14 @@ def _run_event_status(status: str) -> str:
         "failed": "failed",
         "timed_out": "failed",
         "cancelled": "cancelled",
+        "interrupted": "interrupted",
     }.get(status, "error")
 
 
 def _run_event_level(status: str) -> str:
     if status in ("failed", "timed_out"):
         return "Error"
-    if status == "cancelled":
+    if status in ("cancelled", "interrupted"):
         return "Warning"
     if status in ("success",):
         return "Information"
@@ -1778,12 +1779,13 @@ class CIManager:
             runner = trace.runner
             await self._deploy(row)
         except asyncio.CancelledError:
-            run_status = "cancelled" if row[0] in self.cancelled else "error"
+            cancelled = row[0] in self.cancelled
+            run_status = "cancelled" if cancelled else "interrupted"
             if not ci_finished:
                 await _db_call(
                     database.db_ci_run_update,
                     row[0],
-                    status="cancelled" if row[0] in self.cancelled else "interrupted",
+                    status="cancelled" if cancelled else "interrupted",
                     finished_at=datetime.now(timezone.utc).isoformat(),
                 )
             raise

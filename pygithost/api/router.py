@@ -325,16 +325,9 @@ class API:
     async def authenticate(self) -> None:
         values = [v for k, v in self.request.headers.items() if k.lower() == "authorization"]
         if len(values) != 1:
-            sentinel.emit_event(
-                "auth_failure",
-                level="Warning",
-                attributes={
-                    "surface": "api",
-                    "method": "none",
-                    "reason": "missing_credentials",
-                },
-            )
-            sentinel.count("auth.failure.count", attributes={"surface": "api", "method": "none"})
+            # An unauthenticated probe precedes the bearer challenge; count it
+            # as a challenge, not an auth failure event.
+            sentinel.count("auth.challenge.count", attributes={"surface": "api"})
             raise self.unauthorized()
         parts = values[0].split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or len(parts[1]) > 256:

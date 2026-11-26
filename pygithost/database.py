@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast, overload
 
+from . import sentinel
 from .config import AppConfig
 from .database_types import (
     AuthInfo,
@@ -143,6 +144,12 @@ class _Connection(sqlite3.Connection):
             return super().execute(sql, parameters)
         except sqlite3.Error as exc:
             if sqlite_busy(exc):
+                operation = getattr(self, "operation", "unknown")
+                sentinel.observe(
+                    "db.lock_wait.duration",
+                    max(0.0, (time.monotonic() - started) * 1000),
+                    {"operation": operation},
+                )
                 with _transactions_lock:
                     holders = [
                         dict(info, age_seconds=round(time.monotonic() - info["started"], 3))
@@ -151,7 +158,7 @@ class _Connection(sqlite3.Connection):
                 logging.getLogger(__name__).warning(
                     "SQLite busy: connection=%s operation=%s thread=%s active_transactions=%s",
                     id(self),
-                    getattr(self, "operation", "unknown"),
+                    operation,
                     threading.get_ident(),
                     holders,
                 )
@@ -172,11 +179,20 @@ class _Connection(sqlite3.Connection):
                 else:
                     _transactions.pop(id(self), None)
             elapsed = time.monotonic() - started
+            operation = getattr(self, "operation", "unknown")
+            sentinel.observe(
+                "db.operation.duration", max(0.0, elapsed * 1000), {"operation": operation}
+            )
             if elapsed >= 1:
+                sentinel.emit_event(
+                    "slow_db_operation",
+                    level="Warning",
+                    attributes={"operation": operation, "duration_ms": round(elapsed * 1000, 3)},
+                )
                 logging.getLogger(__name__).warning(
                     "Slow SQLite statement: connection=%s operation=%s elapsed_seconds=%.3f",
                     id(self),
-                    getattr(self, "operation", "unknown"),
+                    operation,
                     elapsed,
                 )
 

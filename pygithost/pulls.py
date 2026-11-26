@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypedDict, cast
@@ -75,7 +76,12 @@ class ServerLike(Protocol):
     async def _branch_refs(self, owner: str, repo: str) -> dict[str, str] | None: ...
 
     async def _queue_push_changes(
-        self, owner: str, repo: str, before_refs: dict[str, str] | None
+        self,
+        owner: str,
+        repo: str,
+        before_refs: dict[str, str] | None,
+        *,
+        source: str = "push",
     ) -> None: ...
 
 
@@ -244,6 +250,22 @@ class MergeStatus(TypedDict):
 
 
 async def merge_status(ctx: Context, pr: PullRequest) -> MergeStatus:
+    """Mergeability snapshot, with a duration metric for the whole computation."""
+    started = time.monotonic()
+    outcome = "error"
+    try:
+        status = await _merge_status(ctx, pr)
+        outcome = str(status.get("mergeable", "unknown"))
+        return status
+    finally:
+        sentinel.observe(
+            "pull_request.mergeability.duration",
+            max(0.0, (time.monotonic() - started) * 1000),
+            {"outcome": outcome},
+        )
+
+
+async def _merge_status(ctx: Context, pr: PullRequest) -> MergeStatus:
     policy = await _policy(ctx)
     methods = [m for m in policy.get("merge_methods", list(MERGE_METHODS)) if m in MERGE_METHODS]
     protected = _protected(policy, pr["base"])
@@ -454,7 +476,9 @@ async def merge(
             _event, ctx, pr["id"], "merged", {"method": chosen, "sha": new_sha, "base": pr["base"]}
         )
         _emit_pull_event(ctx, pr["id"], "merged")
-        await ctx.server._queue_push_changes(ctx.owner, ctx.repo, before_refs)
+        await ctx.server._queue_push_changes(
+            ctx.owner, ctx.repo, before_refs, source="pull_request_merge"
+        )
     result: dict[str, Any] = {"merged": True, "sha": new_sha, "merge_method": chosen}
     try:
         await ctx.server.ci_manager.enqueue(

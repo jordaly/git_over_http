@@ -1,7 +1,10 @@
 import json
+import logging
 import os
 import queue
 import sqlite3
+import tempfile
+import threading
 import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -12,6 +15,7 @@ from pygithost.sentinel import (
     _HISTOGRAM_BOUNDS,
     SentinelExporter,
     _ensure_spool_schema,
+    _parse_traceparent,
 )
 
 
@@ -426,6 +430,250 @@ class SentinelRequestTests(unittest.TestCase):
         self.assertEqual(dict(hist_attrs), {"route_group": "git", "status_class": "2xx"})
         self.assertEqual(state.count, 1)
 
+    def test_span_name_normalizes_the_http_method(self) -> None:
+        cases = {
+            "GET": "GET",
+            "head": "HEAD",
+            "Post": "POST",
+            "PUT": "PUT",
+            "PATCH": "PATCH",
+            "DELETE": "DELETE",
+            "OPTIONS": "OPTIONS",
+            "WEIRDMETHOD": "OTHER",
+            "": "OTHER",
+        }
+        for method, expected in cases.items():
+            with self.subTest(method=method):
+                exporter = SentinelExporter(
+                    "http://127.0.0.1", "unused", "test", Path(":memory:"), trace_sample_rate=1
+                )
+                exporter.record_request(method, "web", 200, 5)
+                spans = [json.loads(body) for _, body, kind in _pending(exporter) if kind == "span"]
+                self.assertEqual(len(spans), 1)
+                self.assertEqual(spans[0]["name"], f"{expected} web")
+
+    def test_zero_slow_request_threshold_disables_slow_events(self) -> None:
+        exporter = SentinelExporter(
+            "http://127.0.0.1",
+            "unused",
+            "test",
+            Path(":memory:"),
+            trace_sample_rate=0,
+            slow_request_ms=0,
+        )
+        exporter.record_request("GET", "web", 200, 1_000_000)
+        self.assertEqual(_pending(exporter), [])
+        self.assertEqual(len(exporter._counters), 1)
+
+    def test_incoming_traceparent_joins_trace_and_sampled_forces_it(self) -> None:
+        exporter = SentinelExporter(
+            "http://127.0.0.1", "unused", "test", Path(":memory:"), trace_sample_rate=0
+        )
+        exporter.record_request(
+            "GET",
+            "api",
+            200,
+            5,
+            trace_id="0af7651916cd43dd8448eb211c80319c",
+            parent_span_id="b7ad6b7169203331",
+            sampled=True,
+        )
+        spans = [json.loads(body) for _, body, kind in _pending(exporter) if kind == "span"]
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["trace_id"], "0af7651916cd43dd8448eb211c80319c")
+        self.assertEqual(spans[0]["parent_span_id"], "b7ad6b7169203331")
+        self.assertNotEqual(spans[0]["span_id"], "b7ad6b7169203331")
+
+    def test_incoming_trace_is_ignored_when_invalid(self) -> None:
+        exporter = SentinelExporter(
+            "http://127.0.0.1", "unused", "test", Path(":memory:"), trace_sample_rate=0
+        )
+        exporter.record_request(
+            "GET",
+            "api",
+            200,
+            5,
+            trace_id="0" * 32,
+            parent_span_id="xyz",
+            sampled=False,
+        )
+        self.assertEqual(_pending(exporter), [])
+        exporter.record_request(
+            "GET",
+            "api",
+            500,
+            5,
+            trace_id="0" * 32,
+            parent_span_id="b7ad6b7169203331",
+        )
+        spans = [json.loads(body) for _, body, kind in _pending(exporter) if kind == "span"]
+        self.assertEqual(len(spans), 1)
+        self.assertNotEqual(spans[0]["trace_id"], "0" * 32)
+        self.assertNotIn("parent_span_id", spans[0])
+
+
+class SentinelTraceparentTests(unittest.TestCase):
+    def test_strict_w3c_traceparent_is_parsed(self) -> None:
+        parsed = _parse_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+        self.assertEqual(
+            parsed,
+            ("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", True),
+        )
+        self.assertFalse(
+            _parse_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00")[2]
+        )
+
+    def test_invalid_traceparent_is_ignored(self) -> None:
+        invalid = [
+            None,
+            "",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331",
+            "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "00-" + "0" * 32 + "-b7ad6b7169203331-01",
+            "00-0af7651916cd43dd8448eb211c80319c-" + "0" * 16 + "-01",
+            "00-0AF7651916CD43DD8448EB211C80319C-b7ad6b7169203331-01",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-0g",
+        ]
+        for header in invalid:
+            with self.subTest(header=header):
+                self.assertIsNone(_parse_traceparent(header))
+
+
+class SentinelQueueTests(unittest.TestCase):
+    def test_dropped_queue_counter_is_thread_safe(self) -> None:
+        exporter = SentinelExporter("http://127.0.0.1", "unused", "test", Path(":memory:"))
+        exporter._pending = queue.Queue(maxsize=1)
+        exporter._enqueue(0, "log", "{}")
+
+        def worker() -> None:
+            for _ in range(50):
+                exporter._enqueue(0, "log", "{}")
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(exporter._dropped_total(), 8 * 50)
+        self.assertEqual(exporter._pending.qsize(), 1)
+
+
+class SentinelLoggingBridgeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.exporter = SentinelExporter("http://127.0.0.1", "unused", "test", Path(":memory:"))
+        from pygithost.sentinel import _SentinelLogHandler
+
+        self.handler = _SentinelLogHandler(self.exporter)
+        self.logger = logging.getLogger("pygithost.testbridge")
+        self.logger.addHandler(self.handler)
+        self.logger.propagate = False
+        self.addCleanup(self.logger.removeHandler, self.handler)
+        self.addCleanup(self.handler.close)
+
+    def _events(self) -> list[dict[str, object]]:
+        return [json.loads(body) for _, body, kind in _pending(self.exporter) if kind == "log"]
+
+    def test_warning_uses_fixed_template_not_formatted_message(self) -> None:
+        self.logger.warning("delivery failed: %s", "SECRET-RECIPIENT")
+        events = self._events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_name"], "log_warning")
+        self.assertEqual(events[0]["level"], "Warning")
+        self.assertEqual(
+            events[0]["attributes"],
+            {"logger": "pygithost.testbridge", "template": "delivery failed: %s"},
+        )
+        self.assertNotIn("SECRET-RECIPIENT", json.dumps(events))
+
+    def test_exception_class_name_and_explicit_events(self) -> None:
+        try:
+            raise ValueError("secret message")
+        except ValueError:
+            self.logger.exception("operation failed")
+        events = self._events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_name"], "log_error")
+        self.assertEqual(events[0]["attributes"]["error_type"], "ValueError")
+        self.assertNotIn("secret message", json.dumps(events))
+
+        self.logger.warning("explicit", extra={"event": "ci_email_failure"})
+        self.assertEqual(self._events(), [])
+
+    def test_sentinel_logger_records_are_skipped(self) -> None:
+        record = logging.LogRecord(
+            "pygithost.sentinel", logging.WARNING, __file__, 1, "internal %s", ("x",), None
+        )
+        self.handler.emit(record)
+        self.assertEqual(self._events(), [])
+
+    def test_rate_limit_suppresses_repeats_and_counts(self) -> None:
+        self.logger.warning("repeat %s", "x")
+        self.logger.warning("repeat %s", "y")
+        events = self._events()
+        self.assertEqual(len(events), 1)
+        counters = {name: value for (name, _attrs), value in self.exporter._counters.items()}
+        self.assertEqual(counters.get("log.suppressed.count"), 1)
+        self.assertEqual(counters.get("log.records.count"), 2)
+
+    def test_handler_is_installed_and_removed_around_start_stop(self) -> None:
+        pygithost_logger = logging.getLogger("pygithost")
+        with tempfile.TemporaryDirectory(prefix="sentinel-log-bridge-") as tmp:
+            exporter = SentinelExporter(
+                "http://127.0.0.1", "unused", "test", Path(tmp) / "spool.sqlite3"
+            )
+            exporter.start()
+            handler = exporter._log_handler
+            try:
+                self.assertIn(handler, pygithost_logger.handlers)
+            finally:
+                exporter.stop()
+            self.assertNotIn(handler, pygithost_logger.handlers)
+
+
+class SentinelRegistrationTests(unittest.TestCase):
+    def test_registration_payload_uses_documented_fields(self) -> None:
+        exporter = SentinelExporter("http://127.0.0.1", "unused", "test", Path(":memory:"))
+        exporter.set_registration_metadata(
+            {
+                "platform": "Linux",
+                "port": 8000,
+                "ci_trust_all": False,
+                "nested": {"not": "flat"},
+            }
+        )
+        payload = exporter._registration_payload("client-1")
+        allowed = {
+            "client_id",
+            "application",
+            "application_version",
+            "environment",
+            "machine",
+            "machine_id",
+            "operating_system",
+            "process_id",
+            "session_id",
+            "timestamp",
+            "metadata",
+        }
+        self.assertLessEqual(set(payload), allowed)
+        self.assertEqual(
+            payload["metadata"], {"ci_trust_all": False, "platform": "Linux", "port": 8000}
+        )
+
+    def test_registration_is_posted_once_and_failures_are_ignored(self) -> None:
+        exporter = SentinelExporter("http://127.0.0.1", "unused", "test", Path(":memory:"))
+        exporter.set_registration_metadata({"platform": "Linux"})
+        with patch.object(exporter, "_post", return_value=(200, 0, None)) as post:
+            self.assertTrue(exporter._send_registration("client-1"))
+        endpoint, payload = post.call_args.args
+        self.assertEqual(endpoint, "/api/v1/clients/register")
+        self.assertEqual(payload["client_id"], "client-1")
+        self.assertEqual(payload["metadata"], {"platform": "Linux"})
+
+        with patch.object(exporter, "_post", side_effect=OSError("offline")):
+            self.assertFalse(exporter._send_registration("client-1"))
+        self.assertEqual(_pending(exporter), [])
+
 
 class SentinelHeartbeatTests(unittest.TestCase):
     def test_heartbeat_carries_resource_and_optional_attributes(self) -> None:
@@ -524,6 +772,17 @@ class SentinelConfigurationTests(unittest.TestCase):
         self.assertEqual(exporter.trace_sample_rate, 0.01)
         self.assertEqual(exporter.slow_request_ms, 2000)
         self.assertTrue(exporter.metrics_enabled)
+
+    def test_zero_slow_request_threshold_from_environment_disables_it(self) -> None:
+        env = {
+            "PYGITHOST_SENTINEL_URL": "https://sentinel.example",
+            "PYGITHOST_SENTINEL_KEY": "fs_key",
+            "PYGITHOST_SENTINEL_SLOW_REQUEST_MS": "0",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            exporter = SentinelExporter.from_environment("/tmp/pygithost.db")
+        assert exporter is not None
+        self.assertEqual(exporter.slow_request_ms, 0)
 
     def test_resource_contains_documented_fields(self) -> None:
         exporter = SentinelExporter("http://127.0.0.1", "unused", "test", Path(":memory:"))

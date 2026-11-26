@@ -50,13 +50,56 @@ _BATCH_TARGETS: dict[str, tuple[str, str]] = {
     "span": ("/api/v1/traces/batch", "spans"),
 }
 
+# Events that call sites already send with ``sentinel.emit_event``. The logging
+# bridge skips records carrying one of these as their ``event`` extra so one
+# condition is not reported twice.
+_EXPLICIT_EVENTS = frozenset(
+    {
+        "audit_failure",
+        "auth_failure",
+        "ci_coordinator_failure",
+        "ci_email_failure",
+        "ci_ip_trust_all_enabled",
+        "ci_retention_refresh_failure",
+        "ci_retention_retry_failure",
+        "ci_retention_startup_failure",
+        "ci_run_finished",
+        "ci_run_queued",
+        "ci_run_started",
+        "deployment_email_failure",
+        "deployment_finished",
+        "deployment_started",
+        "git_push",
+        "http_request",
+        "pr_push_record_failure",
+        "pull_request_closed",
+        "pull_request_merged",
+        "pull_request_opened",
+        "pull_request_reopened",
+        "pull_request_review",
+        "request_failure",
+        "server_error",
+        "server_start",
+        "server_stop",
+        "slow_request",
+        "source_cleanup_deferred",
+    }
+)
+
+
 _REQUEST_LOG_MODES = frozenset({"errors", "all", "off"})
 _METRIC_MODES = frozenset({"on", "off"})
+_HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 _DEFAULT_TRACE_SAMPLE_RATE = 0.01
 _DEFAULT_SLOW_REQUEST_MS = 2000.0
 
 _METRIC_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_./-]{0,254}")
 _HEX_ID = re.compile(r"[0-9a-fA-F]+")
+_LOG_EVENT_NAME = re.compile(r"[a-z_]{1,64}")
+_ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,127}")
+_TRACEPARENT = re.compile(r"00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})")
+_MAX_LOG_TEMPLATE = 256
+_LOG_SUPPRESS_SECONDS = 60.0
 _MAX_METRIC_SERIES = 500
 _MAX_METRIC_ATTRIBUTES = 16
 _MAX_ATTRIBUTE_KEY = 128
@@ -136,6 +179,23 @@ def _valid_hex_id(value: object, length: int) -> bool:
     if not isinstance(value, str) or len(value) != length or _HEX_ID.fullmatch(value) is None:
         return False
     return value.strip("0") != ""
+
+
+def _parse_traceparent(header: str | None) -> tuple[str, str, bool] | None:
+    """Strict W3C ``traceparent`` parse: trace ID, parent span ID, sampled flag.
+
+    Version ``00`` only, lowercase hex, and neither ID may be all zeros. Invalid
+    or missing headers return ``None`` so the request is traced independently.
+    """
+    if not header:
+        return None
+    match = _TRACEPARENT.fullmatch(header.strip())
+    if match is None:
+        return None
+    trace_id, parent_span_id, flags = match.groups()
+    if not _valid_hex_id(trace_id, 32) or not _valid_hex_id(parent_span_id, 16):
+        return None
+    return trace_id, parent_span_id, bool(int(flags, 16) & 0x01)
 
 
 @lru_cache(maxsize=1)
@@ -322,6 +382,85 @@ def _ensure_spool_schema(db: sqlite3.Connection) -> None:
         db.execute("CREATE INDEX IF NOT EXISTS events_kind ON events(kind, id)")
 
 
+class _SentinelLogHandler(logging.Handler):
+    """Forward WARNING+ ``pygithost`` log records to Sentinel as fixed events.
+
+    Only fixed text is exported: the logger name, an optional fixed event name,
+    an exception class name, and the raw %-template when the call used arguments
+    (never the formatted message, which could contain user data).
+    """
+
+    def __init__(self, exporter: SentinelExporter) -> None:
+        super().__init__(logging.WARNING)
+        self._exporter = exporter
+        self._lock = threading.Lock()
+        self._last_seen: dict[tuple[str, str], float] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D102 - logging API
+        try:
+            self._forward(record)
+        except Exception:  # pragma: no cover - telemetry must never break logging
+            self.handleError(record)
+
+    def _forward(self, record: logging.LogRecord) -> None:
+        name = record.name
+        if name == "pygithost.sentinel" or name.startswith("pygithost.sentinel."):
+            return
+        extra = record.__dict__
+        event = extra.get("event")
+        event_name = event if isinstance(event, str) and _LOG_EVENT_NAME.fullmatch(event) else None
+        if event_name is not None and event_name in _EXPLICIT_EVENTS:
+            return
+
+        is_error = record.levelno >= logging.ERROR
+        level = "error" if is_error else "warning"
+        self._exporter.count(
+            "log.records.count", 1, {"level": level, "logger": name[:_MAX_ATTRIBUTE_STRING]}
+        )
+
+        attributes: dict[str, str | int | float] = {"logger": name[:_MAX_ATTRIBUTE_STRING]}
+        if event_name is not None:
+            attributes["event"] = event_name
+        error_type = extra.get("error_type")
+        if not (isinstance(error_type, str) and _ERROR_TYPE.fullmatch(error_type)):
+            error_type = None
+            if record.exc_info is not None and record.exc_info[0] is not None:
+                candidate = getattr(record.exc_info[0], "__name__", "")
+                if isinstance(candidate, str) and _ERROR_TYPE.fullmatch(candidate):
+                    error_type = candidate
+        if error_type:
+            attributes["error_type"] = error_type
+        template = None
+        if record.args and isinstance(record.msg, str):
+            template = record.msg[:_MAX_LOG_TEMPLATE]
+            attributes["template"] = template
+
+        key = (name, template or event_name or "")
+        now = time.monotonic()
+        with self._lock:
+            last = self._last_seen.get(key)
+            if last is not None and now - last < _LOG_SUPPRESS_SECONDS:
+                suppressed = True
+            else:
+                suppressed = False
+                self._last_seen[key] = now
+                if len(self._last_seen) > 2048:
+                    cutoff = now - _LOG_SUPPRESS_SECONDS
+                    self._last_seen = {
+                        item: seen for item, seen in self._last_seen.items() if seen >= cutoff
+                    }
+        if suppressed:
+            self._exporter.count(
+                "log.suppressed.count", 1, {"logger": name[:_MAX_ATTRIBUTE_STRING]}
+            )
+            return
+        self._exporter.emit(
+            "log_error" if is_error else "log_warning",
+            "Error" if is_error else "Warning",
+            attributes=attributes,
+        )
+
+
 class SentinelExporter:
     def __init__(
         self,
@@ -349,6 +488,7 @@ class SentinelExporter:
         self.metrics_enabled = bool(metrics_enabled)
         self._pending: queue.Queue[tuple[int, str, str]] = queue.Queue(maxsize=1024)
         self._queue_dropped = 0
+        self._queue_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="sentinel-exporter", daemon=True)
         self._opener = build_opener(_NoRedirect())
@@ -357,6 +497,8 @@ class SentinelExporter:
         self._counters: dict[_SeriesKey, float] = {}
         self._histograms: dict[_SeriesKey, _HistogramState] = {}
         self._gauges: dict[str, tuple[str, Callable[[], float | int | None]]] = {}
+        self._registration_metadata: MetricAttributes | None = None
+        self._log_handler: _SentinelLogHandler | None = None
 
     @classmethod
     def from_environment(cls, db_path: str) -> SentinelExporter | None:
@@ -439,18 +581,40 @@ class SentinelExporter:
         )
 
     def start(self) -> None:
+        self._install_log_handler()
         self._thread.start()
 
     def stop(self) -> None:
+        self._remove_log_handler()
         self._stop.set()
         self._thread.join(timeout=2)
+
+    def _install_log_handler(self) -> None:
+        if self._log_handler is not None:
+            return
+        handler = _SentinelLogHandler(self)
+        logging.getLogger("pygithost").addHandler(handler)
+        self._log_handler = handler
+
+    def _remove_log_handler(self) -> None:
+        handler = self._log_handler
+        if handler is None:
+            return
+        logging.getLogger("pygithost").removeHandler(handler)
+        handler.close()
+        self._log_handler = None
 
     def _enqueue(self, priority: int, kind: str, body: str) -> None:
         try:
             self._pending.put_nowait((priority, body, kind))
         except queue.Full:
-            self._queue_dropped += 1
+            with self._queue_lock:
+                self._queue_dropped += 1
             logger.debug("Fuente Sentinel in-memory queue is full", extra={"kind": kind})
+
+    def _dropped_total(self) -> int:
+        with self._queue_lock:
+            return self._queue_dropped
 
     def emit(
         self,
@@ -543,6 +707,14 @@ class SentinelExporter:
             return
         with self._metrics_lock:
             self._gauges[name] = (unit, callback)
+
+    def set_registration_metadata(self, metadata: Mapping[str, Any]) -> None:
+        """Set flat descriptive fields sent once to ``/clients/register``.
+
+        Only low-cardinality scalars are kept (the same bounds as metric
+        attributes); the fields never include paths, URLs or user data.
+        """
+        self._registration_metadata = _clean_attributes(metadata)
 
     def _series_count(self) -> int:
         return len(self._counters) + len(self._histograms)
@@ -722,11 +894,21 @@ class SentinelExporter:
         *,
         error_type: str | None = None,
         request_id: str | None = None,
+        trace_id: str | None = None,
+        parent_span_id: str | None = None,
+        sampled: bool = False,
     ) -> None:
-        """Record one finished HTTP request without any raw URL or body data."""
+        """Record one finished HTTP request without any raw URL or body data.
+
+        ``trace_id``/``parent_span_id``/``sampled`` carry a validated incoming
+        W3C ``traceparent`` so the server span joins the client's trace.
+        """
         duration = max(0.0, float(duration_ms))
         is_error = status >= 500 or error_type is not None
-        slow = duration >= self.slow_request_ms
+        slow = self.slow_request_ms > 0 and duration >= self.slow_request_ms
+        method_name = method.upper() if isinstance(method, str) else ""
+        if method_name not in _HTTP_METHODS:
+            method_name = "OTHER"
         status_class = f"{status // 100}xx"
         metric_attributes: dict[str, Any] = {
             "route_group": route_group,
@@ -736,23 +918,29 @@ class SentinelExporter:
             self.count("http.server.request.count", 1, metric_attributes)
             self.observe("http.server.request.duration", duration, metric_attributes)
 
-        trace_id: str | None = None
+        incoming_trace = trace_id if _valid_hex_id(trace_id, 32) else None
+        incoming_parent = (
+            parent_span_id
+            if incoming_trace is not None and _valid_hex_id(parent_span_id, 16)
+            else None
+        )
+        span_trace_id: str | None = None
         span_id: str | None = None
-        should_trace = is_error or slow
+        should_trace = sampled or is_error or slow
         if not should_trace and self.trace_sample_rate > 0:
             should_trace = random.random() < self.trace_sample_rate
         if should_trace:
-            trace_id = new_trace_id()
+            span_trace_id = incoming_trace or new_trace_id()
             span_id = new_span_id()
             end = datetime.now(UTC)
             start = end - timedelta(milliseconds=duration)
             self.span(
-                f"{method} {route_group}",
+                f"{method_name} {route_group}",
                 start,
                 end,
-                trace_id=trace_id,
+                trace_id=span_trace_id,
                 span_id=span_id,
-                parent_span_id=None,
+                parent_span_id=incoming_parent,
                 kind="server",
                 status="error" if is_error else "ok",
                 status_message="Request failed" if is_error else None,
@@ -776,7 +964,7 @@ class SentinelExporter:
                 "Error" if is_error else "Information",
                 attributes=log_attributes,
                 correlation_id=request_id,
-                trace_id=trace_id,
+                trace_id=span_trace_id,
                 span_id=span_id,
             )
         if slow and self.request_logs != "off":
@@ -789,7 +977,7 @@ class SentinelExporter:
                     "duration_ms": round(duration, 3),
                 },
                 correlation_id=request_id,
-                trace_id=trace_id,
+                trace_id=span_trace_id,
                 span_id=span_id,
             )
 
@@ -853,6 +1041,25 @@ class SentinelExporter:
         payload["attributes"] = attributes
         return payload
 
+    def _registration_payload(self, client_id: str) -> dict[str, Any]:
+        """Same identity as the heartbeat plus flat descriptive ``metadata``."""
+        payload = self._heartbeat_payload(client_id, 0, 0, 0)
+        payload.pop("uptime_seconds", None)
+        payload.pop("attributes", None)
+        payload["metadata"] = dict(self._registration_metadata or {})
+        return payload
+
+    def _send_registration(self, client_id: str) -> bool:
+        """Register the worker once; failures are ignored like heartbeats."""
+        if self._registration_metadata is None:
+            return False
+        try:
+            self._post("/api/v1/clients/register", self._registration_payload(client_id))
+        except Exception:
+            logger.debug("Fuente Sentinel registration failed", exc_info=True)
+            return False
+        return True
+
     def _enforce_cap(self, db: sqlite3.Connection) -> int:
         overflow = int(
             db.execute("SELECT max(count(*) - ?, 0) FROM events", (_BUFFER_SIZE,)).fetchone()[0]
@@ -900,6 +1107,7 @@ class SentinelExporter:
         spool_dropped = 0
         kind_index = 0
         flushed_on_stop = False
+        registered = False
         while True:
             stopping = self._stop.is_set()
             while len(pending) < 1024:
@@ -907,6 +1115,10 @@ class SentinelExporter:
                     pending.append(self._pending.get_nowait())
                 except queue.Empty:
                     break
+            if not registered:
+                # Registration is not buffered: a failure is skipped, not retried.
+                self._send_registration(client_id)
+                registered = True
             if pending:
                 with db:
                     db.executemany(
@@ -918,7 +1130,7 @@ class SentinelExporter:
             if stopping and not flushed_on_stop:
                 spool_dropped += self._flush_metrics(db)
                 flushed_on_stop = True
-            dropped_total = spool_dropped + self._queue_dropped
+            dropped_total = spool_dropped + self._dropped_total()
             if dropped_total != dropped_reported:
                 dropped_reported = dropped_total
                 logger.warning(

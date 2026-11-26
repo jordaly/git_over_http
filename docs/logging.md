@@ -159,3 +159,44 @@ runner-token issuance records its name and repository restrictions.
 - `settings_pages` writes unknown/new keys back to the startup file when an
   administrator saves the basic form, so the logging block appears there after
   the first save.
+
+## Exporting to Fuente Sentinel
+
+PyGitHost can send operational events to Fuente Sentinel's Release 0.2
+ingestion API. Register an application named **PyGitHost** in Sentinel and
+create an API key with the `ingest` scope restricted to that application.
+Set the following variables in the Git server's service environment and restart
+PyGitHost.
+
+| Variable | Value |
+| --- | --- |
+| `PYGITHOST_SENTINEL_URL` | Sentinel base URL, for example `https://192.168.16.16:8002`. Leave unset to disable export. |
+| `PYGITHOST_SENTINEL_KEY` | The application's ingestion key. Store it in a restricted service environment or secret store. |
+| `PYGITHOST_SENTINEL_ENVIRONMENT` | Deployment name used in Sentinel, defaulting to `production`. |
+| `SSL_CERT_FILE` | Optional PEM trust bundle for a private or self-signed Sentinel certificate. System trust is used by default. |
+
+HTTPS validates the server certificate and hostname. Plain HTTP is available
+for local testing on loopback.
+
+Check **Clients** for the PyGitHost heartbeat and **Logs** for `server_start`
+and `http_request` after making a Git, REST API, or web request. Requests
+include a route group, status, and duration in milliseconds. REST API events
+carry the response's `X-Request-ID` as their correlation ID. Server failures
+can include the exception type. The exporter uses fixed messages and omits
+raw URLs, query strings, request bodies, usernames, IP addresses, and
+tracebacks. Request durations are log attributes.
+
+The background worker stores batches in a separate
+`*.sentinel-*.sqlite3` file beside the PyGitHost database. Each destination
+and deployment environment has its own spool and installation ID. The
+worker retries transient failures using the same event IDs, honors
+`Retry-After`, and waits longer on authentication or application errors.
+Permanently rejected events are stored in the spool's `dead_letters` table.
+
+The spool holds up to 20,000 unsent events and 500 recent dead letters.
+Spool overflow evicts the oldest informational events first. A full in-memory
+queue drops incoming events and reports a count to the local log. Events
+already committed to the spool survive a restart. Events still in memory can
+be lost if the process is killed or exits while the worker is blocked on an
+HTTP request. Shutdown waits up to two seconds for the exporter to persist
+queued events for the next run.

@@ -128,6 +128,7 @@ from .octicons import octicon
 from .readme import render_readme
 from .repo_templates import GITIGNORE_TEMPLATES, LICENSES, initial_files
 from .repository_info import RepositoryOverview, repository_overview
+from .sentinel import SentinelExporter
 
 logger = logging.getLogger(__name__)
 
@@ -8929,6 +8930,7 @@ class AsyncGitServer:
             )
         self.access_log = bool(server_config.access_log)
         self.audit_log = bool(server_config.audit_log)
+        self.sentinel: SentinelExporter | None = None
         self.settings_lock = asyncio.Lock()
         # Loaded from the database on first use (the database is initialised after
         # construction) so form tokens survive restarts and deploys.
@@ -9075,6 +9077,7 @@ class AsyncGitServer:
     ) -> None:
         started = time.monotonic()
         req: Request | None = None
+        error_type: str | None = None
         peer = writer.get_extra_info("peername")
         ip = peer[0] if peer else ""
         try:
@@ -9094,6 +9097,7 @@ class AsyncGitServer:
                 await _send_text(dummy_req, 400, str_t(t"400 Bad Request: {e}\n"))
             req.status = dummy_req.status
         except Exception as e:
+            error_type = type(e).__name__
             dummy_req = Request("GET", "/", "HTTP/1.1", Headers([]), BodyReader(reader), writer, ip)
             req = req or dummy_req
             with contextlib.suppress(
@@ -9116,12 +9120,41 @@ class AsyncGitServer:
             )
             logger.debug("Unhandled request traceback", exc_info=True)
         finally:
+            duration_ms = (time.monotonic() - started) * 1000
+            if (
+                self.sentinel is not None
+                and req is not None
+                and (req.status is not None or error_type is not None)
+            ):
+                path = req.target.partition("?")[0]
+                if path == "/api" or path.startswith("/api/"):
+                    group = "api"
+                elif path == URL_PREFIX or path.startswith(URL_PREFIX + "/"):
+                    group = "git"
+                elif _is_static_request_path(path):
+                    group = "static"
+                else:
+                    group = "web"
+                status = req.status or 500
+                attributes: dict[str, str | int | float] = {
+                    "route_group": group,
+                    "status": status,
+                    "duration_ms": round(duration_ms, 3),
+                }
+                if error_type is not None:
+                    attributes["error_type"] = error_type
+                self.sentinel.emit(
+                    "request_failure" if error_type else "http_request",
+                    "Error" if status >= 500 or error_type else "Information",
+                    attributes=attributes,
+                    correlation_id=req.request_id,
+                )
             if self.access_log:
                 log_access(
                     method=req.method if req else "?",
                     target=req.target if req else "/",
                     status=req.status if req else None,
-                    duration_ms=(time.monotonic() - started) * 1000,
+                    duration_ms=duration_ms,
                     ip=ip,
                     user=req.remote_user if req else None,
                     size=req.response_size if req else None,
@@ -9176,6 +9209,14 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
         print(f"ERROR: could not configure logging: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        exporter = SentinelExporter.from_environment(config.db_path)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Fuente Sentinel exporter unavailable", extra={"error_type": type(exc).__name__}
+        )
+        exporter = None
+
     server: asyncio.Server | None = None
     try:
         await app.ci_manager.start()
@@ -9184,6 +9225,15 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
         await app.shutdown()
         raise
     assert server is not None
+    try:
+        if exporter is not None:
+            exporter.start()
+            app.sentinel = exporter
+            exporter.emit("server_start", "Information")
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Fuente Sentinel exporter unavailable", extra={"error_type": type(exc).__name__}
+        )
 
     print("=" * 60)
     print(str_t(t"Async Git Smart HTTP + Web UI running on port {PORT}"))
@@ -9217,14 +9267,23 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if app.sentinel is not None:
+            app.sentinel.emit(
+                "server_error", "Error", attributes={"error_type": type(exc).__name__}
+            )
         logger.error(
             "Server stopped unexpectedly",
             extra={"event": "server_error", "error_type": type(exc).__name__},
         )
         raise
     finally:
-        await app.shutdown()
-        logger.info("Server stopped", extra={"event": "server_stop", "port": PORT})
+        try:
+            await app.shutdown()
+        finally:
+            if app.sentinel is not None:
+                app.sentinel.emit("server_stop", "Information")
+                await asyncio.to_thread(app.sentinel.stop)
+            logger.info("Server stopped", extra={"event": "server_stop", "port": PORT})
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

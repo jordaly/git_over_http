@@ -24,6 +24,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_APPLICATION = "PyGitHost"
 _BATCH_SIZE = 100
 _BUFFER_SIZE = 20_000
 _DEAD_LETTER_SIZE = 500
@@ -39,10 +40,18 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 class SentinelExporter:
-    def __init__(self, url: str, key: str, environment: str, spool: Path) -> None:
+    def __init__(
+        self,
+        url: str,
+        key: str,
+        environment: str,
+        spool: Path,
+        application: str = DEFAULT_APPLICATION,
+    ) -> None:
         self.url = url.rstrip("/")
         self._key = key
         self.environment = environment
+        self.application = application
         self.spool = spool
         self.session_id = uuid.uuid4().hex
         self.started = time.monotonic()
@@ -60,6 +69,9 @@ class SentinelExporter:
         if not url:
             return None
         environment = os.environ.get("PYGITHOST_SENTINEL_ENVIRONMENT", "production").strip()
+        application = (
+            os.environ.get("PYGITHOST_SENTINEL_APPLICATION", "").strip() or DEFAULT_APPLICATION
+        )
         try:
             parsed = urlsplit(url)
             # Validate the port now rather than retrying a malformed URL forever.
@@ -84,12 +96,17 @@ class SentinelExporter:
             or not key.isascii()
             or not key.isprintable()
             or not (0 < len(environment) <= 256 and environment.isprintable())
+            or not (len(application) <= 256 and application.isprintable())
         ):
             logger.warning("Fuente Sentinel disabled due to invalid exporter settings")
             return None
-        destination = hashlib.sha256(f"{url.rstrip('/')}\n{environment}".encode()).hexdigest()[:16]
+        # Spooled events embed the application name, so each one gets its own spool.
+        target = f"{url.rstrip('/')}\n{environment}"
+        if application != DEFAULT_APPLICATION:
+            target += f"\n{application}"
+        destination = hashlib.sha256(target.encode()).hexdigest()[:16]
         spool = Path(db_path).expanduser().with_suffix(f".sentinel-{destination}.sqlite3")
-        return cls(url, key, environment, spool)
+        return cls(url, key, environment, spool, application)
 
     def start(self) -> None:
         self._thread.start()
@@ -107,7 +124,7 @@ class SentinelExporter:
         correlation_id: str | None = None,
     ) -> None:
         event = {
-            "application": "PyGitHost",
+            "application": self.application,
             "environment": self.environment,
             "session_id": self.session_id,
             "event_id": str(uuid.uuid4()),
@@ -202,7 +219,7 @@ class SentinelExporter:
                 status, retry, _ = self._post(
                     "/api/v1/clients/heartbeat",
                     {
-                        "application": "PyGitHost",
+                        "application": self.application,
                         "environment": self.environment,
                         "client_id": client_id,
                         "session_id": self.session_id,
@@ -240,7 +257,7 @@ class SentinelExporter:
             "/api/v1/logs/batch",
             {
                 "schema_version": 1,
-                "resource": {"service.name": "PyGitHost", "client.id": client_id},
+                "resource": {"service.name": self.application, "client.id": client_id},
                 "events": events,
             },
         )

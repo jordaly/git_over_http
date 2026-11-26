@@ -53,3 +53,25 @@ class SentinelDeliveryTests(unittest.TestCase):
             self.assertIsNotNone(delay)
             self.assertFalse(split)
             self.assertEqual(db.execute("SELECT * FROM events").fetchall(), rows)
+
+
+class SentinelConfigurationTests(unittest.TestCase):
+    def test_application_name_comes_from_environment(self) -> None:
+        env = {
+            "PYGITHOST_SENTINEL_URL": "https://sentinel.example",
+            "PYGITHOST_SENTINEL_KEY": "fs_key",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            default = SentinelExporter.from_environment("/tmp/pygithost.db")
+        with patch.dict(
+            "os.environ", {**env, "PYGITHOST_SENTINEL_APPLICATION": "GitHost"}, clear=True
+        ):
+            custom = SentinelExporter.from_environment("/tmp/pygithost.db")
+
+        assert default is not None and custom is not None
+        self.assertEqual(default.application, "PyGitHost")
+        self.assertEqual(custom.application, "GitHost")
+        self.assertNotEqual(default.spool, custom.spool)
+        custom.emit("server_start", "Information")
+        _, body = custom._pending.get_nowait()
+        self.assertEqual(json.loads(body)["application"], "GitHost")

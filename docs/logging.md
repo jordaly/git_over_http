@@ -163,8 +163,9 @@ runner-token issuance records its name and repository restrictions.
 ## Exporting to Fuente Sentinel
 
 PyGitHost can send operational events to Fuente Sentinel's Release 0.2
-ingestion API. Register an application named **PyGitHost** in Sentinel and
-create an API key with the `ingest` scope restricted to that application.
+ingestion API. Register an application in Sentinel (named **PyGitHost** unless
+`PYGITHOST_SENTINEL_APPLICATION` says otherwise) and create an API key with the
+`ingest` scope restricted to that application.
 Set the following variables in the Git server's service environment and restart
 PyGitHost.
 
@@ -172,6 +173,7 @@ PyGitHost.
 | --- | --- |
 | `PYGITHOST_SENTINEL_URL` | Sentinel base URL, for example `https://192.168.16.16:8002`. Leave unset to disable export. |
 | `PYGITHOST_SENTINEL_KEY` | The application's ingestion key. Store it in a restricted service environment or secret store. |
+| `PYGITHOST_SENTINEL_APPLICATION` | Sentinel application name the key is authorized for, defaulting to `PyGitHost`. |
 | `PYGITHOST_SENTINEL_ENVIRONMENT` | Deployment name used in Sentinel, defaulting to `production`. |
 | `SSL_CERT_FILE` | Optional PEM trust bundle for a private or self-signed Sentinel certificate. System trust is used by default. |
 

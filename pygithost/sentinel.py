@@ -333,12 +333,25 @@ def _windows_memory_usage() -> int | None:
 
     counters = ProcessMemoryCounters()
     counters.cb = ctypes.sizeof(counters)
-    windll = getattr(ctypes, "windll", None)
+    windll = getattr(ctypes, "WinDLL", None)
     if windll is None:
         return None
-    kernel32 = windll.kernel32
-    handle = kernel32.GetCurrentProcess()
-    if not kernel32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+    from ctypes import wintypes
+
+    kernel32 = windll("kernel32", use_last_error=True)
+    # Declare the types: without them ctypes truncates the 64-bit pseudo-handle
+    # returned by GetCurrentProcess and the memory query fails.
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    kernel32.K32GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessMemoryCounters),
+        wintypes.DWORD,
+    ]
+    if not kernel32.K32GetProcessMemoryInfo(
+        kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+    ):
         return None
     return int(counters.WorkingSetSize)
 

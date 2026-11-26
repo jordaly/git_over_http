@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -117,7 +118,8 @@ class CIImprovementsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_database_migration_is_idempotent_and_preserves_old_runs(self):
         run_id = database.db_ci_run_create("owner", "repo", "manual", "main", "a" * 40, "{}")
-        with sqlite3.connect(database.DB_PATH) as connection:
+        # closing(): sqlite3's own context manager commits but never closes.
+        with closing(sqlite3.connect(database.DB_PATH)) as connection, connection:
             for column in ("config_json", "phase", "reason", "notification"):
                 if column == "notification":
                     connection.execute("DROP INDEX IF EXISTS idx_ci_runs_pending_email")

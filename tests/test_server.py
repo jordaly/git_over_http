@@ -40,6 +40,33 @@ def _which_git():
     return shutil.which("git")
 
 
+def csrf_token(runner, cookie_header=None, ip="127.0.0.1"):
+    """The web form token the running server expects from this client.
+
+    Mirrors GitHTTPHandler._settings_csrf_token: an HMAC of the session cookie when
+    authentication is required, otherwise of the client IP.
+    """
+    import hashlib
+    import hmac
+
+    from pygithost import application
+
+    session = ""
+    for part in (cookie_header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == application.SESSION_COOKIE_NAME:
+            session = value
+    identity = session if application.REQUIRE_AUTH else "ip:" + ip
+    return hmac.new(runner.app.settings_csrf_secret, identity.encode(), hashlib.sha256).hexdigest()
+
+
+def with_csrf(runner, fields, cookie_header=None):
+    """Return form fields with the server's CSRF token added (unless already present)."""
+    fields = dict(fields)
+    fields.setdefault("csrf", csrf_token(runner, cookie_header))
+    return fields
+
+
 class ServerRunner:
     """
     Context manager to run the HTTP server with the REAL git-http-backend.

@@ -32,7 +32,7 @@ from tests.ci_fixtures import (
     trusted_ci_repositories,
     verified_retention,
 )
-from tests.test_server import ServerRunner, _which_git_backend
+from tests.test_server import ServerRunner, _which_git_backend, with_csrf
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -938,7 +938,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     connection.request(
                         "POST",
                         f"/r/{FLAT_OWNER_UI}/repo/ci/config",
-                        body=urlencode(fields),
+                        body=urlencode(with_csrf(server, fields)),
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
                     )
                     response = connection.getresponse()
@@ -977,7 +977,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         connection.request(
                             "POST",
                             f"/r/{FLAT_OWNER_UI}/repo/pulls/{pr_id}/merge",
-                            body=b"",
+                            body=urlencode(with_csrf(server, {})),
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
                         )
                         response = connection.getresponse()
@@ -1074,7 +1074,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         connection.request(
                             "POST",
                             f"/r/{FLAT_OWNER_UI}/repo/pulls/{pr_id}/merge",
-                            body=b"",
+                            body=urlencode(with_csrf(server, {})),
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
                         )
                         response = connection.getresponse()

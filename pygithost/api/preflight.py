@@ -13,6 +13,11 @@ from . import settings
 from .types import APIContext
 
 
+def _is_remote_path(path: str) -> bool:
+    r"""UNC (\\host\share), device (\\?\ and \\.\) and //host paths."""
+    return path.replace("/", "\\").startswith("\\\\")
+
+
 def inspect(config: Mapping[str, Any], repository: str) -> dict[str, object]:
     checks: list[dict[str, object]] = []
 
@@ -32,7 +37,15 @@ def inspect(config: Mapping[str, Any], repository: str) -> dict[str, object]:
         )
     content = config.get("deploy_script_content", "")
     path = config.get("deploy_script")
-    if path and not content:
+    if path and not content and config.get("_repository_config_error"):
+        # Untrusted repository configuration: never let it make the server touch
+        # arbitrary paths (existence probes, or SMB connections on Windows).
+        check("script_checked", False)
+    elif path and not content and _is_remote_path(str(path)):
+        # UNC/network paths would make the server open a connection to another host,
+        # which can leak its Windows credentials. Deploy scripts must be local.
+        check("script_local", False)
+    elif path and not content:
         try:
             script = Path(path).resolve()
             check(

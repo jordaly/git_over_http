@@ -8,7 +8,11 @@ from .errors import APIError
 from .types import Identity
 
 
-def can_read_repository(identity: Identity, owner: str, flat_owner: str) -> bool:
+def can_read_repository(identity: Identity, owner: str, repo: str, flat_owner: str) -> bool:
+    # A repository-bound token never reaches another repository, whoever owns it.
+    bound = identity.get("repository")
+    if bound is not None and tuple(bound) != (owner, repo):
+        return False
     return bool(identity["is_admin"] or (owner != flat_owner and owner == identity["username"]))
 
 

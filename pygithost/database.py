@@ -358,6 +358,12 @@ def _db_init() -> None:
             conn.execute("ALTER TABLE tokens ADD COLUMN expires_at TEXT")
         if "revoked_at" not in token_cols:
             conn.execute("ALTER TABLE tokens ADD COLUMN revoked_at TEXT")
+        # A token bound to one repository (owner, repo). NULL in both columns marks
+        # a legacy token created before repository scoping, valid for every repository.
+        if "repo_owner" not in token_cols:
+            conn.execute("ALTER TABLE tokens ADD COLUMN repo_owner TEXT")
+        if "repo_name" not in token_cols:
+            conn.execute("ALTER TABLE tokens ADD COLUMN repo_name TEXT")
 
         conn.execute("""CREATE TABLE IF NOT EXISTS api_mutations (
             user_id INTEGER NOT NULL,
@@ -378,6 +384,9 @@ def _db_init() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tokens_repository ON tokens(repo_owner, repo_name)"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tokens_status ON tokens(user_id, is_active, expires_at, revoked_at)"
         )
@@ -901,8 +910,23 @@ def _normalize_token_scopes(scopes: str | None) -> str:
 
 
 def db_create_token(
-    user_id: int, name: str, scopes: str = "read,write", expires_at: str | None = None
+    user_id: int,
+    name: str,
+    scopes: str = "read,write",
+    expires_at: str | None = None,
+    repository: tuple[str, str] | None = None,
 ) -> str:
+    """Create a personal access token and return its plaintext value.
+
+    *repository* binds the token to one ``(owner, repo)``: Git HTTP and the API
+    then refuse every other repository. ``None`` creates an unrestricted token,
+    which is reserved for the bootstrap administrator token.
+    """
+    repo_owner = repo_name = None
+    if repository is not None:
+        repo_owner, repo_name = (part.strip() for part in repository)
+        if not repo_owner or not repo_name or len(repo_owner) > 256 or len(repo_name) > 256:
+            raise ValueError("Choose a repository for the token.")
     clean_name = (name or "").strip()
     if not clean_name:
         raise ValueError("Token name is required.")
@@ -918,10 +942,12 @@ def db_create_token(
     try:
         conn.execute(
             """
-            INSERT INTO tokens(user_id, name, token_hash, scopes, is_active, expires_at)
-            VALUES(?,?,?,?,1,?)
+            INSERT INTO tokens(
+                user_id, name, token_hash, scopes, is_active, expires_at, repo_owner, repo_name
+            )
+            VALUES(?,?,?,?,1,?,?,?)
             """,
-            (user_id, clean_name, th, clean_scopes, clean_expires_at),
+            (user_id, clean_name, th, clean_scopes, clean_expires_at, repo_owner, repo_name),
         )
     finally:
         conn.close()
@@ -945,7 +971,9 @@ def db_list_tokens_for_user(user_id: int) -> list[TokenListRow]:
                     WHEN revoked_at IS NOT NULL OR is_active = 0 THEN 'revoked'
                     WHEN expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now', 'localtime') THEN 'expired'
                     ELSE 'active'
-                END AS status
+                END AS status,
+                repo_owner,
+                repo_name
             FROM tokens
             WHERE user_id=?
             ORDER BY id DESC
@@ -1050,13 +1078,34 @@ def db_audit_list(limit: int = 100, action: str | None = None) -> list[dict[str,
 def _token_info_from_row(row: TokenAuthRow | None) -> AuthInfo | None:
     if not row:
         return None
-    uid, uname, is_admin, user_active, scopes, token_active, expires_at, revoked_at = row
+    (
+        uid,
+        uname,
+        is_admin,
+        user_active,
+        scopes,
+        token_active,
+        expires_at,
+        revoked_at,
+        repo_owner,
+        repo_name,
+    ) = row
     if not user_active or not token_active or revoked_at:
         return None
     if _token_is_expired(expires_at):
         return None
     scopes_set = {s.strip().lower() for s in (scopes or "").split(",") if s.strip()}
-    return {"user_id": uid, "username": uname, "is_admin": bool(is_admin), "scopes": scopes_set}
+    # Fail closed on a half-set binding: a token with only one column set is unusable.
+    if (repo_owner is None) != (repo_name is None):
+        return None
+    repository = (repo_owner, repo_name) if repo_owner is not None else None
+    return {
+        "user_id": uid,
+        "username": uname,
+        "is_admin": bool(is_admin),
+        "scopes": scopes_set,
+        "repository": repository,
+    }
 
 
 def db_verify_token(username: str, token: str) -> AuthInfo | None:
@@ -1070,7 +1119,7 @@ def db_verify_token(username: str, token: str) -> AuthInfo | None:
         cur = conn.execute(
             """
             SELECT u.id, u.username, u.is_admin, u.is_active,
-                   t.scopes, t.is_active, t.expires_at, t.revoked_at
+                   t.scopes, t.is_active, t.expires_at, t.revoked_at, t.repo_owner, t.repo_name
             FROM tokens t
             JOIN users u ON u.id = t.user_id
             WHERE u.username=? AND t.token_hash=?
@@ -1100,7 +1149,7 @@ def db_verify_token_any_user(token: str) -> AuthInfo | None:
         cur = conn.execute(
             """
             SELECT u.id, u.username, u.is_admin, u.is_active,
-                   t.scopes, t.is_active, t.expires_at, t.revoked_at
+                   t.scopes, t.is_active, t.expires_at, t.revoked_at, t.repo_owner, t.repo_name
             FROM tokens t
             JOIN users u ON u.id = t.user_id
             WHERE t.token_hash=?
@@ -1112,6 +1161,42 @@ def db_verify_token_any_user(token: str) -> AuthInfo | None:
     finally:
         conn.close()
     return _token_info_from_row(row)
+
+
+def db_server_secret(name: str) -> bytes:
+    """Return a random 32-byte server secret, creating it on first use.
+
+    Stored in ``server_settings`` so values derived from it (such as web form
+    tokens) stay valid across restarts and deploys.
+    """
+    key = "secret:" + name
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO server_settings(key,value) VALUES(?,?)",
+            (key, secrets.token_hex(32)),
+        )
+        row = conn.execute("SELECT value FROM server_settings WHERE key=?", (key,)).fetchone()
+    finally:
+        conn.close()
+    return bytes.fromhex(str(row[0]))
+
+
+def db_token_owner_without_auth() -> int | None:
+    """Return the user that owns tokens created while web authentication is disabled.
+
+    Without sign-in there is no current user, so tokens belong to the oldest active
+    administrator (normally the bootstrap ``admin``). Their repository binding is
+    what limits them.
+    """
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id FROM users WHERE is_admin=1 AND is_active=1 ORDER BY id LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row[0]) if row else None
 
 
 def db_ensure_default_admin() -> None:
@@ -3260,6 +3345,15 @@ def db_repository_archive(owner: str, repo: str, archive_path: str) -> dict[str,
                     counts[child] = conn.execute(
                         f"DELETE FROM main.{child} WHERE {where}", key
                     ).rowcount
+                # Tokens are not archived: they belong to users, not the repository.
+                # Revoke them so a new repository with the same name starts with none.
+                counts["tokens_revoked"] = conn.execute(
+                    """UPDATE main.tokens
+                       SET is_active=0,
+                           revoked_at=COALESCE(revoked_at, datetime('now', 'localtime'))
+                       WHERE repo_owner=? AND repo_name=? AND is_active=1""",
+                    key,
+                ).rowcount
                 for table in _REPOSITORY_TABLES:
                     if table not in existing:
                         continue

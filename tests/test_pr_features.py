@@ -11,7 +11,7 @@ from urllib.parse import quote, urlencode
 from pygithost import application, database
 from pygithost.application import FLAT_OWNER_UI
 from tests.ci_fixtures import commit_ci_config
-from tests.test_server import ServerRunner, _which_git_backend
+from tests.test_server import ServerRunner, _which_git_backend, with_csrf
 
 
 @unittest.skipUnless(True, "runs with local git")
@@ -77,7 +77,7 @@ class PullRequestFeaturesTests(unittest.TestCase):
             connection.request(
                 "GET" if fields is None else "POST",
                 path,
-                body=None if fields is None else urlencode(fields),
+                body=None if fields is None else urlencode(with_csrf(self.server, fields)),
                 headers={}
                 if fields is None
                 else {"Content-Type": "application/x-www-form-urlencoded"},
@@ -370,7 +370,8 @@ class PullRequestFeaturesTests(unittest.TestCase):
         path = self.base + f"/pulls/{self.pr}/resolve"
         name = self.git("--git-dir", str(self.bare), "rev-parse", "refs/heads/feature/pr")
         status, _ = self.request(
-            path, {"conflict_count": "1", "path_0": "app.py", "content_0": "resolved\n"}
+            path,
+            {"csrf": "", "conflict_count": "1", "path_0": "app.py", "content_0": "resolved\n"},
         )
         self.assertEqual(status, 403)
         _, page = self.request(path)

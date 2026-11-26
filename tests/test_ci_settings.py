@@ -238,7 +238,8 @@ class AutomaticCISettingsTests(unittest.TestCase):
         self.fixture.git("--git-dir", self.fixture.bare, "update-ref", "refs/heads/main", parent)
         status, page = self.fixture.request(self.base + "/ci")
         self.assertEqual(status, 200)
-        self.assertIn('<option value="ci">ci</option>', page)
+        # The workflows sidebar still lists the pipeline defined in the server settings.
+        self.assertIn(f'href="{self.base}/ci?pipeline=ci"', page)
         status, page = self.fixture.request(
             self.base + "/ci/run", {"pipeline": "ci", "branch": "main"}
         )

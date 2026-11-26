@@ -109,7 +109,14 @@ class APITests(unittest.TestCase):
         status, headers, value = self.request("/api/v1/user")
         self.assertEqual(status, 200)
         self.assertEqual(
-            value, {"id": self.alice, "login": "alice", "is_admin": False, "scopes": ["read"]}
+            value,
+            {
+                "id": self.alice,
+                "login": "alice",
+                "is_admin": False,
+                "scopes": ["read"],
+                "repository": None,
+            },
         )
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")

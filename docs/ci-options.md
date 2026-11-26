@@ -282,7 +282,12 @@ container per step; only checkout files persist, not container `/tmp`.
 fail the step. Filters, expressions, loops/calls and recursive expansion are not
 supported. Values are **not shell-escaped**; quote for the runner shell and avoid
 interpolating untrusted executable syntax. Prefer tools reading values directly
-from their environment. JSON strings escape newlines as `\n` and quotes as `\"`.
+from their environment. Branch placeholders (`PYGITHOST_REF`, `PYGITHOST_BRANCH`,
+`PYGITHOST_BASE_BRANCH`, `PYGITHOST_HEAD_BRANCH`) are chosen by whoever pushes or
+opens the pull request, so the step fails instead of inserting a value containing
+anything other than letters, digits and `. _ / @ + , = -`; use the quoted
+environment variable (`"$PYGITHOST_BRANCH"`, `%PYGITHOST_BRANCH%`) when you need
+arbitrary branch names. JSON strings escape newlines as `\n` and quotes as `\"`.
 Committed configuration and stored snapshots are plaintext; page-managed values are
 resolved live and are not stored in new snapshots. Neither logs nor remote job
 assignments are secret-redacted.

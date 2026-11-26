@@ -22,7 +22,7 @@ from tests.ci_fixtures import (
     commit_legacy_config,
     trusted_ci_repositories,
 )
-from tests.test_server import ServerRunner, _which_git_backend
+from tests.test_server import ServerRunner, _which_git_backend, with_csrf
 
 
 @unittest.skipUnless(shutil.which("git") and _which_git_backend(), "requires Git HTTP backend")
@@ -206,11 +206,15 @@ class RepositoryUITests(unittest.TestCase):
                     "POST",
                     self.base + "/pulls/create",
                     body=urlencode(
-                        {
-                            "title": "Authenticated pull request",
-                            "source_branch": "feature/api",
-                            "target_branch": "main",
-                        }
+                        with_csrf(
+                            self.server,
+                            {
+                                "title": "Authenticated pull request",
+                                "source_branch": "feature/api",
+                                "target_branch": "main",
+                            },
+                            application.SESSION_COOKIE_NAME + "=" + session,
+                        )
                     ),
                     headers={
                         "Content-Type": "application/x-www-form-urlencoded",
@@ -251,7 +255,7 @@ class RepositoryUITests(unittest.TestCase):
             connection.request(
                 "GET" if fields is None else "POST",
                 path,
-                body=None if fields is None else urlencode(fields),
+                body=None if fields is None else urlencode(with_csrf(self.server, fields)),
                 headers={}
                 if fields is None
                 else {"Content-Type": "application/x-www-form-urlencoded"},
@@ -732,7 +736,10 @@ class RepositoryUITests(unittest.TestCase):
             (index, f"token-{index:02}", "read", True, "2026-01-01", None, None, "active")
             for index in range(30)
         ]
-        with mock.patch("pygithost.application.db_list_tokens_for_user", return_value=tokens):
+        with (
+            mock.patch("pygithost.application.db_list_tokens_for_user", return_value=tokens),
+            mock.patch("pygithost.application.db_token_owner_without_auth", return_value=1),
+        ):
             _, first = self.request("/tokens")
             _, second = self.request("/tokens?page=2")
         self.assertIn("token-00", first)

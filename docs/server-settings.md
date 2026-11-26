@@ -163,6 +163,19 @@ Protected page values use a separate server process allowlist. The exact
 commit must equal the current branch tip. A repository writer cannot grant this by
 editing `ci/config.json`.
 
+## Web form protection
+
+Every state-changing web form carries a hidden anti-CSRF token, and the server
+rejects form posts without a valid one (`403`: "the form expired or came from
+another site"). The token is derived from your session when sign-in is enabled,
+or from your client IP when it is disabled, using a secret stored in the database,
+so tokens stay valid across restarts and deploys. A machine whose IP changes, or
+a signed-out session, sees the message once; reload the page. Scripts should use
+the REST API with a repository token instead of posting web forms. Form bodies are
+limited to 2 MiB (64 KiB for sign-in; the Web IDE allows larger commits), and
+signing out requires the menu's **Sign out** button: opening `/logout` directly
+only shows a confirmation button.
+
 ## Basic server configuration and restart
 
 The page edits the same startup file passed to `server.py run --config ...`.

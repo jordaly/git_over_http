@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 from collections.abc import Mapping, Sequence
@@ -284,10 +285,18 @@ class API:
                     + json.dumps(self.document, sort_keys=True, ensure_ascii=True)
                 ).encode()
             ).hexdigest()
+            # Repository-bound tokens get their own key space, so one token's keys
+            # neither collide with nor reveal another token's (same user) requests.
+            bound = self.identity.get("repository")
+            key = (
+                self.idempotency_key
+                if bound is None
+                else "/".join(bound) + "\n" + self.idempotency_key
+            )
             key_hash, cached = await asyncio.to_thread(
                 mutations.claim,
                 self.identity["user_id"],
-                self.idempotency_key,
+                key,
                 fingerprint,
                 self.request_id,
                 self.request.method,
@@ -380,7 +389,7 @@ class API:
             )
             or not self.app._safe_seg(owner)
             or not self.app._safe_seg(repo)
-            or not can_read_repository(self.identity, owner, self.app.FLAT_OWNER_UI)
+            or not can_read_repository(self.identity, owner, repo, self.app.FLAT_OWNER_UI)
         ):
             raise APIError(404, "not_found", "Repository not found.")
 
@@ -395,6 +404,13 @@ class API:
             # never turn owner-namespace access into access to Bob's Git data.
             component = root
             for part in relative.parts:
+                # Exact on-disk spelling only: NTFS would otherwise accept "Project.git"
+                # or "project.git." as another name (and lock key) for one repository.
+                try:
+                    if part not in os.listdir(component):
+                        return None
+                except OSError:
+                    return None
                 component /= part
                 if component.is_symlink() or component.is_junction():
                     return None
@@ -441,6 +457,9 @@ class API:
                 "login": self.identity["username"],
                 "is_admin": self.identity["is_admin"],
                 "scopes": sorted(self.identity["scopes"]),
+                "repository": (
+                    "/".join(self.identity["repository"]) if self.identity["repository"] else None
+                ),
             }
         if self.path == PREFIX + "/repos":
             self.parameters()
@@ -449,7 +468,7 @@ class API:
             )
             visible = []
             for owner, repo, _relative in sorted(scanned, key=lambda row: (row[0], row[1])):
-                if can_read_repository(self.identity, owner, self.app.FLAT_OWNER_UI):
+                if can_read_repository(self.identity, owner, repo, self.app.FLAT_OWNER_UI):
                     try:
                         await self.repository(owner, repo)
                     except APIError as exc:

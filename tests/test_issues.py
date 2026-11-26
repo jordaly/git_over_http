@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 
 from pygithost import database
 from pygithost.application import FLAT_OWNER_UI
-from tests.test_server import ServerRunner, _which_git_backend
+from tests.test_server import ServerRunner, _which_git_backend, with_csrf
 
 
 class IssuesTests(unittest.TestCase):
@@ -49,7 +49,7 @@ class IssuesTests(unittest.TestCase):
             connection.request(
                 "GET" if fields is None else "POST",
                 path,
-                body=None if fields is None else urlencode(fields),
+                body=None if fields is None else urlencode(with_csrf(self.server, fields)),
                 headers={}
                 if fields is None
                 else {"Content-Type": "application/x-www-form-urlencoded"},

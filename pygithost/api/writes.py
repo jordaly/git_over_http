@@ -104,6 +104,8 @@ async def authorize(api: APIContext) -> tuple[str, str | None, str | None, str]:
     if "write" not in api.identity["scopes"]:
         raise APIError(403, "insufficient_scope", "Token requires write scope.")
     if api.path == "/api/v1/user/repos" and api.request.method == "POST":
+        if api.identity.get("repository") is not None:
+            raise APIError(403, "forbidden", "A repository-bound token cannot create repositories.")
         owner = api.identity["username"]
         if (
             owner == api.app.FLAT_OWNER_UI
@@ -291,12 +293,14 @@ async def create_repository(
             "repository_conflict",
             "Owner namespace conflicts with an existing repository or alias.",
         )
-    directory.mkdir(exist_ok=True)
     target = directory / (repo + ".git")
     if (directory / repo).exists() or (directory / repo).is_symlink():
         raise APIError(409, "repository_conflict", "Repository already exists.")
-    default = await branch(str(directory), doc.get("default_branch", "main"))
+    # Validate every input before touching the disk, so a rejected request leaves
+    # no empty owner directory behind.
+    default = await branch(str(root), doc.get("default_branch", "main"))
     starter = starter_files(doc, repo, owner)
+    directory.mkdir(exist_ok=True)
     try:
         target.mkdir()
     except FileExistsError:

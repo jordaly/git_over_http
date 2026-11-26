@@ -111,9 +111,9 @@ class SettingsPagesTests(unittest.TestCase):
             revision = re.search(r'name="trust_revision" value="([^"]+)"', page)[1]
             fields["trust_revision"] = revision
             self.assertEqual(
-                self.fixture.request("/admin/settings", {"action": "ci_execution_trust", **fields})[
-                    0
-                ],
+                self.fixture.request(
+                    "/admin/settings", {"action": "ci_execution_trust", "csrf": "", **fields}
+                )[0],
                 403,
             )
             _, page = self.save("ci_execution_trust", **{**fields, "trusted_repositories": "ops/*"})
@@ -174,9 +174,9 @@ class SettingsPagesTests(unittest.TestCase):
             self.assertIn('name="trusted_repositories"', page)
             self.assertIn("IP-only mode", page)
             self.assertEqual(
-                self.fixture.request("/admin/settings", {"action": "ci_execution_trust", **fields})[
-                    0
-                ],
+                self.fixture.request(
+                    "/admin/settings", {"action": "ci_execution_trust", "csrf": "", **fields}
+                )[0],
                 403,
             )
             self.assertEqual(self.save("ci_execution_trust", **fields)[0], 200)

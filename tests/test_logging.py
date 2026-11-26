@@ -18,7 +18,7 @@ from pygithost.logging_setup import (
     configure_logging,
     safe_target,
 )
-from tests.test_server import ServerRunner, _which_git_backend
+from tests.test_server import ServerRunner, _which_git_backend, with_csrf
 
 
 class FormatterTests(unittest.TestCase):
@@ -352,6 +352,9 @@ class ServerLoggingTests(unittest.TestCase):
 
     def test_login_token_and_settings_events_reach_the_audit_trail(self):
         self.start(require_auth=True)
+        subprocess.run(
+            ["git", "init", "--bare", "-q", str(self.root / "repos" / "audited.git")], check=True
+        )
         database.db_create_user("auditor", "s3cret-pass", False)
         database.db_create_user("rootadmin", "s3cret-pass", True)
         connection = database._db_connect()
@@ -369,7 +372,13 @@ class ServerLoggingTests(unittest.TestCase):
         status, _headers, _body = self.request(
             "/tokens/create",
             method="POST",
-            body=urlencode({"name": "ci-token", "scopes": "read"}),
+            body=urlencode(
+                with_csrf(
+                    self.server,
+                    {"name": "ci-token", "scopes": "read", "repository": "root/audited"},
+                    cookie,
+                )
+            ),
             headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
         )
         self.assertEqual(status, 200)
@@ -383,7 +392,7 @@ class ServerLoggingTests(unittest.TestCase):
         self.request(
             "/tokens/revoke",
             method="POST",
-            body=urlencode({"token_id": str(token_id)}),
+            body=urlencode(with_csrf(self.server, {"token_id": str(token_id)}, cookie)),
             headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
         )
 
@@ -392,13 +401,23 @@ class ServerLoggingTests(unittest.TestCase):
         self.request(
             "/admin/users/create",
             method="POST",
-            body=urlencode({"username": "newuser", "password": "another-pass", "is_admin": "0"}),
+            body=urlencode(
+                with_csrf(
+                    self.server,
+                    {"username": "newuser", "password": "another-pass", "is_admin": "0"},
+                    admin_cookie,
+                )
+            ),
             headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": admin_cookie},
         )
         self.request(
             "/admin/settings",
             method="POST",
-            body=urlencode({"action": "appearance", "display_name": "Audit UI"}),
+            body=urlencode(
+                with_csrf(
+                    self.server, {"action": "appearance", "display_name": "Audit UI"}, admin_cookie
+                )
+            ),
             headers={"Content-Type": "application/x-www-form-urlencoded", "Cookie": admin_cookie},
         )
 

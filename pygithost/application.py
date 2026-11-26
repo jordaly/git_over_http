@@ -111,6 +111,7 @@ from .database import (
     db_revoke_session,
     db_revoke_token,
     db_set_user_active,
+    db_token_owner_without_auth,
     db_verify_password,
     db_verify_session,
     db_verify_token,
@@ -171,6 +172,11 @@ _display_name = ContextVar("display_name", default="pygithost")
 # Per-request view state used by the shared page shell (header menus and context).
 _request_path: ContextVar[str] = ContextVar("request_path", default="")
 _viewer: ContextVar[tuple[str | None, bool]] = ContextVar("viewer", default=(None, False))
+# Anti-CSRF token of the current UI request; _html_page adds it to every POST form.
+_csrf_token: ContextVar[str] = ContextVar("csrf_token", default="")
+_POST_FORM_RE = re.compile(r"""<form\b[^>]*\bmethod=["']?post["']?[^>]*>""", re.IGNORECASE)
+# Default upper bound for urlencoded UI form bodies; the Web IDE routes allow more.
+MAX_FORM_BYTES = 2 * 1024 * 1024
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -748,7 +754,11 @@ def _has_write_scope(handler: object) -> bool:
     scopes = getattr(handler, "remote_scopes", None) or set()
     if not isinstance(scopes, (set, frozenset, list, tuple)):
         scopes = set()
-    if getattr(handler, "remote_is_admin", False):
+    # A repository-bound token carries exactly the scopes it was created with; the
+    # owner's administrator status must not turn a read-only token into a push token.
+    if getattr(handler, "remote_is_admin", False) and not getattr(
+        handler, "remote_repository", None
+    ):
         return True
     return "write" in {str(s).lower() for s in scopes}
 
@@ -882,6 +892,49 @@ def _scan_repos(project_root: str) -> list[tuple[str, str, str]]:
             uniq.append((owner, repo, rel))
 
     return uniq
+
+
+def _same_directory(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _canonical_repo_for_git_dir(git_dir: Path) -> tuple[str, str] | None:
+    """Return the scanned (owner, repo) whose Git directory *is* ``git_dir``.
+
+    Compares real files rather than spellings, so on case-insensitive file
+    systems (NTFS) ``MyRepo.git`` and ``myrepo.git`` resolve to the one repository
+    name the rest of the server uses for locks, protection and CI.
+    """
+    root = Path(GIT_PROJECT_ROOT)
+    for owner, repo, rel in _scan_repos(GIT_PROJECT_ROOT):
+        if _same_directory(root / rel, git_dir):
+            return owner, repo
+    return None
+
+
+def _canonical_repo(owner_ui: str, repo: str) -> tuple[str, str] | None:
+    """Canonical (owner, repo) for a name from a URL, or None if no such repository."""
+    if not (_safe_seg(owner_ui) and _safe_seg(repo)):
+        return None
+    git_dir = Path(_repo_git_path(owner_ui, repo))
+    if not _is_git_dir(git_dir):
+        return None
+    return _canonical_repo_for_git_dir(git_dir)
+
+
+# Every legitimate Git smart-HTTP path (repository names, info/refs, HEAD, loose
+# objects, packs, services) uses only these characters.
+_GIT_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]*")
+
+
+def _git_path_info_is_safe(path_info: str) -> bool:
+    """Reject backslashes, drive colons, escapes, control bytes and dot segments."""
+    if not _GIT_PATH_RE.fullmatch(path_info):
+        return False
+    return not any(part in (".", "..") for part in path_info.split("/"))
 
 
 def _repo_git_path(owner_ui: str, repo: str) -> str:
@@ -1118,6 +1171,8 @@ async def _git_list_branches(repo_git: str) -> list[str]:
 
 
 async def _git_resolve_commit(repo_git: str, refish: str) -> str | None:
+    if not refish or refish.startswith("-"):
+        return None
     code, out, _ = await _run_git(repo_git, ["rev-parse", "--verify", refish + "^{commit}"])
     if code != 0:
         return None
@@ -1596,7 +1651,7 @@ def _app_header() -> SafeHTML:
         name = user or "Local user"
         sign_out = (
             html_t(
-                t'<div class="app-menu-divider" role="separator"></div><a role="menuitem" href="/logout">{octicon("sign-out")}Sign out</a>'
+                t'<div class="app-menu-divider" role="separator"></div><form method="POST" action="/logout" class="app-menu-form"><button type="submit" role="menuitem">{octicon("sign-out")}Sign out</button></form>'
             )
             if REQUIRE_AUTH
             else ""
@@ -1717,6 +1772,11 @@ def _html_page(title: str, body_html: str | SafeHTML, *, wide: bool = False) -> 
 </body>
 </html>"""
     )
+    token = _csrf_token.get()
+    if token:
+        # Every state-changing form posts the token; do_POST rejects requests without it.
+        hidden = f'<input type="hidden" name="csrf" value="{token}">'
+        rendered = _POST_FORM_RE.sub(lambda m: m.group(0) + hidden, rendered)
     return rendered.encode("utf-8")
 
 
@@ -2071,7 +2131,11 @@ def _safe_next_url(raw: str | None) -> str:
     value = (raw or "/").strip()
     if not value.startswith("/") or value.startswith("//"):
         return "/"
-    if "\r" in value or "\n" in value:
+    # Browsers read a backslash as "/" and drop tabs and newlines, so "/<backslash>x"
+    # or "/<TAB>/x" would become the protocol-relative (off-site) URL "//x".
+    if "\\" in value or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return "/"
+    if urlparse(value).netloc:
         return "/"
     if value.startswith(URL_PREFIX + "/"):
         return "/"
@@ -2213,6 +2277,18 @@ def _static_headers(path: Path) -> list[tuple[str, str]]:
 # ============================================================
 # SERVER HANDLER
 # ============================================================
+class FormTooLarge(Exception):
+    """A UI form body exceeds the route's size limit."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"Form body exceeds {limit} bytes.")
+        self.limit = limit
+
+
+class BadForm(Exception):
+    """A UI form body cannot be read (for example a non-numeric Content-Length)."""
+
+
 class GitHTTPHandler:
     def __init__(self, request: Request, server: "AsyncGitServer"):
         self.request = request
@@ -2225,6 +2301,8 @@ class GitHTTPHandler:
         self.remote_user_id: int | None = None
         self.remote_is_admin = False
         self.remote_scopes: set[str] = set()
+        # (owner, repo) of a repository-bound token; None for sessions and passwords.
+        self.remote_repository: tuple[str, str] | None = None
 
     def _client_ip(self) -> str:
         return self.request.peer_ip
@@ -2290,6 +2368,12 @@ class GitHTTPHandler:
         if not isinstance(raw_scopes, (set, frozenset, list, tuple)):
             raw_scopes = {"read"}
         self.remote_scopes = {str(scope) for scope in raw_scopes}
+        repository = info.get("repository")
+        self.remote_repository = (
+            (str(repository[0]), str(repository[1]))
+            if isinstance(repository, (tuple, list)) and len(repository) == 2
+            else None
+        )
         self.request.remote_user = self.remote_user
         self.request.remote_user_id = self.remote_user_id
         self.request.remote_is_admin = self.remote_is_admin
@@ -2384,7 +2468,12 @@ class GitHTTPHandler:
         if "application/x-www-form-urlencoded" not in ctype:
             return await _send_text(self.request, 415, "Unsupported Media Type\n")
 
-        form = await self._read_form_urlencoded()
+        try:
+            form = await self._read_form_urlencoded(64 * 1024)
+        except FormTooLarge:
+            return await _send_text(self.request, 413, "413 Payload Too Large\n")
+        except BadForm as exc:
+            return await _send_text(self.request, 400, str_t(t"400 Bad Request: {exc}\n"))
         username = (form.get("username") or "").strip()
         password = form.get("password") or ""
         next_url = _safe_next_url(form.get("next") or "/")
@@ -2415,6 +2504,16 @@ class GitHTTPHandler:
             next_url,
             [("Set-Cookie", _session_cookie_header(session_token))],
         )
+
+    async def _ui_logout_confirm(self) -> None:
+        # Signing out changes state, so it needs a POST with the form token; a plain
+        # link or bookmark to /logout lands here instead of signing anyone out.
+        body = safe_html(
+            '<main class="auth-page"><div class="box auth-box"><h1>Sign out</h1>'
+            '<form method="POST" action="/logout"><button type="submit">Sign out</button></form>'
+            "</div></main>"
+        )
+        await _send_html(self.request, 200, _html_page("Sign out", body))
 
     async def _ui_logout(self) -> None:
         cookies = _parse_cookie_header(self.headers.get("Cookie"))
@@ -2497,14 +2596,27 @@ class GitHTTPHandler:
             )
         return await _send_response(self.request, 200, body, headers, include_body=include_body)
 
-    async def _read_form_urlencoded(self) -> dict[str, str]:
-        clen = int(self.headers.get("Content-Length") or 0)
-        if clen <= 0:
-            return {}
-        raw = await self.request.reader.readexactly(clen)
+    async def _read_form_urlencoded(self, max_bytes: int = MAX_FORM_BYTES) -> dict[str, str]:
+        """Read (once) and parse the request's urlencoded body.
+
+        Raises FormTooLarge or BadForm; do_POST turns them into 413/400 before any
+        handler runs. Later calls return the same parsed form.
+        """
+        cached: dict[str, str] | None = getattr(self, "_form_cache", None)
+        if cached is not None:
+            return cached
+        raw_length = (self.headers.get("Content-Length") or "0").strip()
+        if not raw_length.isdigit():
+            raise BadForm("Invalid Content-Length.")
+        clen = int(raw_length)
+        if clen > max_bytes:
+            raise FormTooLarge(max_bytes)
+        raw = await self.request.reader.readexactly(clen) if clen > 0 else b""
         text = raw.decode("utf-8", "replace")
         qs = parse_qs(text, keep_blank_values=True)
-        return {k: (v[0] if v else "") for k, v in qs.items()}
+        form = {k: (v[0] if v else "") for k, v in qs.items()}
+        self._form_cache = form
+        return form
 
     async def _read_multipart_form(
         self, *, max_bytes: int
@@ -2657,11 +2769,26 @@ class GitHTTPHandler:
         )
         await _send_html(self.request, 200, _html_page("Repositories", safe_html(body)))
 
+    async def _token_owner_id(self) -> int | None:
+        """The user whose tokens this page lists, creates and revokes."""
+        if REQUIRE_AUTH:
+            return self.remote_user_id
+        # Without sign-in there is no current user; see db_token_owner_without_auth.
+        return await asyncio.to_thread(db_token_owner_without_auth)
+
+    async def _token_repositories(self) -> list[str]:
+        scanned = await asyncio.to_thread(_scan_repos, GIT_PROJECT_ROOT)
+        return sorted({f"{owner}/{repo}" for owner, repo, _relative in scanned}, key=str.lower)
+
     async def _ui_tokens(
-        self, notice: str = "", notice_kind: str = "ok", new_token: str = ""
+        self,
+        notice: str = "",
+        notice_kind: str = "ok",
+        new_token: str = "",
+        new_token_repo: str = "",
     ) -> None:
-        user_id = int(self.remote_user_id or 0)
-        tokens = await asyncio.to_thread(db_list_tokens_for_user, user_id)
+        user_id = await self._token_owner_id()
+        tokens = await asyncio.to_thread(db_list_tokens_for_user, user_id) if user_id else []
         tokens, pagination, _page = _paginate_items(tokens, self.path, "/tokens")
 
         notice_html = safe_html("")
@@ -2673,18 +2800,57 @@ class GitHTTPHandler:
 
         new_token_html = safe_html("")
         if new_token:
+            token_owner, _, token_repo = new_token_repo.partition("/")
+            clone_path = (
+                str_t(t"{URL_PREFIX}/{q(token_repo)}.git")
+                if token_owner == FLAT_OWNER_UI
+                else str_t(t"{URL_PREFIX}/{q(token_owner)}/{q(token_repo)}.git")
+            )
             new_token_html = safe_html(
                 html_t(
                     t"""<div class="ok" style="margin-bottom:14px">
 <div><b>Token created.</b> Copy it now. It will not be shown again.</div>
 <pre><code>{new_token}</code></pre>
-<div class="muted">Git example: <code>git clone http://token:{new_token}@HOST:{PORT}{URL_PREFIX}/repo.git</code></div>
+<div class="muted">Git example: <code>git clone http://token:{new_token}@HOST:{PORT}{clone_path}</code></div>
 </div>"""
                 )
             )
 
+        repositories = await self._token_repositories()
+        wanted = new_token_repo or (parse_qs(urlparse(self.path).query).get("repo") or [""])[0]
+        if repositories:
+            repo_options = join_html(
+                [
+                    html_t(
+                        t'<option value="{name}"{" selected" if name == wanted else ""}>{name}</option>'
+                    )
+                    for name in repositories
+                ]
+            )
+            repo_field = safe_html(
+                html_t(
+                    t"""<div><label for="token-repo">Repository</label><select id="token-repo" name="repository" required><option value="">Choose a repository</option>{repo_options}</select></div>"""
+                )
+            )
+        else:
+            repo_field = safe_html(
+                '<div><label>Repository</label><p class="muted">Create a repository first.</p></div>'
+            )
+
         rows: list[str] = []
-        for token_id, name, scopes, is_active, created_at, expires_at, revoked_at, status in tokens:
+        for row in tokens:
+            token_id, name, scopes, is_active, created_at, expires_at, revoked_at, status = row[:8]
+            repo_owner, repo_name = (row[8], row[9]) if len(row) >= 10 else (None, None)
+            if repo_owner and repo_name:
+                repo_html = safe_html(
+                    html_t(
+                        t'<a href="/r/{q(repo_owner)}/{q(repo_name)}"><code>{repo_owner}/{repo_name}</code></a>'
+                    )
+                )
+            else:
+                repo_html = safe_html(
+                    '<span class="pill muted" title="Created before tokens were limited to one repository">All repositories (legacy)</span>'
+                )
             status_class = "pill"
             if status == "expired":
                 status_class = "pill muted"
@@ -2715,6 +2881,7 @@ class GitHTTPHandler:
                 html_t(
                     t"""<tr>
 <td><b>{name}</b><br><small class="muted">Created: {created_at}</small></td>
+<td>{repo_html}</td>
 <td><code>{scopes}</code></td>
 <td>{expires_display}</td>
 <td><span class="{status_class}">{status}</span>{revoked_html}</td>
@@ -2727,7 +2894,7 @@ class GitHTTPHandler:
             join_html(rows)
             if rows
             else safe_html(
-                '<tr><td class="muted">No tokens yet.</td><td></td><td></td><td></td><td></td></tr>'
+                '<tr><td class="muted">No tokens yet.</td><td></td><td></td><td></td><td></td><td></td></tr>'
             )
         )
 
@@ -2743,17 +2910,18 @@ class GitHTTPHandler:
 <form method="POST" action="/tokens/create">
 <div class="row">
 <div><label>Token name</label><input name="name" placeholder="laptop, ci-server, vscode" maxlength="80" required /></div>
+{repo_field}
 <div><label>Scopes</label><select name="scopes"><option value="read">read</option><option value="read,write" selected>read,write</option></select></div>
 <div><label>Expiration date/time</label><input name="expires_at" type="datetime-local" /></div>
 <div><button type="submit">Create token</button></div>
 </div>
-<p class="muted" style="margin:10px 0 0 0">Leave expiration empty for a token that never expires. Tokens are stored hashed, so only metadata is visible later.</p>
+<p class="muted" style="margin:10px 0 0 0">Each token works only for the repository you choose, for Git over HTTP and the REST API. Leave expiration empty for a token that never expires. Tokens are stored hashed, so only metadata is visible later.</p>
 </form>
 </div>
 <div class="box">
 <h2 style="margin:0 0 10px 0;font-size:16px">Your tokens</h2>
 <table>
-<tr><td><b>Name</b></td><td><b>Scopes</b></td><td><b>Expires</b></td><td><b>Status</b></td><td></td></tr>
+<tr><td><b>Name</b></td><td><b>Repository</b></td><td><b>Scopes</b></td><td><b>Expires</b></td><td><b>Status</b></td><td></td></tr>
 {rows_html}
 </table>
 {pagination}
@@ -2766,11 +2934,21 @@ class GitHTTPHandler:
         name = (form.get("name") or "").strip()
         scopes = (form.get("scopes") or "read,write").strip() or "read,write"
         expires_at = (form.get("expires_at") or "").strip()
+        full_name = (form.get("repository") or "").strip()
         if not name:
             return await self._ui_tokens("Token name is required.", "warn")
+        if full_name not in await self._token_repositories():
+            return await self._ui_tokens("Choose a repository for the token.", "warn")
+        owner_id = await self._token_owner_id()
+        if not owner_id:
+            return await self._ui_tokens(
+                "Tokens need an active administrator account to belong to. Create one first.",
+                "warn",
+            )
+        repo_owner, repo_name = full_name.split("/", 1)
         try:
             token = await asyncio.to_thread(
-                db_create_token, int(self.remote_user_id or 0), name, scopes, expires_at
+                db_create_token, owner_id, name, scopes, expires_at, (repo_owner, repo_name)
             )
         except ValueError as e:
             await self._audit("token_create", "failure", target=name, detail=str(e))
@@ -2778,8 +2956,10 @@ class GitHTTPHandler:
         except Exception as e:
             await self._audit("token_create", "failure", target=name, detail=type(e).__name__)
             return await self._ui_tokens(str_t(t"Failed to create token: {e}"), "warn")
-        await self._audit("token_create", "success", target=name, detail=f"scopes={scopes}")
-        return await self._ui_tokens("Token created.", "ok", token)
+        await self._audit(
+            "token_create", "success", target=name, detail=f"scopes={scopes} repo={full_name}"
+        )
+        return await self._ui_tokens("Token created.", "ok", token, full_name)
 
     async def _ui_revoke_token(self) -> None:
         form = await self._read_form_urlencoded()
@@ -2788,7 +2968,10 @@ class GitHTTPHandler:
         except Exception:
             return await self._ui_tokens("Invalid token id.", "warn")
 
-        ok = await asyncio.to_thread(db_revoke_token, int(self.remote_user_id or 0), token_id)
+        owner_id = await self._token_owner_id()
+        ok = bool(owner_id) and await asyncio.to_thread(
+            db_revoke_token, int(owner_id or 0), token_id
+        )
         if not ok:
             await self._audit("token_revoke", "failure", target=str(token_id), detail="not_found")
             return await self._ui_tokens("Token was not found or was already revoked.", "warn")
@@ -2921,6 +3104,8 @@ class GitHTTPHandler:
         body = html_t(
             t"""<main class="repo-page">{_repo_tabs(base, "settings")}<div class="topbar"><div><h2>Settings</h2><p class="muted">Repository administration.</p></div></div>
 {notice_html}
+<section class="box"><h2>Access tokens</h2><p class="muted">Tokens are limited to one repository. A token for <strong>{full_name}</strong> can clone, fetch and (with write scope) push to it, and use the REST API for it only.</p>
+<a class="btn" href="/tokens?repo={q(full_name)}">Create a token for this repository</a></section>
 <section class="box repo-danger-zone"><h2>Danger zone</h2>
 <div class="repo-danger-row"><div><strong>Delete this repository</strong><p class="muted">The repository is moved to the server's deleted-repositories archive. Restoring it requires server access. Please be certain.</p></div></div>
 {delete_html}</section></main>"""
@@ -5710,7 +5895,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             form_html = safe_html(
                 html_t(
                     t'<form method="POST" action="{base}/pulls/{pr_id}/resolve" class="pr-resolve-form">'
-                    t'<input type="hidden" name="csrf" value="{self._email_csrf_token()}">'
+                    t'<input type="hidden" name="csrf" value="{self._settings_csrf_token()}">'
                     t"{join_html(rows)}"
                     t"<label>Merge commit message</label>"
                     t'<textarea name="message" required maxlength="4000">{default_message}</textarea>'
@@ -5741,7 +5926,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._forbidden(b"403 Forbidden: write scope required.\n")
         form = await self._read_form_urlencoded()
         if not secrets.compare_digest(
-            form.get("csrf", "").encode(), self._email_csrf_token().encode()
+            form.get("csrf", "").encode(), self._settings_csrf_token().encode()
         ):
             return await self._forbidden(b"403 Forbidden: invalid security token.\n")
         try:
@@ -5884,7 +6069,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 )
             form = await self._read_form_urlencoded()
             if not secrets.compare_digest(
-                form.get("csrf", "").encode(), self._email_csrf_token().encode()
+                form.get("csrf", "").encode(), self._settings_csrf_token().encode()
             ):
                 return await respond_json(
                     403, {"error": "Invalid security token. Reload the editor."}
@@ -6000,7 +6185,7 @@ document.addEventListener("DOMContentLoaded", function() {{
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         return_url = str_t(t"{base}/pulls/{pr_id}")
         conflict_paths_json = json.dumps([item["path"] for item in conflicts])
-        token = self._email_csrf_token()
+        token = self._settings_csrf_token()
         body = html_t(t'''<main class="repo-page webide-page">{_repo_tabs(base, "pulls")}
 <section id="webide" data-base="{base}/ide" data-csrf="{token}" data-mode="resolve"
  data-commit-url="{base}/pulls/{pr_id}/resolve/ide" data-return="{return_url}"
@@ -6044,9 +6229,9 @@ document.addEventListener("DOMContentLoaded", function() {{
     async def _ui_pull_reopen(self, owner: str, repo: str, pr_id: int) -> None:
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
-            return await self._forbidden(b"403 Forbidden\\n")
+            return await self._forbidden(b"403 Forbidden\n")
         if not _has_write_scope(self):
-            return await self._forbidden(b"403 Forbidden: write scope required.\\n")
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
         pr = await asyncio.to_thread(db_pr_get, pr_id)
         if not pr or pr[1] != owner or pr[2] != repo:
             return await self._not_found()
@@ -6161,13 +6346,6 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         return await self._ui_pull_view(owner, repo, pr_id, msg, "ok")
 
-    def _email_csrf_token(self) -> str:
-        token = getattr(self.server, "email_csrf_token", None)
-        if not token:
-            token = secrets.token_urlsafe(32)
-            self.server.email_csrf_token = token
-        return token
-
     async def _ui_admin_email(
         self, notice: str = "", error: bool = False, submitted: dict[str, object] | None = None
     ) -> None:
@@ -6175,7 +6353,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._forbidden(b"403 Forbidden: admin required.\n")
         settings = await _call_in_thread(load_email_settings)
         display = submitted if submitted is not None else settings
-        token = self._email_csrf_token()
+        token = self._settings_csrf_token()
         password_status = (
             "A password is configured."
             if settings.get("password")
@@ -6235,7 +6413,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             return await self._forbidden(b"403 Forbidden: admin required.\n")
         form = await self._read_form_urlencoded()
         if not secrets.compare_digest(
-            str(form.get("csrf", "")).encode("utf-8"), self._email_csrf_token().encode("utf-8")
+            str(form.get("csrf", "")).encode("utf-8"), self._settings_csrf_token().encode("utf-8")
         ):
             return await self._forbidden(b"403 Forbidden: invalid form token.\n")
         current = await _call_in_thread(load_email_settings)
@@ -7073,7 +7251,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         ):
             return await self._not_found()
         if REQUIRE_AUTH and not _require_admin(self):
-            return await self._forbidden(b"403 Forbidden: admin required.\\n")
+            return await self._forbidden(b"403 Forbidden: admin required.\n")
         config = await self.server.ci_manager.config(owner, repo)
         base = str_t(t"/r/{q(owner)}/{q(repo)}")
         from .database import db_ci_preferences_get
@@ -7172,7 +7350,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
         ):
             return await self._not_found()
         if not _has_write_scope(self):
-            return await self._forbidden(b"403 Forbidden: write scope required.\\n")
+            return await self._forbidden(b"403 Forbidden: write scope required.\n")
         form = await self._read_form_urlencoded()
         branch = (form.get("branch") or "").strip()
         commit = (
@@ -7717,7 +7895,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
                     return await respond(413, {"error": "Commit request exceeds the size limit."})
                 form = await self._read_form_urlencoded()
                 if not secrets.compare_digest(
-                    form.get("csrf", "").encode(), self._email_csrf_token().encode()
+                    form.get("csrf", "").encode(), self._settings_csrf_token().encode()
                 ):
                     return await respond(
                         403, {"error": "Invalid security token. Reload the editor."}
@@ -7894,7 +8072,7 @@ if (document.getElementById("ci-run-result").dataset.active !== "true") clearInt
             # language selector, so every branch is embedded as raw JSON and the
             # client filters it locally.
             branches_json = json.dumps(branches)
-            token = self._email_csrf_token()
+            token = self._settings_csrf_token()
             return_url = (
                 str_t(t"{base}/blob/{q(branch)}/{q(filename, safe='/')}")
                 if filename
@@ -8410,14 +8588,41 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             with contextlib.suppress(Exception):
                 await proc.stdin.wait_closed()
 
+    @staticmethod
+    def _git_path_in_repository(path_info: str, owner: str, repo: str) -> bool:
+        """Whether a mapped Git PATH_INFO addresses exactly the given repository."""
+        # Backslashes and drive colons are path separators on Windows, and percent
+        # signs and control characters have no legitimate use in a Git smart-HTTP
+        # path: refuse them so ..\ segments cannot slip past the "/" split below.
+        if any(ch in path_info for ch in "\\:%") or any(ord(ch) < 32 for ch in path_info):
+            return False
+        parts = path_info.split("/")[1:]
+        if not path_info.startswith("/") or any(part in ("", ".", "..") for part in parts):
+            return False
+        base = _git_dir_path_info(owner, repo, [])
+        if not base or not (path_info == base or path_info.startswith(base + "/")):
+            return False
+        # Belt and braces: the resolved target must stay inside the bound repository.
+        root = Path(GIT_PROJECT_ROOT)
+        target = root.joinpath(*parts).resolve()
+        return target.is_relative_to(root.joinpath(*base.split("/")[1:]).resolve())
+
     async def _handle_git(self) -> None:
         if not self.path.startswith(URL_PREFIX + "/"):
             return await self._not_found()
 
         parsed = urlparse(self.path)
         path_info = parsed.path[len(URL_PREFIX) :]
+        if not _git_path_info_is_safe(path_info):
+            return await self._not_found()
         path_info = _map_git_http_path_info(path_info)
         query = parsed.query or ""
+
+        if self.remote_repository and not self._git_path_in_repository(
+            path_info, *self.remote_repository
+        ):
+            # Same answer as a missing repository, so a token cannot probe for others.
+            return await self._not_found()
 
         if self._git_request_needs_write(path_info, query) and not _has_write_scope(self):
             return await self._forbidden(b"403 Forbidden: write scope required for git push.\n")
@@ -8485,10 +8690,14 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         connected = True
         is_receive_pack_post = self.command == "POST" and path_info.endswith("/git-receive-pack")
         if is_receive_pack_post:
-            for candidate_owner, candidate_repo, rel in _scan_repos(GIT_PROJECT_ROOT):
-                if path_info.startswith("/" + rel.strip("/") + "/"):
-                    push_identity = (candidate_owner, candidate_repo)
-                    break
+            git_dir = Path(GIT_PROJECT_ROOT).joinpath(
+                *path_info[: -len("/git-receive-pack")].split("/")[1:]
+            )
+            push_identity = await asyncio.to_thread(_canonical_repo_for_git_dir, git_dir)
+            if push_identity is None:
+                # Never let a push through without the lock, branch protection and
+                # CI that hang off the repository identity.
+                return await self._not_found()
         if push_identity:
             current_task = asyncio.current_task()
             if current_task is not None:
@@ -8712,9 +8921,6 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             if info:
                 return await _send_redirect(self.request, "/")
             return await self._ui_login()
-        if p == "/logout":
-            return await self._ui_logout()
-
         if self.path.startswith(URL_PREFIX + "/"):
             if not await self._require_auth():
                 return
@@ -8723,6 +8929,8 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         if not await self._require_session_auth():
             return
 
+        if p == "/logout":
+            return await self._ui_logout_confirm()
         if p == "/":
             return await self._ui_home()
         if p == "/tokens":
@@ -8858,6 +9066,51 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         ctype = (self.headers.get("Content-Type") or "").lower()
         if "application/x-www-form-urlencoded" not in ctype:
             return await _send_text(self.request, 415, "Unsupported Media Type\n")
+
+        if re.fullmatch(r"/r/[^/]+/[^/]+/ide/commit", parsed.path):
+            from .webide import MAX_REQUEST
+
+            form_limit = MAX_REQUEST * 2
+        elif re.fullmatch(r"/r/[^/]+/[^/]+/pulls/\d+/resolve/ide/commit", parsed.path):
+            form_limit = 5 * 1024 * 1024
+        else:
+            form_limit = MAX_FORM_BYTES
+        try:
+            form = await self._read_form_urlencoded(form_limit)
+        except FormTooLarge:
+            return await _send_text(self.request, 413, "413 Payload Too Large\n")
+        except BadForm as exc:
+            return await _send_text(self.request, 400, str_t(t"400 Bad Request: {exc}\n"))
+        # One CSRF gate for every state-changing UI form (pages add the token to
+        # forms automatically); handlers that also check it keep doing so.
+        if not self._valid_settings_csrf(form):
+            await self._audit("csrf", "failure", target=parsed.path)
+            if parsed.path.endswith("/ide/commit"):
+                # The Web IDE reads JSON errors and shows them in the editor.
+                return await _send_response(
+                    self.request,
+                    403,
+                    json.dumps({"error": "Invalid security token. Reload the editor."}).encode(),
+                    [
+                        ("Content-Type", "application/json; charset=utf-8"),
+                        ("Cache-Control", "no-store"),
+                    ],
+                )
+            return await _send_text(
+                self.request,
+                403,
+                "403 Forbidden: the form expired or came from another site. "
+                "Reload the page and try again.\n",
+            )
+        if parsed.path == "/logout":
+            return await self._ui_logout()
+        # Repository routes act only on an existing repository under its canonical
+        # name, so locks, protection and CI never see two spellings of one repository.
+        m = re.match(r"^/r/([^/]+)/([^/]+)/", parsed.path)
+        if m:
+            owner, repo = unquote(m.group(1)), unquote(m.group(2))
+            if await asyncio.to_thread(_canonical_repo, owner, repo) != (owner, repo):
+                return await self._not_found()
         m = re.match(r"^/r/([^/]+)/([^/]+)/ide/commit$", parsed.path)
         if m:
             return await self._ui_ide(m.group(1), m.group(2), "commit")
@@ -9030,6 +9283,9 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             _display_name.set(await self.server.display_name())
             _request_path.set(path)
             _viewer.set((None, False))
+            if getattr(self.server, "_settings_csrf_secret", b"") is None:
+                await asyncio.to_thread(lambda: self.server.settings_csrf_secret)
+            _csrf_token.set(self._settings_csrf_token())
         if self.command == "GET":
             return await self.do_GET()
         if self.command == "POST":
@@ -9091,13 +9347,26 @@ class AsyncGitServer:
         self.access_log = bool(server_config.access_log)
         self.audit_log = bool(server_config.audit_log)
         self.settings_lock = asyncio.Lock()
-        self.settings_csrf_secret = secrets.token_bytes(32)
-        self.email_csrf_token: str | None = None
+        # Loaded from the database on first use (the database is initialised after
+        # construction) so form tokens survive restarts and deploys.
+        self._settings_csrf_secret: bytes | None = None
         from .api.policy import RateLimiter
 
         self.api_limiter = RateLimiter()
         self.api_slots = asyncio.Semaphore(8)
         self.api_download_slots = asyncio.Semaphore(2)
+
+    @property
+    def settings_csrf_secret(self) -> bytes:
+        if self._settings_csrf_secret is None:
+            from .database import db_server_secret
+
+            self._settings_csrf_secret = db_server_secret("ui_csrf_secret")
+        return self._settings_csrf_secret
+
+    @settings_csrf_secret.setter
+    def settings_csrf_secret(self, value: bytes) -> None:
+        self._settings_csrf_secret = value
 
     async def display_name(self) -> str:
         from .database import db_display_name_get

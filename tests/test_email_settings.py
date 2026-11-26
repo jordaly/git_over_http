@@ -23,8 +23,9 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = str(Path(self.temp.name) / "test.db")
         database._db_init()
         self.handler = object.__new__(GitHTTPHandler)
-        self.handler.server = SimpleNamespace()
-        self.handler.request = SimpleNamespace()
+        self.handler.server = SimpleNamespace(settings_csrf_secret=b"email-test")
+        self.handler.request = SimpleNamespace(peer_ip="127.0.0.1")
+        self.handler.headers = {}
         self.handler.remote_is_admin = True
         self.handler._forbidden = AsyncMock()
         self.settings = {
@@ -44,7 +45,7 @@ class EmailSettingsTests(unittest.IsolatedAsyncioTestCase):
 
     async def post(self, form, test=False):
         self.handler._read_form_urlencoded = AsyncMock(
-            return_value={**form, "csrf": self.handler._email_csrf_token()}
+            return_value={**form, "csrf": self.handler._settings_csrf_token()}
         )
         with mock.patch("pygithost.application._send_response", new_callable=AsyncMock) as send:
             await self.handler._ui_admin_email_save(test=test)

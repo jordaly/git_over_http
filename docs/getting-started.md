@@ -137,7 +137,8 @@ git clone http://127.0.0.1:8000/git/OWNER/REPOSITORY.git
 
 Replace the example URL with the copied one. When authentication is enabled,
 enter your username and password or access token when Git prompts. Tokens can be
-managed on the **Tokens** page; use an appropriate scope for read or write access.
+managed on the **Tokens** page. Each token is limited to the one repository you pick
+when creating it; use an appropriate scope for read or write access.
 Never embed credentials in a clone URL or commit them in scripts.
 
 ## Before allowing remote access

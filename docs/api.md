@@ -7,6 +7,14 @@ Existing Git HTTP and web routes are unchanged.
 ## Authentication and repository access
 
 Create a personal access token on the **Tokens** page with at least `read` scope.
+Every new token is bound to **one repository**, chosen when it is created (the
+repository's **Settings** page links to the form with it preselected). The token
+then works only for that repository, both here and for Git over HTTP: every other
+repository answers `404`, and `GET /api/v1/repos` lists only the bound one.
+`GET /api/v1/user` reports the binding as `"repository": "owner/repo"`. Tokens
+created before repository binding existed report `null` and keep working for every
+repository; revoke and recreate them to restrict them. Deleting a repository revokes
+its tokens, so a new repository with the same name starts with none.
 Send it in `Authorization: Bearer TOKEN`. A token with `write` scope also receives
 `read`; `admin` alone does not imply `read`. Tokens are checked on every request:
 revoked, expired tokens and tokens belonging to disabled users are rejected.
@@ -17,7 +25,9 @@ and query-string tokens are not accepted. Anonymous API reads are not supported.
 Use HTTPS when accessing the API outside trusted local development. The HTTP
 server does not provide TLS; configure a reverse proxy.
 
-Repository access is intentionally stricter than the web interface:
+Repository access is intentionally stricter than the web interface. The binding
+narrows these rules and never widens them: a token bound to `bob/project` that
+belongs to the non-admin `alice` still cannot read it through the API.
 
 - Non-admin users can read only repositories whose owner namespace exactly matches
   their username.
@@ -27,12 +37,18 @@ Repository access is intentionally stricter than the web interface:
 - Missing and inaccessible repositories both return `404`.
 - Symlinked/junction owner directories and repositories are not exposed by the API,
   including aliases to another repository inside the project root.
-- Repository collaborator ACLs and repository-restricted tokens are not implemented.
-  Do not interpret token scopes as repository membership.
+- Repository collaborator ACLs are not implemented. A token's repository binding
+  limits that token; it does not grant its owner membership of the repository.
 
 The existing server IP allowlist applies. CORS access is not enabled.
 Every mutation requires `write` scope as well as repository access. An administrator's
 read-only token cannot write, even when web authentication is disabled.
+
+When web authentication is disabled there is no signed-in user, so tokens made on
+the **Tokens** page belong to the oldest active administrator account (normally the
+bootstrap `admin`). Their repository binding is what limits them. Git over HTTP does
+not check tokens at all in that mode (the IP allowlist is the boundary), so the
+binding only restricts the API there.
 
 ## Quick start
 
@@ -78,7 +94,7 @@ a body. Supported mutations are listed separately below.
 | --- | --- |
 | `/` | API discovery and documentation URLs |
 | `/openapi.json` | OpenAPI 3.1 specification |
-| `/user` | Token owner, administrator flag and granted scopes |
+| `/user` | Token owner, administrator flag, granted scopes and bound `repository` (`owner/repo`, or `null` for a legacy token) |
 | `/repos` | Accessible repositories, ordered by owner then name |
 | `/repos/{owner}/{repo}` | Repository and default branch |
 | `/repos/{owner}/{repo}/branches` | Branches, ordered by full ref name |
@@ -145,6 +161,8 @@ chunked bodies are not accepted. Unknown fields, forged authors, invalid types,
 blank titles/comments and unsupported states are rejected rather than ignored.
 Titles are limited to 256 characters, bodies to 65536, and commit messages to 4000.
 The authenticated token owner is always recorded as the author.
+Idempotency keys are scoped to the user, and additionally to the repository for
+repository-bound tokens, so two bound tokens of one user never collide.
 
 | Method | Path | Required JSON fields |
 | --- | --- | --- |
@@ -177,7 +195,8 @@ Creation returns `201`; updates, merges and deletions return `200` with a JSON
 result. File PUT returns `201` for a new file and `200` for an update. CI triggers
 and reruns return `202` with a run summary; cancellation returns `200`.
 Repository creation is limited to the current user's namespace, including for
-administrators. Repositories are initially empty: push their first commit with Git.
+administrators, and is refused (`403`) for repository-bound tokens. Without
+`auto_init` or a template a repository starts empty: push its first commit with Git.
 Creating the first commit in an unborn branch through the contents API is not yet
 supported. Repository deletion and repository settings updates are not implemented.
 
@@ -478,6 +497,12 @@ readability/executability, outside-repository placement, simple direct-script
 shebang prerequisites and the named-step shell. It **does not execute** commands,
 scripts or deployment code. No enabled targets yields `ok: false`. Advanced
 `/usr/bin/env` shebang flags are conservatively reported as unsupported.
+
+Preflight never opens a script path from an untrusted repository configuration
+(`script_checked: false`), and never opens UNC or network paths such as
+`\\host\share\deploy.ps1` (`script_local: false`), which on Windows would connect
+to another machine with the server's credentials. Keep deployment scripts on a
+local disk.
 
 Preflight cannot validate arbitrary shell command dependencies, remote credentials,
 network services, deployment destination permissions or future filesystem changes.

@@ -26,6 +26,8 @@ class Identity(TypedDict):
     username: str
     is_admin: bool
     scopes: set[str]
+    #: ``(owner, repo)`` the token is bound to; ``None`` for a legacy unrestricted token.
+    repository: tuple[str, str] | None
 
 
 class Author(TypedDict):

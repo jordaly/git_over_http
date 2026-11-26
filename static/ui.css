@@ -192,6 +192,10 @@ html[data-theme="dark"] .theme-icon-dark, html:not([data-theme="dark"]) .theme-i
 .app-menu-list a { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; color: var(--fg); font-size: 14px; white-space: nowrap; }
 .app-menu-list a .octicon { color: var(--muted); }
 .app-menu-list a:hover { background: var(--btn-hover); text-decoration: none; }
+.app-menu-form { margin: 0; }
+.app-menu-form button { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 6px; background: none; color: var(--fg); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+.app-menu-form button .octicon { color: var(--muted); }
+.app-menu-form button:hover { background: var(--btn-hover); }
 .app-menu-header { display: flex; align-items: center; gap: 10px; padding: 6px 8px; }
 .app-menu-header strong { display: block; font-size: 14px; overflow-wrap: anywhere; }
 .app-menu-header .muted { display: block; font-size: 12px; }

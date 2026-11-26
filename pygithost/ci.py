@@ -508,6 +508,13 @@ def pipeline_config(
     return merged
 
 
+# Built-ins whose values come from Git ref names, which pushers and PR authors choose.
+REF_DERIVED = frozenset(
+    {"PYGITHOST_REF", "PYGITHOST_BRANCH", "PYGITHOST_BASE_BRANCH", "PYGITHOST_HEAD_BRANCH"}
+)
+SHELL_SAFE_REF = re.compile(r"[A-Za-z0-9._/@+,=-]*")
+
+
 def render_command(command: str, env: Mapping[str, str]) -> str:
     """Single-pass {{ env.NAME }} substitution, without expression evaluation."""
     reference = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
@@ -516,7 +523,16 @@ def render_command(command: str, env: Mapping[str, str]) -> str:
         name = match.group(1)
         if name not in env:
             raise ValueError(f"Undefined CI environment variable: {name}")
-        return env[name]
+        value = env[name]
+        # Git allows branch names such as "x;`id`" and a pull request author chooses
+        # them, so a placeholder pasted into a shell command must not carry shell syntax.
+        if name in REF_DERIVED and not SHELL_SAFE_REF.fullmatch(value):
+            raise ValueError(
+                f"Refusing to insert {{{{ env.{name} }}}}: the branch name contains characters "
+                f"that are unsafe in a shell command. Use the ${name} environment variable "
+                "(quoted) instead of the placeholder."
+            )
+        return value
 
     # Validate the original template before insertion, so values containing
     # template-like text are always treated literally and never expanded again.

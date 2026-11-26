@@ -41,11 +41,16 @@ UserAuthRow: TypeAlias = tuple[int, str, bytes, bytes, int, int]
 # users: id, username, is_admin, is_active, created_at.
 UserRow: TypeAlias = tuple[int, str, int, int, str]
 
-# tokens: id, name, scopes, is_active, created_at, expires_at, revoked_at, status.
-TokenListRow: TypeAlias = tuple[int, str, str, int, str, str | None, str | None, str]
+# tokens: id, name, scopes, is_active, created_at, expires_at, revoked_at, status,
+# repo_owner, repo_name (both NULL for a legacy token valid for every repository).
+TokenListRow: TypeAlias = tuple[
+    int, str, str, int, str, str | None, str | None, str, str | None, str | None
+]
 # tokens joined with users: u.id, u.username, u.is_admin, u.is_active,
-# t.scopes, t.is_active, t.expires_at, t.revoked_at.
-TokenAuthRow: TypeAlias = tuple[int, str, int, int, str, int, str | None, str | None]
+# t.scopes, t.is_active, t.expires_at, t.revoked_at, t.repo_owner, t.repo_name.
+TokenAuthRow: TypeAlias = tuple[
+    int, str, int, int, str, int, str | None, str | None, str | None, str | None
+]
 # sessions joined with users: session id, user id, username, is_admin,
 # is_active, expires_at, revoked_at.
 SessionRow: TypeAlias = tuple[int, int, str, int, int, str, str | None]

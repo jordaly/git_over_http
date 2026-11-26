@@ -28,6 +28,11 @@ def specification() -> DynamicJSONObject:
                 "login": string,
                 "is_admin": {"type": "boolean"},
                 "scopes": {"type": "array", "items": string},
+                "repository": {
+                    "type": ["string", "null"],
+                    "description": "owner/repo the token is bound to; null for a legacy "
+                    "token that is valid for every repository.",
+                },
             }
         ),
         "Author": obj({"id": integer, "login": {"type": ["string", "null"]}}),
@@ -851,6 +856,7 @@ def specification() -> DynamicJSONObject:
             "version": "1.3.0",
             "description": "GitHub-inspired API with repository browsing, discussions, safe writes and CI automation. Not GitHub API compatible. "
             "Owner namespace access; administrators can read all repositories. "
+            "A repository-bound token can only reach its own repository. "
             "A read-scoped bearer token is required regardless of web authentication settings.",
         },
         "servers": [{"url": "/api/v1"}],
@@ -861,7 +867,8 @@ def specification() -> DynamicJSONObject:
                 "bearerAuth": {
                     "type": "http",
                     "scheme": "bearer",
-                    "description": "Personal access token with read scope.",
+                    "description": "Personal access token with read scope, bound to one "
+                    "repository.",
                 }
             },
             "schemas": schemas,

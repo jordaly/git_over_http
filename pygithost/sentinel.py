@@ -122,6 +122,8 @@ class SentinelExporter:
         *,
         attributes: dict[str, str | int | float] | None = None,
         correlation_id: str | None = None,
+        trace_id: str | None = None,
+        span_id: str | None = None,
     ) -> None:
         event = {
             "application": self.application,
@@ -136,10 +138,37 @@ class SentinelExporter:
         }
         if correlation_id:
             event["correlation_id"] = correlation_id
+        if trace_id:
+            event["trace_id"] = trace_id
+            if span_id:
+                event["span_id"] = span_id
         try:
             self._pending.put_nowait((int(level in {"Warning", "Error"}), json.dumps(event)))
         except queue.Full:
             self._queue_dropped += 1
+
+    # Placeholders for the metrics and traces pipeline (not yet exported).
+    def count(self, name: str, value: float, attributes: dict[str, Any] | None) -> None:
+        pass
+
+    def observe(self, name: str, value_ms: float, attributes: dict[str, Any] | None) -> None:
+        pass
+
+    def span(
+        self,
+        name: str,
+        start: datetime,
+        end: datetime,
+        *,
+        trace_id: str,
+        span_id: str,
+        parent_span_id: str | None,
+        kind: str,
+        status: str,
+        status_message: str | None,
+        attributes: dict[str, Any] | None,
+    ) -> None:
+        pass
 
     def _run(self) -> None:
         pending: list[tuple[int, str]] = []
@@ -338,3 +367,124 @@ def _retry_after(value: str | None) -> float:
             except ValueError, TypeError, OverflowError, OSError:
                 pass
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Module-level instrumentation API.
+#
+# Call sites anywhere in PyGitHost (CI, pull requests, auth, ...) use these
+# helpers; they are no-ops while no exporter is active, never raise, and never
+# block. Attribute values must be low-cardinality scalars and must not contain
+# usernames, IP addresses, raw URLs, query strings, bodies, tokens or
+# tracebacks. Repository full names ("owner/repo") are allowed.
+# ---------------------------------------------------------------------------
+
+Attributes = dict[str, str | int | float | bool]
+
+_current: SentinelExporter | None = None
+
+
+def set_current(exporter: SentinelExporter | None) -> None:
+    """Install (or clear) the process-wide exporter used by the helpers below."""
+    global _current
+    _current = exporter
+
+
+def current() -> SentinelExporter | None:
+    return _current
+
+
+def new_trace_id() -> str:
+    """32 lowercase hex characters (W3C trace ID)."""
+    return uuid.uuid4().hex
+
+
+def new_span_id() -> str:
+    """16 lowercase hex characters (W3C span ID)."""
+    return uuid.uuid4().hex[:16]
+
+
+def emit_event(
+    name: str,
+    level: str = "Information",
+    attributes: Attributes | None = None,
+    *,
+    correlation_id: str | None = None,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+) -> None:
+    """Send a log event. ``level`` is Information, Warning or Error."""
+    exporter = _current
+    if exporter is None:
+        return
+    try:
+        exporter.emit(
+            name,
+            level,
+            attributes=dict(attributes) if attributes else None,
+            correlation_id=correlation_id,
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+    except Exception:  # pragma: no cover - telemetry must never break callers
+        logger.debug("Fuente Sentinel emit failed", exc_info=True)
+
+
+def count(name: str, value: float = 1, attributes: Attributes | None = None) -> None:
+    """Add to a delta counter metric (aggregated in-process, flushed periodically)."""
+    exporter = _current
+    if exporter is None:
+        return
+    try:
+        exporter.count(name, value, dict(attributes) if attributes else None)
+    except Exception:  # pragma: no cover
+        logger.debug("Fuente Sentinel count failed", exc_info=True)
+
+
+def observe(name: str, value_ms: float, attributes: Attributes | None = None) -> None:
+    """Record a duration in milliseconds into an aggregated histogram metric."""
+    exporter = _current
+    if exporter is None:
+        return
+    try:
+        exporter.observe(name, value_ms, dict(attributes) if attributes else None)
+    except Exception:  # pragma: no cover
+        logger.debug("Fuente Sentinel observe failed", exc_info=True)
+
+
+def record_span(
+    name: str,
+    start: datetime,
+    end: datetime,
+    *,
+    trace_id: str,
+    span_id: str,
+    parent_span_id: str | None = None,
+    kind: str = "internal",
+    status: str = "unset",
+    status_message: str | None = None,
+    attributes: Attributes | None = None,
+) -> None:
+    """Send a finished span. ``start``/``end`` must be timezone-aware datetimes.
+
+    ``kind``: internal, server, client, producer, consumer.
+    ``status``: unset, ok, error. ``status_message`` must be a fixed, non-sensitive text.
+    """
+    exporter = _current
+    if exporter is None:
+        return
+    try:
+        exporter.span(
+            name,
+            start,
+            end,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            kind=kind,
+            status=status,
+            status_message=status_message,
+            attributes=dict(attributes) if attributes else None,
+        )
+    except Exception:  # pragma: no cover
+        logger.debug("Fuente Sentinel span failed", exc_info=True)

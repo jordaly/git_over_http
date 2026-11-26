@@ -128,7 +128,7 @@ from .octicons import octicon
 from .readme import render_readme
 from .repo_templates import GITIGNORE_TEMPLATES, LICENSES, initial_files
 from .repository_info import RepositoryOverview, repository_overview
-from .sentinel import SentinelExporter
+from .sentinel import SentinelExporter, set_current
 
 logger = logging.getLogger(__name__)
 
@@ -9136,19 +9136,17 @@ class AsyncGitServer:
                 else:
                     group = "web"
                 status = req.status or 500
-                attributes: dict[str, str | int | float] = {
-                    "route_group": group,
-                    "status": status,
-                    "duration_ms": round(duration_ms, 3),
-                }
-                if error_type is not None:
-                    attributes["error_type"] = error_type
-                self.sentinel.emit(
-                    "request_failure" if error_type else "http_request",
-                    "Error" if status >= 500 or error_type else "Information",
-                    attributes=attributes,
-                    correlation_id=req.request_id,
-                )
+                try:
+                    self.sentinel.record_request(
+                        req.method,
+                        group,
+                        status,
+                        duration_ms,
+                        error_type=error_type,
+                        request_id=req.request_id,
+                    )
+                except Exception:  # pragma: no cover - telemetry must never break requests
+                    logger.debug("Fuente Sentinel request telemetry failed", exc_info=True)
             if self.access_log:
                 log_access(
                     method=req.method if req else "?",
@@ -9229,6 +9227,7 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
         if exporter is not None:
             exporter.start()
             app.sentinel = exporter
+            set_current(exporter)
             exporter.emit("server_start", "Information")
     except (OSError, RuntimeError, ValueError) as exc:
         logger.warning(
@@ -9283,6 +9282,7 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
             if app.sentinel is not None:
                 app.sentinel.emit("server_stop", "Information")
                 await asyncio.to_thread(app.sentinel.stop)
+                set_current(None)
             logger.info("Server stopped", extra={"event": "server_stop", "port": PORT})
 
 

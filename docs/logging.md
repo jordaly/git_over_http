@@ -175,18 +175,35 @@ PyGitHost.
 | `PYGITHOST_SENTINEL_KEY` | The application's ingestion key. Store it in a restricted service environment or secret store. |
 | `PYGITHOST_SENTINEL_APPLICATION` | Sentinel application name the key is authorized for, defaulting to `PyGitHost`. |
 | `PYGITHOST_SENTINEL_ENVIRONMENT` | Deployment name used in Sentinel, defaulting to `production`. |
+| `PYGITHOST_SENTINEL_REQUEST_LOGS` | Per-request log volume: `errors` (default) logs only 5xx and unhandled failures, `all` logs every request, `off` logs none. Invalid values fall back to `errors`. |
+| `PYGITHOST_SENTINEL_TRACE_SAMPLE_RATE` | Fraction of successful requests sent as traces, from `0` to `1`, default `0.01`. Errors and slow requests are always traced. |
+| `PYGITHOST_SENTINEL_SLOW_REQUEST_MS` | Request duration that always produces a `slow_request` Warning and a trace, default `2000`. |
+| `PYGITHOST_SENTINEL_METRICS` | `on` (default) or `off` for aggregated request metrics and gauges. |
 | `SSL_CERT_FILE` | Optional PEM trust bundle for a private or self-signed Sentinel certificate. System trust is used by default. |
 
 HTTPS validates the server certificate and hostname. Plain HTTP is available
 for local testing on loopback.
 
 Check **Clients** for the PyGitHost heartbeat and **Logs** for `server_start`
-and `http_request` after making a Git, REST API, or web request. Requests
-include a route group, status, and duration in milliseconds. REST API events
-carry the response's `X-Request-ID` as their correlation ID. Server failures
-can include the exception type. The exporter uses fixed messages and omits
-raw URLs, query strings, request bodies, usernames, IP addresses, and
-tracebacks. Request durations are log attributes.
+after making a Git, REST API, or web request. The exporter sends a batch
+`resource` once per connection (`service.name`, `service.version`,
+`deployment.environment.name`, `client.id`, `host.name`, `os.type`,
+`process.pid`, `session.id`); events, metrics, and spans inherit it. Heartbeats
+include the application version, machine, operating system, process ID, and
+attributes for memory usage, spool backlog, and dropped events.
+
+With the default `errors` mode, successful requests produce no log event. Every
+request contributes `http.server.request.count` and
+`http.server.request.duration` metrics keyed by route group and status class.
+Sampled requests produce a `server` span named from the HTTP method and route
+group, never the raw path. Errors and slow requests are always traced; slow
+requests also emit `slow_request`. REST API events carry the response's
+`X-Request-ID` as their correlation ID, and related logs carry the span's trace
+and span IDs. Server failures can include the exception type.
+
+The exporter uses fixed messages and omits raw URLs, query strings, request
+bodies, usernames, IP addresses, and tracebacks. Metric names are validated and
+each interval is capped at 500 distinct series to bound cardinality.
 
 The background worker stores batches in a separate
 `*.sentinel-*.sqlite3` file beside the PyGitHost database. Each destination
@@ -195,10 +212,12 @@ worker retries transient failures using the same event IDs, honors
 `Retry-After`, and waits longer on authentication or application errors.
 Permanently rejected events are stored in the spool's `dead_letters` table.
 
-The spool holds up to 20,000 unsent events and 500 recent dead letters.
-Spool overflow evicts the oldest informational events first. A full in-memory
-queue drops incoming events and reports a count to the local log. Events
-already committed to the spool survive a restart. Events still in memory can
+The spool holds up to 20,000 unsent items and 500 recent dead letters. Logs,
+aggregated metrics, and spans share the spool but are always sent in
+single-kind batches to `/api/v1/logs/batch`, `/api/v1/metrics/batch`, and
+`/api/v1/traces/batch`. Spool overflow evicts the oldest informational items
+first. A full in-memory queue drops incoming items and reports a count to the
+local log. Items already committed to the spool survive a restart. Items still in memory can
 be lost if the process is killed or exits while the worker is blocked on an
 HTTP request. Shutdown waits up to two seconds for the exporter to persist
 queued events for the next run.

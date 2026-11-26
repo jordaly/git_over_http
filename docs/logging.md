@@ -202,3 +202,50 @@ already committed to the spool survive a restart. Events still in memory can
 be lost if the process is killed or exits while the worker is blocked on an
 HTTP request. Shutdown waits up to two seconds for the exporter to persist
 queued events for the next run.
+
+### Events and metrics sent to Sentinel
+
+All attributes are low-cardinality scalars. Repository names are `owner/repo`;
+usernames, email addresses, IP addresses, raw URLs, file paths, commit messages,
+tokens and exception messages are never sent.
+
+| Event | Level | Attributes |
+| --- | --- | --- |
+| `ci_run_queued` | Information | `repo`, `branch`, `trigger`, `run_number` |
+| `ci_run_started` | Information | `repo`, `branch`, `trigger`, `run_number`, `runner` |
+| `ci_run_finished` | Information / Warning (`cancelled`) / Error (`failed`, `error`) | `repo`, `status`, `run_number`, `duration_ms`, `runner` |
+| `deployment_started` | Information | `repo`, `environment` |
+| `deployment_finished` | Information / Warning (`interrupted`) / Error (`failed`, `timed_out`) | `repo`, `environment`, `status`, `duration_ms` |
+| `git_push` | Information | `repo`, `refs_updated`, `branch` (single branch only), `outcome` |
+| `pull_request_opened` | Information | `repo`, `pr_number` |
+| `pull_request_merged` | Information | `repo`, `pr_number` |
+| `pull_request_closed` | Information | `repo`, `pr_number` |
+| `pull_request_reopened` | Information | `repo`, `pr_number` |
+| `pull_request_review` | Information | `repo`, `pr_number`, `state` |
+| `audit_<action>` | Information, Warning for failed `login`/`csrf` | `action`, `outcome`, `reason` (only fixed code-like details) |
+| `auth_failure` | Warning | `surface`, `method`, `reason` |
+| `audit_failure` | Warning | `action`, `error_type` |
+| `ci_retention_startup_failure`, `ci_retention_retry_failure`, `ci_retention_refresh_failure` | Warning | `repo`, `error_type` |
+| `ci_email_failure`, `deployment_email_failure` | Warning | `repo`, `run_number`, `error_type` |
+| `pr_push_record_failure` | Warning | `repo`, `error_type` |
+| `source_cleanup_deferred` | Warning | `error_type` |
+| `ci_ip_trust_all_enabled` | Warning | none |
+| `ci_coordinator_failure` | Error | `repo`, `run_number`, `error_type` |
+
+| Metric | Type | Attributes |
+| --- | --- | --- |
+| `ci.run.count` | counter | `repo`, `status` |
+| `ci.run.duration` | histogram (ms) | `repo`, `status` |
+| `ci.run.queue_wait` | histogram (ms) | `repo` |
+| `ci.deployment.count` | counter | `repo`, `status` |
+| `git.push.count` | counter | `repo`, `outcome` |
+| `git.fetch.count` | counter | `repo` |
+| `pull_request.event.count` | counter | `repo`, `action` |
+| `auth.login.count` | counter | `outcome`, `method` |
+| `auth.failure.count` | counter | `surface`, `method` |
+| `auth.success.count` | counter | `surface`, `method` |
+
+Each CI execution also emits a `ci run` root span with child spans for
+`checkout`, `merge`, `image build`, every configured step, and (for remote
+runners) the remote execution and any step timing reported at completion.
+Span names longer than 128 characters are truncated.

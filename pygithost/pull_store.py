@@ -12,7 +12,7 @@ import sqlite3
 from collections.abc import Iterable, Mapping
 from typing import Any, Literal, TypedDict, cast
 
-from . import database
+from . import database, sentinel
 
 ReviewState = Literal["pending", "commented", "approved", "changes_requested", "dismissed"]
 Side = Literal["LEFT", "RIGHT"]
@@ -297,6 +297,14 @@ def create_pull(
             raise
     finally:
         conn.close()
+    sentinel.emit_event(
+        "pull_request_opened",
+        attributes={"repo": f"{owner}/{repo}", "pr_number": pr_id},
+    )
+    sentinel.count(
+        "pull_request.event.count",
+        attributes={"repo": f"{owner}/{repo}", "action": "opened"},
+    )
     return pr_id
 
 

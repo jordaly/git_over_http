@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 
-from . import pr_resolver, pull_store, pulls
+from . import pr_resolver, pull_store, pulls, sentinel
 from .ci import CIManager, protected_branch
 from .ci import default_config as ci_default_config
 from .ci_documentation import ci_configuration_guide
@@ -936,6 +936,30 @@ def _git_path_info_is_safe(path_info: str) -> bool:
     if not _GIT_PATH_RE.fullmatch(path_info):
         return False
     return not any(part in (".", "..") for part in path_info.split("/"))
+
+
+def _repo_identity_from_git_path_info(path_info: str) -> tuple[str, str] | None:
+    """Best-effort owner/repo for a public smart-HTTP path; never used for auth."""
+    parts = [part for part in path_info.strip("/").split("/") if part]
+    if len(parts) < 3:
+        return None
+    first = parts[0]
+    flat = first.endswith(".git") or parts[1] in (
+        "info",
+        "git-upload-pack",
+        "git-receive-pack",
+        "HEAD",
+        "objects",
+    )
+    if flat:
+        repo = first[:-4] if first.endswith(".git") else first
+        return (FLAT_OWNER_UI, repo) if _safe_seg(repo) else None
+    owner, repo = first, parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if _safe_seg(owner) and _safe_seg(repo):
+        return owner, repo
+    return None
 
 
 def _repo_git_path(owner_ui: str, repo: str) -> str:
@@ -2297,6 +2321,19 @@ class BadForm(Exception):
     """A UI form body cannot be read (for example a non-numeric Content-Length)."""
 
 
+def _emit_auth_failure(surface: str, method: str, reason: str) -> None:
+    sentinel.emit_event(
+        "auth_failure",
+        level="Warning",
+        attributes={"surface": surface, "method": method, "reason": reason},
+    )
+    sentinel.count("auth.failure.count", attributes={"surface": surface, "method": method})
+
+
+def _emit_auth_success(surface: str, method: str) -> None:
+    sentinel.count("auth.success.count", attributes={"surface": surface, "method": method})
+
+
 class GitHTTPHandler:
     def __init__(self, request: Request, server: "AsyncGitServer"):
         self.request = request
@@ -2323,38 +2360,52 @@ class GitHTTPHandler:
             return True
 
         auth_header = self.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Basic "):
-            return await self._request_auth()
+        if not auth_header:
+            return await self._request_auth("none", "missing_credentials")
+        if not auth_header.startswith("Basic "):
+            return await self._request_auth("none", "malformed_credentials")
 
         try:
             decoded = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
             username, secret = decoded.split(":", 1)
         except Exception:
-            return await self._request_auth()
+            return await self._request_auth("none", "malformed_credentials")
 
         if not _safe_seg(username):
-            return await self._request_auth()
+            return await self._request_auth("password", "invalid_username")
 
         # First support the strict USERNAME:TOKEN form.
         info = await asyncio.to_thread(db_verify_token, username, secret)
+        if info:
+            _emit_auth_success("git", "token")
+            self._apply_auth_info(info)
+            return True
 
         # Then support token-only login, where the Basic Auth username is only a
         # placeholder like "token", "git", or "x-access-token". The real user is
         # resolved from the token owner in SQLite.
-        if not info:
-            info = await asyncio.to_thread(db_verify_token_any_user, secret)
-
-        # Finally fall back to normal USERNAME:PASSWORD login for the web UI.
-        if not info:
-            info = await asyncio.to_thread(db_verify_password, username, secret)
-
+        info = await asyncio.to_thread(db_verify_token_any_user, secret)
         if info:
+            _emit_auth_success("git", "token")
             self._apply_auth_info(info)
             return True
 
-        return await self._request_auth()
+        # Finally fall back to normal USERNAME:PASSWORD login for the web UI.
+        info = await asyncio.to_thread(db_verify_password, username, secret)
+        if info:
+            _emit_auth_success("git", "password")
+            self._apply_auth_info(info)
+            return True
 
-    async def _request_auth(self) -> bool:
+        placeholder = username.lower() in {"token", "git", "x-access-token"}
+        return await self._request_auth(
+            "token" if placeholder else "password", "invalid_credentials"
+        )
+
+    async def _request_auth(
+        self, method: str = "none", reason: str = "missing_credentials"
+    ) -> bool:
+        _emit_auth_failure("git", method, reason)
         body = b"Authentication required.\n"
         await _send_response(
             self.request,
@@ -2399,6 +2450,21 @@ class GitHTTPHandler:
         actor_user_id: int | None = None,
     ) -> None:
         """Append a security event without letting audit failures break requests."""
+        event_attributes: dict[str, str | int | float | bool] = {
+            "action": action,
+            "outcome": outcome,
+        }
+        if detail is not None and re.fullmatch(r"[a-z_]{1,64}", detail):
+            event_attributes["reason"] = detail
+        sentinel.emit_event(
+            f"audit_{action}",
+            level=(
+                "Warning" if action in {"login", "csrf"} and outcome == "failure" else "Information"
+            ),
+            attributes=event_attributes,
+        )
+        if action == "login":
+            sentinel.count("auth.login.count", attributes={"outcome": outcome, "method": "web"})
         if not self.server.audit_log:
             return
         try:
@@ -2414,6 +2480,11 @@ class GitHTTPHandler:
                 user_agent=self.headers.get("User-Agent") or "",
             )
         except Exception as exc:
+            sentinel.emit_event(
+                "audit_failure",
+                level="Warning",
+                attributes={"action": action, "error_type": type(exc).__name__},
+            )
             logger.warning(
                 "Audit write failed",
                 extra={
@@ -5872,6 +5943,14 @@ document.addEventListener("DOMContentLoaded", function() {{
             await asyncio.to_thread(
                 pull_store.add_event, pr_id, self._actor_user_id(), "closed", None
             )
+            sentinel.emit_event(
+                "pull_request_closed",
+                attributes={"repo": f"{owner}/{repo}", "pr_number": pr_id},
+            )
+            sentinel.count(
+                "pull_request.event.count",
+                attributes={"repo": f"{owner}/{repo}", "action": "closed"},
+            )
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request closed.", "ok")
 
     async def _ui_pull_reopen(self, owner: str, repo: str, pr_id: int) -> None:
@@ -5891,6 +5970,14 @@ document.addEventListener("DOMContentLoaded", function() {{
             await asyncio.to_thread(db_pr_reopen, pr_id)
             await asyncio.to_thread(
                 pull_store.add_event, pr_id, self._actor_user_id(), "reopened", None
+            )
+            sentinel.emit_event(
+                "pull_request_reopened",
+                attributes={"repo": f"{owner}/{repo}", "pr_number": pr_id},
+            )
+            sentinel.count(
+                "pull_request.event.count",
+                attributes={"repo": f"{owner}/{repo}", "action": "reopened"},
             )
             repo_git = _repo_bare_path(owner, repo)
             base_commit = await _git_resolve_commit(repo_git, "refs/heads/" + pr[6]) or ""
@@ -8191,11 +8278,18 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
             return await self._not_found()
 
         parsed = urlparse(self.path)
-        path_info = parsed.path[len(URL_PREFIX) :]
+        public_path_info = parsed.path[len(URL_PREFIX) :]
+        path_info = public_path_info
         if not _git_path_info_is_safe(path_info):
             return await self._not_found()
         path_info = _map_git_http_path_info(path_info)
         query = parsed.query or ""
+        if path_info.endswith("/git-upload-pack") or "git-upload-pack" in query:
+            identity = _repo_identity_from_git_path_info(public_path_info)
+            if identity:
+                sentinel.count(
+                    "git.fetch.count", attributes={"repo": f"{identity[0]}/{identity[1]}"}
+                )
 
         if self.remote_repository and not self._git_path_in_repository(
             path_info, *self.remote_repository
@@ -8919,6 +9013,7 @@ class AsyncGitServer:
             log_format=server_config.log_format,
         )
         if self.ci_manager.trust_all_repositories:
+            sentinel.emit_event("ci_ip_trust_all_enabled", level="Warning")
             logger.warning(
                 "IP-only CI trust enabled for all repositories: host jobs, deployments, and authenticated runners.",
                 extra={"event": "ci_ip_trust_all_enabled"},
@@ -8982,12 +9077,32 @@ class AsyncGitServer:
         after_refs = await self._branch_refs(owner, repo)
         if after_refs is None or before_refs is None:
             return
+        changed = {
+            branch for branch, commit in after_refs.items() if before_refs.get(branch) != commit
+        }
+        changed.update(branch for branch in before_refs if branch not in after_refs)
+        if changed:
+            repository = f"{owner}/{repo}"
+            attributes: dict[str, str | int | float | bool] = {
+                "repo": repository,
+                "refs_updated": len(changed),
+                "outcome": "success",
+            }
+            if len(changed) == 1:
+                attributes["branch"] = next(iter(changed))
+            sentinel.emit_event("git_push", attributes=attributes)
+            sentinel.count("git.push.count", attributes={"repo": repository, "outcome": "success"})
         if after_refs != before_refs:
             try:
                 await self.ci_manager.refresh_retention(owner, repo)
             except Exception as exc:
                 # The ref update is already accepted. Leave the old cache in
                 # place so cleanup stays paused, but still queue its CI runs.
+                sentinel.emit_event(
+                    "ci_retention_refresh_failure",
+                    level="Warning",
+                    attributes={"repo": f"{owner}/{repo}", "error_type": type(exc).__name__},
+                )
                 logger.warning(
                     "CI retention refresh failed; cleanup paused",
                     extra={
@@ -9013,6 +9128,14 @@ class AsyncGitServer:
                         self, owner, repo, repo_git, int(pr_id), old_commit or "", commit
                     )
                 except Exception as exc:
+                    sentinel.emit_event(
+                        "pr_push_record_failure",
+                        level="Warning",
+                        attributes={
+                            "repo": f"{owner}/{repo}",
+                            "error_type": type(exc).__name__,
+                        },
+                    )
                     logger.warning(
                         "Recording a pull request push failed",
                         extra={"event": "pr_push_record_failure", "error_type": type(exc).__name__},

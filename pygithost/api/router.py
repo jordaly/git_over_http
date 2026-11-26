@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, NoReturn, cast
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
-from .. import database
+from .. import database, sentinel
 from ..database_types import AuthInfo
 from . import data, git
 from .errors import APIError
@@ -325,13 +325,44 @@ class API:
     async def authenticate(self) -> None:
         values = [v for k, v in self.request.headers.items() if k.lower() == "authorization"]
         if len(values) != 1:
+            sentinel.emit_event(
+                "auth_failure",
+                level="Warning",
+                attributes={
+                    "surface": "api",
+                    "method": "none",
+                    "reason": "missing_credentials",
+                },
+            )
+            sentinel.count("auth.failure.count", attributes={"surface": "api", "method": "none"})
             raise self.unauthorized()
         parts = values[0].split()
         if len(parts) != 2 or parts[0].lower() != "bearer" or len(parts[1]) > 256:
+            sentinel.emit_event(
+                "auth_failure",
+                level="Warning",
+                attributes={
+                    "surface": "api",
+                    "method": "none",
+                    "reason": "malformed_credentials",
+                },
+            )
+            sentinel.count("auth.failure.count", attributes={"surface": "api", "method": "none"})
             raise self.unauthorized()
         auth: AuthInfo | None = await asyncio.to_thread(database.db_verify_token_any_user, parts[1])
         if not auth:
+            sentinel.emit_event(
+                "auth_failure",
+                level="Warning",
+                attributes={
+                    "surface": "api",
+                    "method": "token",
+                    "reason": "invalid_credentials",
+                },
+            )
+            sentinel.count("auth.failure.count", attributes={"surface": "api", "method": "token"})
             raise self.unauthorized()
+        sentinel.count("auth.success.count", attributes={"surface": "api", "method": "token"})
         # The database verifier always supplies these keys and value types.
         identity = cast(Identity, auth)
         if "read" not in identity["scopes"]:

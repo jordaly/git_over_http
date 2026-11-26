@@ -20,11 +20,12 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any, ParamSpec, TextIO, TypeVar
 
-from . import database
+from . import database, sentinel
 from .ci_email import load_settings, send_notification, validate_recipients
 from .database_types import CIRunStatusRow
 from .runner_types import JsonObject, RunIdentity, RunRow, StepState
@@ -64,6 +65,159 @@ BUILTINS = {
     "PYGITHOST_DEPLOYMENT",
     "PYGITHOST_DEPLOY_SCRIPT",
 }
+
+
+@dataclass
+class _RunTrace:
+    """In-memory execution trace for one CI run (never persisted)."""
+
+    trace_id: str
+    span_id: str
+    queued_at: datetime | None = None
+    started: datetime | None = None
+    started_monotonic: float | None = None
+    started_emitted: bool = False
+    runner: str = "local"
+    status: str = "error"
+
+
+_RUN_TRACES: dict[int, _RunTrace] = {}
+
+
+def _trace_queued(run_id: int) -> _RunTrace:
+    trace = _RUN_TRACES.get(run_id)
+    if trace is None:
+        trace = _RunTrace(sentinel.new_trace_id(), sentinel.new_span_id())
+        _RUN_TRACES[run_id] = trace
+    trace.queued_at = datetime.now(timezone.utc)
+    return trace
+
+
+def _trace_begin(run_id: int) -> _RunTrace:
+    trace = _RUN_TRACES.get(run_id)
+    if trace is None:
+        trace = _RunTrace(sentinel.new_trace_id(), sentinel.new_span_id())
+        _RUN_TRACES[run_id] = trace
+    if trace.started is None:
+        trace.started = datetime.now(timezone.utc)
+        trace.started_monotonic = time.monotonic()
+    return trace
+
+
+def _trace_get(run_id: int) -> _RunTrace | None:
+    return _RUN_TRACES.get(run_id)
+
+
+def _run_event_status(status: str) -> str:
+    return {
+        "success": "success",
+        "failed": "failed",
+        "timed_out": "failed",
+        "cancelled": "cancelled",
+    }.get(status, "error")
+
+
+def _run_event_level(status: str) -> str:
+    if status in ("failed", "timed_out"):
+        return "Error"
+    if status == "cancelled":
+        return "Warning"
+    if status in ("success",):
+        return "Information"
+    return "Error"
+
+
+def _span_status(status: str) -> str:
+    if status == "success":
+        return "ok"
+    if status in ("pending", "queued", "skipped"):
+        return "unset"
+    return "error"
+
+
+def _parse_span_time(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _record_child_span(
+    trace: _RunTrace, name: str, start: datetime, end: datetime, status: str, repo: str
+) -> None:
+    sentinel.record_span(
+        name[:128],
+        start,
+        end,
+        trace_id=trace.trace_id,
+        span_id=sentinel.new_span_id(),
+        parent_span_id=trace.span_id,
+        kind="internal",
+        status=_span_status(status),
+        attributes={"repo": repo},
+    )
+
+
+def _record_remote_step_spans(run_id: int, repo: str, steps: Sequence[Mapping[str, Any]]) -> None:
+    """Remote step timing is only known when the runner completes the job."""
+    trace = _RUN_TRACES.get(run_id)
+    if trace is None:
+        return
+    for step in steps:
+        name = step.get("name")
+        started = step.get("started_at")
+        finished = step.get("finished_at")
+        if not (isinstance(name, str) and isinstance(started, str) and isinstance(finished, str)):
+            continue
+        start = _parse_span_time(started)
+        end = _parse_span_time(finished)
+        if start is None or end is None:
+            continue
+        _record_child_span(trace, name, start, end, str(step.get("status", "")), repo)
+
+
+def _record_remote_completion(run_id: int, repo: str, status: str) -> None:
+    trace = _RUN_TRACES.get(run_id)
+    if trace is None:
+        return
+    finished = datetime.now(timezone.utc)
+    _record_child_span(trace, "remote execution", trace.started or finished, finished, status, repo)
+
+
+def _deployment_event_level(status: str) -> str:
+    if status in ("failed", "timed_out"):
+        return "Error"
+    if status == "interrupted":
+        return "Warning"
+    return "Information"
+
+
+def _emit_deployment_started(owner: str, repo: str, environment: str) -> None:
+    sentinel.emit_event(
+        "deployment_started",
+        attributes={"repo": f"{owner}/{repo}", "environment": environment},
+    )
+
+
+def _emit_deployment_finished(
+    owner: str, repo: str, environment: str, status: str, started: datetime
+) -> None:
+    repository = f"{owner}/{repo}"
+    duration_ms = max(0.0, (datetime.now(timezone.utc) - started).total_seconds() * 1000)
+    sentinel.emit_event(
+        "deployment_finished",
+        level=_deployment_event_level(status),
+        attributes={
+            "repo": repository,
+            "environment": environment,
+            "status": status,
+            "duration_ms": round(duration_ms, 3),
+        },
+    )
+    sentinel.count("ci.deployment.count", attributes={"repo": repository, "status": status})
 
 
 async def _db_call(func: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
@@ -873,6 +1027,14 @@ class CIManager:
                     except Exception as exc:
                         # Cleanup stays paused until a retry succeeds, but a
                         # retention cache failure must not stop the scheduler.
+                        sentinel.emit_event(
+                            "ci_retention_startup_failure",
+                            level="Warning",
+                            attributes={
+                                "repo": f"{owner}/{repo}",
+                                "error_type": type(exc).__name__,
+                            },
+                        )
                         logging.getLogger(__name__).warning(
                             "CI retention refresh failed during startup; cleanup paused",
                             extra={
@@ -1007,6 +1169,11 @@ class CIManager:
         try:
             await self.refresh_retention(owner, repo)
         except Exception as exc:
+            sentinel.emit_event(
+                "ci_retention_retry_failure",
+                level="Warning",
+                attributes={"repo": f"{owner}/{repo}", "error_type": type(exc).__name__},
+            )
             logging.getLogger(__name__).warning(
                 "CI retention refresh retry failed; cleanup paused",
                 extra={
@@ -1480,6 +1647,18 @@ class CIManager:
             self._schedule_notification((run_id, owner, repo))
             return run_id
         self.pending[run_id] = row
+        trace = _trace_queued(run_id)
+        sentinel.emit_event(
+            "ci_run_queued",
+            attributes={
+                "repo": f"{owner}/{repo}",
+                "branch": branch,
+                "trigger": event,
+                "run_number": run_id,
+            },
+            trace_id=trace.trace_id,
+            span_id=trace.span_id,
+        )
         self.wakeup.set()
         return run_id
 
@@ -1556,6 +1735,7 @@ class CIManager:
                 finished_at=datetime.now(timezone.utc).isoformat(),
             )
             self.cancelled.discard(run_id)
+            _RUN_TRACES.pop(run_id, None)
             self._schedule_notification((row[0], row[1], row[2]))
         self.cancelled.discard(run_id)
         self.wakeup.set()
@@ -1587,12 +1767,18 @@ class CIManager:
                     logging.getLogger(__name__).exception("CI queue reconciliation failed")
 
     async def _run_one(self, row: RunRow) -> None:
+        trace = _trace_begin(row[0])
         ci_finished = False
+        run_status = "error"
+        runner = "local"
         try:
             await self._execute(row)
             ci_finished = True
+            run_status = trace.status
+            runner = trace.runner
             await self._deploy(row)
         except asyncio.CancelledError:
+            run_status = "cancelled" if row[0] in self.cancelled else "error"
             if not ci_finished:
                 await _db_call(
                     database.db_ci_run_update,
@@ -1602,6 +1788,17 @@ class CIManager:
                 )
             raise
         except Exception as exc:
+            if not ci_finished:
+                run_status = "error" if isinstance(exc, sqlite3.Error) else "failed"
+            sentinel.emit_event(
+                "ci_coordinator_failure",
+                level="Error",
+                attributes={
+                    "repo": f"{row[1]}/{row[2]}",
+                    "run_number": row[0],
+                    "error_type": type(exc).__name__,
+                },
+            )
             logging.getLogger(__name__).exception("CI coordinator failed for run #%s", row[0])
             if ci_finished:
                 logging.getLogger(__name__).exception(
@@ -1615,10 +1812,52 @@ class CIManager:
                 finished_at=datetime.now(timezone.utc).isoformat(),
             )
         finally:
+            self._emit_run_finished(row, trace, run_status, runner)
             self.cancelled.discard(row[0])
             self.active.pop(row[0], None)
             self.wakeup.set()
             self._schedule_notification((row[0], row[1], row[2]))
+
+    @staticmethod
+    def _emit_run_finished(row: RunRow, trace: _RunTrace, status: str, runner: str) -> None:
+        repo = f"{row[1]}/{row[2]}"
+        event_status = _run_event_status(status)
+        finished = datetime.now(timezone.utc)
+        duration_ms = 0.0
+        if trace.started_monotonic is not None:
+            duration_ms = max(0.0, (time.monotonic() - trace.started_monotonic) * 1000)
+        sentinel.emit_event(
+            "ci_run_finished",
+            level=_run_event_level(status),
+            attributes={
+                "repo": repo,
+                "status": event_status,
+                "run_number": row[0],
+                "duration_ms": round(duration_ms, 3),
+                "runner": runner,
+            },
+            trace_id=trace.trace_id,
+            span_id=trace.span_id,
+        )
+        sentinel.count("ci.run.count", attributes={"repo": repo, "status": event_status})
+        sentinel.observe(
+            "ci.run.duration", duration_ms, attributes={"repo": repo, "status": event_status}
+        )
+        if trace.queued_at is not None and trace.started is not None:
+            wait_ms = max(0.0, (trace.started - trace.queued_at).total_seconds() * 1000)
+            sentinel.observe("ci.run.queue_wait", wait_ms, attributes={"repo": repo})
+        sentinel.record_span(
+            "ci run",
+            trace.started or finished,
+            finished,
+            trace_id=trace.trace_id,
+            span_id=trace.span_id,
+            kind="internal",
+            status="ok" if status == "success" else "error",
+            status_message=None if status == "success" else event_status,
+            attributes={"repo": repo, "run_number": row[0]},
+        )
+        _RUN_TRACES.pop(row[0], None)
 
     def _schedule_notification(self, identity: RunIdentity) -> None:
         task = asyncio.create_task(self._notify(identity))
@@ -1718,6 +1957,7 @@ class CIManager:
             return
         output, truncated = bytearray(), [False]
         claimed = False
+        deployment_started_at: datetime | None = None
         try:
             with deployment_workspace() as home:
                 env = runner_environment(home)
@@ -1785,6 +2025,8 @@ class CIManager:
                         "this repository/deployment/commit already has a deployment attempt; see Deployments."
                     )
                     return
+                deployment_started_at = datetime.now(timezone.utc)
+                _emit_deployment_started(owner, repo, deployment_key)
                 script: Path | None
                 if config.get("deploy_script_content"):
                     prefix = deployment_prefix(config["deploy_interpreter"])
@@ -1892,6 +2134,10 @@ class CIManager:
                     output.decode("utf-8", "replace"),
                     deployment_key,
                 )
+                if deployment_started_at is not None:
+                    _emit_deployment_finished(
+                        owner, repo, deployment_key, "interrupted", deployment_started_at
+                    )
             raise
         except Exception as exc:
             status = "timed_out" if isinstance(exc, asyncio.TimeoutError) else "failed"
@@ -1914,6 +2160,10 @@ class CIManager:
                 output.decode("utf-8", "replace"),
                 deployment_key,
             )
+            if deployment_started_at is not None:
+                _emit_deployment_finished(
+                    owner, repo, deployment_key, status, deployment_started_at
+                )
 
     async def _notify(self, identity: RunIdentity) -> None:
         async with self.notification_slots:
@@ -1977,6 +2227,15 @@ class CIManager:
                 database.db_deployment_email_update, run_id, "sent", False, deployment_key
             )
         except Exception as exc:
+            sentinel.emit_event(
+                "deployment_email_failure",
+                level="Warning",
+                attributes={
+                    "repo": f"{owner}/{repo}",
+                    "run_number": run_id,
+                    "error_type": type(exc).__name__,
+                },
+            )
             logging.getLogger(__name__).warning(
                 "Deployment email failed for run #%s (%s)", run_id, type(exc).__name__
             )
@@ -2032,6 +2291,15 @@ class CIManager:
             await _db_call(database.db_ci_run_update, identity[0], notification="sent")
         except Exception as exc:
             error_type = type(exc).__name__
+            sentinel.emit_event(
+                "ci_email_failure",
+                level="Warning",
+                attributes={
+                    "repo": f"{identity[1]}/{identity[2]}",
+                    "run_number": identity[0],
+                    "error_type": error_type,
+                },
+            )
             logging.getLogger(__name__).warning(
                 "CI email delivery failed for run #%s (%s); check SMTP configuration and server connectivity",
                 identity[0],
@@ -2137,6 +2405,8 @@ class CIManager:
         started_at: str | None = None,
     ) -> None:
         run_id, owner, repo, event, branch, commit, payload_json = row
+        trace = _trace_begin(run_id)
+        repository = f"{owner}/{repo}"
         payload = json.loads(payload_json or "{}")
         meta = await _db_call(database.db_ci_run_metadata, owner, repo, run_id)
         stored: JsonObject = json.loads(meta["config"]) if meta and meta["config"] else {}
@@ -2147,10 +2417,28 @@ class CIManager:
         git_values = config["env"] if stored.get("_page_environment_live") is True else {}
         config["env"] = await self.execution_environment(row, config["pipeline_id"], git_values)
         config = validate_config(config)
+        runner = "remote" if config["runner"] == "remote-docker" else "local"
+        trace.runner = runner
+        if not trace.started_emitted:
+            trace.started_emitted = True
+            sentinel.emit_event(
+                "ci_run_started",
+                attributes={
+                    "repo": repository,
+                    "branch": branch,
+                    "trigger": event,
+                    "run_number": run_id,
+                    "runner": runner,
+                },
+                trace_id=trace.trace_id,
+                span_id=trace.span_id,
+            )
         if config["runner"] == "remote-docker":
             from .remote_ci import execute_remote
 
             await execute_remote(self, row, config)
+            run = await _db_call(database.db_ci_run_get, owner, repo, run_id)
+            trace.status = run[4] if run else "error"
             return
         maximum_output: int = config["limits"]["log_mb"] * 1024 * 1024
 
@@ -2186,6 +2474,7 @@ class CIManager:
                 return_code=1,
                 finished_at=datetime.now(timezone.utc).isoformat(),
             )
+            trace.status = "failed"
             return
         if not commit and branch:
             commit = payload.get("commit", "")
@@ -2220,6 +2509,8 @@ class CIManager:
         ]
         current_step: StepState | None = None
         step_start = 0
+        step_started_at: datetime | None = None
+        step_span_recorded = True
 
         async def save_steps() -> None:
             if current_step is not None:
@@ -2264,6 +2555,7 @@ class CIManager:
 
         logger = asyncio.create_task(flush_logs())
         try:
+            checkout_started = datetime.now(timezone.utc)
             rc = await capture(
                 ["git", "clone", "--no-hardlinks", "--no-checkout", "--", bare, worktree],
                 shell=False,
@@ -2293,8 +2585,17 @@ class CIManager:
                     truncated=truncated,
                     timeout=deadline - asyncio.get_running_loop().time(),
                 )
+            _record_child_span(
+                trace,
+                "checkout",
+                checkout_started,
+                datetime.now(timezone.utc),
+                "success" if rc == 0 else "failed",
+                repository,
+            )
             if rc == 0 and event.startswith("pull_request") and payload.get("head_commit"):
                 phase = "merge"
+                merge_started = datetime.now(timezone.utc)
                 rc = await capture(
                     [
                         "git",
@@ -2311,6 +2612,14 @@ class CIManager:
                     output=output,
                     truncated=truncated,
                     timeout=deadline - asyncio.get_running_loop().time(),
+                )
+                _record_child_span(
+                    trace,
+                    "merge",
+                    merge_started,
+                    datetime.now(timezone.utc),
+                    "success" if rc == 0 else "failed",
+                    repository,
                 )
             if rc == 0:
                 if config.get("image_build"):
@@ -2332,8 +2641,17 @@ class CIManager:
                         )
 
                     preparation_started = asyncio.get_running_loop().time()
+                    image_started = datetime.now(timezone.utc)
                     image_guard = await prepare(
                         self, row, config, worktree, output, truncated, publish_image
+                    )
+                    _record_child_span(
+                        trace,
+                        "image build",
+                        image_started,
+                        datetime.now(timezone.utc),
+                        "success",
+                        repository,
                     )
                     # Build preparation has its own budget, not the test-step budget.
                     deadline += asyncio.get_running_loop().time() - preparation_started
@@ -2382,6 +2700,8 @@ class CIManager:
                     current_step = step_states[index] if step_states else None
                     step_start = len(output)
                     step_clock = asyncio.get_running_loop().time()
+                    step_started_at = datetime.now(timezone.utc)
+                    step_span_recorded = False
                     if current_step is not None:
                         phase = f"step {index + 1}: {step['name']}"
                         current_step["status"] = "running"
@@ -2437,6 +2757,15 @@ class CIManager:
                         )
                         await save_steps()
                         current_step = None
+                    _record_child_span(
+                        trace,
+                        step["name"],
+                        step_started_at,
+                        datetime.now(timezone.utc),
+                        "success" if rc == 0 else "failed",
+                        repository,
+                    )
+                    step_span_recorded = True
                     if container and index < len(commands) - 1 and rc == 0:
                         remove_rc = await capture(
                             ["docker", "rm", "--force", container],
@@ -2481,6 +2810,15 @@ class CIManager:
                 current_step["return_code"] = rc
                 current_step["finished_at"] = datetime.now(timezone.utc).isoformat()
                 current_step["duration"] = f"{asyncio.get_running_loop().time() - step_clock:.2f}s"
+                if not step_span_recorded and step_started_at is not None:
+                    _record_child_span(
+                        trace,
+                        current_step["name"],
+                        step_started_at,
+                        datetime.now(timezone.utc),
+                        str(current_step["status"]),
+                        repository,
+                    )
             for step in step_states:
                 if step["status"] == "pending":
                     step["status"] = "skipped"
@@ -2568,5 +2906,6 @@ class CIManager:
                 else cleanup_error or ""
             ),
         )
+        trace.status = status
         if cancelled:
             raise asyncio.CancelledError

@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypedDict, cast
 
-from . import database, merging, pull_store
+from . import database, merging, pull_store, sentinel
 from .ci import MERGE_METHODS
 from .diffview import extract_suggestion
 from .pull_store import Review, Side, Thread
@@ -209,6 +209,12 @@ def _protected(policy: Mapping[str, Any], branch: str) -> bool:
 
 def _event(ctx: Context, pr_id: int, kind: str, data: Mapping[str, Any] | None = None) -> None:
     pull_store.add_event(pr_id, ctx.actor.user_id if ctx.actor.known else None, kind, data)
+
+
+def _emit_pull_event(ctx: Context, pr_id: int, action: str) -> None:
+    repo = f"{ctx.owner}/{ctx.repo}"
+    sentinel.emit_event(f"pull_request_{action}", attributes={"repo": repo, "pr_number": pr_id})
+    sentinel.count("pull_request.event.count", attributes={"repo": repo, "action": action})
 
 
 # ---------------------------------------------------------------- merge status
@@ -412,6 +418,7 @@ async def merge(
             await _thread(
                 _event, ctx, pr["id"], "merged", {"method": chosen, "sha": base, "base": pr["base"]}
             )
+            _emit_pull_event(ctx, pr["id"], "merged")
             return {"merged": True, "sha": base, "merge_method": chosen, "up_to_date": True}
         subjects = await _commit_subjects(ctx.repo_git, pr["merge_base"] or base, head)
         default_title, default_message = _merge_messages(pr, chosen, subjects)
@@ -446,6 +453,7 @@ async def merge(
         await _thread(
             _event, ctx, pr["id"], "merged", {"method": chosen, "sha": new_sha, "base": pr["base"]}
         )
+        _emit_pull_event(ctx, pr["id"], "merged")
         await ctx.server._queue_push_changes(ctx.owner, ctx.repo, before_refs)
     result: dict[str, Any] = {"merged": True, "sha": new_sha, "merge_method": chosen}
     try:
@@ -842,6 +850,18 @@ async def submit_review(
         # Submitting a review fulfils that reviewer's request.
         await _thread(pull_store.remove_review_request, pr["id"], ctx.actor.user_id)
     review = await _thread(pull_store.get_review, pr["id"], review_id)
+    sentinel.emit_event(
+        "pull_request_review",
+        attributes={
+            "repo": f"{ctx.owner}/{ctx.repo}",
+            "pr_number": pr["id"],
+            "state": state,
+        },
+    )
+    sentinel.count(
+        "pull_request.event.count",
+        attributes={"repo": f"{ctx.owner}/{ctx.repo}", "action": "review"},
+    )
     return cast(Review, review)
 
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -403,6 +404,7 @@ class CITelemetryTests(SentinelTestCase):
         trust.__enter__()
         self.addCleanup(trust.__exit__, None, None, None)
 
+    @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
     async def test_run_lifecycle_events_metrics_and_spans(self) -> None:
         bare = Path(self.temp.name) / "repo.git"
         subprocess.run(

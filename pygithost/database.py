@@ -194,6 +194,7 @@ class _Connection(sqlite3.Connection):
                     id(self),
                     operation,
                     elapsed,
+                    extra={"event": "slow_db_operation"},
                 )
 
     def _transaction_end(self) -> None:

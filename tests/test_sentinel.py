@@ -797,3 +797,41 @@ class SentinelConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlowDatabaseBridgeTests(unittest.TestCase):
+    def test_slow_statement_warning_is_not_forwarded_twice(self) -> None:
+        from pygithost import sentinel as sentinel_module
+
+        exporter = SentinelExporter("http://127.0.0.1", "unused", "test", Path(":memory:"))
+        handler = sentinel_module._SentinelLogHandler(exporter)
+        record = logging.LogRecord(
+            "pygithost.database",
+            logging.WARNING,
+            __file__,
+            1,
+            "Slow SQLite statement: connection=%s operation=%s elapsed_seconds=%.3f",
+            (1, "db_x", 1.5),
+            None,
+        )
+        record.event = "slow_db_operation"
+        with patch.object(exporter, "emit") as emit:
+            handler.emit(record)
+        emit.assert_not_called()
+
+
+class ExplicitEventRegistryTests(unittest.TestCase):
+    def test_every_explicit_event_is_skipped_by_the_logging_bridge(self) -> None:
+        """A log record tagged with an explicitly sent event must not be re-sent."""
+        import re
+
+        from pygithost import sentinel as sentinel_module
+
+        root = Path(sentinel_module.__file__).resolve().parent
+        names: set[str] = set()
+        pattern = re.compile(r'(?:emit_event|\.emit)\(\s*"([a-z_]+)"')
+        for path in root.rglob("*.py"):
+            names.update(pattern.findall(path.read_text(encoding="utf-8")))
+        names -= {"log_error", "log_warning"}
+        self.assertTrue(names)
+        self.assertEqual(sorted(names - sentinel_module._EXPLICIT_EVENTS), [])

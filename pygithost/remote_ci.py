@@ -36,6 +36,16 @@ from .ci_limits import (
 from .runner_types import JsonObject, RunRow, SourceManager
 
 LEASE = 90
+# Wall-clock time of the last authenticated runner API call (poll, claim,
+# heartbeat or completion). In-memory only: it reports runner health to
+# Fuente Sentinel and resets on restart.
+_last_runner_contact: float | None = None
+
+
+def last_runner_contact() -> float | None:
+    return _last_runner_contact
+
+
 _SECRET_CONFIG_KEYS = ("env", "pipeline_env", "env_scopes")
 
 
@@ -377,6 +387,8 @@ def operation(
     document: Mapping[str, Any],
 ) -> JsonObject:
     """Serialize claims and transitions. None means server-authorized all-repository access."""
+    global _last_runner_contact
+    _last_runner_contact = time.time()
     conn = connect()
     try:
         prepared: tuple[JsonObject, bytes | None] | None = None

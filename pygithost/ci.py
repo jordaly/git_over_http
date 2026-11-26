@@ -1801,10 +1801,18 @@ class CIManager:
                     "error_type": type(exc).__name__,
                 },
             )
-            logging.getLogger(__name__).exception("CI coordinator failed for run #%s", row[0])
+            # Sent explicitly as ci_coordinator_failure; the event tag keeps the
+            # Sentinel logging bridge from forwarding these records again.
+            logging.getLogger(__name__).exception(
+                "CI coordinator failed for run #%s",
+                row[0],
+                extra={"event": "ci_coordinator_failure"},
+            )
             if ci_finished:
                 logging.getLogger(__name__).exception(
-                    "Deployment processing failed for run #%s", row[0]
+                    "Deployment processing failed for run #%s",
+                    row[0],
+                    extra={"event": "ci_coordinator_failure"},
                 )
                 return
             await _db_call(
@@ -2239,7 +2247,10 @@ class CIManager:
                 },
             )
             logging.getLogger(__name__).warning(
-                "Deployment email failed for run #%s (%s)", run_id, type(exc).__name__
+                "Deployment email failed for run #%s (%s)",
+                run_id,
+                type(exc).__name__,
+                extra={"event": "deployment_email_failure"},
             )
             await _db_call(
                 database.db_deployment_email_update,
@@ -2306,6 +2317,7 @@ class CIManager:
                 "CI email delivery failed for run #%s (%s); check SMTP configuration and server connectivity",
                 identity[0],
                 error_type,
+                extra={"event": "ci_email_failure"},
             )
             # Never leak SMTP credentials or turn a passing build into a failure.
             with contextlib.suppress(Exception):

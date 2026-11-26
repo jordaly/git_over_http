@@ -197,8 +197,8 @@ attributes for memory usage, spool backlog, and dropped events.
 When the worker starts it sends `POST /api/v1/clients/register` once with the
 same identity fields as a heartbeat plus a flat `metadata` object:
 `platform`, `port`, `url_prefix`, `ci_trust_all` (bool),
-`remote_runner_enabled` (bool; the HTTP runner API is always mounted, so this
-is `true`), `request_logs`, and `trace_sample_rate`.
+`remote_runner_enabled` (bool; `true` when at least one remote-runner token
+exists), `request_logs`, and `trace_sample_rate`.
 Registration is not buffered and a failure is ignored, exactly like a
 heartbeat; the next heartbeat still proves the installation is online.
 
@@ -325,7 +325,7 @@ never raise, and costly queries are cached for five minutes.
 | `disk.database.free` | By | Free bytes on the database directory filesystem. |
 | `repositories.count` | `{repository}` | Existing repositories (cached). |
 | `sessions.active` | `{session}` | Non-expired, non-revoked web sessions (cached). |
-| `ci.remote_runner.last_seen_age` | s | Seconds since the last remote-runner claim or heartbeat; absent before any runner activity. |
+| `ci.remote_runner.last_seen_age` | s | Seconds since a remote runner last called the runner API (idle polls included), so a healthy idle runner stays low; absent until a runner contacts this process. |
 
 ### Logging bridge
 

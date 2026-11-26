@@ -14,7 +14,7 @@ from typing import Any, cast
 from unittest import mock
 from unittest.mock import AsyncMock
 
-from pygithost import application, database, pull_store, pulls, sentinel
+from pygithost import application, database, pull_store, pulls, remote_ci, sentinel
 from pygithost.api.errors import APIError
 from pygithost.api.router import API
 from pygithost.application import AsyncGitServer, GitHTTPHandler, Headers
@@ -651,10 +651,8 @@ class HealthGaugeTests(unittest.TestCase):
                 conn.execute(
                     "INSERT INTO sessions VALUES (2, NULL, datetime('now','localtime','-1 hour'))"
                 )
-                conn.execute(
-                    "CREATE TABLE ci_remote_jobs (run_id INTEGER PRIMARY KEY, heartbeat REAL)"
-                )
-                conn.execute("INSERT INTO ci_remote_jobs VALUES (1, ?)", (time.time() - 10,))
+                conn.execute("CREATE TABLE ci_runner_tokens (digest TEXT PRIMARY KEY)")
+                conn.execute("INSERT INTO ci_runner_tokens VALUES ('d')")
                 conn.commit()
             exporter = SentinelExporter("http://127.0.0.1", "unused", "test", Path(":memory:"))
             fake_app = SimpleNamespace(
@@ -671,7 +669,9 @@ class HealthGaugeTests(unittest.TestCase):
             with (
                 mock.patch.object(application, "DB_PATH", str(db_path)),
                 mock.patch.object(application, "GIT_PROJECT_ROOT", str(repos)),
+                mock.patch.object(remote_ci, "_last_runner_contact", time.time() - 10),
             ):
+                self.assertTrue(application._remote_runner_configured())
                 application._register_health_gauges(fake_app, exporter, config)
                 gauges = {
                     name: (unit, callback) for name, (unit, callback) in exporter._gauges.items()
@@ -692,11 +692,13 @@ class HealthGaugeTests(unittest.TestCase):
                 assert isinstance(age, float)
                 self.assertGreaterEqual(age, 5)
                 self.assertLess(age, 120)
+            with mock.patch.object(remote_ci, "_last_runner_contact", None):
+                self.assertIsNone(application._remote_runner_last_seen_age())
 
     def test_gauge_callbacks_survive_a_missing_database(self) -> None:
         with mock.patch.object(application, "DB_PATH", "/nonexistent/pygithost.db"):
             self.assertIsNone(application._active_session_count())
-            self.assertIsNone(application._remote_runner_last_seen_age())
+            self.assertFalse(application._remote_runner_configured())
             self.assertIsNone(application._database_size_bytes())
 
     def test_cached_gauge_recomputes_only_after_the_interval(self) -> None:

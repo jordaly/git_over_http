@@ -9089,18 +9089,25 @@ def _active_session_count() -> int | None:
 
 
 def _remote_runner_last_seen_age() -> float | None:
-    """Seconds since the most recent remote-runner claim or heartbeat."""
+    """Seconds since any remote runner last called the runner API (poll or job)."""
+    from .remote_ci import last_runner_contact
+
+    contact = last_runner_contact()
+    if contact is None:
+        return None
+    return max(0.0, time.time() - contact)
+
+
+def _remote_runner_configured() -> bool:
+    """True when at least one remote-runner token exists."""
     conn = _read_only_database()
     if conn is None:
-        return None
+        return False
     try:
-        row = conn.execute("SELECT max(heartbeat) FROM ci_remote_jobs").fetchone()
-        heartbeat = row[0] if row is not None else None
-        if not isinstance(heartbeat, int | float) or isinstance(heartbeat, bool):
-            return None
-        return max(0.0, time.time() - float(heartbeat))
+        row = conn.execute("SELECT count(*) FROM ci_runner_tokens").fetchone()
+        return bool(row and row[0])
     except sqlite3.Error:
-        return None
+        return False
     finally:
         conn.close()
 
@@ -9472,9 +9479,7 @@ def _register_health_gauges(
     )
     exporter.register_gauge("repositories.count", "{repository}", _CachedGauge(_repository_count))
     exporter.register_gauge("sessions.active", "{session}", _CachedGauge(_active_session_count))
-    exporter.register_gauge(
-        "ci.remote_runner.last_seen_age", "s", _CachedGauge(_remote_runner_last_seen_age)
-    )
+    exporter.register_gauge("ci.remote_runner.last_seen_age", "s", _remote_runner_last_seen_age)
 
 
 async def main_async(config_path: str | os.PathLike[str]) -> None:
@@ -9543,7 +9548,7 @@ async def main_async(config_path: str | os.PathLike[str]) -> None:
                     "port": PORT,
                     "url_prefix": URL_PREFIX,
                     "ci_trust_all": app.ci_manager.trust_all_repositories,
-                    "remote_runner_enabled": True,
+                    "remote_runner_enabled": await asyncio.to_thread(_remote_runner_configured),
                     "request_logs": exporter.request_logs,
                     "trace_sample_rate": exporter.trace_sample_rate,
                 }

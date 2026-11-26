@@ -81,6 +81,7 @@ _EXPLICIT_EVENTS = frozenset(
         "server_error",
         "server_start",
         "server_stop",
+        "slow_db_operation",
         "slow_request",
         "source_cleanup_deferred",
     }

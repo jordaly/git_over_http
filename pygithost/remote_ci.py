@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import database
+from . import database, sentinel
 from .api.errors import APIError
 from .api.router import API
 from .ci_limits import (
@@ -127,6 +127,11 @@ def _delete_sources(paths: Iterable[str | None]) -> None:
             except OSError as exc:
                 # Windows readers/scanners can temporarily deny deletion. Do not
                 # turn a successful/cancelled run or server startup into failure.
+                sentinel.emit_event(
+                    "source_cleanup_deferred",
+                    level="Warning",
+                    attributes={"error_type": type(exc).__name__},
+                )
                 logging.getLogger(__name__).warning(
                     "Remote source cleanup deferred",
                     extra={"event": "source_cleanup_deferred", "error_type": type(exc).__name__},
@@ -317,6 +322,12 @@ async def execute_remote(manager: SourceManager, row: RunRow, config: Mapping[st
             if status == "finished":
                 values = json.loads(result)
                 steps = values.pop("steps", [])
+                from .ci import _record_remote_completion, _record_remote_step_spans
+
+                _record_remote_step_spans(run_id, f"{owner}/{repo}", steps)
+                _record_remote_completion(
+                    run_id, f"{owner}/{repo}", values.get("status", "unknown")
+                )
                 await _db_call(database.db_ci_steps_set, run_id, json.dumps(steps))
                 if artifact:
                     await _db_call(database.db_ci_artifact_set, run_id, artifact)

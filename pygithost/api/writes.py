@@ -121,8 +121,15 @@ async def authorize(api: APIContext) -> tuple[str, str | None, str | None, str]:
     if not match:
         raise APIError(405, "method_not_allowed", "Mutation endpoint is not supported.")
     owner, repo, tail = unquote(match[1]), unquote(match[2]), match[3] or ""
+    if not tail and api.request.method == "DELETE":
+        from . import repo_ops
+
+        repo_ops.authorize_deletion(api)
+        # A completed archive can be replayed after the repository has moved.
+        # A new deletion still resolves the repository before moving it.
+        return owner, repo, None, tail
     path = await api.repository(owner, repo)
-    if tail == "ci/settings":
+    if tail in {"ci/settings", "ci/variables"}:
         from . import settings
 
         settings.authorize(api)
@@ -145,8 +152,18 @@ async def route(
         lock = api.handler.server.push_locks.setdefault((owner, repo), asyncio.Lock())
         async with lock:
             return 201, await create_repository(api, owner, repo, doc)
-    assert path is not None
     assert repo is not None
+    from . import pulls_api, repo_ops
+
+    if not tail and method == "DELETE":
+        return await repo_ops.delete_repository(api, owner, repo)
+    assert path is not None
+    if repo_ops.handles_mutation(tail, method):
+        return await repo_ops.mutate(api, owner, repo, path, tail)
+    if pulls_api.handles_mutation(tail, method, doc):
+        # Pull request operations take the repository lock themselves when they
+        # move refs; holding it here would deadlock (asyncio locks are not reentrant).
+        return await pulls_api.mutate(api, owner, repo, path, tail)
     lock = api.handler.server.push_locks.setdefault((owner, repo), asyncio.Lock())
     async with lock:
         # Validate the current path again after waiting for the repository lock.
@@ -162,7 +179,7 @@ async def route(
                 discussions.mutate, owner, repo, tail, method, doc, api.identity
             )
         if method == "POST" and (
-            tail == "ci/runs" or re.fullmatch(r"ci/runs/[0-9]{1,18}/(cancel|rerun)", tail)
+            tail == "ci/runs" or re.fullmatch(r"ci/runs/[0-9]{1,18}/(cancel|rerun|notify)", tail)
         ):
             from . import ci_operations
 
@@ -200,9 +217,6 @@ async def route(
             return await change_file(
                 api, owner, repo, path, unquote(tail[len("contents/") :]), doc, method
             )
-        merge = re.fullmatch(r"pulls/([0-9]{1,18})/merge", tail)
-        if merge and method == "PUT":
-            return await merge_pull(api, owner, repo, path, int(merge[1]), doc)
         entity = re.fullmatch(
             r"(issues|pulls)(?:/([0-9]{1,18})(?:/comments(?:/([0-9]{1,18}))?)?)?", tail
         )
@@ -356,7 +370,9 @@ async def create_entity(
     doc: Mapping[str, object],
 ) -> tuple[int, Mapping[str, object]]:
     required = {"title"} | ({"head", "base"} if kind == "pulls" else set())
-    fields(doc, required | {"body"}, required)
+    fields(doc, required | {"body"} | ({"draft"} if kind == "pulls" else set()), required)
+    if "draft" in doc and type(doc["draft"]) is not bool:
+        raise APIError(422, "validation_error", "draft must be true or false.")
     title = text(doc, "title", maximum=256)
     body = text(doc, "body", empty=True) if "body" in doc else ""
     result: list[Issue] | list[Pull]
@@ -371,8 +387,18 @@ async def create_entity(
             raise APIError(422, "validation_error", "Head and base branches must differ.")
         await branch_head(path, head)
         await branch_head(path, base)
+        from .. import pull_store
+
         identity = await asyncio.to_thread(
-            database.db_pr_create, owner, repo, title, body, head, base, api.identity["user_id"]
+            pull_store.create_pull,
+            owner,
+            repo,
+            title,
+            body,
+            head,
+            base,
+            api.identity["user_id"],
+            bool(doc.get("draft", False)),
         )
         result = await asyncio.to_thread(data.pulls, owner, repo, "all", 1, 0, identity)
         await queue_pull(api, owner, repo, path, result[0], "pull_request")
@@ -476,79 +502,3 @@ async def change_file(
     return (201 if method == "PUT" and old is None else 200), await notify(
         api, owner, repo, before, result
     )
-
-
-async def merge_pull(
-    api: APIContext,
-    owner: str,
-    repo: str,
-    path: str,
-    identity: int,
-    doc: Mapping[str, object],
-) -> tuple[int, Mapping[str, object]]:
-    fields(doc, {"sha", "expected_base_sha"}, {"sha", "expected_base_sha"})
-    expected_source, expected_target = sha(doc, "sha"), sha(doc, "expected_base_sha")
-    rows = await asyncio.to_thread(data.pulls, owner, repo, "all", 1, 0, identity)
-    if not rows:
-        raise APIError(404, "not_found", "Pull request not found.")
-    pull = rows[0]
-    if pull["state"] != "open":
-        raise APIError(409, "state_conflict", "Pull request is not open.")
-    head, base = pull["head"]["ref"], pull["base"]["ref"]
-    source, target = await branch_head(path, head), await branch_head(path, base)
-    if (source, target) != (expected_source, expected_target):
-        raise APIError(
-            409, "revision_conflict", "Pull request branches changed. Refresh both SHAs."
-        )
-    await not_checked_out(path, base)
-    manager = api.handler.server.ci_manager
-    # CI requirements are repository-wide and come from the default branch.
-    # The exact target commit still selects and verifies the required checks.
-    policy = await manager.config(owner, repo)
-    if policy.get("_configuration_git_error"):
-        raise APIError(
-            503,
-            "ci_policy_unavailable",
-            "Repository CI policy cannot be verified; merge rejected.",
-        )
-    if policy["require_ci"]:
-        check = await manager.merge_check(owner, repo, identity, target, source, base)
-        if not check or check[1] != "success":
-            raise APIError(
-                409,
-                "ci_required",
-                "Successful CI is required for the current source and target commits.",
-            )
-    before = await api.handler.server._branch_refs(owner, repo)
-    # Shared with the web UI: ff-only ancestry and both refs are checked in one
-    # Git transaction, so external pushes cannot invalidate a successful CI gate.
-    ok, _message, merged_sha = await api.app._git_ff_merge(
-        path, base, head, expected=(target, source)
-    )
-    if not ok or not merged_sha:
-        raise APIError(
-            409,
-            "merge_conflict",
-            "Only fast-forward merges are supported; branches may also have changed or the reference transaction was rejected.",
-        )
-    await asyncio.to_thread(database.db_pr_mark_merged, identity, "ff-only", source)
-    result = {"merged": True, "sha": source, "merge_method": "ff-only"}
-    await notify(api, owner, repo, before, result)
-    try:
-        await manager.enqueue(
-            owner,
-            repo,
-            "pull_request_merged",
-            base,
-            source,
-            {
-                "pr_number": identity,
-                "base_branch": base,
-                "head_branch": head,
-                "base_commit": source,
-            },
-        )
-    except Exception as exc:
-        api.log_failure(exc)
-        result["warnings"] = ["Merge succeeded, but merged-event CI scheduling failed."]
-    return 200, result

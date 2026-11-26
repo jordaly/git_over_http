@@ -96,9 +96,9 @@ class PullRequestFeaturesTests(unittest.TestCase):
     def test_file_filter_shows_pill_link_not_escaped_html(self):
         page = self.page(quote("?file=" + "app.py", safe="=?&"))
         self.assertIn(
-            'Diff — <code>app.py</code> <a class="pill" href="/r/root/project/pulls/'
+            'Showing <code>app.py</code> only. <a class="pill" href="/r/root/project/pulls/'
             + str(self.pr)
-            + '?tab=files#diff">All files</a>',
+            + '?tab=files">All files</a>',
             page,
         )
         self.assertNotIn("&lt;a", page)
@@ -106,17 +106,15 @@ class PullRequestFeaturesTests(unittest.TestCase):
     def test_pr_shows_merge_base_diff_excluding_target_changes(self):
         page = self.page("?tab=files")
         self.assertIn("three-edited", page)
-        self.assertIn("+six", page)
+        self.assertIn('data-text="six"', page)
         self.assertNotIn("unrelated main change", page)
-        self.assertIn("Changed files (2)", page)
-        self.assertIn("app.py", page)
-        self.assertIn("new.txt", page)
-        self.assertIn('<span class="add">+3</span>', page)
-        self.assertIn('<span class="del">−1</span>', page)
+        self.assertIn("<b>2</b> files", page)
+        self.assertIn('data-path="app.py"', page)
+        self.assertIn('data-path="new.txt"', page)
         file_filter = quote("?file=" + "app.py", safe="=?&")
         status, page = self.request(self.base + f"/pulls/{self.pr}" + file_filter)
         self.assertEqual(status, 200)
-        self.assertIn("Changed files (2)", page)
+        self.assertIn("<b>1</b> files", page)
         self.assertIn("three-edited", page)
         self.assertNotIn("brand new file", page)
 
@@ -220,7 +218,7 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertEqual(status, 200, page)
         self.assertIn('action="' + self.base + '/pulls/create"', page)
         self.assertIn("Source branch", page)
-        self.assertIn("fast-forward only", page)
+        self.assertIn("Create draft pull request", page)
 
     def test_conflict_warning_links_straight_to_web_ide(self):
         self._make_conflict()
@@ -327,7 +325,7 @@ class PullRequestFeaturesTests(unittest.TestCase):
         self.assertEqual(database.db_pr_comment_count(self.pr), 1)
         self.assertIn("web IDE", database.db_pr_comment_list(self.pr)[0][3])
         status, page = self.request(self.base + f"/pulls/{self.pr}")
-        self.assertIn("Merge (ff-only)", page)
+        self.assertIn("Confirm merge", page)
 
     def test_resolve_apply_creates_merge_commit_then_ff_merge(self):
         self._make_conflict()
@@ -356,9 +354,9 @@ class PullRequestFeaturesTests(unittest.TestCase):
             self.git("--git-dir", str(self.bare), "merge-base", "main", "feature/pr"), main_tip
         )
         self.assertEqual(database.db_pr_comment_count(self.pr), 1)
-        # The integrated branch can now be merged by the ff-only policy.
-        status, page = self.request(self.base + f"/pulls/{self.pr}/merge", {})
-        self.assertEqual(status, 200, page)
+        # The integrated branch can now be fast-forward merged.
+        status, page = self.request(self.base + f"/pulls/{self.pr}/merge", {"merge_method": "ff"})
+        self.assertEqual(status, 303, page)
         pr = database.db_pr_get(self.pr)
         self.assertEqual(pr[8], "merged")
         self.assertEqual(

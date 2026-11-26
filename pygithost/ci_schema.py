@@ -21,7 +21,16 @@ PR_EVENTS = {
     "reopened": "pr_reopened",
     "merged": "pr_merged",
 }
-POLICIES = {"require_ci", "block_direct_pushes", "protected_branches"}
+POLICIES = {
+    "require_ci",
+    "block_direct_pushes",
+    "protected_branches",
+    "merge_methods",
+    "required_approvals",
+    "dismiss_stale_approvals",
+    "block_on_changes_requested",
+    "require_conversation_resolution",
+}
 GROUPS = {"execution", "triggers", "cancellation", "artifacts"}
 DEPLOYMENT_FIELDS = {
     "enabled",

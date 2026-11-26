@@ -145,7 +145,7 @@ def pulls(
     rows = _query(
         "SELECT p.id,p.title,p.body,p.author_user_id,u.username,p.status,"
         "p.created_at,p.closed_at,p.merged_at,p.source_branch,p.target_branch,"
-        "p.merge_method,p.merge_commit FROM pull_requests p "
+        "p.merge_method,p.merge_commit,p.draft FROM pull_requests p "
         "LEFT JOIN users u ON u.id=p.author_user_id WHERE "
         + where
         + " ORDER BY p.id DESC LIMIT ? OFFSET ?",
@@ -171,6 +171,7 @@ def pulls(
                     "base": {"ref": _text(r[10])},
                     "merge_method": _text_or_none(r[11]),
                     "merge_commit_sha": _text_or_none(r[12]),
+                    "draft": bool(r[13]),
                 }
             ),
         )

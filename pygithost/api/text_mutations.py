@@ -114,6 +114,17 @@ def edit(
                 f"UPDATE {table} SET {','.join(updates)} WHERE id=? AND owner=? AND repo=?",
                 [*params, identity, owner, repo],
             )
+            state = document.get("state")
+            if (
+                kind == "pulls"
+                and state is not None
+                and state != cast(Issue | Pull, current)["state"]
+            ):
+                # Same timeline event the web Close / Reopen buttons record.
+                conn.execute(
+                    "INSERT INTO pr_events(pr_id, actor_user_id, kind) VALUES(?,?,?)",
+                    (identity, actor["user_id"], "closed" if state == "closed" else "reopened"),
+                )
             result = read(owner, repo, "all", 1, 0, identity, _connection=conn)[0]
         conn.commit()
         return result

@@ -317,7 +317,7 @@ class APIWriteTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, pull)
         merge_path = path + "/merge"
-        doc = {"sha": source_sha, "expected_base_sha": self.sha}
+        doc = {"sha": source_sha, "expected_base_sha": self.sha, "merge_method": "ff"}
         self.assertEqual(self.mutate(merge_path, {**doc, "sha": "f" * 40}, method="PUT")[0], 409)
         status, _headers, result = self.mutate(merge_path, doc, method="PUT", key="merge-once")
         self.assertEqual(status, 200, result)
@@ -361,7 +361,7 @@ class APIWriteTests(unittest.TestCase):
             "alice", "project", "Release PR", "", "feature/api", "release", self.alice
         )
         path = self.base + f"/pulls/{pull}/merge"
-        doc = {"sha": feature, "expected_base_sha": release}
+        doc = {"sha": feature, "expected_base_sha": release, "merge_method": "ff"}
 
         status, _headers, result = self.mutate(path, doc, method="PUT")
         self.assertEqual(status, 409, result)
@@ -582,6 +582,6 @@ class APIWriteTests(unittest.TestCase):
         )
         self.assertEqual(
             set(operation["requestBody"]["content"]["application/json"]["schema"]["required"]),
-            {"sha", "expected_base_sha"},
+            set(),
         )
         self.assertIn("revision", schema["components"]["schemas"]["Issue"]["required"])

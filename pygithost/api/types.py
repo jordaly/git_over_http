@@ -90,6 +90,7 @@ class Pull(TypedDict):
     base: BranchReference
     merge_method: str | None
     merge_commit_sha: str | None
+    draft: bool
     revision: str
 
 
@@ -281,6 +282,7 @@ class CIManager(Protocol):
     ) -> int | None: ...
     async def cancel(self, owner: str, repo: str, identity: int) -> bool: ...
     async def rerun(self, owner: str, repo: str, identity: int) -> int | None: ...
+    async def retry_email(self, owner: str, repo: str, run_id: int) -> None: ...
     async def merge_check(
         self,
         owner: str,
@@ -366,6 +368,15 @@ class HTTPHandler(Protocol):
     def server(self) -> Server: ...
 
     def _apply_auth_info(self, info: Mapping[str, object]) -> None: ...
+
+    # Shared with the web pages so API endpoints behave exactly like their forms.
+    async def _archive_repository(self, owner: str, repo: str) -> Path: ...
+    async def _ui_pull_resolve_poststate(
+        self, owner: str, repo: str, pr_id: int
+    ) -> tuple[str, str, str, str, str, str] | None: ...
+    async def _pull_resolution_policy_error(
+        self, owner: str, repo: str, source_branch: str
+    ) -> tuple[int, str] | None: ...
 
 
 class APIContext(Protocol):

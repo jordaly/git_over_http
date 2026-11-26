@@ -977,7 +977,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         connection.request(
                             "POST",
                             f"/r/{FLAT_OWNER_UI}/repo/pulls/{pr_id}/merge",
-                            body=urlencode(with_csrf(server, {})),
+                            body=urlencode(with_csrf(server, {"merge_method": "ff"})),
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
                         )
                         response = connection.getresponse()
@@ -991,7 +991,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 FLAT_OWNER_UI, "repo", "Optional", "", "feature", "main", author
             )
             status, _ = await merge(pr_id)
-            self.assertEqual(status, 200)
+            self.assertEqual(status, 303)
             self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), head)
             self.git("--git-dir", bare, "update-ref", "refs/heads/main", base)
             required = commit_legacy_config(
@@ -1011,7 +1011,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 FLAT_OWNER_UI, "repo", "Required", "", "feature", "main", author
             )
             status, body = await merge(pr_id)
-            self.assertEqual(status, 200)
+            self.assertEqual(status, 409)
             self.assertIn(b"Merge blocked", body)
             self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), required)
             payload = {"pr_number": pr_id, "base_commit": required, "head_commit": changed}
@@ -1038,7 +1038,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             )
             database.db_ci_run_update(run_id, status="success")
             status, body = await merge(pr_id)
-            self.assertEqual(status, 200, body)
+            self.assertEqual(status, 303, body)
             self.assertNotIn(b"Merge blocked", body)
             self.assertEqual(self.git("--git-dir", bare, "rev-parse", "main"), newer, body)
 
@@ -1074,7 +1074,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         connection.request(
                             "POST",
                             f"/r/{FLAT_OWNER_UI}/repo/pulls/{pr_id}/merge",
-                            body=urlencode(with_csrf(server, {})),
+                            body=urlencode(with_csrf(server, {"merge_method": "ff"})),
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
                         )
                         response = connection.getresponse()
@@ -1113,7 +1113,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             )
             database.db_ci_run_update(release_run, status="success")
             status, body = await merge()
-            self.assertEqual(status, 200, body)
+            self.assertEqual(status, 303, body)
             self.assertNotIn(b"Merge blocked", body)
             self.assertEqual(self.git("--git-dir", bare, "rev-parse", "release"), head)
 

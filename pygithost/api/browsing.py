@@ -155,7 +155,9 @@ async def search(
 
 
 @overload
-async def diff(path: str, base: str | None, head: str, *, patch: Literal[True]) -> Diff: ...
+async def diff(
+    path: str, base: str | None, head: str, *, patch: Literal[True], ignore_whitespace: bool = False
+) -> Diff: ...
 @overload
 async def diff(
     path: str, base: str | None, head: str, *, patch: Literal[False] = False
@@ -166,9 +168,12 @@ async def diff(
     head: str,
     *,
     patch: bool = False,
+    ignore_whitespace: bool = False,
 ) -> Diff | list[ChangedFile]:
     # Never execute a repository's external diff or textconv programs.
     common = ["--no-ext-diff", "--no-textconv", "--no-renames", "--no-color"]
+    if ignore_whitespace:
+        common.append("--ignore-all-space")
     args = (
         ["diff", *common, base, head]
         if base
@@ -249,6 +254,7 @@ async def read(api: APIContext, owner: str, repo: str, path: str, tail: str) -> 
     base: str | None
     head: str
     view: str
+    ignore_whitespace = False
     if compare:
         api.parameters("base", "head")
         base, head = (
@@ -270,7 +276,11 @@ async def read(api: APIContext, owner: str, repo: str, path: str, tail: str) -> 
     elif pull_view:
         from .writes import branch_head
 
-        api.parameters()
+        if pull_view[2] == "diff":
+            api.parameters("ignore_whitespace")
+            ignore_whitespace = query_bool(api, "ignore_whitespace")
+        else:
+            api.parameters()
         pull_rows = await asyncio.to_thread(data.pulls, owner, repo, "all", 1, 0, int(pull_view[1]))
         if not pull_rows:
             raise APIError(404, "not_found", "Pull request not found.")
@@ -290,7 +300,7 @@ async def read(api: APIContext, owner: str, repo: str, path: str, tail: str) -> 
     else:
         raise APIError(404, "not_found", "Repository browsing endpoint not found.")
     if view == "diff":
-        return await diff(path, base, head, patch=True)
+        return await diff(path, base, head, patch=True, ignore_whitespace=ignore_whitespace)
     changed_rows = await diff(path, base, head)
     api.response_headers.extend([("X-Commit-SHA", head), ("X-Base-SHA", base or "")])
     return api.listing(changed_rows[api.offset : api.offset + api.per_page + 1])

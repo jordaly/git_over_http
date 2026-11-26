@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from hl_mappings import PRISM_LANGUAGE_BY_EXTENSION
 
-from . import pr_resolver
+from . import pr_resolver, pull_store, pulls
 from .ci import CIManager, protected_branch
 from .ci import default_config as ci_default_config
 from .ci_documentation import ci_configuration_guide
@@ -387,7 +387,7 @@ def _pr_create_form_html(base: str, opt_src: str, opt_tgt: str, warn_merge: str)
 <div style="min-width:220px"><label>Target branch</label><select name="target_branch" required>{opt_tgt}</select></div></div>
 <div class="row" style="margin-top:10px"><div style="flex:1;min-width:260px"><label>Title</label><input name="title" placeholder="Add feature X" required style="width:100%"/></div></div>
 <div style="margin-top:10px"><label>Description</label><textarea name="body" data-markdown placeholder="What does this change?"></textarea></div>
-<div style="margin-top:10px"><button type="submit">Create PR</button></div></form>{warn_merge}'''
+<div class="pr-create-actions" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap"><button type="submit">Create pull request</button><button type="submit" name="draft" value="1" class="secondary">Create draft pull request</button></div></form>{warn_merge}'''
         )
     )
 
@@ -2277,6 +2277,13 @@ def _static_headers(path: Path) -> list[tuple[str, str]]:
 # ============================================================
 # SERVER HANDLER
 # ============================================================
+class RepositoryDeleteError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
 class FormTooLarge(Exception):
     """A UI form body exceeds the route's size limit."""
 
@@ -3116,9 +3123,91 @@ class GitHTTPHandler:
             _html_page(str_t(t"Settings · {owner}/{repo}"), safe_html(body)),
         )
 
-    async def _ui_repo_delete(self, owner: str, repo: str) -> None:
+    async def _archive_repository(self, owner: str, repo: str) -> Path:
+        """Delete a repository by moving it and its rows into the archive.
+
+        Shared by the Settings page and ``DELETE /api/v1/repos/{owner}/{repo}``.
+        Permission and confirmation checks are the caller's job. Raises
+        RepositoryDeleteError with an HTTP status and a user-presentable message.
+        """
         from .database import db_repository_active_ci, db_repository_archive
 
+        full_name = f"{owner}/{repo}"
+        lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
+        async with lock:
+            repo_git = Path(_repo_bare_path(owner, repo))
+            root = Path(GIT_PROJECT_ROOT).resolve()
+            parent = root if owner == FLAT_OWNER_UI else root / owner
+            if not _is_git_dir(repo_git):
+                raise RepositoryDeleteError(404, "Repository not found.")
+            # Only delete a real bare repository directly inside its namespace:
+            # never a symlinked alias or a working tree with uncommitted files.
+            if (
+                repo_git.name == ".git"
+                or repo_git.is_symlink()
+                or repo_git.parent.is_symlink()
+                or repo_git.resolve().parent != parent
+            ):
+                await self._audit("repo_delete", "failure", target=full_name, detail="unsafe_path")
+                raise RepositoryDeleteError(
+                    409, "This repository cannot be deleted from the web interface or API."
+                )
+            if await _call_in_thread(db_repository_active_ci, owner, repo):
+                raise RepositoryDeleteError(
+                    409, "CI is running for this repository. Cancel or wait for it, then try again."
+                )
+            # Nothing is erased: the folder moves to the archive (outside the Git
+            # root, so the Git service cannot reach it) and the database rows move
+            # into a SQLite file beside it, so an administrator can restore both.
+            config = self.server.context.config
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest = (
+                config.deleted_repos_dir().absolute()
+                / owner
+                / f"{repo}-{stamp}-{secrets.token_hex(3)}"
+            )
+            archived_git = dest / repo_git.name
+            try:
+                dest.mkdir(parents=True)
+                await asyncio.to_thread(_move_directory, repo_git, archived_git)
+            except OSError as e:
+                with contextlib.suppress(OSError):
+                    dest.rmdir()
+                await self._audit(
+                    "repo_delete", "failure", target=full_name, detail=type(e).__name__
+                )
+                raise RepositoryDeleteError(
+                    500, str_t(t"Failed to move repository to the archive: {e}")
+                ) from None
+            try:
+                counts = await _call_in_thread(
+                    db_repository_archive, owner, repo, str(dest / "data.sqlite")
+                )
+            except Exception as e:
+                await asyncio.to_thread(_move_directory, archived_git, repo_git)
+                with contextlib.suppress(OSError):
+                    dest.rmdir()
+                await self._audit(
+                    "repo_delete", "failure", target=full_name, detail=type(e).__name__
+                )
+                raise RepositoryDeleteError(
+                    500, "Failed to archive repository data; nothing was changed."
+                ) from None
+            manifest = {
+                "owner": owner,
+                "repo": repo,
+                "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "deleted_by": self.remote_user or ("ip:" + self._client_ip()),
+                "original_path": str(repo_git),
+                "git_dir": repo_git.name,
+                "rows": counts,
+            }
+            with contextlib.suppress(OSError):
+                (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        await self._audit("repo_delete", "success", target=full_name, detail=str(dest))
+        return dest
+
+    async def _ui_repo_delete(self, owner: str, repo: str) -> None:
         owner, repo = unquote(owner), unquote(repo)
         if not (_safe_seg(owner) and _safe_seg(repo)):
             return await self._forbidden(b"403 Forbidden\n")
@@ -3142,86 +3231,12 @@ class GitHTTPHandler:
                 422,
             )
 
-        lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
-        async with lock:
-            repo_git = Path(_repo_bare_path(owner, repo))
-            root = Path(GIT_PROJECT_ROOT).resolve()
-            parent = root if owner == FLAT_OWNER_UI else root / owner
-            if not _is_git_dir(repo_git):
+        try:
+            await self._archive_repository(owner, repo)
+        except RepositoryDeleteError as exc:
+            if exc.status == 404:
                 return await self._not_found()
-            # Only delete a real bare repository directly inside its namespace:
-            # never a symlinked alias or a working tree with uncommitted files.
-            if (
-                repo_git.name == ".git"
-                or repo_git.is_symlink()
-                or repo_git.parent.is_symlink()
-                or repo_git.resolve().parent != parent
-            ):
-                await self._audit("repo_delete", "failure", target=full_name, detail="unsafe_path")
-                return await self._ui_repo_settings(
-                    owner, repo, "This repository cannot be deleted from the web interface.", "warn"
-                )
-            if await _call_in_thread(db_repository_active_ci, owner, repo):
-                return await self._ui_repo_settings(
-                    owner,
-                    repo,
-                    "CI is running for this repository. Cancel or wait for it, then try again.",
-                    "warn",
-                    409,
-                )
-            # Nothing is erased: the folder moves to the archive (outside the Git
-            # root, so the Git service cannot reach it) and the database rows move
-            # into a SQLite file beside it, so an administrator can restore both.
-            config = self.server.context.config
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dest = (
-                config.deleted_repos_dir().absolute()
-                / owner
-                / f"{repo}-{stamp}-{secrets.token_hex(3)}"
-            )
-            archived_git = dest / repo_git.name
-            try:
-                dest.mkdir(parents=True)
-                await asyncio.to_thread(_move_directory, repo_git, archived_git)
-            except OSError as e:
-                with contextlib.suppress(OSError):
-                    dest.rmdir()
-                await self._audit(
-                    "repo_delete", "failure", target=full_name, detail=type(e).__name__
-                )
-                return await self._ui_repo_settings(
-                    owner,
-                    repo,
-                    str_t(t"Failed to move repository to the archive: {e}"),
-                    "warn",
-                    500,
-                )
-            try:
-                counts = await _call_in_thread(
-                    db_repository_archive, owner, repo, str(dest / "data.sqlite")
-                )
-            except Exception as e:
-                await asyncio.to_thread(_move_directory, archived_git, repo_git)
-                with contextlib.suppress(OSError):
-                    dest.rmdir()
-                await self._audit(
-                    "repo_delete", "failure", target=full_name, detail=type(e).__name__
-                )
-                return await self._ui_repo_settings(
-                    owner, repo, "Failed to archive repository data; nothing was changed.", "warn"
-                )
-            manifest = {
-                "owner": owner,
-                "repo": repo,
-                "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "deleted_by": self.remote_user or ("ip:" + self._client_ip()),
-                "original_path": str(repo_git),
-                "git_dir": repo_git.name,
-                "rows": counts,
-            }
-            with contextlib.suppress(OSError):
-                (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        await self._audit("repo_delete", "success", target=full_name, detail=str(dest))
+            return await self._ui_repo_settings(owner, repo, exc.message, "warn", exc.status)
         return await self._ui_home(
             str_t(t"Repository {full_name} was deleted and moved to the archive."), "ok"
         )
@@ -4327,7 +4342,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             ]
         )
         warn_merge = safe_html(
-            '<div class="warn" style="margin-top:10px">Merging is <b>fast-forward only</b> on this server.</div>'
+            '<p class="muted" style="margin-top:10px">Drafts cannot be merged until they are marked ready for review. The merge methods allowed for this repository are set by <code>policies.merge_methods</code> in <code>ci/config.json</code>.</p>'
         )
         notice_html = safe_html("")
         if notice:
@@ -4389,7 +4404,7 @@ document.addEventListener("DOMContentLoaded", function() {{
                 owner, repo, str_t(t"Target branch not found: {target_branch}"), "warn"
             )
         pr_id = await asyncio.to_thread(
-            db_pr_create,
+            pull_store.create_pull,
             owner,
             repo,
             title,
@@ -4397,6 +4412,7 @@ document.addEventListener("DOMContentLoaded", function() {{
             source_branch,
             target_branch,
             self.remote_user_id,
+            form.get("draft") == "1",
         )
         await self.server.ci_manager.enqueue(
             owner,
@@ -4417,382 +4433,9 @@ document.addEventListener("DOMContentLoaded", function() {{
     async def _ui_pull_view(
         self, owner: str, repo: str, pr_id: int, notice: str = "", notice_kind: str = "ok"
     ) -> None:
-        owner = unquote(owner)
-        repo = unquote(repo)
-        row = await asyncio.to_thread(db_pr_get, pr_id)
-        if not row:
-            return await self._not_found()
-        (
-            _id,
-            db_owner,
-            db_repo,
-            title,
-            body,
-            src_branch,
-            tgt_branch,
-            author_user_id,
-            status,
-            created_at,
-            closed_at,
-            merged_at,
-            merge_method,
-            merge_commit,
-        ) = row
-        if db_owner != owner or db_repo != repo:
-            return await self._not_found()
-        repo_git = _repo_bare_path(owner, repo)
-        if not os.path.isdir(repo_git):
-            return await self._not_found()
-        base = str_t(t"/r/{q(owner)}/{q(repo)}")
-        src_commit = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
-        tgt_commit = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
-        commits: list[dict[str, str]] = []
-        params = parse_qs(urlparse(self.path).query or "")
-        pr_url = f"{base}/pulls/{pr_id}"
-        view = (params.get("tab") or [""])[0]
-        if view not in ("conversation", "commits", "checks", "files"):
-            view = (
-                "files" if "file" in params else "commits" if "page" in params else "conversation"
-            )
-        page = _page_number(params)
-        size = _page_size(params)
-        total: int | None = 0
-        merge_base = (
-            await _git_merge_base(repo_git, tgt_commit, src_commit)
-            if (src_commit and tgt_commit)
-            else None
-        )
-        if src_commit and tgt_commit and src_commit != tgt_commit:
-            total = await _git_commit_count(repo_git, tgt_commit + ".." + src_commit)
-            if total is not None:
-                page = _clamp_page(page, total, size)
-            if view == "commits":
-                commits = await _git_list_commits(
-                    repo_git, tgt_commit + ".." + src_commit, limit=size + 1, skip=(page - 1) * size
-                )
-        commits_pagination = _pagination(
-            pr_url, {"tab": "commits"}, page, len(commits) > size, total=total, per_page=size
-        )
-        commits = commits[:size]
-        changed_files: list[ChangedFile] = (
-            await _git_diff_files(repo_git, merge_base, src_commit)
-            if (merge_base and src_commit and merge_base != src_commit)
-            else []
-        )
-        selected_file = (params.get("file") or [""])[0]
-        if selected_file and not any(f["path"] == selected_file for f in changed_files):
-            selected_file = ""
-        diff_text, diff_trunc = "", False
-        if view == "files" and src_commit and tgt_commit and src_commit != tgt_commit:
-            # Three-dot diff: show what this PR adds relative to the merge base,
-            # not unrelated target-branch changes.
-            diff_text, diff_trunc = await _git_diff_between(
-                repo_git,
-                merge_base or tgt_commit,
-                src_commit,
-                max_bytes=PR_PATCH_MAX_BYTES,
-                path=selected_file,
-            )
-        elif src_commit and tgt_commit and src_commit == tgt_commit:
-            diff_text, diff_trunc = "(No changes; branches point to the same commit.)", False
-        else:
-            diff_text, diff_trunc = "(Could not resolve one or both branches.)", False
-        notice_html = safe_html("")
-        if notice:
-            cls = "ok" if notice_kind == "ok" else "warn"
-            notice_html = safe_html(
-                html_t(t'<div class="{cls}" style="margin-bottom:12px">{notice}</div>')
-            )
-        can_write = _has_write_scope(self)
-        merge_box = safe_html("")
-        needs_checks = view in ("conversation", "checks")
-        ci_policy = (
-            await self.server.ci_manager.config(owner, repo, include_secrets=False)
-            if needs_checks
-            else {"require_ci": False}
-        )
-        check = (
-            await self.server.ci_manager.merge_check(
-                owner, repo, pr_id, tgt_commit or "", src_commit or "", tgt_branch
-            )
-            if needs_checks
-            else None
-        )
-        ci_passed = bool(check and check[1] == "success" and src_commit and tgt_commit)
-        ci_label = (
-            check[1].replace("_", " ")
-            if check
-            else "not run for current commits (missing or outdated)"
-        )
-        ci_requirement = "required" if ci_policy["require_ci"] else "informational"
-        check_href = f"{base}/ci/runs/{check[0]}" if check else f"{base}/ci"
-        ci_panel = safe_html(
-            html_t(
-                t'<section class="box pr-check-panel"><h2>CI checks</h2><p>CI is {ci_requirement}: {ci_label}.</p><a href="{check_href}">{"View check run" if check else "View CI runs"}</a></section>'
-            )
-        )
-        merge_note = safe_html("")
-        if status == "merged":
-            short_commit = (merge_commit or "")[:8]
-            merge_note = safe_html(
-                html_t(
-                    t'<div class="ok" style="margin-top:10px">Merged ({merge_method or ""}). Target now at <code>{short_commit}</code>.</div>'
-                )
-            )
-        elif status == "closed":
-            merge_note = safe_html('<div class="warn" style="margin-top:10px">Closed.</div>')
+        from .pull_pages import render
 
-        conflicts = None
-        if view == "conversation" and status == "open" and src_commit and tgt_commit:
-            if merge_base is None:
-                conflicts = None  # incompatible histories; simulate unavailable
-            elif merge_base != tgt_commit:
-                conflicts = await _git_merge_conflicts(
-                    repo_git, "refs/heads/" + tgt_branch, "refs/heads/" + src_branch
-                )
-            else:
-                conflicts = []  # fast-forward possible; no conflict simulation needed
-        conflict_html = safe_html("")
-        if status == "open" and can_write:
-            if conflicts is None:
-                conflict_html = safe_html(
-                    '<div class="warn" style="margin-top:10px">Cannot simulate a merge (incompatible histories); a fast-forward merge will still verify the current commits.</div>'
-                )
-            elif merge_base == tgt_commit:
-                conflict_html = safe_html(
-                    '<div class="muted" style="margin-top:10px">The target is an ancestor of this branch; a clean fast-forward merge is possible.</div>'
-                )
-            elif conflicts:
-                conflict_html = safe_html(
-                    html_t(
-                        t'<div class="warn" style="margin-top:10px"><b>Merge conflict:</b> <code>{tgt_branch}</code> has advanced past the merge base, and merging this branch now would conflict. <a class="pill" href="{base}/pulls/{pr_id}/resolve/ide">Resolve conflicts in the web IDE</a> creates a merge commit on <code>{src_branch}</code>, or update the branch with Git (merge/rebase, resolve, push).</div>'
-                    )
-                )
-            else:
-                conflict_html = safe_html(
-                    '<div class="muted" style="margin-top:10px">The target has advanced past the merge base, but the simulated merge reports no conflicts. Fast-forward merges still verify both commits at merge time.</div>'
-                )
-        merge_disabled = safe_html(
-            ' disabled title="Successful CI for the current PR commits is required"'
-            if ci_policy["require_ci"] and not ci_passed
-            else ""
-        )
-        if status == "open":
-            if can_write:
-                merge_box = safe_html(
-                    html_t(
-                        t"""<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Merge</h2>
-<div class="muted">This server supports <b>fast-forward only</b> merges.</div>
-{conflict_html}
-<form method="POST" action="{base}/pulls/{pr_id}/merge" style="margin-top:10px"><button type="submit"{merge_disabled}>Merge (ff-only)</button></form>
-<form method="POST" action="{base}/pulls/{pr_id}/close" style="margin-top:10px"><button class="secondary" type="submit">{octicon("git-pull-request-closed", cls="issue-action-icon-close-pr")}Close pull request</button></form></div>"""
-                    )
-                )
-            else:
-                merge_box = safe_html(
-                    '<div class="box warn" style="margin-bottom:14px">You don’t have <code>write</code> scope. You can’t merge/close this PR from the UI.</div>'
-                )
-        elif status == "closed" and can_write:
-            merge_box = safe_html(
-                html_t(
-                    t'<div class="box"><form method="POST" action="{base}/pulls/{pr_id}/reopen"><button class="secondary" type="submit">Reopen pull request</button></form></div>'
-                )
-            )
-
-        commit_rows: list[str] = []
-        for c in commits:
-            ch = c["hash"]
-            commit_rows.append(
-                html_t(
-                    t"""<tr><td style="width:110px"><a href="{base}/commit/{q(ch)}"><code>{ch[:8]}</code></a></td>
-<td>{c["subject"]}</td><td class="muted">{c["author_name"]}</td><td class="muted"><small>{c["date"]}</small></td></tr>"""
-                )
-            )
-        commits_html = (
-            join_html(commit_rows)
-            if commit_rows
-            else safe_html(
-                '<tr><td class="muted">No commits (or branches not resolvable).</td></tr>'
-            )
-        )
-        diff_html = _prism_diff_patch_html(diff_text, diff_trunc, "Diff") if view == "files" else ""
-        if selected_file:
-            heading = safe_html(
-                html_t(
-                    t'Diff — <code>{selected_file}</code> <a class="pill" href="{pr_url}?tab=files#diff">All files</a>'
-                )
-            )
-        else:
-            heading = safe_html("Diff")
-        description = (
-            safe_html(html_t(t'<div class="md-body">{body}</div>'))
-            if (body or "").strip()
-            else safe_html('<span class="muted">(no description)</span>')
-        )
-        src_short = (src_commit or "")[:8]
-        tgt_short = (tgt_commit or "")[:8]
-        file_rows: list[str] = []
-        for f in changed_files:
-            path = str(f["path"])
-            kind = str(f["kind"])
-            adds, dels = f["added"], f["deleted"]
-            meta = {
-                "added": ("A", "ok"),
-                "deleted": ("D", "warn"),
-                "modified": ("M", "muted"),
-                "binary": ("B", "muted"),
-            }
-            badge, cls = meta.get(str(kind), meta["modified"])
-            link = safe_html(
-                html_t(t'<a href="{pr_url}?tab=files&amp;file={q(path)}#diff">{path}</a>')
-            )
-            selected = (
-                safe_html(' class="pr-file-selected"') if path == selected_file else safe_html("")
-            )
-            file_rows.append(
-                html_t(
-                    t'<tr{selected}><td style="width:26px"><span class="pull-file-badge pull-file-{kind}" title="{kind}">{badge}</span></td><td>{link}</td><td class="muted" style="width:110px"><span class="add">+{adds}</span> <span class="del">−{dels}</span></td></tr>'
-                )
-            )
-        files_html = (
-            join_html(file_rows)
-            if file_rows
-            else safe_html('<tr><td class="muted">No changed files.</td></tr>')
-        )
-        files_panel = (
-            safe_html(
-                html_t(
-                    t'<div class="box" style="margin-bottom:14px"><h2 style="margin:0 0 10px 0;font-size:16px">Changed files ({len(changed_files)})</h2><table>{files_html}</table></div>'
-                )
-            )
-            if changed_files and view == "files"
-            else safe_html("")
-        )
-        total_adds = sum(f["added"] for f in changed_files)
-        total_dels = sum(f["deleted"] for f in changed_files)
-        summary = (
-            safe_html(
-                html_t(
-                    t'<div class="muted" style="margin-bottom:10px">{total if total is not None else "—"} commit(s), {len(changed_files)} file(s) changed: <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></div>'
-                )
-            )
-            if changed_files
-            else safe_html("")
-        )
-        comments = (
-            await asyncio.to_thread(db_pr_comment_list, pr_id) if view == "conversation" else []
-        )
-        comment_count = (
-            len(comments)
-            if view == "conversation"
-            else await _call_in_thread(db_pr_comment_count, pr_id)
-        )
-        author = (
-            await _call_in_thread(db_get_user_by_id, author_user_id)
-            if author_user_id is not None
-            else None
-        )
-        author_name = author[1] if author else "Anonymous"
-        viewer_id = self.remote_user_id
-        viewer_admin = bool(getattr(self, "remote_is_admin", False))
-        comment_rows = []
-        for comment in comments:
-            cid, c_author, c_username, c_body, c_created, c_edited = comment
-            edited = " (edited)" if c_edited else ""
-            when = _relative_time(c_created) or c_created
-            can_manage = (
-                (not REQUIRE_AUTH and can_write)
-                or (viewer_id is not None and c_author == viewer_id)
-                or viewer_admin
-            )
-            controls = safe_html("")
-            if can_manage:
-                controls = safe_html(
-                    html_t(
-                        t'<form method="POST" action="{base}/pulls/{pr_id}/comments/{cid}/delete" class="pr-comment-actions"><button class="danger" type="submit">Delete</button></form>'
-                    )
-                )
-            comment_rows.append(
-                html_t(
-                    t'<div class="pr-comment"><div class="pr-comment-head"><b>{c_username or "anonymous"}</b> <span class="muted"><time title="{c_created}">{when}</time>{edited}</span>{controls}</div><div class="pr-comment-body md-body">{c_body}</div></div>'
-                )
-            )
-        comments_join = (
-            join_html(comment_rows)
-            if comment_rows
-            else safe_html('<p class="muted">No comments yet.</p>')
-        )
-        comment_form = safe_html("")
-        if status == "open" and can_write:
-            comment_form = safe_html(
-                html_t(
-                    t'<form method="POST" action="{base}/pulls/{pr_id}/comments" class="pr-comment-form pr-md-form"><label>Add comment</label><textarea name="body" data-markdown required maxlength="{MARKDOWN_BODY_LIMIT}" placeholder="Write a comment… Markdown and image uploads supported"></textarea><button type="submit">Comment</button></form>'
-                )
-            )
-        else:
-            comment_form = safe_html('<p class="muted">Write scope is required to comment.</p>')
-        comments_box = safe_html(
-            html_t(
-                t'<section id="discussion" class="pr-conversation"><h2>Conversation</h2>{comments_join}</section>'
-            )
-        )
-        title_form = safe_html("")
-        if status == "open" and can_write:
-            title_form = safe_html(
-                html_t(
-                    t'<details style="margin-top:10px"><summary>Edit title and description</summary><form method="POST" action="{base}/pulls/{pr_id}/update" class="pr-update-form pr-md-form"><label>Title</label><input name="title" value="{title}" required maxlength="200"><label>Description</label><textarea name="body" data-markdown maxlength="{MARKDOWN_BODY_LIMIT}">{body}</textarea><button type="submit">Save</button></form></details>'
-                )
-            )
-        tabs = join_html(
-            html_t(
-                t'''<a href="{pr_url + ("?tab=" + key if key != "conversation" else "")}"{safe_html(' aria-current="page"' if view == key else "")}>{label}{safe_html(html_t(t"<span>{count}</span>")) if count is not None else safe_html("")}</a>'''
-            )
-            for key, label, count in (
-                ("conversation", "Conversation", comment_count),
-                ("commits", "Commits", total),
-                ("checks", "Checks", None),
-                ("files", "Files changed", len(changed_files)),
-            )
-        )
-        sidebar = html_t(t"""<aside class="review-sidebar" aria-label="Pull request details">
-<h3>Pull request details</h3><dl><dt>Source branch</dt><dd><code>{src_branch}</code><br><code>{src_short}</code></dd><dt>Target branch</dt><dd><code>{tgt_branch}</code><br><code>{tgt_short}</code></dd>
-<dt>Changes</dt><dd>{len(changed_files)} files <span class="add">+{total_adds}</span> <span class="del">−{total_dels}</span></dd></dl></aside>""")
-        if view == "conversation":
-            panel = html_t(t"""<div class="review-layout pr-conversation-layout"><div class="review-main">
-<article class="pr-comment pr-description"><div class="pr-comment-head"><b>{author_name}</b> <span class="muted">opened this pull request <time title="{created_at}">{_relative_time(created_at)}</time></span></div>
-<div class="pr-comment-body">{description}{title_form}</div></article>
-{comments_box}<div class="pr-merge-stack">{merge_note}{ci_panel}{merge_box}</div>{comment_form}</div>{safe_html(sidebar)}</div>""")
-        elif view == "commits":
-            panel = html_t(
-                t'<section class="box pr-tab-panel" id="pr-commits"><h2>Commits</h2><div class="pr-commit-scroll"><table>{commits_html}</table></div>{commits_pagination}</section>'
-            )
-        elif view == "checks":
-            panel = str(ci_panel)
-        else:
-            panel = html_t(
-                t'<div class="pr-files-layout"><section class="box pr-tab-panel" id="diff"><h2>{heading}</h2>{summary}{diff_html}</section><aside class="pr-files-sidebar" aria-label="Changed files">{files_panel}</aside></div>'
-            )
-        body_html = html_t(
-            t"""{_repo_tabs(base, "pulls")}<div class="review-breadcrumb"><a href="{base}/pulls">Pull requests</a> <span>/</span> #{pr_id}</div>
-<header class="pr-detail-header"><div><h2>{title} <span>#{pr_id}</span></h2>
-<div class="pr-detail-meta"><span class="pill pill-{status}">{status.capitalize()}</span> <strong>{author_name}</strong><span>·</span>
-<code>{src_branch}</code> <span>→</span> <code>{tgt_branch}</code></div></div>
-<div class="pr-header-actions">{_repo_code_menu(owner, repo, src_branch, can_edit=can_write and bool(src_commit))}</div></header>
-{notice_html}<nav class="review-section-nav pr-detail-tabs" aria-label="Pull request views">{tabs}</nav>{safe_html(panel)}"""
-        )
-        editor_assets = self._issue_editor_assets() if view == "conversation" else safe_html("")
-        await _send_html(
-            self.request,
-            200,
-            _html_page(
-                str_t(t"PR #{pr_id} · {owner}/{repo}"),
-                safe_html(
-                    html_t(
-                        t'<main class="repo-page review-page review-detail">{safe_html(body_html)}{editor_assets}</main>'
-                    )
-                ),
-            ),
-        )
+        await render(self, unquote(owner), unquote(repo), pr_id, notice, notice_kind)
 
     async def _ui_pull_comment(self, owner: str, repo: str, pr_id: int) -> None:
         owner = unquote(owner)
@@ -6223,7 +5866,11 @@ document.addEventListener("DOMContentLoaded", function() {{
         pr = await asyncio.to_thread(db_pr_get, pr_id)
         if not pr or pr[1] != owner or pr[2] != repo:
             return await self._not_found()
-        await asyncio.to_thread(db_pr_close, pr_id)
+        if pr[8] == "open":
+            await asyncio.to_thread(db_pr_close, pr_id)
+            await asyncio.to_thread(
+                pull_store.add_event, pr_id, self._actor_user_id(), "closed", None
+            )
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request closed.", "ok")
 
     async def _ui_pull_reopen(self, owner: str, repo: str, pr_id: int) -> None:
@@ -6241,6 +5888,9 @@ document.addEventListener("DOMContentLoaded", function() {{
             )
         if pr[8] == "closed":
             await asyncio.to_thread(db_pr_reopen, pr_id)
+            await asyncio.to_thread(
+                pull_store.add_event, pr_id, self._actor_user_id(), "reopened", None
+            )
             repo_git = _repo_bare_path(owner, repo)
             base_commit = await _git_resolve_commit(repo_git, "refs/heads/" + pr[6]) or ""
             head_commit = await _git_resolve_commit(repo_git, "refs/heads/" + pr[5]) or ""
@@ -6261,90 +5911,18 @@ document.addEventListener("DOMContentLoaded", function() {{
         return await self._ui_pull_view(owner, repo, pr_id, "Pull request reopened.", "ok")
 
     async def _ui_pull_merge(self, owner: str, repo: str, pr_id: int) -> None:
-        owner = unquote(owner)
-        repo = unquote(repo)
-        if not _has_write_scope(self):
-            return await self._forbidden(b"403 Forbidden: write scope required.\n")
-        pr = await asyncio.to_thread(db_pr_get, pr_id)
-        if not pr:
-            return await self._not_found()
-        (
-            _id,
-            db_owner,
-            db_repo,
-            _title,
-            _body,
-            src_branch,
-            tgt_branch,
-            _author_user_id,
-            status,
-            _created_at,
-            _closed_at,
-            _merged_at,
-            _merge_method,
-            _merge_commit,
-        ) = pr
-        if db_owner != owner or db_repo != repo:
-            return await self._not_found()
-        if status != "open":
-            return await self._ui_pull_view(owner, repo, pr_id, "PR is not open.", "warn")
-        # Serialize with HTTP pushes; the Git transaction also verifies both SHAs.
-        lock = self.server.push_locks.setdefault((owner, repo), asyncio.Lock())
-        async with lock:
-            current_pr = await _call_in_thread(db_pr_get, pr_id)
-            if not current_pr or current_pr[8] != "open":
-                return await self._ui_pull_view(owner, repo, pr_id, "PR is no longer open.", "warn")
-            repo_git = _repo_bare_path(owner, repo)
-            tgt = await _git_resolve_commit(repo_git, "refs/heads/" + tgt_branch)
-            src = await _git_resolve_commit(repo_git, "refs/heads/" + src_branch)
-            # CI requirements are repository-wide and come from the default
-            # branch. The exact target commit still selects the required checks.
-            policy = await self.server.ci_manager.config(owner, repo)
-            if policy.get("_configuration_git_error"):
-                return await self._ui_pull_view(
-                    owner,
-                    repo,
-                    pr_id,
-                    "Merge blocked: repository CI policy cannot be verified.",
-                    "warn",
-                )
-            check = await self.server.ci_manager.merge_check(
-                owner, repo, pr_id, tgt or "", src or "", tgt_branch
-            )
-            if policy["require_ci"] and (not tgt or not src or not check or check[1] != "success"):
-                return await self._ui_pull_view(
-                    owner,
-                    repo,
-                    pr_id,
-                    "Merge blocked: successful CI is required for the current source and target commits.",
-                    "warn",
-                )
-            before_refs = await self.server._branch_refs(owner, repo)
-            ok, msg, new_commit = await _git_ff_merge(
-                repo_git, tgt_branch, src_branch, expected=(tgt, src)
-            )
-            if ok and new_commit:
-                await _call_in_thread(db_pr_mark_merged, pr_id, "ff-only", new_commit)
-                # A merge changes the target for other open PRs, invalidating
-                # their previous checks just like a push would.
-                await self.server._queue_push_changes(owner, repo, before_refs)
-        if not ok:
-            return await self._ui_pull_view(owner, repo, pr_id, msg, "warn")
-        if new_commit:
-            await self.server.ci_manager.enqueue(
-                owner,
-                repo,
-                "pull_request_merged",
-                tgt_branch,
-                new_commit,
-                {
-                    "pr_number": pr_id,
-                    "base_branch": tgt_branch,
-                    "head_branch": src_branch,
-                    "base_commit": new_commit,
-                },
-            )
-        return await self._ui_pull_view(owner, repo, pr_id, msg, "ok")
+        from .pull_pages import handle_post
+
+        await handle_post(self, unquote(owner), unquote(repo), pr_id, "merge")
+
+    async def _ui_pull_action(self, owner: str, repo: str, pr_id: int, action: str) -> None:
+        from .pull_pages import handle_post
+
+        await handle_post(self, unquote(owner), unquote(repo), pr_id, action)
+
+    def _actor_user_id(self) -> int | None:
+        """Recorded author of an action: the signed-in user, or None without sign-in."""
+        return self.remote_user_id if REQUIRE_AUTH else None
 
     async def _ui_admin_email(
         self, notice: str = "", error: bool = False, submitted: dict[str, object] | None = None
@@ -9210,6 +8788,11 @@ document.getElementById("repo-copy-file")?.addEventListener("click", async funct
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/merge$", parsed.path)
         if m:
             return await self._ui_pull_merge(m.group(1), m.group(2), int(m.group(3)))
+        from .pull_pages import ACTION_ROUTE
+
+        m = ACTION_ROUTE.match(parsed.path)
+        if m:
+            return await self._ui_pull_action(m.group(1), m.group(2), int(m.group(3)), m.group(4))
         m = re.match(r"^/r/([^/]+)/([^/]+)/pulls/(\d+)/comments$", parsed.path)
         if m:
             return await self._ui_pull_comment(m.group(1), m.group(2), int(m.group(3)))
@@ -9423,6 +9006,15 @@ class AsyncGitServer:
             for pr_id, target_branch in await asyncio.to_thread(
                 db_prs_for_source, owner, repo, branch
             ):
+                try:
+                    await pulls.record_head_update(
+                        self, owner, repo, repo_git, int(pr_id), old_commit or "", commit
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Recording a pull request push failed",
+                        extra={"event": "pr_push_record_failure", "error_type": type(exc).__name__},
+                    )
                 base_commit = (
                     await _git_resolve_commit(repo_git, "refs/heads/" + target_branch) or ""
                 )

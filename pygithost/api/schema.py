@@ -88,6 +88,7 @@ def specification() -> DynamicJSONObject:
                 "base": obj({"ref": string}),
                 "merge_method": nullable_string,
                 "merge_commit_sha": nullable_string,
+                "draft": {"type": "boolean"},
                 "revision": string,
             }
         ),
@@ -253,10 +254,9 @@ def specification() -> DynamicJSONObject:
         ]
         if "{id}" in path:
             parameters.append(parameter("id", {"type": "integer", "minimum": 1}, "path", True))
-        if "{comment_id}" in path:
-            parameters.append(
-                parameter("comment_id", {"type": "integer", "minimum": 1}, "path", True)
-            )
+        for key in ("comment_id", "review_id", "thread_id"):
+            if "{" + key + "}" in path:
+                parameters.append(parameter(key, {"type": "integer", "minimum": 1}, "path", True))
         if listing:
             parameters += [
                 parameter(
@@ -532,7 +532,13 @@ def specification() -> DynamicJSONObject:
             listing=view == "files",
         )
         endpoint(
-            base + "/pulls/{id}/" + view, "getPull" + view.title(), schema, listing=view == "files"
+            base + "/pulls/{id}/" + view,
+            "getPull" + view.title(),
+            schema,
+            listing=view == "files",
+            filters=[parameter("ignore_whitespace", {"type": "boolean", "default": False})]
+            if view == "diff"
+            else [],
         )
     endpoint(base + "/pulls/{id}/commits", "listPullCommits", ref("Commit"), listing=True)
     endpoint(
@@ -613,10 +619,11 @@ def specification() -> DynamicJSONObject:
                 True,
             )
         ]
-        for key in ("owner", "repo", "branch", "path", "id", "comment_id"):
+        numeric = ("id", "comment_id", "review_id", "thread_id")
+        for key in ("owner", "repo", "branch", "path", *numeric):
             if "{" + key + "}" in path:
                 parameters.append(
-                    parameter(key, integer if key in ("id", "comment_id") else string, "path", True)
+                    parameter(key, integer if key in numeric else string, "path", True)
                 )
         responses: DynamicJSONObject = {
             key: value for key, value in paths["/user"]["get"]["responses"].items() if key != "200"
@@ -724,7 +731,7 @@ def specification() -> DynamicJSONObject:
         props = {"title": title, "body": body}
         required = {"title"}
         if resource == "pulls":
-            props.update(head=string, base=string)
+            props.update(head=string, base=string, draft={"type": "boolean"})
             required.update({"head", "base"})
         mutation(base + "/" + resource, "post", "create" + label, props, required, ref(label), 201)
         mutation(
@@ -770,9 +777,24 @@ def specification() -> DynamicJSONObject:
         base + "/pulls/{id}/merge",
         "put",
         "mergePull",
-        {"sha": commit_sha, "expected_base_sha": commit_sha},
-        {"sha", "expected_base_sha"},
+        {
+            "merge_method": {"enum": ["merge", "squash", "rebase", "ff"]},
+            "sha": commit_sha,
+            "expected_base_sha": commit_sha,
+            "commit_title": title,
+            "commit_message": {"type": "string", "maxLength": 4000},
+            "delete_branch": {"type": "boolean"},
+        },
+        (),
         ref("Merge"),
+    )
+    _review_endpoints(base, endpoint, mutation, obj, ref, string, integer, commit_sha, body)
+    # PATCH /pulls/{id} also takes draft and base (without expected_revision).
+    pull_patch = paths[base + "/pulls/{id}"]["patch"]["requestBody"]["content"]["application/json"]
+    pull_patch["schema"]["properties"].update(draft={"type": "boolean"}, base=string)
+    pull_patch["schema"]["required"] = []
+    pull_patch["schema"]["description"] = (
+        "Either draft and/or base alone, or title/body/state with expected_revision."
     )
     mutation(
         base + "/ci/runs",
@@ -874,3 +896,215 @@ def specification() -> DynamicJSONObject:
             "schemas": schemas,
         },
     }
+
+
+def _review_endpoints(
+    base: str,
+    endpoint: Any,
+    mutation: Any,
+    obj: Any,
+    ref: Any,
+    string: Any,
+    integer: Any,
+    commit_sha: Any,
+    body: Any,
+) -> None:
+    """Pull request review, lifecycle and remaining repository endpoints."""
+    flag = {"type": "boolean"}
+    anything = {"type": "object"}
+    pull = base + "/pulls/{id}"
+    side = {"enum": ["LEFT", "RIGHT"]}
+    line = {"type": "integer", "minimum": 1}
+    mode = {"enum": ["single", "review"]}
+    review_comment = {
+        "type": "object",
+        "properties": {
+            "path": string,
+            "line": line,
+            "side": side,
+            "start_line": line,
+            "body": body,
+        },
+        "required": ["path", "line", "body"],
+    }
+    endpoint(pull + "/merge-status", "pullMergeStatus", anything)
+    endpoint(pull + "/reviews", "listPullReviews", anything, listing=True)
+    endpoint(pull + "/reviews/{review_id}", "getPullReview", anything)
+    endpoint(pull + "/threads", "listReviewThreads", anything, listing=True)
+    endpoint(pull + "/threads/{thread_id}", "getReviewThread", anything)
+    endpoint(pull + "/requested_reviewers", "listRequestedReviewers", anything)
+    endpoint(pull + "/events", "listPullEvents", anything, listing=True)
+    endpoint(pull + "/timeline", "listPullTimeline", anything, listing=True)
+    endpoint(pull + "/viewed-files", "listViewedFiles", anything)
+    endpoint(pull + "/conflicts", "getPullConflicts", anything)
+    endpoint(base + "/ci/variables", "getCiVariables", anything)
+    mutation(
+        pull + "/update-branch",
+        "put",
+        "updatePullBranch",
+        {"expected_head_sha": commit_sha},
+        (),
+        anything,
+        202,
+    )
+    mutation(pull + "/head-branch", "delete", "deletePullHeadBranch", {}, (), anything)
+    mutation(pull + "/head-branch/restore", "post", "restorePullHeadBranch", {}, (), anything, 201)
+    reviewers = {"reviewers": {"type": "array", "items": string, "minItems": 1, "maxItems": 20}}
+    mutation(
+        pull + "/requested_reviewers",
+        "post",
+        "requestReviewers",
+        reviewers,
+        {"reviewers"},
+        anything,
+        201,
+    )
+    mutation(
+        pull + "/requested_reviewers",
+        "delete",
+        "removeRequestedReviewers",
+        reviewers,
+        {"reviewers"},
+        anything,
+    )
+    mutation(
+        pull + "/reviews",
+        "post",
+        "submitPullReview",
+        {
+            "event": {"enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"]},
+            "body": body,
+            "comments": {"type": "array", "items": review_comment, "maxItems": 100},
+            "commit_id": commit_sha,
+        },
+        (),
+        anything,
+        201,
+    )
+    mutation(pull + "/reviews/pending", "delete", "discardPendingReview", {}, (), anything)
+    mutation(
+        pull + "/reviews/{review_id}/dismissals",
+        "put",
+        "dismissPullReview",
+        {"message": {"type": "string", "minLength": 1, "maxLength": 1000}},
+        {"message"},
+        anything,
+    )
+    mutation(
+        pull + "/threads",
+        "post",
+        "createReviewThread",
+        {
+            "path": string,
+            "line": line,
+            "side": side,
+            "start_line": line,
+            "body": body,
+            "mode": mode,
+        },
+        {"path", "line", "body"},
+        anything,
+        201,
+    )
+    mutation(
+        pull + "/threads/{thread_id}/replies",
+        "post",
+        "replyToReviewThread",
+        {"body": body, "mode": mode},
+        {"body"},
+        anything,
+        201,
+    )
+    mutation(
+        pull + "/threads/{thread_id}/resolution",
+        "put",
+        "resolveReviewThread",
+        {"resolved": flag},
+        {"resolved"},
+        anything,
+    )
+    mutation(
+        pull + "/review-comments/{comment_id}",
+        "patch",
+        "updateReviewComment",
+        {"body": body},
+        {"body"},
+        anything,
+    )
+    mutation(
+        pull + "/review-comments/{comment_id}", "delete", "deleteReviewComment", {}, (), anything
+    )
+    mutation(
+        pull + "/review-comments/{comment_id}/apply-suggestion",
+        "post",
+        "applyReviewSuggestion",
+        {"expected_head_sha": commit_sha},
+        (),
+        anything,
+        201,
+    )
+    mutation(
+        pull + "/viewed-files",
+        "put",
+        "setFileViewed",
+        {"path": string, "viewed": flag},
+        {"path", "viewed"},
+        anything,
+    )
+    resolution_file = {
+        "type": "object",
+        "properties": {"path": string, "content": string, "delete": flag},
+        "required": ["path"],
+    }
+    mutation(
+        pull + "/conflicts/resolution",
+        "post",
+        "resolvePullConflicts",
+        {
+            "files": {"type": "array", "items": resolution_file, "minItems": 1, "maxItems": 40},
+            "message": {"type": "string", "maxLength": 4000},
+            "expected_head": commit_sha,
+            "expected_base": commit_sha,
+        },
+        {"files"},
+        anything,
+        201,
+    )
+    mutation(base, "delete", "deleteRepository", {"confirm": string}, {"confirm"}, anything)
+    mutation(
+        base + "/commits",
+        "post",
+        "commitFiles",
+        {
+            "branch": string,
+            "expected_head": commit_sha,
+            "message": {"type": "string", "minLength": 1, "maxLength": 4000},
+            "changes": {
+                "type": "object",
+                "description": "Path to base64 UTF-8 content, or null to delete the file.",
+                "additionalProperties": {"type": ["string", "null"]},
+            },
+        },
+        {"branch", "expected_head", "message", "changes"},
+        anything,
+        201,
+    )
+    variable = {
+        "type": "object",
+        "properties": {
+            "name": string,
+            "value": string,
+            "pipeline": {"type": ["string", "null"]},
+            "scope": {"enum": ["ordinary", "protected", "deployment"]},
+        },
+        "required": ["name", "value"],
+    }
+    mutation(
+        base + "/ci/variables",
+        "put",
+        "replaceCiVariables",
+        {"variables": {"type": "array", "items": variable, "maxItems": 256}},
+        {"variables"},
+        anything,
+    )
+    mutation(base + "/ci/runs/{id}/notify", "post", "notifyRun", {}, (), anything, 202)

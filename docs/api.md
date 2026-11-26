@@ -118,7 +118,7 @@ a body. Supported mutations are listed separately below.
 | `/repos/{owner}/{repo}/pulls/{id}/comments` | PR comments, ordered oldest first |
 | `/repos/{owner}/{repo}/pulls/{id}/comments/{comment_id}` | One PR comment and its revision |
 | `/repos/{owner}/{repo}/pulls/{id}/files` | Files changed from the PR merge base to its head |
-| `/repos/{owner}/{repo}/pulls/{id}/diff` | Bounded PR patch from the merge base |
+| `/repos/{owner}/{repo}/pulls/{id}/diff` | Bounded PR patch from the merge base. Set `ignore_whitespace=true` to suppress whitespace-only changes |
 | `/repos/{owner}/{repo}/pulls/{id}/commits` | Head commits not reachable from the current target |
 | `/repos/{owner}/{repo}/discussions/categories` | Supported categories and accepted-answer capability |
 | `/repos/{owner}/{repo}/discussions` | Discussion list; optional `category` and `locked` filters |
@@ -176,12 +176,12 @@ repository-bound tokens, so two bound tokens of one user never collide.
 | `POST` | `/repos/{owner}/{repo}/issues/{id}/comments` | `body` |
 | `PATCH` | `/repos/{owner}/{repo}/issues/{id}/comments/{comment_id}` | `body`, `expected_revision` |
 | `DELETE` | `/repos/{owner}/{repo}/issues/{id}/comments/{comment_id}` | `expected_revision` |
-| `POST` | `/repos/{owner}/{repo}/pulls` | `title`, `head`, `base` (branch names); optional `body` |
-| `PATCH` | `/repos/{owner}/{repo}/pulls/{id}` | `expected_revision`; one or more of `title`, `body`, `state` |
+| `POST` | `/repos/{owner}/{repo}/pulls` | `title`, `head`, `base` (branch names). Optional `body` and `draft` |
+| `PATCH` | `/repos/{owner}/{repo}/pulls/{id}` | `draft` and/or `base`, or one or more of `title`, `body`, `state` with `expected_revision` |
 | `POST` | `/repos/{owner}/{repo}/pulls/{id}/comments` | `body` |
 | `PATCH` | `/repos/{owner}/{repo}/pulls/{id}/comments/{comment_id}` | `body`, `expected_revision` |
 | `DELETE` | `/repos/{owner}/{repo}/pulls/{id}/comments/{comment_id}` | `expected_revision` |
-| `PUT` | `/repos/{owner}/{repo}/pulls/{id}/merge` | `sha` (source SHA), `expected_base_sha` (target SHA) |
+| `PUT` | `/repos/{owner}/{repo}/pulls/{id}/merge` | Optional `merge_method`, `sha`, `expected_base_sha`, `commit_title`, `commit_message`, and `delete_branch` |
 | `POST` | `/repos/{owner}/{repo}/ci/runs` | `branch`, `pipeline`; optional `sha` to verify the branch tip |
 | `POST` | `/repos/{owner}/{repo}/ci/runs/{id}/cancel` | Empty JSON object `{}` |
 | `POST` | `/repos/{owner}/{repo}/ci/runs/{id}/rerun` | Empty JSON object `{}` |
@@ -198,7 +198,8 @@ Repository creation is limited to the current user's namespace, including for
 administrators, and is refused (`403`) for repository-bound tokens. Without
 `auto_init` or a template a repository starts empty: push its first commit with Git.
 Creating the first commit in an unborn branch through the contents API is not yet
-supported. Repository deletion and repository settings updates are not implemented.
+supported. An administrator with an unbound write token can archive a repository
+with `DELETE /repos/{owner}/{repo}` and `{"confirm":"owner/repo"}`.
 
 For issue/PR/comment edits, first GET the resource and pass its opaque `revision`
 as `expected_revision`. A stale revision returns `409`, including after edits from
@@ -215,17 +216,54 @@ checks. Only regular UTF-8 text files up to 1 MiB are supported; binary files,
 symlinks, submodules, `.git` paths and traversal are rejected. File GET defaults to
 the default branch and returns `commit_sha` for use as `expected_head`.
 
-Merges reuse the web UI's fast-forward-only merge operation. Both current source
-and target SHAs must match, and required CI must pass for that exact pair. A Git
-transaction verifies both refs during the update; non-fast-forward merges and
-checked-out target branches are rejected. Branch operations and merges use Git ref
-transactions, not receive-pack; file commits use receive-pack. There are no API
-approval overrides, squash/rebase merges, or author impersonation fields.
+Merges share the web review and CI policy. Use `merge-status` to see available
+methods (`merge`, `squash`, `rebase`, or `ff`) and merge blockers. Pass the head SHA
+as `sha` and the target SHA as `expected_base_sha` to reject branch changes since
+inspection. Required CI must pass for the current pair.
 
 Git-changing writes schedule the existing push/PR CI events. This preserves normal
 CI/deployment behavior for qualifying branch updates; creating an issue/comment
 does not run CI. If Git succeeds but subsequent CI scheduling fails, the successful
 response includes `warnings`; inspect CI rather than blindly repeating the write.
+
+### Pull request review and repository actions
+
+The following suffixes are relative to `/repos/{owner}/{repo}/pulls/{id}`.
+Use the same bearer authentication and idempotency headers for writes.
+
+| Method | Suffix | Action and fields |
+| --- | --- | --- |
+| GET | `/merge-status`, `/timeline`, `/events` | Inspect merge blockers, conversation and activity |
+| GET | `/reviews`, `/reviews/{review_id}` | Read reviews visible to the token owner |
+| GET | `/threads`, `/threads/{thread_id}` | Read inline review conversations |
+| GET, POST, DELETE | `/requested_reviewers` | List, request or remove reviewers. For writes send `reviewers` as an array of usernames |
+| POST | `/threads` | Send `path`, `line`, and `body`. Optional `side` (`LEFT` or `RIGHT`), `start_line`, and `mode` (`single` or `review`) |
+| POST | `/threads/{thread_id}/replies` | Send `body` and optional `mode` |
+| PUT | `/threads/{thread_id}/resolution` | Send boolean `resolved` |
+| PATCH, DELETE | `/review-comments/{comment_id}` | Edit with `body` or delete with `{}` |
+| POST | `/review-comments/{comment_id}/apply-suggestion` | Commit the suggestion. Optionally send `expected_head_sha` |
+| POST | `/reviews` | Submit with `event` (`COMMENT`, `APPROVE`, or `REQUEST_CHANGES`), optional `body`, `comments`, and `commit_id`. Omit `event` to keep a review pending |
+| DELETE | `/reviews/pending` | Discard the caller's pending review with `{}` |
+| PUT | `/reviews/{review_id}/dismissals` | Dismiss a review with a `message` |
+| GET, PUT | `/viewed-files` | Read viewed files or set a file's boolean `viewed` state by `path` |
+| PUT | `/update-branch` | Merge the base into the head. Optionally send `expected_head_sha` |
+| DELETE | `/head-branch` | Delete an eligible closed or merged PR's head branch with `{}` |
+| POST | `/head-branch/restore` | Restore a head branch deleted through the PR with `{}` |
+| GET | `/conflicts` | Inspect current conflicts and base64-encoded previews |
+| POST | `/conflicts/resolution` | Send `files` containing a `path` and base64 UTF-8 `content` or `delete: true`. Send `expected_head` and `expected_base` from the inspection response to guard against stale resolutions |
+
+Multi-file commits use `POST /repos/{owner}/{repo}/commits` to save several Web IDE changes together.
+Send `branch`, `expected_head`, `message`, and a `changes` object mapping paths to
+base64 UTF-8 content or `null` for deletions.
+
+Administrators can read or replace repository CI variables with
+`GET` or `PUT /repos/{owner}/{repo}/ci/variables`. Send the full `variables` array,
+with `name`, `value`, optional `pipeline`, and optional `scope` (`ordinary`,
+`protected`, or `deployment`). To retry an eligible CI notification, send
+`{}` to `POST /repos/{owner}/{repo}/ci/runs/{id}/notify`.
+
+Repository and pull request form mappings are tested against OpenAPI. Browser
+sessions, server administration, and token management remain web workflows.
 
 ### Write example and retry rules
 
@@ -827,7 +865,7 @@ HTTP error format, rather than the API error envelope.
    repository access, pagination, public serializers, rate/output/time limits,
    OpenAPI, in-page documentation and tests.
 2. **Implemented:** safe repository creation, branch/file changes, issue/comment
-   and PR mutations, ff-only merges, scope/protection enforcement, revision/SHA
+   and PR mutations, scope/protection enforcement, revision/SHA
    checks, durable idempotency/audit records and regression tests.
 3. **Implemented:** CI triggering/cancellation/reruns, bounded UTF-8 log reads,
    paginated artifact metadata and size-limited authenticated ZIP downloads.
@@ -842,13 +880,12 @@ HTTP error format, rather than the API error envelope.
 
 | Area | Still unavailable through the API |
 | --- | --- |
-| File mutations | Multi-file commits, rename/move operations, binary writes and creating an initial commit in an empty repository |
-| Pull requests | Conflict inspection/resolution and frozen historical PR diff snapshots |
-| CI settings | Read-only configuration inspection; replacement is disabled. Separate environment/retention editing and server defaults are not exposed through the API |
-| CI details | Individual step results and email-delivery retry |
+| File mutations | Binary writes and creating an initial commit in an empty repository |
+| Pull requests | Frozen historical PR diff snapshots |
+| CI settings | Server-wide variables and retention defaults |
+| CI details | Individual CI step results |
 | Deployments | Controlled retries; history, step results and bounded logs are now available |
-| Repository administration | Settings updates and deletion |
-| Access administration | Granular/repository-restricted tokens, collaborator ACLs, service accounts and audit/token-management endpoints |
+| Access administration | Collaborator ACLs, service accounts and audit/token-management endpoints |
 | Webhooks | Intentionally deferred; no subscription or delivery infrastructure |
 
 Existing web/Git workflows remain available for supported features without API

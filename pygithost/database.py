@@ -471,6 +471,9 @@ def _db_init() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pr_comments_pr ON pr_comments(pr_id, id)")
+        from .pull_store import init_schema as init_review_schema
+
+        init_review_schema(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS issues (
@@ -3290,6 +3293,13 @@ _REPOSITORY_TABLES = (
     "ci_remote_jobs",
 )
 _REPOSITORY_CHILD_TABLES = (
+    # Review data (pull_store.CHILD_TABLES), comments first so foreign keys hold.
+    ("pr_review_comments", "pr_id", "pull_requests"),
+    ("pr_review_threads", "pr_id", "pull_requests"),
+    ("pr_reviews", "pr_id", "pull_requests"),
+    ("pr_review_requests", "pr_id", "pull_requests"),
+    ("pr_viewed_files", "pr_id", "pull_requests"),
+    ("pr_events", "pr_id", "pull_requests"),
     ("pr_comments", "pr_id", "pull_requests"),
     ("issue_comments", "issue_id", "issues"),
     ("discussion_comments", "discussion_id", "discussions"),

@@ -35,6 +35,16 @@ _T = TypeVar("_T")
 MAX_OUTPUT = 1024 * 1024
 JOB_TIMEOUT = 30 * 60
 UNMERGED_PR_EVENTS = frozenset({"pull_request", "pull_request_updated", "pull_request_reopened"})
+# Pull request merge methods, in the order the merge button offers them.
+MERGE_METHODS = ("merge", "squash", "rebase", "ff")
+# Policy keys that apply to pull requests targeting protected branches.
+PULL_RULES = (
+    "required_approvals",
+    "dismiss_stale_approvals",
+    "block_on_changes_requested",
+    "require_conversation_resolution",
+)
+
 BUILTINS = {
     "CI",
     "PYGITHOST_OWNER",
@@ -127,6 +137,12 @@ def default_config() -> JsonObject:
         "require_ci": False,
         "block_direct_pushes": False,
         "protected_branches": "main",
+        # Pull request merge rules (see docs/ci-options.md "Pull request rules").
+        "merge_methods": list(MERGE_METHODS),
+        "required_approvals": 0,
+        "dismiss_stale_approvals": False,
+        "block_on_changes_requested": False,
+        "require_conversation_resolution": False,
         "steps": [],
         "artifacts": {"paths": [], "when": "always"},
         "artifact_retention_days": 7,
@@ -359,6 +375,31 @@ def validate_config(raw: object, *, nested: bool = False) -> JsonObject:
     if defaults["block_direct_pushes"] and not protected.strip():
         raise ValueError("Specify at least one protected branch pattern.")
     defaults["protected_branches"] = protected
+    methods = raw.get("merge_methods", list(MERGE_METHODS))
+    if (
+        not isinstance(methods, list)
+        or not methods
+        or any(method not in MERGE_METHODS for method in methods)
+        or len(set(methods)) != len(methods)
+    ):
+        raise ValueError(
+            "merge_methods must be a non-empty list of distinct values from: "
+            + ", ".join(MERGE_METHODS)
+            + "."
+        )
+    defaults["merge_methods"] = list(methods)
+    approvals = raw.get("required_approvals", 0)
+    if type(approvals) is not int or not 0 <= approvals <= 10:
+        raise ValueError("required_approvals must be an integer from 0 to 10.")
+    defaults["required_approvals"] = approvals
+    for key in (
+        "dismiss_stale_approvals",
+        "block_on_changes_requested",
+        "require_conversation_resolution",
+    ):
+        if type(raw.get(key, False)) is not bool:
+            raise ValueError(f"{key} must be true or false.")
+        defaults[key] = raw.get(key, False)
     steps = raw.get("steps", [])
     if not isinstance(steps, list) or len(steps) > 64:
         raise ValueError("Steps must be a list of at most 64 named commands.")
@@ -439,7 +480,11 @@ def validate_config(raw: object, *, nested: bool = False) -> JsonObject:
             set(default_config()) | {"pipeline_id", "pipeline_mode", "deploy_script_content"}
         ):
             raise ValueError("Unknown additional pipeline field.")
-        if any(item.get(key) for key in ("require_ci", "block_direct_pushes")):
+        baseline = default_config()
+        if any(
+            key in item and item[key] != baseline[key]
+            for key in ("require_ci", "block_direct_pushes", "merge_methods", *PULL_RULES)
+        ):
             raise ValueError("Merge and branch protections belong to repository settings.")
         child = validate_config(item, nested=True)
         if child["pipeline_id"] in seen:

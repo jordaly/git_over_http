@@ -507,6 +507,14 @@ class API:
             from . import discussions
 
             return await discussions.read(self, owner, repo, tail)
+        from . import pulls_api
+
+        if pulls_api.handles_read(tail):
+            return await pulls_api.read(self, owner, repo, path, tail)
+        from . import repo_ops
+
+        if repo_ops.handles_read(tail):
+            return await repo_ops.read(self, owner, repo, path, tail)
         if (
             tail in ("tree", "search", "archive", "compare/files", "compare/diff")
             or re.fullmatch(r"commits/[^/]+/(files|diff)", tail)

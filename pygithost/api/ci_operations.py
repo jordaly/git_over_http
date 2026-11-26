@@ -85,12 +85,22 @@ async def mutate(
                 "No run queued. Check the repository CI file and scheduler availability.",
             )
         return 202, await run(owner, repo, identity)
-    match = re.fullmatch(r"ci/runs/([0-9]{1,18})/(cancel|rerun)", tail)
+    match = re.fullmatch(r"ci/runs/([0-9]{1,18})/(cancel|rerun|notify)", tail)
     if not match:
         raise APIError(405, "method_not_allowed", "Unsupported CI action.")
     fields(document, set())
     identity, action = int(match[1]), match[2]
     current = await run(owner, repo, identity)
+    if action == "notify":
+        # Same rule as the web "Retry email" button: administrators only when
+        # sign-in is enabled; the API always has a user, so require admin.
+        if not api.identity["is_admin"]:
+            raise APIError(403, "forbidden", "Administrator required to resend notifications.")
+        try:
+            await manager.retry_email(owner, repo, identity)
+        except ValueError as exc:
+            raise APIError(409, "notification_unavailable", str(exc)) from None
+        return 202, await run(owner, repo, identity)
     if action == "cancel":
         if current["status"] == "cancelled":
             return 200, current

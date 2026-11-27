@@ -79,6 +79,9 @@ class _RunTrace:
     started_emitted: bool = False
     runner: str = "local"
     status: str = "error"
+    # Server-clock times of the remote runner's claim and completion request.
+    remote_claimed: datetime | None = None
+    remote_completed: datetime | None = None
 
 
 _RUN_TRACES: dict[int, _RunTrace] = {}
@@ -162,11 +165,47 @@ def _record_child_span(
     )
 
 
-def _record_remote_step_spans(run_id: int, repo: str, steps: Sequence[Mapping[str, Any]]) -> None:
-    """Remote step timing is only known when the runner completes the job."""
+def note_remote_claim(run_id: int) -> None:
+    """Remember (server clock) when a remote runner claimed the job."""
+    trace = _RUN_TRACES.get(run_id)
+    if trace is not None and trace.remote_claimed is None:
+        trace.remote_claimed = datetime.now(timezone.utc)
+
+
+def note_remote_completion(run_id: int) -> None:
+    """Remember (server clock) when the runner's completion request arrived."""
+    trace = _RUN_TRACES.get(run_id)
+    if trace is not None and trace.remote_completed is None:
+        trace.remote_completed = datetime.now(timezone.utc)
+
+
+def _remote_window(trace: _RunTrace, now: datetime) -> tuple[datetime, datetime]:
+    """Server-clock interval in which the remote runner executed the job."""
+    end = trace.remote_completed or now
+    start = trace.remote_claimed or trace.started or end
+    if trace.started is not None:
+        start = max(start, trace.started)
+    return min(start, end), end
+
+
+def _record_remote_step_spans(
+    run_id: int,
+    repo: str,
+    steps: Sequence[Mapping[str, Any]],
+    runner_finished_at: object = None,
+) -> None:
+    """Record remote step spans on the server's timeline.
+
+    Step times come from the runner's own wall clock, which may be skewed from
+    the server's. They are shifted by ``server completion - runner finished``
+    (the job ``finished_at``, else the latest step end) and clamped into the
+    remote execution window, so relative order and durations are kept and no
+    step falls outside its parent.
+    """
     trace = _RUN_TRACES.get(run_id)
     if trace is None:
         return
+    parsed: list[tuple[str, datetime, datetime, str]] = []
     for step in steps:
         name = step.get("name")
         started = step.get("started_at")
@@ -177,15 +216,28 @@ def _record_remote_step_spans(run_id: int, repo: str, steps: Sequence[Mapping[st
         end = _parse_span_time(finished)
         if start is None or end is None:
             continue
-        _record_child_span(trace, name, start, end, str(step.get("status", "")), repo)
+        parsed.append((name, start, max(start, end), str(step.get("status", ""))))
+    if not parsed:
+        return
+    window_start, window_end = _remote_window(trace, datetime.now(timezone.utc))
+    runner_end = (
+        _parse_span_time(runner_finished_at) if isinstance(runner_finished_at, str) else None
+    )
+    if runner_end is None:
+        runner_end = max(end for _, _, end, _ in parsed)
+    offset = window_end - runner_end
+    for name, start, end, status in parsed:
+        shifted_start = min(max(start + offset, window_start), window_end)
+        shifted_end = min(max(end + offset, shifted_start), window_end)
+        _record_child_span(trace, name, shifted_start, shifted_end, status, repo)
 
 
 def _record_remote_completion(run_id: int, repo: str, status: str) -> None:
     trace = _RUN_TRACES.get(run_id)
     if trace is None:
         return
-    finished = datetime.now(timezone.utc)
-    _record_child_span(trace, "remote execution", trace.started or finished, finished, status, repo)
+    start, end = _remote_window(trace, datetime.now(timezone.utc))
+    _record_child_span(trace, "remote execution", start, end, status, repo)
 
 
 def _deployment_event_level(status: str) -> str:

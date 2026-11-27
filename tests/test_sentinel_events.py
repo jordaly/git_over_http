@@ -721,3 +721,115 @@ class HealthGaugeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemoteClockSkewTests(SentinelTestCase):
+    """Remote step times come from the runner's clock; spans must use the server's."""
+
+    RUN_ID = 990216
+
+    def setUp(self) -> None:
+        super().setUp()
+        from datetime import datetime, timedelta, timezone
+
+        from pygithost import ci
+
+        self.ci = ci
+        self.timedelta = timedelta
+        base = datetime(2026, 11, 26, 21, 14, 18, 881000, tzinfo=timezone.utc)
+        self.trace = ci._RunTrace(sentinel.new_trace_id(), sentinel.new_span_id())
+        self.trace.started = base
+        self.trace.remote_claimed = base + timedelta(milliseconds=300)
+        self.trace.remote_completed = base + timedelta(seconds=4, milliseconds=578)
+        ci._RUN_TRACES[self.RUN_ID] = self.trace
+        self.addCleanup(ci._RUN_TRACES.pop, self.RUN_ID, None)
+
+    def _steps(self, skew_seconds: float) -> tuple[list[dict[str, Any]], str]:
+        """Three steps ending exactly at the runner's job finish, skewed by ``skew_seconds``."""
+        runner_finish = self.trace.remote_completed + self.timedelta(seconds=skew_seconds)
+        durations = [0.419, 0.295, 0.390]
+        gaps = [0.064, 0.061]
+        steps: list[dict[str, Any]] = []
+        end = runner_finish
+        for index in reversed(range(3)):
+            start = end - self.timedelta(seconds=durations[index])
+            steps.insert(
+                0,
+                {
+                    "name": f"step {index}",
+                    "status": "success",
+                    "started_at": start.isoformat(),
+                    "finished_at": end.isoformat(),
+                },
+            )
+            if index:
+                end = start - self.timedelta(seconds=gaps[index - 1])
+        return steps, runner_finish.isoformat()
+
+    def _check(self, steps: list[dict[str, Any]]) -> None:
+        spans = [span for span in self.fake.spans if span["name"].startswith("step ")]
+        self.assertEqual([span["name"] for span in spans], ["step 0", "step 1", "step 2"])
+        window_start = self.trace.remote_claimed
+        window_end = self.trace.remote_completed
+        for span, step in zip(spans, steps, strict=True):
+            self.assertGreaterEqual(span["start"], self.trace.started)
+            self.assertGreaterEqual(span["start"], window_start)
+            self.assertLessEqual(span["end"], window_end)
+            self.assertEqual(span["parent_span_id"], self.trace.span_id)
+            runner_duration = self.ci._parse_span_time(
+                step["finished_at"]
+            ) - self.ci._parse_span_time(step["started_at"])
+            self.assertEqual(span["end"] - span["start"], runner_duration)
+        for earlier, later in zip(spans, spans[1:], strict=False):
+            self.assertLessEqual(earlier["end"], later["start"])
+
+    def test_runner_clock_ahead_of_server(self) -> None:
+        steps, finished = self._steps(+10)
+        self.ci._record_remote_step_spans(self.RUN_ID, "root/repo", steps, finished)
+        self._check(steps)
+
+    def test_runner_clock_behind_server(self) -> None:
+        steps, finished = self._steps(-10)
+        self.ci._record_remote_step_spans(self.RUN_ID, "root/repo", steps, finished)
+        self._check(steps)
+
+    def test_missing_job_finished_uses_latest_step_end(self) -> None:
+        steps, _finished = self._steps(+8)
+        self.ci._record_remote_step_spans(self.RUN_ID, "root/repo", steps, None)
+        self._check(steps)
+        last = [span for span in self.fake.spans if span["name"] == "step 2"][0]
+        self.assertEqual(last["end"], self.trace.remote_completed)
+
+    def test_remote_execution_starts_at_claim_and_ends_at_completion(self) -> None:
+        self.ci._record_remote_completion(self.RUN_ID, "root/repo", "success")
+        span = [span for span in self.fake.spans if span["name"] == "remote execution"][0]
+        self.assertEqual(span["start"], self.trace.remote_claimed)
+        self.assertEqual(span["end"], self.trace.remote_completed)
+
+    def test_overlong_runner_steps_are_clamped_into_the_window(self) -> None:
+        start = self.trace.remote_completed - self.timedelta(minutes=5)
+        steps = [
+            {
+                "name": "step 0",
+                "status": "failed",
+                "started_at": start.isoformat(),
+                "finished_at": self.trace.remote_completed.isoformat(),
+            }
+        ]
+        self.ci._record_remote_step_spans(self.RUN_ID, "root/repo", steps, None)
+        span = self.fake.spans[0]
+        self.assertEqual(span["start"], self.trace.remote_claimed)
+        self.assertEqual(span["end"], self.trace.remote_completed)
+
+    def test_claim_and_completion_notes_use_the_server_clock_once(self) -> None:
+        self.trace.remote_claimed = None
+        self.trace.remote_completed = None
+        self.ci.note_remote_claim(self.RUN_ID)
+        first = self.trace.remote_claimed
+        self.ci.note_remote_claim(self.RUN_ID)
+        self.ci.note_remote_completion(self.RUN_ID)
+        self.assertIsNotNone(first)
+        self.assertEqual(self.trace.remote_claimed, first)
+        assert self.trace.remote_completed is not None and first is not None
+        self.assertGreaterEqual(self.trace.remote_completed, first)
+        self.ci.note_remote_claim(123456789)  # unknown run: no error

@@ -334,7 +334,9 @@ async def execute_remote(manager: SourceManager, row: RunRow, config: Mapping[st
                 steps = values.pop("steps", [])
                 from .ci import _record_remote_completion, _record_remote_step_spans
 
-                _record_remote_step_spans(run_id, f"{owner}/{repo}", steps)
+                _record_remote_step_spans(
+                    run_id, f"{owner}/{repo}", steps, values.get("finished_at")
+                )
                 _record_remote_completion(
                     run_id, f"{owner}/{repo}", values.get("status", "unknown")
                 )
@@ -453,6 +455,9 @@ def operation(
                         (digest, attempt, time.time(), candidate_run_id),
                     )
                     row = (candidate_run_id, raw, attempt, candidate_owner, candidate_repo)
+                    from .ci import note_remote_claim
+
+                    note_remote_claim(candidate_run_id)
                     break
             conn.commit()
             _delete_sources([r[1] for r in abandoned])
@@ -534,6 +539,9 @@ def operation(
             return {"cancel": True}
         values, artifact = prepared
         if action == "complete":
+            from .ci import note_remote_completion
+
+            note_remote_completion(run_id)
             conn.execute(
                 "UPDATE ci_remote_jobs SET state='finished',result=?,artifact=?,document=? WHERE run_id=?",
                 (result_json, artifact, _redacted_document(row[7]), run_id),

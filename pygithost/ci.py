@@ -88,11 +88,11 @@ _RUN_TRACES: dict[int, _RunTrace] = {}
 
 
 def _trace_queued(run_id: int) -> _RunTrace:
-    trace = _RUN_TRACES.get(run_id)
-    if trace is None:
-        trace = _RunTrace(sentinel.new_trace_id(), sentinel.new_span_id())
-        _RUN_TRACES[run_id] = trace
+    # Queuing always starts a new trace: never inherit state (such as an
+    # already-emitted start) left behind under the same run ID.
+    trace = _RunTrace(sentinel.new_trace_id(), sentinel.new_span_id())
     trace.queued_at = datetime.now(timezone.utc)
+    _RUN_TRACES[run_id] = trace
     return trace
 
 

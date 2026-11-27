@@ -404,6 +404,17 @@ class CITelemetryTests(SentinelTestCase):
         trust.__enter__()
         self.addCleanup(trust.__exit__, None, None, None)
 
+    def test_queuing_starts_a_fresh_trace_for_a_reused_run_id(self) -> None:
+        from pygithost import ci
+
+        stale = ci._trace_begin(424242)
+        stale.started_emitted = True
+        self.addCleanup(ci._RUN_TRACES.pop, 424242, None)
+        fresh = ci._trace_queued(424242)
+        self.assertIsNot(fresh, stale)
+        self.assertFalse(fresh.started_emitted)
+        self.assertNotEqual(fresh.trace_id, stale.trace_id)
+
     @unittest.skipUnless(os.name == "posix" and shutil.which("git"), "requires POSIX and Git")
     async def test_run_lifecycle_events_metrics_and_spans(self) -> None:
         bare = Path(self.temp.name) / "repo.git"

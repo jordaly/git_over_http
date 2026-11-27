@@ -869,10 +869,12 @@ class APIDownloadTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             mock.patch.object(application, "_send_response", side_effect=blocked) as send,
-            mock.patch("pygithost.api.router.RESPONSE_TIMEOUT", 0.01),
         ):
             with self.assertRaises(application.ClientDisconnected):
-                await api.send_download(BinaryDownload(b"zip", 3, "ci-1-artifacts.zip"))
+                # send_download times out on the download's own timeout_seconds.
+                await api.send_download(
+                    BinaryDownload(b"zip", 3, "ci-1-artifacts.zip", timeout_seconds=0.01)
+                )
         handler.request.writer.close.assert_called_once()
         handler.request.writer.transport.abort.assert_called_once()
         self.assertEqual(send.call_count, 1)
